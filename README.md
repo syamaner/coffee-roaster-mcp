@@ -39,12 +39,7 @@ The future user-facing install target is the `coffee-roaster-mcp` package. PyPI 
 
 ### Setup
 
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e . --group dev
-```
+Use the commands in the [Install](#install) section, then continue with the checks below.
 
 ### Test
 
