@@ -20,7 +20,7 @@ The v0.1 direction is one local stdio MCP server that will own:
 - derived roast metrics
 - roast log export
 
-The current repo state is still bootstrap. The package scaffold, config loading, local development commands, and pull-request CI are in place. The full MCP runtime and tool surface start in Epic 2.
+The current repo state is still bootstrap. The package scaffold, config loading, local development commands, pull-request CI, and the first stdio MCP entrypoint are in place. The full roast-session runtime and control surface continue through Epic 2.
 
 ## Install
 
@@ -82,11 +82,22 @@ The default local path is intentionally mock-safe:
 - no microphone required
 - no model download required
 
-The full stdio MCP server and roast-session tool flow have not landed yet. Until `E2-S1` and later Epic 2 stories are implemented, the practical local mock run is a bootstrap validation flow rather than a real MCP session.
+`E2-S1` now provides a real local stdio MCP server entrypoint with a minimal bootstrap-safe tool list. Later Epic 2 stories still need to add the authoritative roast-session lifecycle and the roast-control tool surface.
+
+### Start The Local MCP Server
+
+```bash
+coffee-roaster-mcp serve
+```
+
+The current `E2-S1` tool list is intentionally narrow:
+
+- `get_server_info`
+- `get_runtime_config`
 
 ### Mock-Safe Bootstrap Smoke
 
-The full stdio MCP server lands in `E2-S1`. Until then, use this mock-safe bootstrap smoke to confirm the default local path stays hardware-free and model-free from a guaranteed-empty temporary directory:
+Use this mock-safe bootstrap smoke to confirm the default local path stays hardware-free and model-free from a guaranteed-empty temporary directory:
 
 ```bash
 python -c "import os, tempfile; from coffee_roaster_mcp.config import load_config; tmp = tempfile.TemporaryDirectory(); os.chdir(tmp.name); c = load_config(environ={}); print(c.roaster.driver, c.first_crack.mode, c.first_crack.precision); tmp.cleanup()"

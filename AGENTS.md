@@ -55,7 +55,7 @@ coffee-roaster-mcp --version
 
 ### Mock-Safe Bootstrap Smoke
 
-The stdio MCP server is not implemented until `E2-S1`. Use this command to verify the default local path stays on the mock driver with first-crack detection disabled from a guaranteed-empty temporary directory:
+`E2-S1` now provides `coffee-roaster-mcp serve` with a minimal bootstrap-safe tool list. Use this command to verify the default local path stays on the mock driver with first-crack detection disabled from a guaranteed-empty temporary directory:
 
 ```bash
 python -c "import os, tempfile; from coffee_roaster_mcp.config import load_config; tmp = tempfile.TemporaryDirectory(); os.chdir(tmp.name); c = load_config(environ={}); print(c.roaster.driver, c.first_crack.mode, c.first_crack.precision); tmp.cleanup()"
@@ -64,8 +64,8 @@ python -c "import os, tempfile; from coffee_roaster_mcp.config import load_confi
 ## Repo-local Workflows
 
 - `.claude/skills/code-quality`: run before marking a story complete or opening a PR.
-- `.claude/skills/mcp-dev`: use for local setup and scaffold-level validation while the MCP runtime is still landing.
-- `.claude/skills/mock-roast`: use for the current mock-safe bootstrap path and later extend it to real mock roast MCP checks.
+- `.claude/skills/mcp-dev`: use for local setup, stdio MCP startup, and scaffold-level validation while the runtime is still landing.
+- `.claude/skills/mock-roast`: use for the current mock-safe bootstrap path and early stdio MCP checks before the full roast-session flow lands.
 - `.claude/skills/hottop-validation`: use for guarded manual Hottop validation planning and release-readiness review.
 - `.claude/skills/release-registry`: use for staged PyPI and MCP Registry release preparation without implying unimplemented release automation exists.
 
@@ -76,6 +76,7 @@ src/coffee_roaster_mcp/
   __init__.py     - package version
   cli.py          - console entrypoint
   config.py       - typed configuration loading from defaults, YAML, and env vars
+  mcp_server.py   - FastMCP stdio entrypoint and bootstrap-safe tools
 tests/
   test_package.py - package and CLI smoke coverage
   test_config.py  - config defaults, YAML, env override, and validation coverage

@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E2-S1`
-- Current target: Implement the stdio MCP server entrypoint and expose a minimal tool list
+- Active story: `E2-S2`
+- Current target: Implement `RoastSession` lifecycle with one authoritative session owner
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -31,6 +31,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - Agent and n8n orchestration are out of scope.
 - Default roaster driver is `mock`.
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
+- `E2-S1` keeps the initial MCP tool surface bootstrap-safe with `get_server_info` and `get_runtime_config`. Roast-session lifecycle and roast-control tools remain later Epic 2 work.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
 - The `coffee-first-crack-detection` repo remains the source of truth for training, ONNX export, Hugging Face sync, model cards, and dataset cards.
@@ -38,6 +39,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
+- The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
 
 ## Current Risks
 
@@ -99,7 +101,7 @@ Goal: implement one authoritative roast session runtime and MCP tool surface.
 
 ### Stories
 
-- [ ] `E2-S1` Implement stdio MCP server entrypoint.
+- [x] `E2-S1` Implement stdio MCP server entrypoint.
   - Done when the server starts locally and exposes a minimal tool list.
 
 - [ ] `E2-S2` Implement `RoastSession` lifecycle.
@@ -355,6 +357,8 @@ After completing a story:
 - E1-S6 added a GitHub Actions CI workflow for pull requests plus manual runs. CI now installs project dev dependencies, runs tests, lint, format check, typecheck, CLI smoke checks, and builds sdist plus wheel artifacts. Package build tooling is declared in `pyproject.toml`.
 - E1-S7 expanded the initial README into a real install and usage entrypoint. It now explains RoastPilot versus `coffee-roaster-mcp`, the local mock path, the current Hottop placeholder, the Hugging Face model boundary, and the planned log-export behavior without claiming unfinished runtime features.
 - E1-S8 completed the repo-local workflow set. The repo now has skills for code quality, scaffold-level MCP setup, mock roast bootstrap validation, guarded Hottop validation, and staged registry release preparation. Those runbooks explicitly keep model training, ONNX export, and Hugging Face sync out of this repo.
+- Epic 2 planning now has a local crosswalk for the old `coffee-roasting` POC. It identifies the old stdio entrypoint, tool registration, session manager, and roast tracker as the main implementation references while explicitly rejecting the old split-server and orchestration architecture.
+- E2-S1 added the first local stdio FastMCP entrypoint, `coffee-roaster-mcp serve`, and a bootstrap-safe runtime tool surface with `get_server_info` and `get_runtime_config`. It keeps roast-session lifecycle and roast-control tools out of the entrypoint story.
 - Validation run for E1-S8:
   - Reviewed issue #15 acceptance criteria against `AGENTS.md`, the active epic, and the overall plan.
   - Added `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, and `.claude/skills/release-registry` using the existing repo-local skill format.
@@ -401,3 +405,13 @@ After completing a story:
   - Ran `/tmp/roastpilot-e1s6-venv/bin/python -m ruff check .`: passed.
   - Ran `/tmp/roastpilot-e1s6-venv/bin/python -m pyright --pythonpath /tmp/roastpilot-e1s6-venv/bin/python`: 0 errors.
   - Ran `/tmp/roastpilot-e1s6-venv/bin/coffee-roaster-mcp --help` and `--version`: passed.
+- Validation run for E2-S1:
+  - Added `mcp>=1.0.0,<2` as a declared runtime dependency and configured local pyright venv resolution.
+  - Added `src/coffee_roaster_mcp/mcp_server.py` with a FastMCP stdio server and bootstrap-safe introspection tools only.
+  - Added `coffee-roaster-mcp serve` and a module `__main__` guard so the entrypoint works through both the console script and `python -m coffee_roaster_mcp.cli serve`.
+  - Updated `README.md`, `AGENTS.md`, `.claude/skills/mcp-dev`, and `.claude/skills/mock-roast` so they no longer claim the stdio server is missing.
+  - Ran `./.venv/bin/python -m pytest`: 18 passed, including a stdio startup smoke test that initialized the server and listed tools over MCP.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help` and `--version`: passed.
