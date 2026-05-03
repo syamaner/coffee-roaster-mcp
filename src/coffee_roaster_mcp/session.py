@@ -104,6 +104,10 @@ class TelemetrySample:
 class RoastSession:
     """Authoritative in-process roast session state.
 
+    This object is mutable and not thread-safe by itself. Runtime code should
+    mutate it through `RoastSessionStore` methods so store-owned locking stays
+    authoritative as concurrent MCP tool handlers are added.
+
     Attributes:
         id: Stable unique session identifier.
         created_at_utc: Wall-clock UTC creation time.
@@ -177,7 +181,12 @@ class RoastSession:
         Args:
             sample: Telemetry sample to append.
             max_samples: Maximum samples to keep in the rolling buffer.
+
+        Raises:
+            ValueError: If `max_samples` is negative.
         """
+        if max_samples < 0:
+            raise ValueError("max_samples must be >= 0.")
         self.telemetry_buffer.append(sample)
         while len(self.telemetry_buffer) > max_samples:
             self.telemetry_buffer.popleft()
@@ -192,6 +201,11 @@ class RoastSessionStore:
 
     This keeps the active-session ownership explicit for Epic 2 while allowing
     tests and later tool stories to resolve the latest session state cleanly.
+
+    `RoastSession` instances returned from this store are not independently
+    thread-safe. Callers should treat this store as the authoritative mutation
+    boundary and use store-owned methods for lifecycle and future event or
+    telemetry writes.
     """
 
     def __init__(
@@ -213,6 +227,9 @@ class RoastSessionStore:
             default_log_dir: Base directory for future log writer references.
         """
         import time
+
+        if telemetry_buffer_limit < 0:
+            raise ValueError("telemetry_buffer_limit must be >= 0.")
 
         self._telemetry_buffer_limit = telemetry_buffer_limit
         self._utc_now = utc_now or (lambda: datetime.now(UTC))

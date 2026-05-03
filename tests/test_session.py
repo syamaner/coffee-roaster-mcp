@@ -63,7 +63,7 @@ def test_start_session_rejects_second_active_session() -> None:
         store.start_session()
 
 
-def test_stop_session_marks_session_complete_and_clears_active_reference() -> None:
+def test_stop_session_marks_session_complete_and_clears_active_session() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
         utc_now=clock.utc_now,
@@ -91,6 +91,26 @@ def test_stop_session_is_clean_when_no_session_exists() -> None:
     assert store.stop_session() is None
 
 
+def test_negative_telemetry_buffer_limit_is_rejected() -> None:
+    with pytest.raises(ValueError, match="telemetry_buffer_limit"):
+        RoastSessionStore(telemetry_buffer_limit=-1)
+
+
+def test_session_append_telemetry_rejects_negative_max_samples() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    with pytest.raises(ValueError, match="max_samples"):
+        session.append_telemetry(
+            TelemetrySample(recorded_at_utc=clock.utc_now(), monotonic_seconds=1.0),
+            max_samples=-1,
+        )
+
+
 def test_session_telemetry_buffer_retains_only_recent_samples() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
@@ -116,3 +136,29 @@ def test_session_telemetry_buffer_retains_only_recent_samples() -> None:
     samples = list(session.telemetry_buffer)
     assert len(samples) == 2
     assert [sample.monotonic_seconds for sample in samples] == [2.0, 3.0]
+
+
+def test_start_session_allows_new_session_after_previous_stop() -> None:
+    clock = ClockHarness()
+    issued_ids = iter(["session-001", "session-002"])
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        session_id_factory=lambda: next(issued_ids),
+    )
+
+    first_session = store.start_session()
+    clock.utc_value = datetime(2026, 5, 4, 12, 5, tzinfo=UTC)
+    clock.monotonic_value = 120.0
+    store.stop_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 6, tzinfo=UTC)
+    clock.monotonic_value = 121.0
+    second_session = store.start_session()
+
+    assert first_session.id == "session-001"
+    assert first_session.active is False
+    assert second_session.id == "session-002"
+    assert second_session.active is True
+    assert store.get_active_session() is second_session
+    assert store.get_latest_session() is second_session
