@@ -27,10 +27,12 @@ class ServerContext:
 
     Attributes:
         config: Loaded RoastPilot configuration.
+        transport: Actual MCP transport used by this server process.
         started_at_utc: UTC time when the MCP process initialized.
     """
 
     config: AppConfig
+    transport: str
     started_at_utc: datetime
 
 
@@ -98,12 +100,16 @@ class RuntimeConfigSnapshot:
     auto_t0_detection_enabled: bool
 
 
-def create_mcp_server(config_path: str | Path | None = None) -> FastMCP:
+def create_mcp_server(
+    config_path: str | Path | None = None,
+    transport: str = "stdio",
+) -> FastMCP:
     """Create the RoastPilot FastMCP server.
 
     Args:
         config_path: Optional explicit config path. When omitted, the standard
             config loading rules apply.
+        transport: Actual MCP transport used by this server instance.
 
     Returns:
         A configured FastMCP server instance.
@@ -114,6 +120,7 @@ def create_mcp_server(config_path: str | Path | None = None) -> FastMCP:
         """Load typed config once for the MCP process lifetime."""
         yield ServerContext(
             config=load_config(path=config_path),
+            transport=transport,
             started_at_utc=datetime.now(UTC),
         )
 
@@ -135,7 +142,7 @@ def create_mcp_server(config_path: str | Path | None = None) -> FastMCP:
             product_name="RoastPilot",
             package_name="coffee-roaster-mcp",
             version=__version__,
-            transport=config.transport.type,
+            transport=server_context.transport,
             current_phase="bootstrap",
             roaster_driver=config.roaster.driver,
             first_crack_mode=config.first_crack.mode,
@@ -175,7 +182,7 @@ def run_stdio_server(config_path: str | Path | None = None) -> None:
     Args:
         config_path: Optional explicit config path.
     """
-    create_mcp_server(config_path=config_path).run(transport="stdio")
+    create_mcp_server(config_path=config_path, transport="stdio").run(transport="stdio")
 
 
 def _is_bootstrap_safe(config: AppConfig) -> bool:
@@ -185,6 +192,10 @@ def _is_bootstrap_safe(config: AppConfig) -> bool:
         config: Loaded RoastPilot configuration.
 
     Returns:
-        True when the config stays on the mock driver and disabled detector mode.
+        True when the config stays on the mock driver and uses a first-crack mode
+        that does not require audio capture or model startup.
     """
-    return config.roaster.driver == "mock" and config.first_crack.mode == "disabled"
+    return config.roaster.driver == "mock" and config.first_crack.mode in {
+        "disabled",
+        "manual",
+    }
