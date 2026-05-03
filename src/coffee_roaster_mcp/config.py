@@ -97,13 +97,18 @@ def load_config(
 ) -> AppConfig:
     """Load RoastPilot configuration from defaults, YAML, and environment overrides."""
     env = os.environ if environ is None else environ
+    env_config_path = (
+        _none_if_empty(env["COFFEE_ROASTER_MCP_CONFIG"])
+        if "COFFEE_ROASTER_MCP_CONFIG" in env
+        else None
+    )
     config_path = _resolve_config_path(path, env)
     config_path_exists = config_path.exists()
     raw_config: Mapping[str, Any] = {}
 
     if config_path_exists:
         raw_config = _read_yaml_config(config_path)
-    elif path is not None or "COFFEE_ROASTER_MCP_CONFIG" in env:
+    elif path is not None or env_config_path is not None:
         raise ConfigError(f"Config file {config_path} does not exist.")
 
     source_path = config_path if config_path_exists else None
@@ -179,7 +184,8 @@ def _roaster_from_mapping(raw: Mapping[str, Any]) -> RoasterConfig:
         port=_optional_string(raw, "port", label="roaster.port"),
         baudrate=_integer(raw, "baudrate", 115_200, label="roaster.baudrate"),
         temperature_unit=_temperature_unit(
-            _string(raw, "temperature_unit", "celsius", label="roaster.temperature_unit")
+            _string(raw, "temperature_unit", "celsius", label="roaster.temperature_unit"),
+            label="roaster.temperature_unit",
         ),
         command_interval_seconds=_float(
             raw,
@@ -193,7 +199,10 @@ def _roaster_from_mapping(raw: Mapping[str, Any]) -> RoasterConfig:
 def _first_crack_from_mapping(raw: Mapping[str, Any]) -> FirstCrackConfig:
     local_model_dir = _optional_path(raw, "local_model_dir", label="first_crack.local_model_dir")
     return FirstCrackConfig(
-        mode=_first_crack_mode(_string(raw, "mode", "disabled", label="first_crack.mode")),
+        mode=_first_crack_mode(
+            _string(raw, "mode", "disabled", label="first_crack.mode"),
+            label="first_crack.mode",
+        ),
         repo_id=_string(
             raw,
             "repo_id",
@@ -202,7 +211,8 @@ def _first_crack_from_mapping(raw: Mapping[str, Any]) -> FirstCrackConfig:
         ),
         revision=_optional_string(raw, "revision", label="first_crack.revision"),
         precision=_model_precision(
-            _string(raw, "precision", "int8", label="first_crack.precision")
+            _string(raw, "precision", "int8", label="first_crack.precision"),
+            label="first_crack.precision",
         ),
         local_model_dir=local_model_dir,
         onnx_threads=_integer(raw, "onnx_threads", 2, label="first_crack.onnx_threads"),
@@ -274,16 +284,28 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
     if "COFFEE_ROASTER_TEMP_UNIT" in environ:
         roaster = replace(
             roaster,
-            temperature_unit=_temperature_unit(environ["COFFEE_ROASTER_TEMP_UNIT"]),
+            temperature_unit=_temperature_unit(
+                environ["COFFEE_ROASTER_TEMP_UNIT"],
+                label="COFFEE_ROASTER_TEMP_UNIT",
+            ),
         )
 
     if "COFFEE_FIRST_CRACK_MODE" in environ:
         first_crack = replace(
             first_crack,
-            mode=_first_crack_mode(environ["COFFEE_FIRST_CRACK_MODE"]),
+            mode=_first_crack_mode(
+                environ["COFFEE_FIRST_CRACK_MODE"],
+                label="COFFEE_FIRST_CRACK_MODE",
+            ),
         )
     if "COFFEE_FIRST_CRACK_REPO_ID" in environ:
-        first_crack = replace(first_crack, repo_id=environ["COFFEE_FIRST_CRACK_REPO_ID"])
+        first_crack = replace(
+            first_crack,
+            repo_id=_required_string(
+                environ["COFFEE_FIRST_CRACK_REPO_ID"],
+                "COFFEE_FIRST_CRACK_REPO_ID",
+            ),
+        )
     if "COFFEE_FIRST_CRACK_REVISION" in environ:
         first_crack = replace(
             first_crack,
@@ -292,7 +314,10 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
     if "COFFEE_FIRST_CRACK_PRECISION" in environ:
         first_crack = replace(
             first_crack,
-            precision=_model_precision(environ["COFFEE_FIRST_CRACK_PRECISION"]),
+            precision=_model_precision(
+                environ["COFFEE_FIRST_CRACK_PRECISION"],
+                label="COFFEE_FIRST_CRACK_PRECISION",
+            ),
         )
     if "COFFEE_FIRST_CRACK_LOCAL_MODEL_DIR" in environ:
         local_dir = _none_if_empty(environ["COFFEE_FIRST_CRACK_LOCAL_MODEL_DIR"])
@@ -418,24 +443,24 @@ def _float(raw: Mapping[str, Any], key: str, default: float, label: str | None =
     raise ConfigError(f"{error_key} must be a number.")
 
 
-def _temperature_unit(value: str) -> TemperatureUnit:
+def _temperature_unit(value: str, label: str = "temperature_unit") -> TemperatureUnit:
     normalized = _normalized_token(value)
     if normalized not in {"celsius", "fahrenheit", "auto"}:
-        raise ConfigError("temperature_unit must be one of: celsius, fahrenheit, auto.")
+        raise ConfigError(f"{label} must be one of: celsius, fahrenheit, auto.")
     return cast(TemperatureUnit, normalized)
 
 
-def _first_crack_mode(value: str) -> FirstCrackMode:
+def _first_crack_mode(value: str, label: str = "first_crack.mode") -> FirstCrackMode:
     normalized = _normalized_token(value)
     if normalized not in {"disabled", "audio", "manual"}:
-        raise ConfigError("first_crack.mode must be one of: disabled, audio, manual.")
+        raise ConfigError(f"{label} must be one of: disabled, audio, manual.")
     return cast(FirstCrackMode, normalized)
 
 
-def _model_precision(value: str) -> ModelPrecision:
+def _model_precision(value: str, label: str = "first_crack.precision") -> ModelPrecision:
     normalized = _normalized_token(value)
     if normalized not in {"int8", "fp32"}:
-        raise ConfigError("first_crack.precision must be one of: int8, fp32.")
+        raise ConfigError(f"{label} must be one of: int8, fp32.")
     return cast(ModelPrecision, normalized)
 
 

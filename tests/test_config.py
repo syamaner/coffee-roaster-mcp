@@ -69,7 +69,7 @@ session:
         encoding="utf-8",
     )
 
-    config = load_config(config_path)
+    config = load_config(config_path, environ={})
 
     assert config.source_path == config_path
     assert config.roaster.driver == "hottop_kn8828b_2k_plus"
@@ -155,8 +155,8 @@ def test_invalid_enum_value_fails(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text("first_crack:\n  precision: fp16\n", encoding="utf-8")
 
-    with pytest.raises(ConfigError, match="precision"):
-        load_config(config_path)
+    with pytest.raises(ConfigError, match="first_crack.precision"):
+        load_config(config_path, environ={})
 
 
 def test_error_messages_include_section_context(tmp_path: Path) -> None:
@@ -164,7 +164,7 @@ def test_error_messages_include_section_context(tmp_path: Path) -> None:
     config_path.write_text("roaster:\n  baudrate: invalid\n", encoding="utf-8")
 
     with pytest.raises(ConfigError, match="roaster.baudrate"):
-        load_config(config_path)
+        load_config(config_path, environ={})
 
 
 def test_empty_log_dir_environment_override_fails(tmp_path: Path) -> None:
@@ -181,3 +181,35 @@ def test_empty_roaster_driver_environment_override_fails(tmp_path: Path) -> None
 
     with pytest.raises(ConfigError, match="COFFEE_ROASTER_DRIVER"):
         load_config(config_path, environ={"COFFEE_ROASTER_DRIVER": " \n"})
+
+
+def test_empty_first_crack_repo_id_environment_override_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("first_crack:\n  mode: disabled\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="COFFEE_FIRST_CRACK_REPO_ID"):
+        load_config(config_path, environ={"COFFEE_FIRST_CRACK_REPO_ID": "  "})
+
+
+def test_empty_config_path_environment_override_uses_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    config = load_config(
+        environ={
+            "COFFEE_ROASTER_MCP_CONFIG": " \n",
+            "COFFEE_ROASTER_DRIVER": "mock",
+        }
+    )
+
+    assert config.roaster.driver == "mock"
+
+
+def test_temperature_unit_error_reports_context(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("roaster:\n  temperature_unit: kelvin\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="roaster.temperature_unit"):
+        load_config(config_path, environ={})
