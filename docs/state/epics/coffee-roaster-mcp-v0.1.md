@@ -361,7 +361,7 @@ After completing a story:
   - Ran `PYTHONPATH=src` `--help` and `--version` smoke checks successfully.
 - Validation run for E1-S4:
   - Created a temporary virtualenv at `/tmp/roastpilot-e1s4-venv` and installed the package with dev dependencies.
-  - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m pytest`: 12 passed.
+  - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m pytest`: 14 passed.
   - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m ruff check .`: passed.
   - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m pyright --pythonpath /tmp/roastpilot-e1s4-venv/bin/python`: 0 errors.
   - PR #65 remains open and mergeable. GitHub issue #11 remains open until PR merge.
