@@ -1,4 +1,4 @@
-# Session Summary: E1-S5 Through E1-S7 And E1-S8 Prep
+# Session Summary: E1-S5 Through E1-S8
 
 Date: 2026-05-03
 
@@ -15,8 +15,8 @@ The main outcomes were:
 - complete `E1-S5` local development commands
 - complete `E1-S6` pull-request CI and package build automation
 - complete `E1-S7` initial README and install/run documentation
-- sync durable state so `E1-S8` is now the next active story
-- prepare a clean branch for the remaining repo-local workflow/runbook story
+- complete `E1-S8` repo-local workflow and runbook coverage
+- sync durable state so `E2-S1` is now the next active story
 
 This file is intended to preserve enough context for compaction without requiring the full conversational history.
 
@@ -154,6 +154,33 @@ Durable state after completion:
 - `E1-S7` complete
 - `E1-S8` next
 
+### E1-S8: Add repo-local skills or runbooks
+
+Issue: `#15`
+
+PR: `#69`
+
+Branch used: `feature/15-add-repo-local-skills-or-runbooks`
+
+What landed:
+
+- Added `.claude/skills/mock-roast/SKILL.md` for the current mock-safe bootstrap path
+- Added `.claude/skills/hottop-validation/SKILL.md` as a guarded manual hardware validation checklist
+- Added `.claude/skills/release-registry/SKILL.md` as a staged PyPI and MCP Registry release runbook
+- Updated `AGENTS.md` so agents are pointed at the full repo-local workflow set
+- Updated durable state so the active story advanced from `E1-S8` to `E2-S1`
+- Kept model training, ONNX export, and Hugging Face sync explicitly out of this repo
+
+Review follow-up:
+
+- Copilot flagged that this handoff file had gone stale relative to the rest of the PR because it still described `E1-S8` as upcoming work.
+- Fixed by updating the summary to record `E1-S8` as complete and point future sessions at `E2-S1`.
+
+Durable state after completion:
+
+- `E1-S8` complete
+- `E2-S1` next
+
 ## Validation Summary Across The Completed Stories
 
 Reusable validation environment:
@@ -174,6 +201,7 @@ Additional notable validations:
 - E1-S5 bootstrap smoke output: `mock disabled int8`
 - E1-S6 package build: `python -m build` succeeded when rerun with network access
 - E1-S7 README reviewed against story acceptance criteria
+- E1-S8 bootstrap smoke output: `mock disabled int8`
 
 ## Durable State Progression
 
@@ -182,38 +210,32 @@ State progression across this chat:
 1. `E1-S5` completed
 2. `E1-S6` completed
 3. `E1-S7` completed
-4. Active story advanced to `E1-S8`
+4. `E1-S8` completed
+5. Active story advanced to `E2-S1`
 
 Current intended next story:
 
-- `E1-S8` / issue `#15`
-- Remaining repo-local workflows:
-  - `mock-roast`
-  - `hottop-validation`
-  - `release-registry`
+- `E2-S1` / issue `#16`
+- Implement the stdio MCP server entrypoint and expose a minimal tool list
 
-Current branch prepared for that work:
+Current branch at summary close:
 
 - `feature/15-add-repo-local-skills-or-runbooks`
 
-## Current E1-S8 Context
+## Current Resume Context
 
-What already exists locally:
+Repo-local workflows now present:
 
 - `.claude/skills/code-quality/SKILL.md`
 - `.claude/skills/mcp-dev/SKILL.md`
-
-What remains to add:
-
 - `.claude/skills/mock-roast/SKILL.md`
 - `.claude/skills/hottop-validation/SKILL.md`
 - `.claude/skills/release-registry/SKILL.md`
 
-Current readiness assessment:
+Next implementation target:
 
-- `mock-roast`: enough context to write a real current-state workflow now
-- `hottop-validation`: enough context for a safety-first guarded checklist, not a fake fully-operational procedure
-- `release-registry`: enough context for a staged runbook with explicit prereqs and not-yet-implemented gates
+- `E2-S1` should add the first stdio MCP server entrypoint
+- The new runbooks should remain honest about current bootstrap limits until runtime stories land
 
 ## GitHub Workflow Notes
 
@@ -222,6 +244,7 @@ PRs opened and merged in this chat sequence:
 - `#66` for `E1-S5`
 - `#67` for `E1-S6`
 - `#68` for `E1-S7`
+- `#69` for `E1-S8`
 
 Issue comments were posted for each completed story before PR creation.
 
@@ -235,18 +258,19 @@ Notable operational detail:
 If context needs to be compacted, preserve these facts first:
 
 1. `E1-S5`, `E1-S6`, and `E1-S7` were all completed in this chat.
-2. Durable state now points to `E1-S8` as the active story.
-3. The repo already has two repo-local skills:
+2. `E1-S8` was also completed in this chat.
+3. Durable state now points to `E2-S1` as the active story.
+4. The repo now has the full bootstrap repo-local workflow set:
    - `code-quality`
    - `mcp-dev`
-4. The next concrete work is to add:
    - `mock-roast`
    - `hottop-validation`
    - `release-registry`
-5. The repo boundary remains strict:
+5. The next concrete work is the stdio MCP server entrypoint, not more runbook scaffolding.
+6. The repo boundary remains strict:
    - no model training/export/HF sync in this repo
    - consume released artifacts only
-6. The default local path remains:
+7. The default local path remains:
    - roaster driver `mock`
    - first-crack mode `disabled`
 
@@ -258,4 +282,7 @@ If context needs to be compacted, preserve these facts first:
 - `AGENTS.md`
 - `.claude/skills/code-quality/SKILL.md`
 - `.claude/skills/mcp-dev/SKILL.md`
+- `.claude/skills/mock-roast/SKILL.md`
+- `.claude/skills/hottop-validation/SKILL.md`
+- `.claude/skills/release-registry/SKILL.md`
 - `README.md`
