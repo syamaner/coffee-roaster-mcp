@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "coffee-roaster-mcp"
-version = "0.1.0"
+dynamic = ["version"]
 description = "RoastPilot: a spec-driven MCP server for autonomous coffee roasting."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -46,6 +46,9 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/coffee_roaster_mcp"]
+
+[tool.hatch.version]
+path = "src/coffee_roaster_mcp/__init__.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

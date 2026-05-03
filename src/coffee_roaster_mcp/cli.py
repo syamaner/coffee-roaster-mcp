@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 
 from coffee_roaster_mcp import __version__
 
@@ -21,8 +22,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Run the RoastPilot CLI."""
     parser = build_parser()
-    parser.parse_args()
+    parser.parse_args(argv)
     return 0

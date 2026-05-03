@@ -345,4 +345,9 @@ After completing a story:
 
 ## Validation Notes
 
-No validation has been run yet. The repo is in bootstrap state.
+- E1-S1 created durable state docs and the copied overall plan.
+- E1-S2 added the initial Python package scaffold, console entrypoint declaration, package module, CLI module, and package smoke tests.
+- Validation run for E1-S2:
+  - Parsed `pyproject.toml` with stdlib `tomllib` and confirmed package name plus console script target.
+  - Ran `PYTHONPATH=src` package import and CLI parser smoke check successfully.
+  - Full `pytest` execution is pending dev environment setup because ambient Python does not have `pytest` installed yet.
