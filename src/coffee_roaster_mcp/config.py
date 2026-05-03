@@ -98,14 +98,15 @@ def load_config(
     """Load RoastPilot configuration from defaults, YAML, and environment overrides."""
     env = os.environ if environ is None else environ
     config_path = _resolve_config_path(path, env)
+    config_path_exists = config_path.exists()
     raw_config: Mapping[str, Any] = {}
 
-    if config_path.exists():
+    if config_path_exists:
         raw_config = _read_yaml_config(config_path)
     elif path is not None or "COFFEE_ROASTER_MCP_CONFIG" in env:
         raise ConfigError(f"Config file {config_path} does not exist.")
 
-    source_path = config_path if config_path.exists() else None
+    source_path = config_path if config_path_exists else None
     config = _config_from_mapping(raw_config, source_path=source_path)
     return _apply_env_overrides(config, env)
 
@@ -351,7 +352,7 @@ def _float(raw: Mapping[str, Any], key: str, default: float) -> float:
     value = raw.get(key, default)
     if isinstance(value, bool):
         raise ConfigError(f"{key} must be a number.")
-    if isinstance(value, int | float):
+    if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
         try:
@@ -383,7 +384,7 @@ def _model_precision(value: str) -> ModelPrecision:
 
 
 def _export_formats(value: object) -> tuple[ExportFormat, ...]:
-    if not isinstance(value, list | tuple):
+    if not isinstance(value, (list, tuple)):
         raise ConfigError("logging.export_formats must be a list or tuple.")
 
     formats: list[ExportFormat] = []
