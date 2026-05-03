@@ -61,6 +61,11 @@ The stdio MCP server is not implemented until `E2-S1`. Use this command to verif
 python -c "import os, tempfile; from coffee_roaster_mcp.config import load_config; tmp = tempfile.TemporaryDirectory(); os.chdir(tmp.name); c = load_config(environ={}); print(c.roaster.driver, c.first_crack.mode, c.first_crack.precision); tmp.cleanup()"
 ```
 
+## Repo-local Workflows
+
+- `.claude/skills/code-quality`: run before marking a story complete or opening a PR.
+- `.claude/skills/mcp-dev`: use for local setup and scaffold-level validation while the MCP runtime is still landing.
+
 ## Codebase Architecture
 
 ```text
