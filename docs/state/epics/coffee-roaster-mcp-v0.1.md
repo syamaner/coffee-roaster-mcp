@@ -37,6 +37,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - This repo consumes released Hugging Face artifacts only.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
+- Agent rules and code-quality runbooks are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, and Copilot review instructions should be kept current as story workflow changes.
 
 ## Current Risks
 
@@ -82,7 +83,7 @@ Goal: create a usable standalone Python project with durable state, dev workflow
 - [ ] `E1-S7` Add initial README and install/run documentation.
   - Done when README explains RoastPilot, local mock run, Hottop config placeholder, Hugging Face model boundary, and log export.
 
-- [ ] `E1-S8` Add repo-local skills or runbooks.
+- [~] `E1-S8` Add repo-local skills or runbooks.
   - Done when `mcp-dev`, `mock-roast`, `hottop-validation`, and `release-registry` workflows exist as repo-local docs or skills.
 
 ### Epic Acceptance Criteria
@@ -350,6 +351,7 @@ After completing a story:
 - E1-S2 added the initial Python package scaffold, console entrypoint declaration, package module, CLI module, and package smoke tests.
 - E1-S3 added CLI help/version behavior and smoke coverage.
 - E1-S4 added typed config dataclasses, YAML loading, environment override precedence, config documentation, and focused tests.
+- E1-S8 started early with `AGENTS.md`, code-quality skill, scaffold-level MCP dev skill, and Copilot review instructions. Remaining runbooks: `mock-roast`, `hottop-validation`, and `release-registry`.
 - Validation run for E1-S2:
   - Parsed `pyproject.toml` with stdlib `tomllib` and confirmed package name plus console script target.
   - Ran `PYTHONPATH=src` package import and CLI parser smoke check successfully.
