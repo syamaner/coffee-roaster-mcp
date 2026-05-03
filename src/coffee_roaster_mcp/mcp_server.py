@@ -18,6 +18,7 @@ from mcp.server.session import ServerSession
 
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.config import AppConfig, load_config
+from coffee_roaster_mcp.session import RoastSessionStore
 
 
 @dataclass(frozen=True)
@@ -27,11 +28,13 @@ class ServerContext:
     Attributes:
         config: Loaded RoastPilot configuration.
         transport: Actual MCP transport used by this server process.
+        session_store: Authoritative in-process roast session owner.
         started_at_utc: UTC time when the MCP process initialized.
     """
 
     config: AppConfig
     transport: str
+    session_store: RoastSessionStore
     started_at_utc: datetime
 
 
@@ -120,6 +123,7 @@ def create_mcp_server(
         yield ServerContext(
             config=load_config(path=config_path),
             transport=transport,
+            session_store=RoastSessionStore(),
             started_at_utc=datetime.now(UTC),
         )
 
