@@ -65,6 +65,9 @@ python -c "import os, tempfile; from coffee_roaster_mcp.config import load_confi
 
 - `.claude/skills/code-quality`: run before marking a story complete or opening a PR.
 - `.claude/skills/mcp-dev`: use for local setup and scaffold-level validation while the MCP runtime is still landing.
+- `.claude/skills/mock-roast`: use for the current mock-safe bootstrap path and later extend it to real mock roast MCP checks.
+- `.claude/skills/hottop-validation`: use for guarded manual Hottop validation planning and release-readiness review.
+- `.claude/skills/release-registry`: use for staged PyPI and MCP Registry release preparation without implying unimplemented release automation exists.
 
 ## Codebase Architecture
 
