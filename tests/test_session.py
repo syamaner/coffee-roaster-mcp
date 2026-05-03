@@ -96,19 +96,16 @@ def test_negative_telemetry_buffer_limit_is_rejected() -> None:
         RoastSessionStore(telemetry_buffer_limit=-1)
 
 
-def test_session_append_telemetry_rejects_negative_max_samples() -> None:
+def test_stop_session_returns_none_after_session_already_stopped() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
         utc_now=clock.utc_now,
         monotonic_now=clock.monotonic_now,
     )
-    session = store.start_session()
+    store.start_session()
+    store.stop_session()
 
-    with pytest.raises(ValueError, match="max_samples"):
-        session.append_telemetry(
-            TelemetrySample(recorded_at_utc=clock.utc_now(), monotonic_seconds=1.0),
-            max_samples=-1,
-        )
+    assert store.stop_session() is None
 
 
 def test_session_telemetry_buffer_retains_only_recent_samples() -> None:
@@ -120,17 +117,17 @@ def test_session_telemetry_buffer_retains_only_recent_samples() -> None:
     )
     session = store.start_session()
 
-    session.append_telemetry(
+    store.append_telemetry(
+        session,
         TelemetrySample(recorded_at_utc=clock.utc_now(), monotonic_seconds=1.0, bean_temp_c=100.0),
-        max_samples=store.telemetry_buffer_limit,
     )
-    session.append_telemetry(
+    store.append_telemetry(
+        session,
         TelemetrySample(recorded_at_utc=clock.utc_now(), monotonic_seconds=2.0, bean_temp_c=101.0),
-        max_samples=store.telemetry_buffer_limit,
     )
-    session.append_telemetry(
+    store.append_telemetry(
+        session,
         TelemetrySample(recorded_at_utc=clock.utc_now(), monotonic_seconds=3.0, bean_temp_c=102.0),
-        max_samples=store.telemetry_buffer_limit,
     )
 
     samples = list(session.telemetry_buffer)
@@ -162,3 +159,29 @@ def test_start_session_allows_new_session_after_previous_stop() -> None:
     assert second_session.active is True
     assert store.get_active_session() is second_session
     assert store.get_latest_session() is second_session
+
+
+def test_store_append_telemetry_rejects_non_latest_session() -> None:
+    clock = ClockHarness()
+    issued_ids = iter(["session-001", "session-002"])
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        session_id_factory=lambda: next(issued_ids),
+    )
+
+    first_session = store.start_session()
+    store.stop_session()
+    second_session = store.start_session()
+
+    with pytest.raises(SessionLifecycleError, match="latest session"):
+        store.append_telemetry(
+            first_session,
+            TelemetrySample(recorded_at_utc=clock.utc_now(), monotonic_seconds=1.0),
+        )
+
+    store.append_telemetry(
+        second_session,
+        TelemetrySample(recorded_at_utc=clock.utc_now(), monotonic_seconds=2.0),
+    )
+    assert [sample.monotonic_seconds for sample in second_session.telemetry_buffer] == [2.0]

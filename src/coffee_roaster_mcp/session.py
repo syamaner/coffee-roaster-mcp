@@ -47,6 +47,20 @@ def _telemetry_buffer_default() -> deque[TelemetrySample]:
     return deque()
 
 
+def _append_telemetry_with_limit(
+    session: RoastSession,
+    sample: TelemetrySample,
+    *,
+    max_samples: int,
+) -> None:
+    """Append telemetry to one session with an explicit retention limit."""
+    if max_samples < 0:
+        raise ValueError("max_samples must be >= 0.")
+    session.telemetry_buffer.append(sample)
+    while len(session.telemetry_buffer) > max_samples:
+        session.telemetry_buffer.popleft()
+
+
 @dataclass(frozen=True)
 class LogWriterReference:
     """Reference to the append-only roast log target.
@@ -170,27 +184,6 @@ class RoastSession:
         self.monotonic_stop = monotonic_now()
         self.phase = phase
 
-    def append_telemetry(
-        self,
-        sample: TelemetrySample,
-        *,
-        max_samples: int,
-    ) -> None:
-        """Append one sample and retain only the most recent entries.
-
-        Args:
-            sample: Telemetry sample to append.
-            max_samples: Maximum samples to keep in the rolling buffer.
-
-        Raises:
-            ValueError: If `max_samples` is negative.
-        """
-        if max_samples < 0:
-            raise ValueError("max_samples must be >= 0.")
-        self.telemetry_buffer.append(sample)
-        while len(self.telemetry_buffer) > max_samples:
-            self.telemetry_buffer.popleft()
-
 
 class SessionLifecycleError(RuntimeError):
     """Raised when a roast session lifecycle transition is invalid."""
@@ -272,10 +265,10 @@ class RoastSessionStore:
             phase: Final phase to set on the stopped session.
 
         Returns:
-            The active session after stopping, or `None` when no session exists.
+            The active session after stopping, or `None` when no active session exists.
         """
         with self._lock:
-            if self._active_session is None:
+            if self._active_session is None or not self._active_session.active:
                 return None
             self._active_session.stop(
                 utc_now=self._utc_now,
@@ -283,6 +276,29 @@ class RoastSessionStore:
                 phase=phase,
             )
             return self._active_session
+
+    def append_telemetry(
+        self,
+        session: RoastSession,
+        sample: TelemetrySample,
+    ) -> None:
+        """Append telemetry under store-owned locking and retention policy.
+
+        Args:
+            session: Session to mutate.
+            sample: Telemetry sample to append.
+
+        Raises:
+            SessionLifecycleError: If the session is not the latest session in this store.
+        """
+        with self._lock:
+            if self._active_session is not session:
+                raise SessionLifecycleError("Telemetry can only be appended to the latest session.")
+            _append_telemetry_with_limit(
+                session,
+                sample,
+                max_samples=self._telemetry_buffer_limit,
+            )
 
     def get_active_session(self) -> RoastSession | None:
         """Return the current active session when present."""
