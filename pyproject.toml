@@ -41,6 +41,7 @@ coffee-roaster-mcp = "coffee_roaster_mcp.cli:main"
 
 [dependency-groups]
 dev = [
+  "build>=1.2",
   "pytest>=8.0",
   "ruff>=0.8",
   "pyright>=1.1",
