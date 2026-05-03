@@ -53,6 +53,7 @@ path = "src/coffee_roaster_mcp/__init__.py"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 100

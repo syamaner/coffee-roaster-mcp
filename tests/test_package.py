@@ -24,3 +24,13 @@ def test_main_prints_version(capsys: pytest.CaptureFixture[str]) -> None:
 
     assert exc_info.value.code == 0
     assert capsys.readouterr().out.strip() == f"coffee-roaster-mcp {__version__}"
+
+
+def test_main_prints_help(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "usage: coffee-roaster-mcp" in output
+    assert "RoastPilot" in output
