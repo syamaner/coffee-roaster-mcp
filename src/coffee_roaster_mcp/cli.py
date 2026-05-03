@@ -40,6 +40,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the RoastPilot CLI."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_help()
+        return 0
     if args.command == "serve":
         run_stdio_server(config_path=args.config)
     return 0
