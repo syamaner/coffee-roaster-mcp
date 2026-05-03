@@ -9,7 +9,7 @@ Use this skill for the mock-first local workflow.
 
 ## Current Scope
 
-- The stdio MCP server is not implemented until `E2-S1`.
+- `E2-S1` provides a real stdio MCP server entrypoint.
 - A full mock roast through MCP tools is not implemented until later runtime stories.
 - This workflow validates the current mock-safe bootstrap path without claiming a real roast session exists yet.
 
@@ -21,6 +21,7 @@ Run from the repository root:
 python -c "import os, tempfile; from coffee_roaster_mcp.config import load_config; tmp = tempfile.TemporaryDirectory(); os.chdir(tmp.name); c = load_config(environ={}); print(c.roaster.driver, c.first_crack.mode, c.first_crack.precision); tmp.cleanup()"
 coffee-roaster-mcp --help
 coffee-roaster-mcp --version
+coffee-roaster-mcp serve
 ```
 
 Expected bootstrap output:
@@ -38,7 +39,6 @@ mock disabled int8
 
 ## Do Not Claim Yet
 
-- Do not claim a working stdio MCP server before `E2-S1`.
 - Do not claim a start-to-export mock roast before `E2-S7` and `E7-S1`.
 - Do not add model download, model export, or Hugging Face sync steps here. Those stay in `coffee-first-crack-detection`.
 
@@ -46,7 +46,6 @@ mock disabled int8
 
 Once the MCP runtime exists, extend this workflow with:
 
-- local stdio MCP server startup
 - mock roast session start
 - state polling
 - manual first-crack injection if needed

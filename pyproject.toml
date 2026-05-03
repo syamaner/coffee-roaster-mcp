@@ -28,6 +28,7 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence"
 ]
 dependencies = [
+  "mcp>=1.0.0,<2",
   "PyYAML>=6.0.2"
 ]
 
@@ -70,3 +71,5 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
 include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"

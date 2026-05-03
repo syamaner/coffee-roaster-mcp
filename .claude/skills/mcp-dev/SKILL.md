@@ -25,11 +25,12 @@ python -m ruff format --check .
 python -m pyright
 coffee-roaster-mcp --help
 coffee-roaster-mcp --version
+coffee-roaster-mcp serve
 ```
 
 ## Mock-Safe Bootstrap Smoke
 
-The stdio MCP server is not implemented until `E2-S1`. For bootstrap work, confirm the default config still requires no roaster hardware, no microphone, and no model download from a guaranteed-empty temporary directory:
+For bootstrap work, confirm the default config still requires no roaster hardware, no microphone, and no model download from a guaranteed-empty temporary directory:
 
 ```bash
 python -c "import os, tempfile; from coffee_roaster_mcp.config import load_config; tmp = tempfile.TemporaryDirectory(); os.chdir(tmp.name); c = load_config(environ={}); print(c.roaster.driver, c.first_crack.mode, c.first_crack.precision); tmp.cleanup()"
@@ -43,5 +44,5 @@ mock disabled int8
 
 ## Notes
 
-- The full MCP server and mock roast flow are not implemented yet.
-- Once E2 stories land, extend this skill with mock MCP server startup and basic tool-call smoke tests.
+- `E2-S1` adds the first stdio MCP server entrypoint with bootstrap-safe introspection tools only.
+- The full mock roast flow is still pending later Epic 2 stories.

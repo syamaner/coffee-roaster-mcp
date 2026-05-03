@@ -22,8 +22,10 @@
 
 RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.
 
-E1-S8 is complete. RoastPilot now has repo-local workflow docs for code quality, scaffold-level MCP development, mock roast bootstrap validation, guarded Hottop hardware validation, and staged PyPI plus MCP Registry release preparation.
+E2-S1 is complete. RoastPilot now has its first local stdio MCP server entrypoint plus a minimal bootstrap-safe tool surface for runtime introspection.
 
-The next story is E2-S1: implement the stdio MCP server entrypoint.
+The next story is E2-S2: implement the RoastSession lifecycle.
 
 The first implementation milestone remains a thin mock vertical slice: install the package, start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
+
+For Epic 2 implementation, the old `coffee-roasting` repository is a behavioral reference only. Reuse proven roast-session and stdio MCP patterns, but do not recreate the old two-server, Auth0, SSE, or `n8n` architecture.
