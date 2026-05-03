@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E1-S4`
-- Current target: Config loading from YAML and environment variables
+- Active story: `E1-S5`
+- Current target: Local dev commands for lint, format check, typecheck, tests, and mock server run
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -36,6 +36,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - The `coffee-first-crack-detection` repo remains the source of truth for training, ONNX export, Hugging Face sync, model cards, and dataset cards.
 - This repo consumes released Hugging Face artifacts only.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
+- Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
+- Agent rules and code-quality runbooks are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, and Copilot review instructions should be kept current as story workflow changes.
 
 ## Current Risks
 
@@ -69,7 +71,7 @@ Goal: create a usable standalone Python project with durable state, dev workflow
 - [x] `E1-S3` Add CLI basics.
   - Done when `coffee-roaster-mcp --help` and `coffee-roaster-mcp --version` work after editable install.
 
-- [ ] `E1-S4` Add config loading from YAML and environment variables.
+- [x] `E1-S4` Add config loading from YAML and environment variables.
   - Done when config defaults allow a local mock run with no config file and documented env overrides are supported.
 
 - [ ] `E1-S5` Add local dev commands.
@@ -81,7 +83,7 @@ Goal: create a usable standalone Python project with durable state, dev workflow
 - [ ] `E1-S7` Add initial README and install/run documentation.
   - Done when README explains RoastPilot, local mock run, Hottop config placeholder, Hugging Face model boundary, and log export.
 
-- [ ] `E1-S8` Add repo-local skills or runbooks.
+- [~] `E1-S8` Add repo-local skills or runbooks.
   - Done when `mcp-dev`, `mock-roast`, `hottop-validation`, and `release-registry` workflows exist as repo-local docs or skills.
 
 ### Epic Acceptance Criteria
@@ -348,6 +350,8 @@ After completing a story:
 - E1-S1 created durable state docs and the copied overall plan.
 - E1-S2 added the initial Python package scaffold, console entrypoint declaration, package module, CLI module, and package smoke tests.
 - E1-S3 added CLI help/version behavior and smoke coverage.
+- E1-S4 added typed config dataclasses, YAML loading, environment override precedence, config documentation, and focused tests. Copilot review hardening added whitespace/case normalization, empty log-dir validation, conventional runtime type checks, and cached config path existence checks.
+- E1-S8 started early with `AGENTS.md`, code-quality skill, scaffold-level MCP dev skill, and Copilot review instructions. Remaining runbooks: `mock-roast`, `hottop-validation`, and `release-registry`.
 - Validation run for E1-S2:
   - Parsed `pyproject.toml` with stdlib `tomllib` and confirmed package name plus console script target.
   - Ran `PYTHONPATH=src` package import and CLI parser smoke check successfully.
@@ -355,3 +359,9 @@ After completing a story:
 - Validation run for E1-S3:
   - Parsed `pyproject.toml` and confirmed pytest `pythonpath` config.
   - Ran `PYTHONPATH=src` `--help` and `--version` smoke checks successfully.
+- Validation run for E1-S4:
+  - Created a temporary virtualenv at `/tmp/roastpilot-e1s4-venv` and installed the package with dev dependencies.
+  - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m pytest`: 17 passed.
+  - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m ruff check .`: passed.
+  - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m pyright --pythonpath /tmp/roastpilot-e1s4-venv/bin/python`: 0 errors.
+  - PR #65 remains open and mergeable. GitHub issue #11 remains open until PR merge.
