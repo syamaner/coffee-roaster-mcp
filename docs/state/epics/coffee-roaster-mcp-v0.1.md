@@ -350,7 +350,7 @@ After completing a story:
 - E1-S1 created durable state docs and the copied overall plan.
 - E1-S2 added the initial Python package scaffold, console entrypoint declaration, package module, CLI module, and package smoke tests.
 - E1-S3 added CLI help/version behavior and smoke coverage.
-- E1-S4 added typed config dataclasses, YAML loading, environment override precedence, config documentation, and focused tests.
+- E1-S4 added typed config dataclasses, YAML loading, environment override precedence, config documentation, and focused tests. Copilot review hardening added whitespace/case normalization, empty log-dir validation, conventional runtime type checks, and cached config path existence checks.
 - E1-S8 started early with `AGENTS.md`, code-quality skill, scaffold-level MCP dev skill, and Copilot review instructions. Remaining runbooks: `mock-roast`, `hottop-validation`, and `release-registry`.
 - Validation run for E1-S2:
   - Parsed `pyproject.toml` with stdlib `tomllib` and confirmed package name plus console script target.
@@ -361,6 +361,7 @@ After completing a story:
   - Ran `PYTHONPATH=src` `--help` and `--version` smoke checks successfully.
 - Validation run for E1-S4:
   - Created a temporary virtualenv at `/tmp/roastpilot-e1s4-venv` and installed the package with dev dependencies.
-  - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m pytest`: 11 passed.
+  - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m pytest`: 12 passed.
   - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m ruff check .`: passed.
   - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m pyright --pythonpath /tmp/roastpilot-e1s4-venv/bin/python`: 0 errors.
+  - PR #65 remains open and mergeable. GitHub issue #11 remains open until PR merge.
