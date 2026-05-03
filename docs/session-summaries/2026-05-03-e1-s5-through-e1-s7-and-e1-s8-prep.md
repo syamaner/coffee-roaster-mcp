@@ -22,7 +22,7 @@ This file is intended to preserve enough context for compaction without requirin
 
 ## Non-PII Codex Status Snapshot (User-Provided Source Of Truth)
 
-Snapshot received from the active Codex UI (PII removed):
+Snapshot received from the active Codex UI:
 
 - Model: `gpt-5.4`
 - Reasoning: `medium`
@@ -37,6 +37,23 @@ Snapshot received from the active Codex UI (PII removed):
 - Weekly limit: `99% left` (reset shown as `20:43 on 10 May`)
 - GPT-5.3-Codex-Spark 5h limit: `100% left` (reset shown as `03:58 on 4 May`)
 - GPT-5.3-Codex-Spark weekly limit: `100% left` (reset shown as `22:58 on 10 May`)
+
+Later snapshot received from the active Codex UI after compaction and Epic 1 completion work:
+
+- Model: `gpt-5.4`
+- Reasoning: `medium`
+- Summaries: `auto`
+- Directory: `~/git/coffee-roaster-mcp`
+- Permissions: `Workspace (on-request)`
+- `AGENTS.md` loaded in this session: `AGENTS.md`
+- Thread name: `coffee roaster mcp`
+- Collaboration mode: `Default`
+- Context window: `67% left (93.9K used / 258K)`
+- 5h limit: `96% left` (reset shown as `01:43 on 4 May`)
+- Weekly limit: `99% left` (reset shown as `20:43 on 10 May`)
+- GPT-5.3-Codex-Spark 5h limit: `100% left` (reset shown as `04:05 on 4 May`)
+- GPT-5.3-Codex-Spark weekly limit: `100% left` (reset shown as `23:05 on 10 May`)
+- Warning: limits may be stale; run `/status` again shortly
 
 Fields intentionally excluded:
 
