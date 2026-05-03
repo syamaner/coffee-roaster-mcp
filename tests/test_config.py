@@ -37,18 +37,18 @@ def test_yaml_config_overrides_defaults(tmp_path: Path) -> None:
     config_path.write_text(
         """
 transport:
-  type: stdio
+  type: STDIO
 roaster:
   driver: hottop_kn8828b_2k_plus
   port: /dev/cu.usbserial-1234
   baudrate: 57600
-  temperature_unit: auto
+  temperature_unit: " auto "
   command_interval_seconds: 0.5
 first_crack:
-  mode: audio
+  mode: " audio "
   repo_id: syamaner/custom-first-crack
   revision: v0.1.0
-  precision: fp32
+  precision: " fp32 "
   local_model_dir: ./models/fp32
   onnx_threads: 4
   allow_manual_override: false
@@ -116,11 +116,11 @@ logging:
         environ={
             "COFFEE_ROASTER_DRIVER": "hottop_kn8828b_2k_plus",
             "COFFEE_ROASTER_PORT": "/dev/cu.usbserial-env",
-            "COFFEE_ROASTER_TEMP_UNIT": "fahrenheit",
-            "COFFEE_FIRST_CRACK_MODE": "manual",
+            "COFFEE_ROASTER_TEMP_UNIT": " fahrenheit ",
+            "COFFEE_FIRST_CRACK_MODE": "manual\n",
             "COFFEE_FIRST_CRACK_REPO_ID": "syamaner/env-model",
             "COFFEE_FIRST_CRACK_REVISION": "main",
-            "COFFEE_FIRST_CRACK_PRECISION": "fp32",
+            "COFFEE_FIRST_CRACK_PRECISION": "fp32 ",
             "COFFEE_FIRST_CRACK_LOCAL_MODEL_DIR": "/models/env",
             "COFFEE_FIRST_CRACK_ONNX_THREADS": "8",
             "COFFEE_AUDIO_INPUT_DEVICE": "env-mic",
@@ -157,3 +157,11 @@ def test_invalid_enum_value_fails(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="precision"):
         load_config(config_path)
+
+
+def test_empty_log_dir_environment_override_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("roaster:\n  driver: mock\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="COFFEE_ROAST_LOG_DIR"):
+        load_config(config_path, environ={"COFFEE_ROAST_LOG_DIR": "  "})

@@ -164,10 +164,10 @@ def _section(raw_config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
 
 
 def _transport_from_mapping(raw: Mapping[str, Any]) -> TransportConfig:
-    transport_type = _string(raw, "type", "stdio")
+    transport_type = _normalized_token(_string(raw, "type", "stdio"))
     if transport_type != "stdio":
         raise ConfigError("transport.type must be 'stdio'.")
-    return TransportConfig(type=transport_type)
+    return TransportConfig(type="stdio")
 
 
 def _roaster_from_mapping(raw: Mapping[str, Any]) -> RoasterConfig:
@@ -268,7 +268,10 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
         audio = replace(audio, input_device=_none_if_empty(environ["COFFEE_AUDIO_INPUT_DEVICE"]))
 
     if "COFFEE_ROAST_LOG_DIR" in environ:
-        logging = replace(logging, log_dir=Path(environ["COFFEE_ROAST_LOG_DIR"]))
+        logging = replace(
+            logging,
+            log_dir=Path(_required_string(environ["COFFEE_ROAST_LOG_DIR"], "COFFEE_ROAST_LOG_DIR")),
+        )
 
     return replace(
         config,
@@ -359,21 +362,21 @@ def _float(raw: Mapping[str, Any], key: str, default: float) -> float:
 
 
 def _temperature_unit(value: str) -> TemperatureUnit:
-    normalized = value.lower()
+    normalized = _normalized_token(value)
     if normalized not in {"celsius", "fahrenheit", "auto"}:
         raise ConfigError("temperature_unit must be one of: celsius, fahrenheit, auto.")
     return cast(TemperatureUnit, normalized)
 
 
 def _first_crack_mode(value: str) -> FirstCrackMode:
-    normalized = value.lower()
+    normalized = _normalized_token(value)
     if normalized not in {"disabled", "audio", "manual"}:
         raise ConfigError("first_crack.mode must be one of: disabled, audio, manual.")
     return cast(FirstCrackMode, normalized)
 
 
 def _model_precision(value: str) -> ModelPrecision:
-    normalized = value.lower()
+    normalized = _normalized_token(value)
     if normalized not in {"int8", "fp32"}:
         raise ConfigError("first_crack.precision must be one of: int8, fp32.")
     return cast(ModelPrecision, normalized)
@@ -381,14 +384,14 @@ def _model_precision(value: str) -> ModelPrecision:
 
 def _export_formats(value: object) -> tuple[ExportFormat, ...]:
     if not isinstance(value, list | tuple):
-        raise ConfigError("logging.export_formats must be a list.")
+        raise ConfigError("logging.export_formats must be a list or tuple.")
 
     formats: list[ExportFormat] = []
     raw_formats = cast(list[object] | tuple[object, ...], value)
     for item in raw_formats:
         if not isinstance(item, str):
             raise ConfigError("logging.export_formats values must be strings.")
-        normalized = item.lower()
+        normalized = _normalized_token(item)
         if normalized not in {"jsonl", "csv", "summary"}:
             raise ConfigError("logging.export_formats values must be jsonl, csv, or summary.")
         formats.append(cast(ExportFormat, normalized))
@@ -398,3 +401,14 @@ def _export_formats(value: object) -> tuple[ExportFormat, ...]:
 def _none_if_empty(value: str) -> str | None:
     stripped = value.strip()
     return stripped or None
+
+
+def _required_string(value: str, key: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        raise ConfigError(f"{key} must not be empty.")
+    return stripped
+
+
+def _normalized_token(value: str) -> str:
+    return value.strip().lower()
