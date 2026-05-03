@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E1-S3`
-- Current target: CLI basics
+- Active story: `E1-S4`
+- Current target: Config loading from YAML and environment variables
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -66,7 +66,7 @@ Goal: create a usable standalone Python project with durable state, dev workflow
 - [x] `E1-S2` Add Python package scaffold.
   - Done when `pyproject.toml`, `src/coffee_roaster_mcp/`, `tests/`, and the `coffee-roaster-mcp` console entrypoint exist.
 
-- [ ] `E1-S3` Add CLI basics.
+- [x] `E1-S3` Add CLI basics.
   - Done when `coffee-roaster-mcp --help` and `coffee-roaster-mcp --version` work after editable install.
 
 - [ ] `E1-S4` Add config loading from YAML and environment variables.
@@ -347,7 +347,11 @@ After completing a story:
 
 - E1-S1 created durable state docs and the copied overall plan.
 - E1-S2 added the initial Python package scaffold, console entrypoint declaration, package module, CLI module, and package smoke tests.
+- E1-S3 added CLI help/version behavior and smoke coverage.
 - Validation run for E1-S2:
   - Parsed `pyproject.toml` with stdlib `tomllib` and confirmed package name plus console script target.
   - Ran `PYTHONPATH=src` package import and CLI parser smoke check successfully.
   - Full `pytest` execution is pending dev environment setup because ambient Python does not have `pytest` installed yet.
+- Validation run for E1-S3:
+  - Parsed `pyproject.toml` and confirmed pytest `pythonpath` config.
+  - Ran `PYTHONPATH=src` `--help` and `--version` smoke checks successfully.
