@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E1-S7`
-- Current target: Initial README and install/run documentation for local mock usage
+- Active story: `E1-S8`
+- Current target: Remaining repo-local workflows for mock-roast, hottop-validation, and release-registry
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -80,7 +80,7 @@ Goal: create a usable standalone Python project with durable state, dev workflow
 - [x] `E1-S6` Add CI for tests and package build.
   - Done when GitHub Actions runs checks and builds the package on pull requests.
 
-- [ ] `E1-S7` Add initial README and install/run documentation.
+- [x] `E1-S7` Add initial README and install/run documentation.
   - Done when README explains RoastPilot, local mock run, Hottop config placeholder, Hugging Face model boundary, and log export.
 
 - [~] `E1-S8` Add repo-local skills or runbooks.
@@ -353,6 +353,7 @@ After completing a story:
 - E1-S4 added typed config dataclasses, YAML loading, environment override precedence, config documentation, and focused tests. Copilot review hardening added whitespace/case normalization, empty log-dir validation, conventional runtime type checks, and cached config path existence checks.
 - E1-S5 added one documented local development workflow across `README.md`, `AGENTS.md`, and `.claude/skills/mcp-dev`. The documented commands now cover setup, tests, lint, format check, typecheck, CLI smoke, and a mock-safe bootstrap smoke path until the stdio MCP server lands in `E2-S1`.
 - E1-S6 added a GitHub Actions CI workflow for pull requests plus manual runs. CI now installs project dev dependencies, runs tests, lint, format check, typecheck, CLI smoke checks, and builds sdist plus wheel artifacts. Package build tooling is declared in `pyproject.toml`.
+- E1-S7 expanded the initial README into a real install and usage entrypoint. It now explains RoastPilot versus `coffee-roaster-mcp`, the local mock path, the current Hottop placeholder, the Hugging Face model boundary, and the planned log-export behavior without claiming unfinished runtime features.
 - E1-S8 started early with `AGENTS.md`, code-quality skill, scaffold-level MCP dev skill, and Copilot review instructions. Remaining runbooks: `mock-roast`, `hottop-validation`, and `release-registry`.
 - Validation run for E1-S2:
   - Parsed `pyproject.toml` with stdlib `tomllib` and confirmed package name plus console script target.
@@ -384,3 +385,9 @@ After completing a story:
   - Ran `/tmp/roastpilot-e1s6-venv/bin/python -m pyright --pythonpath /tmp/roastpilot-e1s6-venv/bin/python`: 0 errors.
   - Ran `/tmp/roastpilot-e1s6-venv/bin/coffee-roaster-mcp --help` and `--version`: passed.
   - Ran `/tmp/roastpilot-e1s6-venv/bin/python -m build`: passed when rerun with network access because isolated build environments must fetch `hatchling`.
+- Validation run for E1-S7:
+  - Reviewed `README.md` against the story acceptance criteria for product naming, local mock run, Hottop placeholder, Hugging Face model boundary, and log export coverage.
+  - Ran `/tmp/roastpilot-e1s6-venv/bin/python -m pytest`: 17 passed.
+  - Ran `/tmp/roastpilot-e1s6-venv/bin/python -m ruff check .`: passed.
+  - Ran `/tmp/roastpilot-e1s6-venv/bin/python -m pyright --pythonpath /tmp/roastpilot-e1s6-venv/bin/python`: 0 errors.
+  - Ran `/tmp/roastpilot-e1s6-venv/bin/coffee-roaster-mcp --help` and `--version`: passed.
