@@ -22,8 +22,8 @@
 
 RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.
 
-E1-S4 is complete. RoastPilot now has typed configuration loading from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and documented environment overrides. First-crack mode defaults to `disabled`.
+E1-S5 is complete. RoastPilot now has one documented local development workflow across `README.md`, `AGENTS.md`, and the repo-local `mcp-dev` skill, including setup, lint, format check, typecheck, tests, CLI smoke, and a mock-safe bootstrap smoke command. The full stdio MCP server still starts in `E2-S1`.
 
-The next story is E1-S5: add local dev commands for lint, format check, typecheck, tests, and mock server run.
+The next story is E1-S6: add CI for tests and package build.
 
 The first implementation milestone remains a thin mock vertical slice: install the package, start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.

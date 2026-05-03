@@ -27,9 +27,9 @@ coffee-roaster-mcp --help
 coffee-roaster-mcp --version
 ```
 
-## Config Smoke
+## Mock-Safe Bootstrap Smoke
 
-Default config should require no roaster hardware, no microphone, and no model download:
+The stdio MCP server is not implemented until `E2-S1`. For bootstrap work, confirm the default config still requires no roaster hardware, no microphone, and no model download:
 
 ```bash
 python -c "from coffee_roaster_mcp.config import load_config; c = load_config(environ={}); print(c.roaster.driver, c.first_crack.mode, c.first_crack.precision)"
@@ -45,4 +45,3 @@ mock disabled int8
 
 - The full MCP server and mock roast flow are not implemented yet.
 - Once E2 stories land, extend this skill with mock MCP server startup and basic tool-call smoke tests.
-
