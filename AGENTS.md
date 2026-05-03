@@ -53,6 +53,14 @@ coffee-roaster-mcp --help
 coffee-roaster-mcp --version
 ```
 
+### Mock-Safe Bootstrap Smoke
+
+The stdio MCP server is not implemented until `E2-S1`. Use this command to verify the default local path stays on the mock driver with first-crack detection disabled from a guaranteed-empty temporary directory:
+
+```bash
+python -c "import os, tempfile; from coffee_roaster_mcp.config import load_config; tmp = tempfile.TemporaryDirectory(); os.chdir(tmp.name); c = load_config(environ={}); print(c.roaster.driver, c.first_crack.mode, c.first_crack.precision); tmp.cleanup()"
+```
+
 ## Codebase Architecture
 
 ```text

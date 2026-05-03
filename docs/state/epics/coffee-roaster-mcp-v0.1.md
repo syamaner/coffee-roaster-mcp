@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E1-S5`
-- Current target: Local dev commands for lint, format check, typecheck, tests, and mock server run
+- Active story: `E1-S6`
+- Current target: GitHub Actions for lint, format check, typecheck, tests, and package build
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -74,7 +74,7 @@ Goal: create a usable standalone Python project with durable state, dev workflow
 - [x] `E1-S4` Add config loading from YAML and environment variables.
   - Done when config defaults allow a local mock run with no config file and documented env overrides are supported.
 
-- [ ] `E1-S5` Add local dev commands.
+- [x] `E1-S5` Add local dev commands.
   - Done when there are documented commands for lint, format check, typecheck, tests, and mock server run.
 
 - [ ] `E1-S6` Add CI for tests and package build.
@@ -351,6 +351,7 @@ After completing a story:
 - E1-S2 added the initial Python package scaffold, console entrypoint declaration, package module, CLI module, and package smoke tests.
 - E1-S3 added CLI help/version behavior and smoke coverage.
 - E1-S4 added typed config dataclasses, YAML loading, environment override precedence, config documentation, and focused tests. Copilot review hardening added whitespace/case normalization, empty log-dir validation, conventional runtime type checks, and cached config path existence checks.
+- E1-S5 added one documented local development workflow across `README.md`, `AGENTS.md`, and `.claude/skills/mcp-dev`. The documented commands now cover setup, tests, lint, format check, typecheck, CLI smoke, and a mock-safe bootstrap smoke path until the stdio MCP server lands in `E2-S1`.
 - E1-S8 started early with `AGENTS.md`, code-quality skill, scaffold-level MCP dev skill, and Copilot review instructions. Remaining runbooks: `mock-roast`, `hottop-validation`, and `release-registry`.
 - Validation run for E1-S2:
   - Parsed `pyproject.toml` with stdlib `tomllib` and confirmed package name plus console script target.
@@ -365,3 +366,12 @@ After completing a story:
   - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m ruff check .`: passed.
   - Ran `/tmp/roastpilot-e1s4-venv/bin/python -m pyright --pythonpath /tmp/roastpilot-e1s4-venv/bin/python`: 0 errors.
   - PR #65 remains open and mergeable. GitHub issue #11 remains open until PR merge.
+- Validation run for E1-S5:
+  - Reviewed the documented commands against `pyproject.toml`, `AGENTS.md`, `README.md`, and `.claude/skills/mcp-dev`.
+  - Created a temporary virtualenv at `/tmp/roastpilot-e1s5-venv` and installed the package with dev dependencies.
+  - Ran `/tmp/roastpilot-e1s5-venv/bin/python -m pytest`: 17 passed.
+  - Ran `/tmp/roastpilot-e1s5-venv/bin/python -m ruff check .`: passed.
+  - Ran `/tmp/roastpilot-e1s5-venv/bin/python -m ruff format --check .`: passed.
+  - Ran `/tmp/roastpilot-e1s5-venv/bin/python -m pyright --pythonpath /tmp/roastpilot-e1s5-venv/bin/python`: 0 errors.
+  - Ran `/tmp/roastpilot-e1s5-venv/bin/coffee-roaster-mcp --help` and `--version`: passed.
+  - Ran the documented bootstrap smoke command and confirmed output `mock disabled int8`.

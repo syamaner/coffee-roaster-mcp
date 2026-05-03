@@ -8,6 +8,62 @@ RoastPilot will provide one local MCP runtime for roaster control, telemetry, fi
 
 The project is currently in bootstrap. See `docs/plans/coffee-roaster-mcp-v0.1-overall-plan.md` and `docs/state/registry.md` for the active plan and state.
 
+## Local Development
+
+### Setup
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e . --group dev
+```
+
+### Test
+
+```bash
+python -m pytest
+```
+
+### Lint
+
+```bash
+python -m ruff check .
+```
+
+### Format Check
+
+```bash
+python -m ruff format --check .
+```
+
+### Typecheck
+
+```bash
+python -m pyright
+```
+
+### CLI Smoke
+
+```bash
+coffee-roaster-mcp --help
+coffee-roaster-mcp --version
+```
+
+### Mock-Safe Bootstrap Smoke
+
+The full stdio MCP server lands in `E2-S1`. Until then, use this mock-safe bootstrap smoke to confirm the default local path stays hardware-free and model-free from a guaranteed-empty temporary directory:
+
+```bash
+python -c "import os, tempfile; from coffee_roaster_mcp.config import load_config; tmp = tempfile.TemporaryDirectory(); os.chdir(tmp.name); c = load_config(environ={}); print(c.roaster.driver, c.first_crack.mode, c.first_crack.precision); tmp.cleanup()"
+```
+
+Expected output:
+
+```text
+mock disabled int8
+```
+
 ## Configuration
 
 RoastPilot loads configuration from `coffee-roaster-mcp.yaml` in the current directory by default. If the file is absent, mock-safe defaults are used so local development does not require roaster hardware, audio hardware, or model downloads.
