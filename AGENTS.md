@@ -75,7 +75,7 @@ docs/plans/
 - RoastPilot will be one local stdio MCP server for v0.1.
 - One authoritative roast session will own timing, telemetry, first-crack events, metrics, logs, and roaster control.
 - `beans_added_at` is T0. Auto-T0 detection is disabled by default.
-- First crack is recorded once unless manual override is explicitly allowed.
+- First crack is recorded once by automatic detection flow. Manual override is enabled by default and can be disabled by config.
 - Roaster support goes through a `RoasterDriver` abstraction. The mock driver comes first; Hottop support requires hardware validation.
 - First-crack models are consumed from `syamaner/coffee-first-crack-detection`.
 - ONNX INT8 is the default runtime precision. ONNX FP32 is supported by config for validation and comparison.
@@ -110,4 +110,3 @@ After completing a story:
 - Do not commit generated logs under `logs/`.
 - Do not commit audio recordings, model artifacts, ONNX files, or raw serial captures.
 - Large or generated artifacts belong in Hugging Face Hub, release artifacts, or ignored local directories depending on the artifact type.
-

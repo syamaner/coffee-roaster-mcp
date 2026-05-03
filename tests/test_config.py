@@ -114,7 +114,7 @@ logging:
     config = load_config(
         config_path,
         environ={
-            "COFFEE_ROASTER_DRIVER": "hottop_kn8828b_2k_plus",
+            "COFFEE_ROASTER_DRIVER": "hottop_kn8828b_2k_plus\n",
             "COFFEE_ROASTER_PORT": "/dev/cu.usbserial-env",
             "COFFEE_ROASTER_TEMP_UNIT": " fahrenheit ",
             "COFFEE_FIRST_CRACK_MODE": "manual\n",
@@ -145,7 +145,7 @@ def test_environment_config_path_is_supported(tmp_path: Path) -> None:
     config_path = tmp_path / "custom.yaml"
     config_path.write_text("roaster:\n  driver: env-path-driver\n", encoding="utf-8")
 
-    config = load_config(environ={"COFFEE_ROASTER_MCP_CONFIG": str(config_path)})
+    config = load_config(environ={"COFFEE_ROASTER_MCP_CONFIG": f"  {config_path} \n"})
 
     assert config.source_path == config_path
     assert config.roaster.driver == "env-path-driver"
@@ -159,9 +159,25 @@ def test_invalid_enum_value_fails(tmp_path: Path) -> None:
         load_config(config_path)
 
 
+def test_error_messages_include_section_context(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("roaster:\n  baudrate: invalid\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="roaster.baudrate"):
+        load_config(config_path)
+
+
 def test_empty_log_dir_environment_override_fails(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text("roaster:\n  driver: mock\n", encoding="utf-8")
 
     with pytest.raises(ConfigError, match="COFFEE_ROAST_LOG_DIR"):
         load_config(config_path, environ={"COFFEE_ROAST_LOG_DIR": "  "})
+
+
+def test_empty_roaster_driver_environment_override_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("roaster:\n  driver: mock\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="COFFEE_ROASTER_DRIVER"):
+        load_config(config_path, environ={"COFFEE_ROASTER_DRIVER": " \n"})
