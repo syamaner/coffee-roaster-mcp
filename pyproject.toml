@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "coffee-roaster-mcp"
+dynamic = ["version"]
+description = "RoastPilot: a spec-driven MCP server for autonomous coffee roasting."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Sertan Yamaner" }
+]
+keywords = [
+  "coffee",
+  "coffee-roasting",
+  "mcp",
+  "model-context-protocol",
+  "roastpilot"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/syamaner/coffee-roaster-mcp"
+Repository = "https://github.com/syamaner/coffee-roaster-mcp"
+Issues = "https://github.com/syamaner/coffee-roaster-mcp/issues"
+
+[project.scripts]
+coffee-roaster-mcp = "coffee_roaster_mcp.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.8",
+  "pyright>=1.1"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coffee_roaster_mcp"]
+
+[tool.hatch.version]
+path = "src/coffee_roaster_mcp/__init__.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["src", "tests"]
