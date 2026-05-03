@@ -52,10 +52,10 @@ coffee-roaster-mcp --version
 
 ### Mock-Safe Bootstrap Smoke
 
-The full stdio MCP server lands in `E2-S1`. Until then, use this mock-safe bootstrap smoke to confirm the default local path stays hardware-free and model-free:
+The full stdio MCP server lands in `E2-S1`. Until then, use this mock-safe bootstrap smoke to confirm the default local path stays hardware-free and model-free from a guaranteed-empty temporary directory:
 
 ```bash
-python -c "from coffee_roaster_mcp.config import load_config; c = load_config(environ={}); print(c.roaster.driver, c.first_crack.mode, c.first_crack.precision)"
+python -c "import os, tempfile; from coffee_roaster_mcp.config import load_config; tmp = tempfile.TemporaryDirectory(); os.chdir(tmp.name); c = load_config(environ={}); print(c.roaster.driver, c.first_crack.mode, c.first_crack.precision); tmp.cleanup()"
 ```
 
 Expected output:
