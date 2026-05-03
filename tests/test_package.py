@@ -1,12 +1,11 @@
 """Package and CLI smoke coverage for RoastPilot."""
-# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownParameterType=false
 
 import asyncio
 import os
 import sys
 from collections.abc import Awaitable
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar, cast
 
 import pytest
 from mcp import ClientSession, StdioServerParameters
@@ -69,17 +68,19 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
     async with stdio_client(server_params) as (read, write), ClientSession(read, write) as session:
         await _call_with_timeout(session.initialize())
 
-        tools = await _call_with_timeout(session.list_tools())
+        tools = cast(Any, await _call_with_timeout(session.list_tools()))
         tool_names = {tool.name for tool in tools.tools}
         assert tool_names == {"get_server_info", "get_runtime_config"}
 
-        server_info = await _call_with_timeout(session.call_tool("get_server_info", {}))
+        server_info = cast(Any, await _call_with_timeout(session.call_tool("get_server_info", {})))
         assert server_info.structuredContent is not None
         assert server_info.structuredContent["product_name"] == "RoastPilot"
         assert server_info.structuredContent["transport"] == "stdio"
         assert server_info.structuredContent["bootstrap_safe"] is True
 
-        runtime_config = await _call_with_timeout(session.call_tool("get_runtime_config", {}))
+        runtime_config = cast(
+            Any, await _call_with_timeout(session.call_tool("get_runtime_config", {}))
+        )
         assert runtime_config.structuredContent is not None
         assert runtime_config.structuredContent["roaster_driver"] == "mock"
         assert runtime_config.structuredContent["first_crack_mode"] == "disabled"
@@ -100,7 +101,7 @@ async def _assert_manual_mode_bootstrap_safe(tmp_path: Path) -> None:
     async with stdio_client(server_params) as (read, write), ClientSession(read, write) as session:
         await _call_with_timeout(session.initialize())
 
-        server_info = await _call_with_timeout(session.call_tool("get_server_info", {}))
+        server_info = cast(Any, await _call_with_timeout(session.call_tool("get_server_info", {})))
         assert server_info.structuredContent is not None
         assert server_info.structuredContent["first_crack_mode"] == "manual"
         assert server_info.structuredContent["bootstrap_safe"] is True

@@ -4,7 +4,6 @@ This module implements the first local MCP server runtime for RoastPilot.
 The `E2-S1` scope is intentionally narrow: start cleanly over stdio, load the
 existing typed configuration, and expose a minimal bootstrap-safe tool list.
 """
-# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownParameterType=false, reportUntypedFunctionDecorator=false, reportUnusedFunction=false
 
 from __future__ import annotations
 
@@ -134,7 +133,9 @@ def create_mcp_server(
     )
 
     @mcp.tool()
-    def get_server_info(ctx: Context[ServerSession, ServerContext]) -> ServerInfo:
+    def get_server_info(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+    ) -> ServerInfo:
         """Return structured metadata about the running MCP server."""
         server_context = ctx.request_context.lifespan_context
         config = server_context.config
@@ -152,11 +153,12 @@ def create_mcp_server(
         )
 
     @mcp.tool()
-    def get_runtime_config(
+    def get_runtime_config(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
     ) -> RuntimeConfigSnapshot:
         """Return a bootstrap-safe summary of the active RoastPilot config."""
-        config = ctx.request_context.lifespan_context.config
+        server_context = ctx.request_context.lifespan_context
+        config = server_context.config
         return RuntimeConfigSnapshot(
             config_source=str(config.source_path) if config.source_path is not None else None,
             roaster_driver=config.roaster.driver,
