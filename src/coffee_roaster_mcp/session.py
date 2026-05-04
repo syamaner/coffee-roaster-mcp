@@ -649,9 +649,32 @@ def _generate_session_id() -> str:
 
 def _copy_session_for_read(session: RoastSession) -> RoastSession:
     """Return a lightweight read snapshot without telemetry buffer retention."""
-    snapshot = deepcopy(session)
-    snapshot.telemetry_buffer = deque()
-    return snapshot
+    return RoastSession(
+        id=session.id,
+        created_at_utc=session.created_at_utc,
+        monotonic_start=session.monotonic_start,
+        phase=session.phase,
+        beans_added_at_utc=session.beans_added_at_utc,
+        beans_added_monotonic_seconds=session.beans_added_monotonic_seconds,
+        first_crack_at_utc=session.first_crack_at_utc,
+        first_crack_monotonic_seconds=session.first_crack_monotonic_seconds,
+        beans_dropped_at_utc=session.beans_dropped_at_utc,
+        beans_dropped_monotonic_seconds=session.beans_dropped_monotonic_seconds,
+        cooling_started_at_utc=session.cooling_started_at_utc,
+        cooling_started_monotonic_seconds=session.cooling_started_monotonic_seconds,
+        cooling_stopped_at_utc=session.cooling_stopped_at_utc,
+        cooling_stopped_monotonic_seconds=session.cooling_stopped_monotonic_seconds,
+        faulted_at_utc=session.faulted_at_utc,
+        faulted_monotonic_seconds=session.faulted_monotonic_seconds,
+        heat_level_percent=session.heat_level_percent,
+        fan_level_percent=session.fan_level_percent,
+        cooling_on=session.cooling_on,
+        event_timeline=deepcopy(session.event_timeline),
+        telemetry_buffer=deque(),
+        log_writer=session.log_writer,
+        stopped_at_utc=session.stopped_at_utc,
+        monotonic_stop=session.monotonic_stop,
+    )
 
 
 def _validate_control_percent(value: object, *, label: str) -> int:
