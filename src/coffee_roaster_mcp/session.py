@@ -42,6 +42,35 @@ _SINGLETON_EVENT_KINDS: frozenset[RoastEventKind] = frozenset(
     }
 )
 
+_ALLOWED_PHASES_BY_EVENT: dict[RoastEventKind, frozenset[RoastPhase]] = {
+    "beans_added": frozenset({"pre_roast"}),
+    "first_crack_detected": frozenset({"roasting"}),
+    "beans_dropped": frozenset({"roasting", "development"}),
+    "cooling_started": frozenset({"dropped"}),
+    "cooling_stopped": frozenset({"cooling"}),
+    "fault": frozenset(
+        {
+            "pre_roast",
+            "roasting",
+            "development",
+            "dropped",
+            "cooling",
+            "complete",
+            "fault",
+        }
+    ),
+}
+
+_PHASE_PROGRESSION_ORDER: tuple[RoastPhase, ...] = (
+    "pre_roast",
+    "roasting",
+    "development",
+    "dropped",
+    "cooling",
+    "complete",
+    "fault",
+)
+
 
 def _event_payload_default() -> dict[str, EventPayloadValue]:
     """Return an empty typed event payload mapping."""
@@ -477,6 +506,7 @@ class RoastSessionStore:
             existing_event = self._get_existing_singleton_event(session, kind)
             if existing_event is not None:
                 return existing_event
+            _validate_event_transition(session, kind)
 
             recorded_at_utc = self._utc_now()
             monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
@@ -640,6 +670,21 @@ def _apply_event_timestamp(session: RoastSession, event: RoastEvent) -> None:
         session.phase = "fault"
         session.faulted_at_utc = event.recorded_at_utc
         session.faulted_monotonic_seconds = event.monotonic_seconds
+
+
+def _validate_event_transition(session: RoastSession, kind: RoastEventKind) -> None:
+    """Validate that one new event is allowed from the current session phase."""
+    allowed_phases = _ALLOWED_PHASES_BY_EVENT.get(kind)
+    if allowed_phases is None:
+        raise SessionLifecycleError(f"Unknown roast event kind: {kind}.")
+    if session.phase not in allowed_phases:
+        allowed_phase_list = ", ".join(
+            phase for phase in _PHASE_PROGRESSION_ORDER if phase in allowed_phases
+        )
+        raise SessionLifecycleError(
+            f"{kind} cannot be recorded while phase is {session.phase}; "
+            f"allowed phases: {allowed_phase_list}."
+        )
 
 
 def _generate_session_id() -> str:

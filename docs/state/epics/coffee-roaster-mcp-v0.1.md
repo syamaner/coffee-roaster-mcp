@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E2-S5`
-- Current target: Make roast-session phase transitions deterministic across the new MCP tool flow
+- Active story: `E2-S6`
+- Current target: Extend fault handling from the mock MCP path into driver-owned emergency-stop behavior
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -35,6 +35,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E2-S2` uses one in-process `RoastSessionStore` with at most one active `RoastSession` at a time. Session state now owns monotonic timing, phase, event timeline storage, telemetry retention, and log-writer references before tool wiring lands.
 - `E2-S3` keeps event writes behind `RoastSessionStore.record_event(...)`. The session timeline now records deterministic append order, authoritative UTC plus monotonic timestamps for core roast events, and idempotent singleton handling for beans added, first crack, bean drop, and cooling transitions.
 - `E2-S4` now exposes the first roast-session MCP tools on top of the mock path. `export_roast_log` currently returns the planned manifest only, while the real JSONL, CSV, and summary writers stay in Epic 5.
+- `E2-S5` now enforces phase-ordered roast events inside `RoastSessionStore`. New events must start with `pre_roast -> roasting`, may move through `development` when first crack is recorded, may drop directly from `roasting` when first crack is not recorded, and then continue through `dropped -> cooling -> complete`; repeated singleton calls keep their original event rows and fault rows remain appendable without resetting the first-fault timestamp.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
 - The `coffee-first-crack-detection` repo remains the source of truth for training, ONNX export, Hugging Face sync, model cards, and dataset cards.
@@ -116,7 +117,7 @@ Goal: implement one authoritative roast session runtime and MCP tool surface.
 - [x] `E2-S4` Implement core MCP tools.
   - Done when `start_roast_session`, `get_roast_state`, `set_heat`, `set_fan`, `mark_beans_added`, `mark_first_crack`, `drop_beans`, `start_cooling`, `stop_cooling`, `export_roast_log`, and `emergency_stop` exist.
 
-- [ ] `E2-S5` Implement phase transitions.
+- [x] `E2-S5` Implement phase transitions.
   - Done when session phase changes are deterministic for pre-roast, roasting, development, dropped, cooling, complete, and fault states.
 
 - [ ] `E2-S6` Implement emergency stop and fault recording.
@@ -443,6 +444,15 @@ After completing a story:
   - Added `tests/test_package.py` coverage for tool registration and a basic end-to-end mock tool flow over stdio MCP, including session start, control updates, event recording, state reads, export-manifest response, and emergency-stop fault recording.
   - Updated `README.md` and `.claude/skills/mock-roast/SKILL.md` so they no longer describe the MCP runtime as introspection-only.
   - Ran `./.venv/bin/python -m pytest`: 35 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E2-S5:
+  - Extended `src/coffee_roaster_mcp/session.py` with an explicit allowed-phase map for new event writes while preserving store-owned idempotent singleton handling and repeatable fault rows.
+  - Added `tests/test_session.py` coverage for invalid pre-roast transitions, roast-to-drop ordering, repeated singleton behavior after later phase changes, and rejecting first-crack reports after drop.
+  - Added `tests/test_package.py` coverage that invalid MCP tool calls surface phase-transition errors over stdio before a valid roast sequence starts.
+  - Used the old `coffee-roasting` repo only as a behavioral reference for roast ordering and development/drop/cooling semantics, not as an architecture template.
+  - Ran `./.venv/bin/python -m pytest`: 53 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
