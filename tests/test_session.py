@@ -165,6 +165,63 @@ def test_start_session_allows_new_session_after_previous_stop() -> None:
     assert store.get_latest_session() is second_session
 
 
+def test_start_cooling_rejects_session_before_bean_drop() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    with pytest.raises(SessionLifecycleError, match="after beans are dropped"):
+        store.start_cooling(session)
+
+
+def test_stop_cooling_marks_session_complete_and_stopped() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_dropped")
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
+    clock.monotonic_value = 110.0
+    store.start_cooling(session)
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 3, tzinfo=UTC)
+    clock.monotonic_value = 120.0
+    event = store.stop_cooling(session)
+
+    assert event.kind == "cooling_stopped"
+    assert session.phase == "complete"
+    assert session.active is False
+    assert session.cooling_on is False
+    assert session.stopped_at_utc == datetime(2026, 5, 4, 12, 3, tzinfo=UTC)
+    assert session.monotonic_stop == 120.0
+    assert store.get_active_session() is None
+
+
+def test_stop_cooling_rejects_session_when_cooling_not_started() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_dropped")
+
+    with pytest.raises(SessionLifecycleError, match="must be started"):
+        store.stop_cooling(session)
+
+
 def test_store_append_telemetry_rejects_non_latest_session() -> None:
     clock = ClockHarness()
     issued_ids = iter(["session-001", "session-002"])

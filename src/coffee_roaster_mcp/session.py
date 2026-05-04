@@ -149,6 +149,9 @@ class RoastSession:
         cooling_stopped_monotonic_seconds: Monotonic elapsed seconds for cooling stop.
         faulted_at_utc: Wall-clock UTC timestamp for the first recorded fault.
         faulted_monotonic_seconds: Monotonic elapsed seconds for the first fault.
+        heat_level_percent: Latest in-memory heat setting for the active mock path.
+        fan_level_percent: Latest in-memory fan setting for the active mock path.
+        cooling_on: Whether cooling is currently active in the session state.
         event_timeline: Shared ordered event timeline for future runtime stories.
         telemetry_buffer: Rolling telemetry sample buffer.
         log_writer: Append-only log writer reference when available.
@@ -172,6 +175,9 @@ class RoastSession:
     cooling_stopped_monotonic_seconds: float | None = None
     faulted_at_utc: datetime | None = None
     faulted_monotonic_seconds: float | None = None
+    heat_level_percent: int = 0
+    fan_level_percent: int = 0
+    cooling_on: bool = False
     event_timeline: list[RoastEvent] = field(default_factory=_event_timeline_default)
     telemetry_buffer: deque[TelemetrySample] = field(default_factory=_telemetry_buffer_default)
     log_writer: LogWriterReference | None = None
@@ -333,6 +339,62 @@ class RoastSessionStore:
                 max_samples=self._telemetry_buffer_limit,
             )
 
+    def set_heat(
+        self,
+        session: RoastSession,
+        *,
+        heat_level_percent: int,
+    ) -> RoastSession:
+        """Set the latest in-memory heat value for one active session."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            session.heat_level_percent = _validate_control_percent(
+                heat_level_percent,
+                label="heat_level_percent",
+            )
+            return session
+
+    def set_fan(
+        self,
+        session: RoastSession,
+        *,
+        fan_level_percent: int,
+    ) -> RoastSession:
+        """Set the latest in-memory fan value for one active session."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            session.fan_level_percent = _validate_control_percent(
+                fan_level_percent,
+                label="fan_level_percent",
+            )
+            return session
+
+    def start_cooling(self, session: RoastSession) -> RoastEvent:
+        """Start cooling for one active session."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            if session.beans_dropped_at_utc is None:
+                raise SessionLifecycleError("Cooling can only start after beans are dropped.")
+            session.cooling_on = True
+            session.phase = "cooling"
+            return self.record_event(session, "cooling_started")
+
+    def stop_cooling(self, session: RoastSession) -> RoastEvent:
+        """Stop cooling for one active session."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            if session.beans_dropped_at_utc is None:
+                raise SessionLifecycleError("Cooling cannot stop before beans are dropped.")
+            if session.cooling_started_at_utc is None or not session.cooling_on:
+                raise SessionLifecycleError("Cooling must be started before it can be stopped.")
+            event = self.record_event(session, "cooling_stopped")
+            session.stop(
+                utc_now=self._utc_now,
+                monotonic_now=self._monotonic_now,
+                phase="complete",
+            )
+            return event
+
     def record_event(
         self,
         session: RoastSession,
@@ -415,26 +477,35 @@ class RoastSessionStore:
 def _apply_event_timestamp(session: RoastSession, event: RoastEvent) -> None:
     """Update authoritative event timestamp fields from one timeline event."""
     if event.kind == "beans_added":
+        session.phase = "roasting"
         session.beans_added_at_utc = event.recorded_at_utc
         session.beans_added_monotonic_seconds = event.monotonic_seconds
         return
     if event.kind == "first_crack_detected":
+        session.phase = "development"
         session.first_crack_at_utc = event.recorded_at_utc
         session.first_crack_monotonic_seconds = event.monotonic_seconds
         return
     if event.kind == "beans_dropped":
+        session.phase = "dropped"
+        session.heat_level_percent = 0
         session.beans_dropped_at_utc = event.recorded_at_utc
         session.beans_dropped_monotonic_seconds = event.monotonic_seconds
         return
     if event.kind == "cooling_started":
+        session.phase = "cooling"
+        session.cooling_on = True
         session.cooling_started_at_utc = event.recorded_at_utc
         session.cooling_started_monotonic_seconds = event.monotonic_seconds
         return
     if event.kind == "cooling_stopped":
+        session.cooling_on = False
+        session.phase = "complete" if session.beans_dropped_at_utc is not None else "pre_roast"
         session.cooling_stopped_at_utc = event.recorded_at_utc
         session.cooling_stopped_monotonic_seconds = event.monotonic_seconds
         return
     if event.kind == "fault" and session.faulted_at_utc is None:
+        session.phase = "fault"
         session.faulted_at_utc = event.recorded_at_utc
         session.faulted_monotonic_seconds = event.monotonic_seconds
 
@@ -442,3 +513,10 @@ def _apply_event_timestamp(session: RoastSession, event: RoastEvent) -> None:
 def _generate_session_id() -> str:
     """Return a stable opaque session identifier."""
     return uuid4().hex
+
+
+def _validate_control_percent(value: int, *, label: str) -> int:
+    """Validate one percentage-like control input."""
+    if not 0 <= value <= 100:
+        raise ValueError(f"{label} must be between 0 and 100.")
+    return value

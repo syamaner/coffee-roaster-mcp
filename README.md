@@ -82,7 +82,7 @@ The default local path is intentionally mock-safe:
 - no microphone required
 - no model download required
 
-`E2-S1` now provides a real local stdio MCP server entrypoint with a minimal bootstrap-safe tool list. Later Epic 2 stories still need to add the authoritative roast-session lifecycle and the roast-control tool surface.
+RoastPilot now provides a real local stdio MCP server entrypoint plus the first mock-safe roast-session tool surface. Later Epic 2 stories still need to refine phase transitions, emergency-stop semantics, and the real log writers.
 
 ### Start The Local MCP Server
 
@@ -90,10 +90,23 @@ The default local path is intentionally mock-safe:
 coffee-roaster-mcp serve
 ```
 
-The current `E2-S1` tool list is intentionally narrow:
+The current MCP tool surface includes:
 
 - `get_server_info`
 - `get_runtime_config`
+- `start_roast_session`
+- `get_roast_state`
+- `set_heat`
+- `set_fan`
+- `mark_beans_added`
+- `mark_first_crack`
+- `drop_beans`
+- `start_cooling`
+- `stop_cooling`
+- `export_roast_log`
+- `emergency_stop`
+
+`export_roast_log` currently returns the planned export manifest only. The real JSONL, CSV, and summary writers land in Epic 5.
 
 ### Mock-Safe Bootstrap Smoke
 
