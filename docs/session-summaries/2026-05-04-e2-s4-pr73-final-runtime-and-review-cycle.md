@@ -47,6 +47,7 @@ Most important token note:
 
 - Earlier in the same long chat, the context window had dropped to `23% left (203K used / 258K)` during the `E2-S1` and `E2-S2` work.
 - By this later summary point it had recovered to `52% left (130K used / 258K)`, which means compaction and durable summaries materially reduced context pressure while the story stream continued.
+- A later status excerpt was provided after more PR `#73` review fixes, but it did not include a fresh context-window line in the pasted portion, so `52% left (130K used / 258K)` remains the latest fully preserved token snapshot in repo docs.
 
 ## Final PR 73 Outcome
 
@@ -67,6 +68,7 @@ Branch:
 State at this summary point:
 
 - PR review rounds completed locally and pushed
+- latest review fixes now include absolute export-path responses and serializer-signature cleanup
 - durable state on the branch already points to `E2-S5` next
 
 ## What Changed In The Final Review Rounds
@@ -93,6 +95,12 @@ State at this summary point:
 
 - export remains a manifest-only read surface
 - tests now resolve relative paths against the server process `cwd`, so the no-side-effects assertion checks the right filesystem location
+- export manifest paths are now returned as absolute server-resolved paths so MCP clients do not have to infer server `cwd`
+
+### Helper and contract cleanup
+
+- `_serialize_session_state()` no longer accepts an unused `server_context` parameter
+- the final helper signatures now better match the actual MCP response contract
 
 ## Final Review-Driven Commit Timeline For PR 73
 
@@ -102,6 +110,7 @@ State at this summary point:
 4. `d53b70b` - `fix: expose event payloads and session history`
 5. `2fb63b2` - `fix: bound session history and atomic snapshots`
 6. `e0e52e0` - `test: tighten snapshot and export coverage`
+7. `e3b8379` - `fix: clarify export path responses`
 
 ## Final Validation State
 

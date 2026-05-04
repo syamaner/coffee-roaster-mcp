@@ -27,6 +27,8 @@ The signal quality was high enough to catch several real MCP runtime problems th
 - concurrency gaps between mutation and response snapshotting
 - read-surface assumptions that were correct for one active session but broke after later session rollover
 - a test bug that checked the wrong filesystem location
+- export-path ambiguity for MCP clients consuming relative manifest paths
+- helper signatures that still reflected earlier implementation structure rather than the final contract
 
 The review also created some churn, because the issues arrived across many rounds and increasingly focused on deeper invariants rather than the initial functional slice. That meant the story expanded from “core tools work” into “core tools have durable MCP semantics under repeated calls and later session rollover”.
 
@@ -83,6 +85,7 @@ Instead of one compact set of findings, the PR accumulated several rounds:
 3. fault-terminal and snapshot lookup behavior
 4. payload visibility and session history
 5. bounded retention, atomic snapshots, and test-process path correctness
+6. absolute export-path clarity and final helper-contract cleanup
 
 This made the story feel longer than the initial acceptance criteria suggested. The review was still useful, but future stories may benefit from front-loading more of these invariants in the first implementation pass.
 
@@ -100,6 +103,8 @@ By the end of PR `#73`, Copilot review materially improved the runtime in these 
 - atomic mutation-and-response semantics
 - lighter-weight read snapshots
 - more realistic export-manifest tests
+- absolute export-path responses for MCP clients
+- cleaner helper signatures around session-state serialization
 
 That is a substantial quality delta compared with the first version of the story.
 
@@ -110,6 +115,10 @@ This PR review cycle happened inside a long-running chat that had already covere
 Most important token snapshot preserved here:
 
 - Context window: `52% left (130K used / 258K)`
+
+Later note:
+
+- A later status block was shared after more PR `#73` fixes, but the pasted portion did not include a fresh context-window line, so this remains the latest fully preserved token figure in repo docs.
 
 Why this matters:
 

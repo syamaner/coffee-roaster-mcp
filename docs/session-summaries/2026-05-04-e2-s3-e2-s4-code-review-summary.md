@@ -78,6 +78,11 @@ PR state at summary time:
 6. snapshot serialization under store locking
 7. read-only export behavior
 8. control-type validation
+9. event-response determinism for idempotent commands
+10. session lookup after later session rollover
+11. event payload visibility in MCP responses
+12. bounded session history and lightweight read snapshots
+13. absolute export-path clarity for MCP clients
 
 ### Important review findings and fixes
 
@@ -131,6 +136,48 @@ Snapshot serialization outside the store lock:
   - added store-owned deep-copied session snapshots
   - MCP tools now serialize from snapshot copies instead of from live mutable objects
 
+Idempotent event-response mismatches:
+
+- Review found repeated singleton event commands could return the wrong event because the MCP layer serialized the latest timeline row instead of the event actually produced or resolved by the command
+- Fix:
+  - event-command tools now serialize the exact `RoastEvent` returned by the store mutation
+  - repeated `mark_beans_added`, `mark_first_crack`, and `drop_beans` calls now return stable command-aligned event results
+
+Session lookup after rollover:
+
+- Review found `get_session_snapshot(session_id=...)` only worked for the latest session, which broke reads and exports for completed sessions after a new roast started
+- Fix:
+  - added bounded retained session history addressable by `session_id`
+  - completed sessions remain readable after rollover within the in-process retained history window
+
+Event payload visibility:
+
+- Review found MCP responses dropped `RoastEvent.payload`, which hid fault reasons and future event metadata from clients
+- Fix:
+  - `EventSnapshot` now includes `payload`
+  - fault reasons from `emergency_stop` now appear in MCP event and session-state responses
+
+Atomic mutation-and-snapshot responses:
+
+- Review found tool handlers could mutate session state and then snapshot it under a later lock acquisition, allowing interleaving changes to leak into the response
+- Fix:
+  - added store-owned mutation-plus-snapshot helpers
+  - MCP tool responses now reflect the command that just happened rather than a later mutation
+
+Lightweight read snapshots:
+
+- Review found session snapshots were still copying more state than needed and holding the lock through full copies
+- Fix:
+  - read snapshots now omit telemetry buffer retention
+  - the final helper avoids copying telemetry only to discard it afterward
+
+Export path ambiguity:
+
+- Review found relative export paths were ambiguous for MCP clients because they depended on server process `cwd`
+- Fix:
+  - export manifest paths are now returned as absolute server-resolved paths
+  - tests now assert absolute paths directly
+
 Export tool side effects:
 
 - Review found `export_roast_log` claimed to be a manifest-only tool but still created directories
@@ -148,10 +195,16 @@ Control-type validation:
 ### Review-driven commits for PR #73
 
 1. `e19f867` - `fix: harden mock tool lifecycle`
+2. `cb4f23a` - `fix: return stable mcp event results`
+3. `cba13c4` - `fix: harden mcp snapshot semantics`
+4. `d53b70b` - `fix: expose event payloads and session history`
+5. `2fb63b2` - `fix: bound session history and atomic snapshots`
+6. `e0e52e0` - `test: tighten snapshot and export coverage`
+7. `e3b8379` - `fix: clarify export path responses`
 
 ### Final E2-S4 quality gate
 
-- `pytest`: 43 passed
+- `pytest`: 47 passed
 - `ruff check .`: passed
 - `ruff format --check .`: passed
 - `pyright`: 0 errors
