@@ -326,8 +326,7 @@ class RoastSessionStore:
             SessionLifecycleError: If the session is not the latest session in this store.
         """
         with self._lock:
-            if self._latest_session is not session:
-                raise SessionLifecycleError("Telemetry can only be appended to the latest session.")
+            self._assert_latest_active_session(session)
             _append_telemetry_with_limit(
                 session,
                 sample,
