@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E2-S8`
-- Current target: Add GitHub Actions code coverage reporting with readable visual output
+- Active story: `E3-S1`
+- Current target: Define the broader roaster driver interface and capabilities model
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -38,7 +38,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E2-S5` now enforces phase-ordered roast events inside `RoastSessionStore`. New events must start with `pre_roast -> roasting`, may move through `development` when first crack is recorded, may drop directly from `roasting` when first crack is not recorded, and then continue through `dropped -> cooling -> complete`; repeated singleton calls keep their original event rows and fault rows remain appendable without resetting the first-fault timestamp.
 - `E2-S6` keeps `RoastSessionStore` as the one-session mutation boundary but moves emergency-stop safety behavior behind the configured driver boundary. The current mock driver fail-closes heat to `0`, fan to `100`, and cooling to `on`; the store records the resulting fault event and stops the session, and MCP responses expose the fault payload plus final session state.
 - `E2-S7` completes the first one-process mock vertical slice. `export_roast_log` now writes snapshot JSONL, CSV, and summary files from the current session state, and `get_roast_state` exposes minimal timestamp-derived roast and development metrics. Append-only telemetry writers and final export schemas remain Epic 5 work.
-- `E2-S8` is the final Epic 2 hardening story before moving into the broader driver contract work. It should add GitHub Actions coverage reporting with an easy-to-read job summary and an HTML artifact, without introducing an external hosted coverage service by default.
+- `E2-S8` completed the final Epic 2 hardening story before broader driver contract work. Pull-request CI now runs tests with coverage for `coffee_roaster_mcp`, writes an easy-to-read GitHub Actions Markdown summary, and uploads an `html-coverage-report` artifact without adding an external hosted coverage service.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
 - The `coffee-first-crack-detection` repo remains the source of truth for training, ONNX export, Hugging Face sync, model cards, and dataset cards.
@@ -129,7 +129,7 @@ Goal: implement one authoritative roast session runtime and MCP tool surface.
 - [x] `E2-S7` Complete thin vertical slice spike.
   - Done when a mock roast can start, mark beans added, inject first crack, drop beans, return state, and export logs in one process.
 
-- [ ] `E2-S8` Add GitHub Actions code coverage reporting.
+- [x] `E2-S8` Add GitHub Actions code coverage reporting.
   - Done when CI runs tests with coverage for `coffee_roaster_mcp`, publishes a readable GitHub Actions summary, uploads a visually useful HTML coverage artifact, and documents how to read the output.
 
 ### Epic Acceptance Criteria
@@ -479,6 +479,18 @@ After completing a story:
   - Updated the stdio MCP smoke flow to prove one process can start a mock roast, mark beans added, inject first crack, drop beans, return state, and export readable files without hardware or model download.
   - Ran `./.venv/bin/python -m pytest tests/test_session.py tests/test_package.py`: 50 passed.
   - Ran `./.venv/bin/python -m pytest`: 64 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed after applying `ruff format`.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E2-S8:
+  - Added `pytest-cov` as a declared dev dependency and configured branch-aware coverage for `coffee_roaster_mcp`.
+  - Updated pull-request CI so the `Checks` job runs pytest with terminal, JSON, and HTML coverage outputs.
+  - Added `.github/scripts/write_coverage_summary.py` to convert `coverage.json` into a readable GitHub Actions Markdown summary with total coverage, line counts, a progress bar, lowest-covered source files, and artifact guidance.
+  - CI uploads `html-coverage-report` for file-by-file drill-down without adding an external hosted coverage service.
+  - Updated `README.md` with local coverage commands and how to read the GitHub Actions summary and artifact.
+  - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`: 65 passed, total coverage 77%.
+  - Ran `./.venv/bin/python .github/scripts/write_coverage_summary.py coverage.json`: passed and produced the expected Markdown summary.
+  - Ran `./.venv/bin/python -m pytest`: 65 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed after applying `ruff format`.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

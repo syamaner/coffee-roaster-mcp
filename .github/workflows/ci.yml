@@ -24,8 +24,34 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e . --group dev
 
-      - name: Run tests
-        run: python -m pytest
+      - name: Run tests with coverage
+        run: |
+          python -m pytest \
+            --cov=coffee_roaster_mcp \
+            --cov-report=term-missing:skip-covered \
+            --cov-report=json:coverage.json \
+            --cov-report=html:htmlcov
+
+      - name: Write coverage summary
+        if: always()
+        run: |
+          if [ -f coverage.json ]; then
+            python .github/scripts/write_coverage_summary.py coverage.json --output "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## Test Coverage"
+              echo
+              echo "Coverage output was not generated because the test step failed before writing coverage.json."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload HTML coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-coverage-report
+          path: htmlcov/
+          if-no-files-found: ignore
 
       - name: Run lint
         run: python -m ruff check .

@@ -20,7 +20,7 @@ The v0.1 direction is one local stdio MCP server that will own:
 - derived roast metrics
 - roast log export
 
-The current repo state is still bootstrap. The package scaffold, config loading, local development commands, pull-request CI, and the first stdio MCP entrypoint are in place. The full roast-session runtime and control surface continue through Epic 2.
+The current repo state is still bootstrap. The package scaffold, config loading, local development commands, pull-request CI, stdio MCP entrypoint, mock roast-session tool surface, and one-process mock vertical slice are in place.
 
 ## Install
 
@@ -46,6 +46,15 @@ Use the commands in the [Install](#install) section, then continue with the chec
 ```bash
 python -m pytest
 ```
+
+### Coverage
+
+```bash
+python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=html:htmlcov --cov-report=json:coverage.json
+python .github/scripts/write_coverage_summary.py coverage.json
+```
+
+Pull-request CI publishes a Markdown coverage summary in the `Checks` job summary and uploads `html-coverage-report` as a workflow artifact for file-by-file drill-down.
 
 ### Lint
 
@@ -106,7 +115,7 @@ The current MCP tool surface includes:
 - `export_roast_log`
 - `emergency_stop`
 
-`export_roast_log` currently returns the planned export manifest only. The real JSONL, CSV, and summary writers land in Epic 5.
+`export_roast_log` writes snapshot `roast.jsonl`, `roast.csv`, and `summary.json` files for the current in-process session. Append-only telemetry writers and final log schemas land in Epic 5.
 
 ### Mock-Safe Bootstrap Smoke
 
