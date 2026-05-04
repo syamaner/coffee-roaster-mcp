@@ -271,6 +271,10 @@ def test_stdio_server_rejects_manual_first_crack_override_when_disabled(tmp_path
     asyncio.run(_assert_manual_override_disabled(tmp_path))
 
 
+def test_stdio_server_rejects_invalid_phase_transition_calls(tmp_path: Path) -> None:
+    asyncio.run(_assert_invalid_phase_transitions(tmp_path))
+
+
 async def _assert_manual_override_disabled(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(
@@ -295,6 +299,46 @@ async def _assert_manual_override_disabled(tmp_path: Path) -> None:
         assert result.isError is True
         assert result.content is not None
         assert "Manual first-crack override is disabled" in result.content[0].text
+
+
+async def _assert_invalid_phase_transitions(tmp_path: Path) -> None:
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "coffee_roaster_mcp.cli", "serve"],
+        env=_build_clean_server_env(),
+        cwd=tmp_path,
+    )
+
+    async with stdio_client(server_params) as (read, write), ClientSession(read, write) as session:
+        await _call_with_timeout(session.initialize())
+        await _call_with_timeout(session.call_tool("start_roast_session", {}))
+
+        first_crack_result = cast(
+            Any,
+            await _call_with_timeout(session.call_tool("mark_first_crack", {})),
+        )
+        assert first_crack_result.isError is True
+        assert first_crack_result.content is not None
+        assert "allowed phases: roasting" in first_crack_result.content[0].text
+
+        drop_result = cast(
+            Any,
+            await _call_with_timeout(session.call_tool("drop_beans", {})),
+        )
+        assert drop_result.isError is True
+        assert drop_result.content is not None
+        assert "development, roasting" in drop_result.content[0].text
+
+        await _call_with_timeout(session.call_tool("mark_beans_added", {}))
+        await _call_with_timeout(session.call_tool("drop_beans", {}))
+
+        late_first_crack_result = cast(
+            Any,
+            await _call_with_timeout(session.call_tool("mark_first_crack", {})),
+        )
+        assert late_first_crack_result.isError is True
+        assert late_first_crack_result.content is not None
+        assert "allowed phases: roasting" in late_first_crack_result.content[0].text
 
 
 def test_stdio_server_reports_manual_mode_as_bootstrap_safe(tmp_path: Path) -> None:

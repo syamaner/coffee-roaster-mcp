@@ -238,6 +238,74 @@ def test_start_cooling_rejects_session_before_bean_drop() -> None:
         store.start_cooling(session)
 
 
+@pytest.mark.parametrize(
+    ("kind", "match"),
+    [
+        ("first_crack_detected", "allowed phases: roasting"),
+        ("beans_dropped", "allowed phases: development, roasting"),
+    ],
+)
+def test_record_event_rejects_invalid_pre_roast_transitions(
+    kind: RoastEventKind,
+    match: str,
+) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    with pytest.raises(SessionLifecycleError, match=match):
+        store.record_event(session, kind)
+
+
+def test_record_event_allows_drop_directly_from_roasting_phase() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
+    clock.monotonic_value = 120.0
+    event = store.record_event(session, "beans_dropped")
+
+    assert event.kind == "beans_dropped"
+    assert session.phase == "dropped"
+    assert session.first_crack_at_utc is None
+
+
+def test_record_event_keeps_later_phase_when_singleton_event_is_repeated() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
+    clock.monotonic_value = 115.0
+    store.record_event(session, "first_crack_detected")
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 3, tzinfo=UTC)
+    clock.monotonic_value = 125.0
+    repeated_event = store.record_event(session, "beans_added")
+
+    assert repeated_event.kind == "beans_added"
+    assert session.phase == "development"
+    assert len(session.event_timeline) == 2
+
+
 def test_stop_cooling_marks_session_complete_and_stopped() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
@@ -248,6 +316,10 @@ def test_stop_cooling_marks_session_complete_and_stopped() -> None:
 
     clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
     clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, 30, tzinfo=UTC)
+    clock.monotonic_value = 108.0
     store.record_event(session, "beans_dropped")
 
     clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
@@ -325,6 +397,10 @@ def test_start_cooling_rejects_session_that_has_faulted() -> None:
 
     clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
     clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, 30, tzinfo=UTC)
+    clock.monotonic_value = 108.0
     store.record_event(session, "beans_dropped")
     store.record_event(session, "fault", payload={"reason": "test"})
 
@@ -342,10 +418,34 @@ def test_stop_cooling_rejects_session_when_cooling_not_started() -> None:
 
     clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
     clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, 30, tzinfo=UTC)
+    clock.monotonic_value = 108.0
     store.record_event(session, "beans_dropped")
 
     with pytest.raises(SessionLifecycleError, match="must be started"):
         store.stop_cooling(session)
+
+
+def test_record_event_rejects_first_crack_after_drop() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
+    clock.monotonic_value = 115.0
+    store.record_event(session, "beans_dropped")
+
+    with pytest.raises(SessionLifecycleError, match="allowed phases: roasting"):
+        store.record_event(session, "first_crack_detected")
 
 
 def test_set_heat_rejects_non_integer_values() -> None:
@@ -415,7 +515,6 @@ def test_record_event_updates_timeline_order_and_authoritative_timestamps() -> N
         ("beans_dropped", datetime(2026, 5, 4, 12, 8, tzinfo=UTC), 150.0),
         ("cooling_started", datetime(2026, 5, 4, 12, 8, 30, tzinfo=UTC), 160.0),
         ("cooling_stopped", datetime(2026, 5, 4, 12, 11, tzinfo=UTC), 190.0),
-        ("fault", datetime(2026, 5, 4, 12, 12, tzinfo=UTC), 200.0),
     ]
 
     for kind, utc_value, monotonic_value in event_steps:
@@ -429,7 +528,6 @@ def test_record_event_updates_timeline_order_and_authoritative_timestamps() -> N
         "beans_dropped",
         "cooling_started",
         "cooling_stopped",
-        "fault",
     ]
     assert [event.monotonic_seconds for event in session.event_timeline] == [
         5.0,
@@ -437,7 +535,6 @@ def test_record_event_updates_timeline_order_and_authoritative_timestamps() -> N
         50.0,
         60.0,
         90.0,
-        100.0,
     ]
     assert session.beans_added_at_utc == datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
     assert session.beans_added_monotonic_seconds == 5.0
@@ -449,15 +546,12 @@ def test_record_event_updates_timeline_order_and_authoritative_timestamps() -> N
     assert session.cooling_started_monotonic_seconds == 60.0
     assert session.cooling_stopped_at_utc == datetime(2026, 5, 4, 12, 11, tzinfo=UTC)
     assert session.cooling_stopped_monotonic_seconds == 90.0
-    assert session.faulted_at_utc == datetime(2026, 5, 4, 12, 12, tzinfo=UTC)
-    assert session.faulted_monotonic_seconds == 100.0
     assert [event.payload["source"] for event in session.event_timeline] == [
         "beans_added",
         "first_crack_detected",
         "beans_dropped",
         "cooling_started",
         "cooling_stopped",
-        "fault",
     ]
 
 
