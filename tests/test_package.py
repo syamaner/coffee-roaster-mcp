@@ -216,11 +216,10 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert export_result.structuredContent["ready"] is False
         export_log_dir = Path(export_result.structuredContent["log_dir"])
         export_jsonl_path = Path(export_result.structuredContent["jsonl_path"])
-        resolved_export_log_dir = (
-            export_log_dir if export_log_dir.is_absolute() else tmp_path / export_log_dir
-        )
+        assert export_log_dir.is_absolute()
+        assert export_jsonl_path.is_absolute()
         assert export_jsonl_path.name == "roast.jsonl"
-        assert not resolved_export_log_dir.exists()
+        assert not export_log_dir.exists()
 
         second_start_result = cast(
             Any,

@@ -298,7 +298,7 @@ def create_mcp_server(
         """Start one new authoritative roast session."""
         server_context = ctx.request_context.lifespan_context
         session = server_context.session_store.start_session_snapshot()
-        return StartRoastSessionResult(session=_serialize_session_state(session, server_context))
+        return StartRoastSessionResult(session=_serialize_session_state(session))
 
     @mcp.tool()
     def get_roast_state(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -308,7 +308,7 @@ def create_mcp_server(
         """Return the current authoritative roast session state."""
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
-        return _serialize_session_state(session, server_context)
+        return _serialize_session_state(session)
 
     @mcp.tool()
     def set_heat(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -399,7 +399,7 @@ def create_mcp_server(
         """
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
-        log_dir = _require_log_dir(session)
+        log_dir = _require_log_dir(session).resolve()
         return ExportRoastLogResult(
             session_id=session.id,
             log_dir=str(log_dir),
@@ -493,7 +493,6 @@ def _snapshot_session(
 
 def _serialize_session_state(
     session: RoastSession,
-    server_context: ServerContext,
 ) -> RoastSessionState:
     """Convert one in-memory session into an MCP-safe snapshot."""
     return RoastSessionState(
@@ -513,7 +512,9 @@ def _serialize_session_state(
         cooling_stopped_at_utc=_iso_or_none(session.cooling_stopped_at_utc),
         faulted_at_utc=_iso_or_none(session.faulted_at_utc),
         events=tuple(_serialize_event(event) for event in session.event_timeline),
-        log_dir=str(session.log_writer.log_dir) if session.log_writer is not None else None,
+        log_dir=str(session.log_writer.log_dir.resolve())
+        if session.log_writer is not None
+        else None,
     )
 
 
