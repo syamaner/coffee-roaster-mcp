@@ -15,6 +15,7 @@ from mcp.server.session import ServerSession
 
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.config import AppConfig, load_config
+from coffee_roaster_mcp.drivers import RoasterSafetyDriver, create_roaster_safety_driver
 from coffee_roaster_mcp.session import (
     EventPayloadValue,
     RoastEvent,
@@ -33,12 +34,14 @@ class ServerContext:
         config: Loaded RoastPilot configuration.
         transport: Actual MCP transport used by this server process.
         session_store: Authoritative in-process roast session owner.
+        roaster_driver: Configured driver safety boundary.
         started_at_utc: UTC time when the MCP process initialized.
     """
 
     config: AppConfig
     transport: str
     session_store: RoastSessionStore
+    roaster_driver: RoasterSafetyDriver
     started_at_utc: datetime
 
 
@@ -200,6 +203,7 @@ def build_server_context(
         config=config,
         transport=transport,
         session_store=RoastSessionStore(default_log_dir=config.logging.log_dir / "roasts"),
+        roaster_driver=create_roaster_safety_driver(config.roaster.driver),
         started_at_utc=datetime.now(UTC),
     )
 
@@ -424,6 +428,10 @@ def create_mcp_server(
         event, snapshot = server_context.session_store.emergency_stop_snapshot(
             session,
             reason=reason,
+            safety_action=lambda active_session: server_context.roaster_driver.emergency_stop(
+                active_session,
+                reason=reason,
+            ).as_event_payload(),
         )
         return _serialize_event_result(snapshot=snapshot, event=event)
 

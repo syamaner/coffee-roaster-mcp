@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 
 from coffee_roaster_mcp.session import (
+    EventPayloadValue,
     RoastEventKind,
     RoastSessionStore,
     SessionLifecycleError,
@@ -358,8 +359,45 @@ def test_emergency_stop_faults_and_stops_session() -> None:
     assert session.heat_level_percent == 0
     assert session.fan_level_percent == 100
     assert session.cooling_on is True
+    assert event.payload["driver_safety_method_called"] is True
     assert session.stopped_at_utc == datetime(2026, 5, 4, 12, 4, tzinfo=UTC)
     assert session.monotonic_stop == 130.0
+
+
+def test_emergency_stop_calls_supplied_driver_safety_action() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+    calls: list[str] = []
+
+    def safety_action(active_session: object) -> dict[str, EventPayloadValue]:
+        assert active_session is session
+        calls.append("emergency_stop")
+        session.heat_level_percent = 0
+        session.fan_level_percent = 100
+        session.cooling_on = True
+        return {
+            "driver": "test-driver",
+            "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
+        }
+
+    event = store.emergency_stop(
+        session,
+        reason="driver-owned-safety",
+        safety_action=safety_action,
+    )
+
+    assert calls == ["emergency_stop"]
+    assert event.kind == "fault"
+    assert event.payload["reason"] == "driver-owned-safety"
+    assert event.payload["driver"] == "test-driver"
+    assert event.payload["driver_safety_method_called"] is True
+    assert session.phase == "fault"
+    assert session.active is False
 
 
 def test_emergency_stop_faults_active_complete_session() -> None:
@@ -394,7 +432,8 @@ def test_emergency_stop_faults_active_complete_session() -> None:
     event = store.emergency_stop(session, reason="post-complete-fault")
 
     assert event.kind == "fault"
-    assert event.payload == {"reason": "post-complete-fault"}
+    assert event.payload["reason"] == "post-complete-fault"
+    assert event.payload["driver_safety_method_called"] is True
     assert session.phase == "fault"
     assert session.active is False
     assert session.heat_level_percent == 0

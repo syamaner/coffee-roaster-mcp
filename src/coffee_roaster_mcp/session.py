@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -537,14 +537,20 @@ class RoastSessionStore:
         session: RoastSession,
         *,
         reason: str,
+        safety_action: Callable[[RoastSession], Mapping[str, EventPayloadValue]] | None = None,
     ) -> RoastEvent:
-        """Apply mock-safe emergency-stop state and finalize the session."""
+        """Apply driver-owned emergency-stop behavior and finalize the session."""
         with self._lock:
             self._assert_latest_active_session(session)
-            session.heat_level_percent = 0
-            session.fan_level_percent = 100
-            session.cooling_on = True
-            event = self.record_event(session, "fault", payload={"reason": reason})
+            _validate_event_transition(session, "fault")
+            safety_payload = (
+                _default_emergency_safety_action(session)
+                if safety_action is None
+                else dict(safety_action(session))
+            )
+            event_payload: dict[str, EventPayloadValue] = {"reason": reason}
+            event_payload.update(safety_payload)
+            event = self.record_event(session, "fault", payload=event_payload)
             session.stop(
                 utc_now=self._utc_now,
                 monotonic_now=self._monotonic_now,
@@ -557,10 +563,15 @@ class RoastSessionStore:
         session: RoastSession,
         *,
         reason: str,
+        safety_action: Callable[[RoastSession], Mapping[str, EventPayloadValue]] | None = None,
     ) -> tuple[RoastEvent, RoastSession]:
         """Apply emergency stop and return the event plus an atomic lightweight snapshot."""
         with self._lock:
-            event = self.emergency_stop(session, reason=reason)
+            event = self.emergency_stop(
+                session,
+                reason=reason,
+                safety_action=safety_action,
+            )
             return event, _copy_session_for_read(session)
 
     def get_active_session(self) -> RoastSession | None:
@@ -690,6 +701,23 @@ def _validate_event_transition(session: RoastSession, kind: RoastEventKind) -> N
 def _generate_session_id() -> str:
     """Return a stable opaque session identifier."""
     return uuid4().hex
+
+
+def _default_emergency_safety_action(
+    session: RoastSession,
+) -> dict[str, EventPayloadValue]:
+    """Apply legacy mock-safe stop state when no driver callback is supplied."""
+    session.heat_level_percent = 0
+    session.fan_level_percent = 100
+    session.cooling_on = True
+    return {
+        "driver": "store-default",
+        "driver_safety_method": "emergency_stop",
+        "driver_safety_method_called": True,
+        "heat_level_percent": session.heat_level_percent,
+        "fan_level_percent": session.fan_level_percent,
+        "cooling_on": session.cooling_on,
+    }
 
 
 def _copy_session_for_read(session: RoastSession) -> RoastSession:

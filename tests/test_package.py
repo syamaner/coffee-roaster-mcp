@@ -235,9 +235,11 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert emergency_stop_result.structuredContent["session_id"] == second_session_id
         assert emergency_stop_result.structuredContent["event"]["kind"] == "fault"
         assert emergency_stop_result.structuredContent["phase"] == "fault"
-        assert emergency_stop_result.structuredContent["event"]["payload"] == {
-            "reason": "test-path"
-        }
+        emergency_payload = emergency_stop_result.structuredContent["event"]["payload"]
+        assert emergency_payload["reason"] == "test-path"
+        assert emergency_payload["driver"] == "mock"
+        assert emergency_payload["driver_safety_method"] == "emergency_stop"
+        assert emergency_payload["driver_safety_method_called"] is True
 
         faulted_state_result = cast(
             Any,
@@ -247,9 +249,10 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         )
         assert faulted_state_result.structuredContent["active"] is False
         assert faulted_state_result.structuredContent["phase"] == "fault"
-        assert faulted_state_result.structuredContent["events"][-1]["payload"] == {
-            "reason": "test-path"
-        }
+        faulted_payload = faulted_state_result.structuredContent["events"][-1]["payload"]
+        assert faulted_payload["reason"] == "test-path"
+        assert faulted_payload["driver"] == "mock"
+        assert faulted_payload["driver_safety_method_called"] is True
 
         third_start_result = cast(
             Any,
