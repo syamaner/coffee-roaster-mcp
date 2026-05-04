@@ -18,6 +18,7 @@ from mcp.server.session import ServerSession
 
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.config import AppConfig, load_config
+from coffee_roaster_mcp.session import RoastSessionStore
 
 
 @dataclass(frozen=True)
@@ -27,11 +28,13 @@ class ServerContext:
     Attributes:
         config: Loaded RoastPilot configuration.
         transport: Actual MCP transport used by this server process.
+        session_store: Authoritative in-process roast session owner.
         started_at_utc: UTC time when the MCP process initialized.
     """
 
     config: AppConfig
     transport: str
+    session_store: RoastSessionStore
     started_at_utc: datetime
 
 
@@ -99,6 +102,29 @@ class RuntimeConfigSnapshot:
     auto_t0_detection_enabled: bool
 
 
+def build_server_context(
+    *,
+    config_path: str | Path | None = None,
+    transport: str = "stdio",
+) -> ServerContext:
+    """Build the MCP server lifecycle context from config and runtime transport.
+
+    Args:
+        config_path: Optional explicit config path.
+        transport: Actual MCP transport used by this server instance.
+
+    Returns:
+        The initialized server context used by the MCP lifespan.
+    """
+    config = load_config(path=config_path)
+    return ServerContext(
+        config=config,
+        transport=transport,
+        session_store=RoastSessionStore(default_log_dir=config.logging.log_dir / "roasts"),
+        started_at_utc=datetime.now(UTC),
+    )
+
+
 def create_mcp_server(
     config_path: str | Path | None = None,
     transport: str = "stdio",
@@ -117,11 +143,7 @@ def create_mcp_server(
     @asynccontextmanager
     async def server_lifespan(_: FastMCP) -> AsyncGenerator[ServerContext, None]:
         """Load typed config once for the MCP process lifetime."""
-        yield ServerContext(
-            config=load_config(path=config_path),
-            transport=transport,
-            started_at_utc=datetime.now(UTC),
-        )
+        yield build_server_context(config_path=config_path, transport=transport)
 
     mcp = FastMCP(
         name="RoastPilot",

@@ -13,6 +13,7 @@ from mcp.client.stdio import stdio_client
 
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.cli import build_parser, main
+from coffee_roaster_mcp.mcp_server import build_server_context
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _T = TypeVar("_T")
@@ -105,6 +106,17 @@ async def _assert_manual_mode_bootstrap_safe(tmp_path: Path) -> None:
         assert server_info.structuredContent is not None
         assert server_info.structuredContent["first_crack_mode"] == "manual"
         assert server_info.structuredContent["bootstrap_safe"] is True
+
+
+def test_stdio_server_uses_configured_log_root_for_session_store(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("logging:\n  log_dir: ./custom-logs\n", encoding="utf-8")
+
+    server_context = build_server_context(config_path=config_path)
+    session = server_context.session_store.start_session()
+
+    assert session.log_writer is not None
+    assert session.log_writer.log_dir == Path("custom-logs/roasts") / session.id
 
 
 def _build_clean_server_env(overrides: dict[str, str] | None = None) -> dict[str, str]:

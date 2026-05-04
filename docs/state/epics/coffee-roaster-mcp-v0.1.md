@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E2-S2`
-- Current target: Implement `RoastSession` lifecycle with one authoritative session owner
+- Active story: `E2-S3`
+- Current target: Implement the core event timeline on the authoritative RoastSession
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -32,6 +32,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - Default roaster driver is `mock`.
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
 - `E2-S1` keeps the initial MCP tool surface bootstrap-safe with `get_server_info` and `get_runtime_config`. Roast-session lifecycle and roast-control tools remain later Epic 2 work.
+- `E2-S2` uses one in-process `RoastSessionStore` with at most one active `RoastSession` at a time. Session state now owns monotonic timing, phase, event timeline storage, telemetry retention, and log-writer references before tool wiring lands.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
 - The `coffee-first-crack-detection` repo remains the source of truth for training, ONNX export, Hugging Face sync, model cards, and dataset cards.
@@ -104,7 +105,7 @@ Goal: implement one authoritative roast session runtime and MCP tool surface.
 - [x] `E2-S1` Implement stdio MCP server entrypoint.
   - Done when the server starts locally and exposes a minimal tool list.
 
-- [ ] `E2-S2` Implement `RoastSession` lifecycle.
+- [x] `E2-S2` Implement `RoastSession` lifecycle.
   - Done when sessions have id, monotonic clock, phase, event timeline, telemetry buffer, and log writer references.
 
 - [ ] `E2-S3` Implement core event timeline.
@@ -359,6 +360,7 @@ After completing a story:
 - E1-S8 completed the repo-local workflow set. The repo now has skills for code quality, scaffold-level MCP setup, mock roast bootstrap validation, guarded Hottop validation, and staged registry release preparation. Those runbooks explicitly keep model training, ONNX export, and Hugging Face sync out of this repo.
 - Epic 2 planning now has a local crosswalk for the old `coffee-roasting` POC. It identifies the old stdio entrypoint, tool registration, session manager, and roast tracker as the main implementation references while explicitly rejecting the old split-server and orchestration architecture.
 - E2-S1 added the first local stdio FastMCP entrypoint, `coffee-roaster-mcp serve`, and a bootstrap-safe runtime tool surface with `get_server_info` and `get_runtime_config`. It keeps roast-session lifecycle and roast-control tools out of the entrypoint story.
+- E2-S2 added `session.py` with an authoritative `RoastSession` model and `RoastSessionStore`. Session lifecycle now has stable ids, monotonic start/stop timing, explicit phase, event-timeline storage, telemetry-buffer retention, log-writer references, and clean single-owner start/stop behavior.
 - Validation run for E1-S8:
   - Reviewed issue #15 acceptance criteria against `AGENTS.md`, the active epic, and the overall plan.
   - Added `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, and `.claude/skills/release-registry` using the existing repo-local skill format.
@@ -415,3 +417,11 @@ After completing a story:
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
   - Ran `./.venv/bin/coffee-roaster-mcp --help` and `--version`: passed.
+- Validation run for E2-S2:
+  - Added `src/coffee_roaster_mcp/session.py` with `RoastSession`, `RoastEvent`, `TelemetrySample`, `LogWriterReference`, `SessionLifecycleError`, and `RoastSessionStore`.
+  - Wired the MCP server lifespan to own one authoritative `RoastSessionStore` for later tool stories.
+  - Added `tests/test_session.py` covering session creation, single-owner enforcement, clean stop semantics, and rolling telemetry retention.
+  - Ran `./.venv/bin/python -m pytest`: 24 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
