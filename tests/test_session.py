@@ -100,6 +100,11 @@ def test_negative_telemetry_buffer_limit_is_rejected() -> None:
         RoastSessionStore(telemetry_buffer_limit=-1)
 
 
+def test_session_history_limit_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="session_history_limit"):
+        RoastSessionStore(session_history_limit=0)
+
+
 def test_stop_session_returns_none_after_session_already_stopped() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
@@ -190,6 +195,35 @@ def test_get_session_snapshot_supports_completed_session_after_rollover() -> Non
     assert first_snapshot.active is False
     assert second_snapshot.id == second_session.id
     assert second_snapshot.active is True
+
+
+def test_oldest_completed_session_is_evicted_when_history_limit_is_exceeded() -> None:
+    clock = ClockHarness()
+    issued_ids = iter(["session-001", "session-002", "session-003"])
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        session_id_factory=lambda: next(issued_ids),
+        session_history_limit=2,
+    )
+
+    first_session = store.start_session()
+    store.stop_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 101.0
+    second_session = store.start_session()
+    store.stop_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
+    clock.monotonic_value = 102.0
+    third_session = store.start_session()
+
+    with pytest.raises(SessionLifecycleError, match=first_session.id):
+        store.get_session_snapshot(session_id=first_session.id)
+
+    assert store.get_session_snapshot(session_id=second_session.id).id == second_session.id
+    assert store.get_session_snapshot(session_id=third_session.id).id == third_session.id
 
 
 def test_start_cooling_rejects_session_before_bean_drop() -> None:
