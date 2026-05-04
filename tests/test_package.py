@@ -151,12 +151,26 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert first_crack_result.structuredContent["event"]["kind"] == "first_crack_detected"
         assert first_crack_result.structuredContent["phase"] == "development"
 
+        repeated_beans_added_result = cast(
+            Any,
+            await _call_with_timeout(session.call_tool("mark_beans_added", {})),
+        )
+        assert repeated_beans_added_result.structuredContent["event"]["kind"] == "beans_added"
+        assert repeated_beans_added_result.structuredContent["event_count"] == 2
+
         drop_result = cast(
             Any,
             await _call_with_timeout(session.call_tool("drop_beans", {})),
         )
         assert drop_result.structuredContent["event"]["kind"] == "beans_dropped"
         assert drop_result.structuredContent["phase"] == "dropped"
+
+        repeated_drop_result = cast(
+            Any,
+            await _call_with_timeout(session.call_tool("drop_beans", {})),
+        )
+        assert repeated_drop_result.structuredContent["event"]["kind"] == "beans_dropped"
+        assert repeated_drop_result.structuredContent["event_count"] == 3
 
         cooling_result = cast(
             Any,
