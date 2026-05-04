@@ -34,6 +34,7 @@ Milestone: `v0.1`
 - #20 E2-S5: Implement phase transitions
 - #21 E2-S6: Implement emergency stop and fault recording
 - #22 E2-S7: Complete thin vertical slice spike
+- #77 E2-S8: Add GitHub Actions code coverage reporting
 
 ## Epic 3 Stories
 
