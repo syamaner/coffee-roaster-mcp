@@ -16,6 +16,7 @@ from mcp.server.session import ServerSession
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.config import AppConfig, ConfigError, load_config
 from coffee_roaster_mcp.drivers import RoasterSafetyDriver, create_roaster_safety_driver
+from coffee_roaster_mcp.exports import export_roast_snapshot
 from coffee_roaster_mcp.session import (
     EventPayloadValue,
     RoastEvent,
@@ -23,6 +24,7 @@ from coffee_roaster_mcp.session import (
     RoastSession,
     RoastSessionStore,
     SessionLifecycleError,
+    compute_roast_metrics,
     default_emergency_safety_payload,
 )
 
@@ -140,6 +142,9 @@ class RoastSessionState:
     cooling_started_at_utc: str | None
     cooling_stopped_at_utc: str | None
     faulted_at_utc: str | None
+    roast_elapsed_seconds: float | None
+    development_time_seconds: float | None
+    development_percent: float | None
     events: tuple[EventSnapshot, ...]
     log_dir: str | None
 
@@ -401,25 +406,18 @@ def create_mcp_server(
         ctx: Context[ServerSession, ServerContext],
         session_id: str | None = None,
     ) -> ExportRoastLogResult:
-        """Return the planned export targets for one roast session.
-
-        Log writing itself lands in Epic 5. This tool only exposes the expected
-        output paths so the MCP surface can stabilize before the writers exist.
-        """
+        """Write a snapshot export for one roast session."""
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
-        log_dir = _require_log_dir(session).resolve()
+        export = export_roast_snapshot(session)
         return ExportRoastLogResult(
-            session_id=session.id,
-            log_dir=str(log_dir),
-            jsonl_path=str(log_dir / "roast.jsonl"),
-            csv_path=str(log_dir / "roast.csv"),
-            summary_path=str(log_dir / "summary.json"),
-            ready=False,
-            note=(
-                "Export writers land in Epic 5. "
-                "This tool currently returns the planned manifest only."
-            ),
+            session_id=export.session_id,
+            log_dir=str(export.log_dir),
+            jsonl_path=str(export.jsonl_path),
+            csv_path=str(export.csv_path),
+            summary_path=str(export.summary_path),
+            ready=export.ready,
+            note=export.note,
         )
 
     @mcp.tool()
@@ -522,6 +520,7 @@ def _serialize_session_state(
     session: RoastSession,
 ) -> RoastSessionState:
     """Convert one in-memory session into an MCP-safe snapshot."""
+    metrics = compute_roast_metrics(session)
     return RoastSessionState(
         session_id=session.id,
         active=session.active,
@@ -538,6 +537,9 @@ def _serialize_session_state(
         cooling_started_at_utc=_iso_or_none(session.cooling_started_at_utc),
         cooling_stopped_at_utc=_iso_or_none(session.cooling_stopped_at_utc),
         faulted_at_utc=_iso_or_none(session.faulted_at_utc),
+        roast_elapsed_seconds=metrics.roast_elapsed_seconds,
+        development_time_seconds=metrics.development_time_seconds,
+        development_percent=metrics.development_percent,
         events=tuple(_serialize_event(event) for event in session.event_timeline),
         log_dir=str(session.log_writer.log_dir.resolve())
         if session.log_writer is not None
@@ -583,10 +585,3 @@ def _serialize_event(event: RoastEvent) -> EventSnapshot:
 def _iso_or_none(value: datetime | None) -> str | None:
     """Return one ISO8601 string when a datetime exists."""
     return value.isoformat() if value is not None else None
-
-
-def _require_log_dir(session: RoastSession) -> Path:
-    """Return the session log directory when configured."""
-    if session.log_writer is None:
-        raise ValueError("Session log target is unavailable.")
-    return session.log_writer.log_dir

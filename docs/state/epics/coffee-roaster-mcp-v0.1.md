@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E2-S7`
-- Current target: Complete the thin vertical slice spike for one-process mock roast flow and export readiness
+- Active story: `E3-S1`
+- Current target: Define the broader roaster driver interface and capabilities model
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -37,6 +37,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E2-S4` now exposes the first roast-session MCP tools on top of the mock path. `export_roast_log` currently returns the planned manifest only, while the real JSONL, CSV, and summary writers stay in Epic 5.
 - `E2-S5` now enforces phase-ordered roast events inside `RoastSessionStore`. New events must start with `pre_roast -> roasting`, may move through `development` when first crack is recorded, may drop directly from `roasting` when first crack is not recorded, and then continue through `dropped -> cooling -> complete`; repeated singleton calls keep their original event rows and fault rows remain appendable without resetting the first-fault timestamp.
 - `E2-S6` keeps `RoastSessionStore` as the one-session mutation boundary but moves emergency-stop safety behavior behind the configured driver boundary. The current mock driver fail-closes heat to `0`, fan to `100`, and cooling to `on`; the store records the resulting fault event and stops the session, and MCP responses expose the fault payload plus final session state.
+- `E2-S7` completes the first one-process mock vertical slice. `export_roast_log` now writes snapshot JSONL, CSV, and summary files from the current session state, and `get_roast_state` exposes minimal timestamp-derived roast and development metrics. Append-only telemetry writers and final export schemas remain Epic 5 work.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
 - The `coffee-first-crack-detection` repo remains the source of truth for training, ONNX export, Hugging Face sync, model cards, and dataset cards.
@@ -124,7 +125,7 @@ Goal: implement one authoritative roast session runtime and MCP tool surface.
 - [x] `E2-S6` Implement emergency stop and fault recording.
   - Done when emergency stop records an event and calls the active driver safety method.
 
-- [ ] `E2-S7` Complete thin vertical slice spike.
+- [x] `E2-S7` Complete thin vertical slice spike.
   - Done when a mock roast can start, mark beans added, inject first crack, drop beans, return state, and export logs in one process.
 
 ### Epic Acceptance Criteria
@@ -465,4 +466,14 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest`: 62 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E2-S7:
+  - Added `src/coffee_roaster_mcp/exports.py` with a deterministic snapshot export path for the current in-process session state.
+  - `export_roast_log` now writes `roast.jsonl`, `roast.csv`, and `summary.json` under the session log directory and reports `ready: true`.
+  - `get_roast_state` now includes minimal timestamp-derived metrics for roast elapsed seconds, development time seconds, and development percent when enough events exist.
+  - Updated the stdio MCP smoke flow to prove one process can start a mock roast, mark beans added, inject first crack, drop beans, return state, and export readable files without hardware or model download.
+  - Ran `./.venv/bin/python -m pytest tests/test_session.py tests/test_package.py`: 50 passed.
+  - Ran `./.venv/bin/python -m pytest`: 64 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed after applying `ruff format`.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

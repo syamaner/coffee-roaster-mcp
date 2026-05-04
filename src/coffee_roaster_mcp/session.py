@@ -154,6 +154,21 @@ class TelemetrySample:
     cooling_on: bool | None = None
 
 
+@dataclass(frozen=True)
+class RoastMetrics:
+    """Timestamp-derived roast metrics for the current session snapshot.
+
+    Attributes:
+        roast_elapsed_seconds: Seconds from beans added to drop, stop, or now.
+        development_time_seconds: Seconds from first crack to drop, stop, or now.
+        development_percent: Development time as a percentage of roast elapsed time.
+    """
+
+    roast_elapsed_seconds: float | None
+    development_time_seconds: float | None
+    development_percent: float | None
+
+
 @dataclass
 class RoastSession:
     """Authoritative in-process roast session state.
@@ -253,6 +268,47 @@ class RoastSession:
         self.stopped_at_utc = utc_now()
         self.monotonic_stop = monotonic_now()
         self.phase = phase
+
+
+def compute_roast_metrics(
+    session: RoastSession,
+    *,
+    monotonic_now: Callable[[], float] | None = None,
+) -> RoastMetrics:
+    """Compute timestamp-derived metrics for one session snapshot.
+
+    Args:
+        session: Session snapshot to inspect.
+        monotonic_now: Optional monotonic clock supplier for active sessions.
+
+    Returns:
+        Minimal roast metrics available from the current event timestamps.
+    """
+    import time
+
+    clock = monotonic_now or time.monotonic
+    roast_elapsed_seconds = _elapsed_since(
+        session,
+        start_seconds=session.beans_added_monotonic_seconds,
+        monotonic_now=clock,
+    )
+    development_time_seconds = _elapsed_since(
+        session,
+        start_seconds=session.first_crack_monotonic_seconds,
+        monotonic_now=clock,
+    )
+    development_percent = None
+    if (
+        roast_elapsed_seconds is not None
+        and roast_elapsed_seconds > 0
+        and development_time_seconds is not None
+    ):
+        development_percent = round((development_time_seconds / roast_elapsed_seconds) * 100, 3)
+    return RoastMetrics(
+        roast_elapsed_seconds=roast_elapsed_seconds,
+        development_time_seconds=development_time_seconds,
+        development_percent=development_percent,
+    )
 
 
 class SessionLifecycleError(RuntimeError):
@@ -739,6 +795,24 @@ def _validate_event_transition(session: RoastSession, kind: RoastEventKind) -> N
             f"{kind} cannot be recorded while phase is {session.phase}; "
             f"allowed phases: {allowed_phase_list}."
         )
+
+
+def _elapsed_since(
+    session: RoastSession,
+    *,
+    start_seconds: float | None,
+    monotonic_now: Callable[[], float],
+) -> float | None:
+    """Return elapsed session seconds from one event timestamp to stop or now."""
+    if start_seconds is None:
+        return None
+    if session.beans_dropped_monotonic_seconds is not None:
+        end_seconds = session.beans_dropped_monotonic_seconds
+    elif session.monotonic_stop is not None:
+        end_seconds = max(0.0, session.monotonic_stop - session.monotonic_start)
+    else:
+        end_seconds = session.elapsed_monotonic_seconds(monotonic_now)
+    return round(max(0.0, end_seconds - start_seconds), 3)
 
 
 def _generate_session_id() -> str:
