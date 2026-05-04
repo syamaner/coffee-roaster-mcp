@@ -22,9 +22,9 @@
 
 RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.
 
-E2-S5 is complete. RoastPilot now enforces deterministic roast-session phase transitions on the mock MCP path, rejecting impossible event ordering while keeping the current one-session store boundary and E2-S4 MCP response semantics intact.
+E2-S6 is complete. RoastPilot emergency stop now routes through a driver-owned mock safety method, records a fault event with driver-call evidence, and keeps fault state visible through the existing MCP session state response.
 
-The next story is E2-S6: extend emergency-stop and fault handling into driver-owned safety behavior.
+The next story is E2-S7: complete the thin vertical slice spike for one-process mock roast flow and export readiness.
 
 The first implementation milestone remains a thin mock vertical slice: install the package, start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

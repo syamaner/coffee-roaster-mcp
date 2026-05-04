@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -537,19 +537,38 @@ class RoastSessionStore:
         session: RoastSession,
         *,
         reason: str,
+        safety_payload: Mapping[str, EventPayloadValue] | None = None,
+        allow_stopped_latest: bool = False,
     ) -> RoastEvent:
-        """Apply mock-safe emergency-stop state and finalize the session."""
+        """Apply driver-owned emergency-stop behavior and finalize the session."""
         with self._lock:
-            self._assert_latest_active_session(session)
-            session.heat_level_percent = 0
-            session.fan_level_percent = 100
-            session.cooling_on = True
-            event = self.record_event(session, "fault", payload={"reason": reason})
-            session.stop(
-                utc_now=self._utc_now,
-                monotonic_now=self._monotonic_now,
-                phase="fault",
+            if allow_stopped_latest:
+                self._assert_latest_session(session)
+            else:
+                self._assert_latest_active_session(session)
+            normalized_safety_payload = (
+                default_emergency_safety_payload()
+                if safety_payload is None
+                else dict(safety_payload)
             )
+            _apply_emergency_safety_payload(session, normalized_safety_payload)
+            event_payload = _build_emergency_fault_payload(
+                reason=reason,
+                safety_payload=normalized_safety_payload,
+            )
+            event = self._record_emergency_fault_locked(
+                session,
+                payload=event_payload,
+                allow_stopped_latest=allow_stopped_latest,
+            )
+            if session.active:
+                session.stop(
+                    utc_now=self._utc_now,
+                    monotonic_now=self._monotonic_now,
+                    phase="fault",
+                )
+            else:
+                session.phase = "fault"
             return event
 
     def emergency_stop_snapshot(
@@ -557,10 +576,17 @@ class RoastSessionStore:
         session: RoastSession,
         *,
         reason: str,
+        safety_payload: Mapping[str, EventPayloadValue] | None = None,
+        allow_stopped_latest: bool = False,
     ) -> tuple[RoastEvent, RoastSession]:
         """Apply emergency stop and return the event plus an atomic lightweight snapshot."""
         with self._lock:
-            event = self.emergency_stop(session, reason=reason)
+            event = self.emergency_stop(
+                session,
+                reason=reason,
+                safety_payload=safety_payload,
+                allow_stopped_latest=allow_stopped_latest,
+            )
             return event, _copy_session_for_read(session)
 
     def get_active_session(self) -> RoastSession | None:
@@ -606,10 +632,14 @@ class RoastSessionStore:
 
     def _assert_latest_active_session(self, session: RoastSession) -> None:
         """Validate that one session is the current mutable active session."""
-        if self._latest_session is not session:
-            raise SessionLifecycleError("Only the latest session can be mutated.")
+        self._assert_latest_session(session)
         if not session.active:
             raise SessionLifecycleError("Stopped sessions cannot be mutated.")
+
+    def _assert_latest_session(self, session: RoastSession) -> None:
+        """Validate that one session is the latest known session."""
+        if self._latest_session is not session:
+            raise SessionLifecycleError("Only the latest session can be mutated.")
 
     def _get_existing_singleton_event(
         self,
@@ -634,6 +664,30 @@ class RoastSessionStore:
             self._session_id_order.popleft()
             if oldest_session is not None:
                 del self._sessions_by_id[oldest_session_id]
+
+    def _record_emergency_fault_locked(
+        self,
+        session: RoastSession,
+        *,
+        payload: dict[str, EventPayloadValue],
+        allow_stopped_latest: bool,
+    ) -> RoastEvent:
+        """Record an emergency fault, including a stopped latest-session race."""
+        if session.active:
+            return self.record_event(session, "fault", payload=payload)
+        if not allow_stopped_latest:
+            raise SessionLifecycleError("Stopped sessions cannot be mutated.")
+        if session.faulted_at_utc is None:
+            _validate_event_transition(session, "fault")
+        event = RoastEvent(
+            kind="fault",
+            recorded_at_utc=self._utc_now(),
+            monotonic_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
+            payload=dict(payload),
+        )
+        session.event_timeline.append(event)
+        _apply_event_timestamp(session, event)
+        return event
 
 
 def _apply_event_timestamp(session: RoastSession, event: RoastEvent) -> None:
@@ -690,6 +744,82 @@ def _validate_event_transition(session: RoastSession, kind: RoastEventKind) -> N
 def _generate_session_id() -> str:
     """Return a stable opaque session identifier."""
     return uuid4().hex
+
+
+def default_emergency_safety_payload(
+    *,
+    driver: str = "store-default",
+    driver_error: str | None = None,
+) -> dict[str, EventPayloadValue]:
+    """Return fail-closed safety state when driver safety behavior is unavailable."""
+    payload: dict[str, EventPayloadValue] = {
+        "driver": driver,
+        "driver_safety_method": "emergency_stop",
+        "driver_safety_method_called": False,
+        "heat_level_percent": 0,
+        "fan_level_percent": 100,
+        "cooling_on": True,
+    }
+    if driver_error is not None:
+        payload["driver_error"] = driver_error
+    return payload
+
+
+def _apply_emergency_safety_payload(
+    session: RoastSession,
+    safety_payload: Mapping[str, EventPayloadValue],
+) -> None:
+    """Apply fail-closed emergency safety state from a driver payload."""
+    session.heat_level_percent = _payload_control_percent(
+        safety_payload,
+        key="heat_level_percent",
+        default=0,
+    )
+    session.fan_level_percent = _payload_control_percent(
+        safety_payload,
+        key="fan_level_percent",
+        default=100,
+    )
+    cooling_on = safety_payload.get("cooling_on", True)
+    session.cooling_on = cooling_on if isinstance(cooling_on, bool) else True
+
+
+def _build_emergency_fault_payload(
+    *,
+    reason: str,
+    safety_payload: Mapping[str, EventPayloadValue],
+) -> dict[str, EventPayloadValue]:
+    """Build a fault payload without allowing drivers to override core keys."""
+    event_payload = dict(safety_payload)
+    event_payload["reason"] = reason
+    event_payload["heat_level_percent"] = _payload_control_percent(
+        safety_payload,
+        key="heat_level_percent",
+        default=0,
+    )
+    event_payload["fan_level_percent"] = _payload_control_percent(
+        safety_payload,
+        key="fan_level_percent",
+        default=100,
+    )
+    cooling_on = safety_payload.get("cooling_on", True)
+    event_payload["cooling_on"] = cooling_on if isinstance(cooling_on, bool) else True
+    return event_payload
+
+
+def _payload_control_percent(
+    payload: Mapping[str, EventPayloadValue],
+    *,
+    key: str,
+    default: int,
+) -> int:
+    """Return a valid control percentage from driver payload or a safe default."""
+    value = payload.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    if not 0 <= value <= 100:
+        return default
+    return value
 
 
 def _copy_session_for_read(session: RoastSession) -> RoastSession:

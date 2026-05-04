@@ -358,8 +358,107 @@ def test_emergency_stop_faults_and_stops_session() -> None:
     assert session.heat_level_percent == 0
     assert session.fan_level_percent == 100
     assert session.cooling_on is True
+    assert event.payload["driver_safety_method_called"] is False
     assert session.stopped_at_utc == datetime(2026, 5, 4, 12, 4, tzinfo=UTC)
     assert session.monotonic_stop == 130.0
+
+
+def test_emergency_stop_calls_supplied_driver_safety_action() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    event = store.emergency_stop(
+        session,
+        reason="driver-owned-safety",
+        safety_payload={
+            "driver": "test-driver",
+            "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    )
+
+    assert event.kind == "fault"
+    assert event.payload["reason"] == "driver-owned-safety"
+    assert event.payload["driver"] == "test-driver"
+    assert event.payload["driver_safety_method_called"] is True
+    assert session.heat_level_percent == 0
+    assert session.fan_level_percent == 100
+    assert session.cooling_on is True
+    assert session.phase == "fault"
+    assert session.active is False
+
+
+def test_emergency_stop_preserves_core_reason_when_driver_payload_collides() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    event = store.emergency_stop(
+        session,
+        reason="core-reason",
+        safety_payload={
+            "reason": "driver-reason",
+            "driver": "test-driver",
+            "heat_level_percent": 25,
+            "fan_level_percent": 75,
+            "cooling_on": False,
+        },
+    )
+
+    assert event.payload["reason"] == "core-reason"
+    assert event.payload["driver"] == "test-driver"
+    assert session.heat_level_percent == 25
+    assert session.fan_level_percent == 75
+    assert session.cooling_on is False
+
+
+def test_emergency_stop_can_fault_latest_session_stopped_after_driver_call() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.stop_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
+    clock.monotonic_value = 115.0
+    event, snapshot = store.emergency_stop_snapshot(
+        session,
+        reason="driver-already-ran",
+        safety_payload={
+            "driver": "test-driver",
+            "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+        allow_stopped_latest=True,
+    )
+
+    assert event.kind == "fault"
+    assert event.payload["reason"] == "driver-already-ran"
+    assert event.payload["driver_safety_method_called"] is True
+    assert session.active is False
+    assert session.phase == "fault"
+    assert session.stopped_at_utc == datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    assert session.monotonic_stop == 105.0
+    assert snapshot.phase == "fault"
+    assert snapshot.event_timeline[-1].kind == "fault"
 
 
 def test_emergency_stop_faults_active_complete_session() -> None:
@@ -394,7 +493,8 @@ def test_emergency_stop_faults_active_complete_session() -> None:
     event = store.emergency_stop(session, reason="post-complete-fault")
 
     assert event.kind == "fault"
-    assert event.payload == {"reason": "post-complete-fault"}
+    assert event.payload["reason"] == "post-complete-fault"
+    assert event.payload["driver_safety_method_called"] is False
     assert session.phase == "fault"
     assert session.active is False
     assert session.heat_level_percent == 0

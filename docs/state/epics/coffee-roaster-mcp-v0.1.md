@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E2-S6`
-- Current target: Extend fault handling from the mock MCP path into driver-owned emergency-stop behavior
+- Active story: `E2-S7`
+- Current target: Complete the thin vertical slice spike for one-process mock roast flow and export readiness
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -36,6 +36,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E2-S3` keeps event writes behind `RoastSessionStore.record_event(...)`. The session timeline now records deterministic append order, authoritative UTC plus monotonic timestamps for core roast events, and idempotent singleton handling for beans added, first crack, bean drop, and cooling transitions.
 - `E2-S4` now exposes the first roast-session MCP tools on top of the mock path. `export_roast_log` currently returns the planned manifest only, while the real JSONL, CSV, and summary writers stay in Epic 5.
 - `E2-S5` now enforces phase-ordered roast events inside `RoastSessionStore`. New events must start with `pre_roast -> roasting`, may move through `development` when first crack is recorded, may drop directly from `roasting` when first crack is not recorded, and then continue through `dropped -> cooling -> complete`; repeated singleton calls keep their original event rows and fault rows remain appendable without resetting the first-fault timestamp.
+- `E2-S6` keeps `RoastSessionStore` as the one-session mutation boundary but moves emergency-stop safety behavior behind the configured driver boundary. The current mock driver fail-closes heat to `0`, fan to `100`, and cooling to `on`; the store records the resulting fault event and stops the session, and MCP responses expose the fault payload plus final session state.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
 - The `coffee-first-crack-detection` repo remains the source of truth for training, ONNX export, Hugging Face sync, model cards, and dataset cards.
@@ -120,7 +121,7 @@ Goal: implement one authoritative roast session runtime and MCP tool surface.
 - [x] `E2-S5` Implement phase transitions.
   - Done when session phase changes are deterministic for pre-roast, roasting, development, dropped, cooling, complete, and fault states.
 
-- [ ] `E2-S6` Implement emergency stop and fault recording.
+- [x] `E2-S6` Implement emergency stop and fault recording.
   - Done when emergency stop records an event and calls the active driver safety method.
 
 - [ ] `E2-S7` Complete thin vertical slice spike.
@@ -453,6 +454,15 @@ After completing a story:
   - Added `tests/test_package.py` coverage that invalid MCP tool calls surface phase-transition errors over stdio before a valid roast sequence starts.
   - Used the old `coffee-roasting` repo only as a behavioral reference for roast ordering and development/drop/cooling semantics, not as an architecture template.
   - Ran `./.venv/bin/python -m pytest`: 53 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E2-S6:
+  - Added `src/coffee_roaster_mcp/drivers.py` with a minimal `RoasterSafetyDriver` protocol and `MockRoasterDriver` emergency-stop safety method.
+  - Routed the MCP `emergency_stop` tool through the configured mock driver safety method while keeping `RoastSessionStore` responsible for fault recording, session stop semantics, and snapshots.
+  - Added unit coverage for the mock driver emergency-stop behavior, store-owned safety payload application, driver failure fail-closed fallback, payload collision handling, stopped-latest fault recording after a driver-side emergency stop, and MCP fault payload visibility through `get_roast_state`.
+  - Review hardening moved driver emergency-stop execution outside the store lock, falls back to centralized safe controls when the driver call raises, preserves core fault payload fields such as `reason`, wraps unknown driver startup as `ConfigError`, and still records a fault if the same latest session stops after the driver safety method has already run.
+  - Ran `./.venv/bin/python -m pytest`: 62 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

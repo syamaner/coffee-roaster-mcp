@@ -14,7 +14,8 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
 from coffee_roaster_mcp import __version__
-from coffee_roaster_mcp.config import AppConfig, load_config
+from coffee_roaster_mcp.config import AppConfig, ConfigError, load_config
+from coffee_roaster_mcp.drivers import RoasterSafetyDriver, create_roaster_safety_driver
 from coffee_roaster_mcp.session import (
     EventPayloadValue,
     RoastEvent,
@@ -22,6 +23,7 @@ from coffee_roaster_mcp.session import (
     RoastSession,
     RoastSessionStore,
     SessionLifecycleError,
+    default_emergency_safety_payload,
 )
 
 
@@ -33,12 +35,14 @@ class ServerContext:
         config: Loaded RoastPilot configuration.
         transport: Actual MCP transport used by this server process.
         session_store: Authoritative in-process roast session owner.
+        roaster_driver: Configured driver safety boundary.
         started_at_utc: UTC time when the MCP process initialized.
     """
 
     config: AppConfig
     transport: str
     session_store: RoastSessionStore
+    roaster_driver: RoasterSafetyDriver
     started_at_utc: datetime
 
 
@@ -196,10 +200,15 @@ def build_server_context(
         The initialized server context used by the MCP lifespan.
     """
     config = load_config(path=config_path)
+    try:
+        roaster_driver = create_roaster_safety_driver(config.roaster.driver)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
     return ServerContext(
         config=config,
         transport=transport,
         session_store=RoastSessionStore(default_log_dir=config.logging.log_dir / "roasts"),
+        roaster_driver=roaster_driver,
         started_at_utc=datetime.now(UTC),
     )
 
@@ -418,12 +427,15 @@ def create_mcp_server(
         ctx: Context[ServerSession, ServerContext],
         reason: str = "manual emergency stop",
     ) -> EventCommandResult:
-        """Apply mock-safe emergency-stop state and record a fault event."""
+        """Call the configured driver safety method and record a fault event."""
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
+        safety_payload = run_driver_emergency_stop(server_context, reason=reason)
         event, snapshot = server_context.session_store.emergency_stop_snapshot(
             session,
             reason=reason,
+            safety_payload=safety_payload,
+            allow_stopped_latest=True,
         )
         return _serialize_event_result(snapshot=snapshot, event=event)
 
@@ -477,6 +489,21 @@ def _record_session_event(
     session = _require_active_session(server_context)
     event, snapshot = server_context.session_store.record_event_snapshot(session, kind)
     return _serialize_event_result(snapshot=snapshot, event=event)
+
+
+def run_driver_emergency_stop(
+    server_context: ServerContext,
+    *,
+    reason: str,
+) -> dict[str, EventPayloadValue]:
+    """Run driver-owned emergency stop before taking the session-store lock."""
+    try:
+        return server_context.roaster_driver.emergency_stop(reason=reason).as_event_payload()
+    except Exception as exc:
+        return default_emergency_safety_payload(
+            driver=server_context.config.roaster.driver,
+            driver_error=f"{type(exc).__name__}: {exc}",
+        )
 
 
 def _snapshot_session(

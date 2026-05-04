@@ -13,7 +13,8 @@ from mcp.client.stdio import stdio_client
 
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.cli import build_parser, main
-from coffee_roaster_mcp.mcp_server import build_server_context
+from coffee_roaster_mcp.config import ConfigError
+from coffee_roaster_mcp.mcp_server import build_server_context, run_driver_emergency_stop
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _T = TypeVar("_T")
@@ -235,9 +236,11 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert emergency_stop_result.structuredContent["session_id"] == second_session_id
         assert emergency_stop_result.structuredContent["event"]["kind"] == "fault"
         assert emergency_stop_result.structuredContent["phase"] == "fault"
-        assert emergency_stop_result.structuredContent["event"]["payload"] == {
-            "reason": "test-path"
-        }
+        emergency_payload = emergency_stop_result.structuredContent["event"]["payload"]
+        assert emergency_payload["reason"] == "test-path"
+        assert emergency_payload["driver"] == "mock"
+        assert emergency_payload["driver_safety_method"] == "emergency_stop"
+        assert emergency_payload["driver_safety_method_called"] is True
 
         faulted_state_result = cast(
             Any,
@@ -247,9 +250,10 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         )
         assert faulted_state_result.structuredContent["active"] is False
         assert faulted_state_result.structuredContent["phase"] == "fault"
-        assert faulted_state_result.structuredContent["events"][-1]["payload"] == {
-            "reason": "test-path"
-        }
+        faulted_payload = faulted_state_result.structuredContent["events"][-1]["payload"]
+        assert faulted_payload["reason"] == "test-path"
+        assert faulted_payload["driver"] == "mock"
+        assert faulted_payload["driver_safety_method_called"] is True
 
         third_start_result = cast(
             Any,
@@ -376,6 +380,38 @@ def test_stdio_server_uses_configured_log_root_for_session_store(tmp_path: Path)
 
     assert session.log_writer is not None
     assert session.log_writer.log_dir == Path("custom-logs/roasts") / session.id
+
+
+def test_build_server_context_wraps_unknown_driver_as_config_error(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("roaster:\n  driver: missing-driver\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="missing-driver"):
+        build_server_context(config_path=config_path)
+
+
+def test_driver_emergency_stop_failure_returns_fail_closed_payload() -> None:
+    server_context = build_server_context()
+    object.__setattr__(server_context, "roaster_driver", _FailingSafetyDriver())
+
+    payload = run_driver_emergency_stop(server_context, reason="unit-test")
+
+    assert payload["driver"] == "mock"
+    assert payload["driver_safety_method"] == "emergency_stop"
+    assert payload["driver_safety_method_called"] is False
+    assert payload["driver_error"] == "RuntimeError: driver offline"
+    assert payload["heat_level_percent"] == 0
+    assert payload["fan_level_percent"] == 100
+    assert payload["cooling_on"] is True
+
+
+class _FailingSafetyDriver:
+    """Test driver that simulates an emergency-stop I/O failure."""
+
+    def emergency_stop(self, *, reason: str) -> object:
+        """Raise a deterministic driver failure."""
+        _ = reason
+        raise RuntimeError("driver offline")
 
 
 def _build_clean_server_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
