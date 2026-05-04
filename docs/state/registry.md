@@ -22,9 +22,9 @@
 
 RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.
 
-E2-S2 is complete. RoastPilot now has an authoritative in-process RoastSession lifecycle with one active-session owner, monotonic timing, telemetry retention, and log-writer references ready for later runtime stories.
+E2-S3 is complete. RoastPilot now records the core roast event timeline inside the authoritative in-process RoastSession with deterministic ordering, authoritative per-event timestamps, and store-owned idempotent singleton event handling.
 
-The next story is E2-S3: implement the core event timeline.
+The next story is E2-S4: implement the core MCP tools.
 
 The first implementation milestone remains a thin mock vertical slice: install the package, start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
