@@ -100,6 +100,11 @@ def test_negative_telemetry_buffer_limit_is_rejected() -> None:
         RoastSessionStore(telemetry_buffer_limit=-1)
 
 
+def test_session_history_limit_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="session_history_limit"):
+        RoastSessionStore(session_history_limit=0)
+
+
 def test_stop_session_returns_none_after_session_already_stopped() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
@@ -163,6 +168,195 @@ def test_start_session_allows_new_session_after_previous_stop() -> None:
     assert second_session.active is True
     assert store.get_active_session() is second_session
     assert store.get_latest_session() is second_session
+
+
+def test_get_session_snapshot_supports_completed_session_after_rollover() -> None:
+    clock = ClockHarness()
+    issued_ids = iter(["session-001", "session-002"])
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        session_id_factory=lambda: next(issued_ids),
+    )
+
+    first_session = store.start_session()
+    clock.utc_value = datetime(2026, 5, 4, 12, 5, tzinfo=UTC)
+    clock.monotonic_value = 120.0
+    store.stop_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 6, tzinfo=UTC)
+    clock.monotonic_value = 121.0
+    second_session = store.start_session()
+
+    first_snapshot = store.get_session_snapshot(session_id=first_session.id)
+    second_snapshot = store.get_session_snapshot(session_id=second_session.id)
+
+    assert first_snapshot.id == first_session.id
+    assert first_snapshot.active is False
+    assert second_snapshot.id == second_session.id
+    assert second_snapshot.active is True
+
+
+def test_oldest_completed_session_is_evicted_when_history_limit_is_exceeded() -> None:
+    clock = ClockHarness()
+    issued_ids = iter(["session-001", "session-002", "session-003"])
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        session_id_factory=lambda: next(issued_ids),
+        session_history_limit=2,
+    )
+
+    first_session = store.start_session()
+    store.stop_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 101.0
+    second_session = store.start_session()
+    store.stop_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
+    clock.monotonic_value = 102.0
+    third_session = store.start_session()
+
+    with pytest.raises(SessionLifecycleError, match=first_session.id):
+        store.get_session_snapshot(session_id=first_session.id)
+
+    assert store.get_session_snapshot(session_id=second_session.id).id == second_session.id
+    assert store.get_session_snapshot(session_id=third_session.id).id == third_session.id
+
+
+def test_start_cooling_rejects_session_before_bean_drop() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    with pytest.raises(SessionLifecycleError, match="after beans are dropped"):
+        store.start_cooling(session)
+
+
+def test_stop_cooling_marks_session_complete_and_stopped() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_dropped")
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
+    clock.monotonic_value = 110.0
+    store.start_cooling(session)
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 3, tzinfo=UTC)
+    clock.monotonic_value = 120.0
+    event = store.stop_cooling(session)
+
+    assert event.kind == "cooling_stopped"
+    assert session.phase == "complete"
+    assert session.active is False
+    assert session.cooling_on is False
+    assert session.stopped_at_utc == datetime(2026, 5, 4, 12, 3, tzinfo=UTC)
+    assert session.monotonic_stop == 120.0
+    assert store.get_active_session() is None
+
+
+def test_emergency_stop_faults_and_stops_session() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 4, tzinfo=UTC)
+    clock.monotonic_value = 130.0
+    event = store.emergency_stop(session, reason="test-fault")
+
+    assert event.kind == "fault"
+    assert session.phase == "fault"
+    assert session.active is False
+    assert session.heat_level_percent == 0
+    assert session.fan_level_percent == 100
+    assert session.cooling_on is True
+    assert session.stopped_at_utc == datetime(2026, 5, 4, 12, 4, tzinfo=UTC)
+    assert session.monotonic_stop == 130.0
+
+
+def test_set_heat_rejects_faulted_session() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+    store.emergency_stop(session, reason="test-fault")
+
+    with pytest.raises(SessionLifecycleError, match="Stopped sessions"):
+        store.set_heat(session, heat_level_percent=50)
+
+
+def test_record_event_rejects_non_fault_events_after_fault() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+    store.emergency_stop(session, reason="test-fault")
+
+    with pytest.raises(SessionLifecycleError, match="Stopped sessions"):
+        store.record_event(session, "beans_dropped")
+
+
+def test_start_cooling_rejects_session_that_has_faulted() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_dropped")
+    store.record_event(session, "fault", payload={"reason": "test"})
+
+    with pytest.raises(SessionLifecycleError, match="No non-fault events"):
+        store.start_cooling(session)
+
+
+def test_stop_cooling_rejects_session_when_cooling_not_started() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_dropped")
+
+    with pytest.raises(SessionLifecycleError, match="must be started"):
+        store.stop_cooling(session)
+
+
+def test_set_heat_rejects_non_integer_values() -> None:
+    store = RoastSessionStore()
+    session = store.start_session()
+
+    with pytest.raises(TypeError, match="integer"):
+        store.set_heat(session, heat_level_percent=True)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="integer"):
+        store.set_heat(session, heat_level_percent=12.5)  # type: ignore[arg-type]
 
 
 def test_store_append_telemetry_rejects_non_latest_session() -> None:

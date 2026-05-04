@@ -1,24 +1,28 @@
-"""FastMCP stdio server entrypoint for RoastPilot.
-
-This module implements the first local MCP server runtime for RoastPilot.
-The `E2-S1` scope is intentionally narrow: start cleanly over stdio, load the
-existing typed configuration, and expose a minimal bootstrap-safe tool list.
-"""
+"""FastMCP stdio server entrypoint for RoastPilot."""
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.config import AppConfig, load_config
-from coffee_roaster_mcp.session import RoastSessionStore
+from coffee_roaster_mcp.session import (
+    EventPayloadValue,
+    RoastEvent,
+    RoastPhase,
+    RoastSession,
+    RoastSessionStore,
+    SessionLifecycleError,
+)
 
 
 @dataclass(frozen=True)
@@ -51,7 +55,8 @@ class ServerInfo:
         roaster_driver: Configured roaster driver.
         first_crack_mode: Configured first-crack mode.
         bootstrap_safe: Whether the current defaults stay hardware-free.
-        available_bootstrap_tools: Minimal tool surface exposed in `E2-S1`.
+        available_bootstrap_tools: Tools available while RoastPilot stays on the
+            bootstrap-safe mock path.
         started_at_utc: UTC timestamp when this server process started.
     """
 
@@ -102,6 +107,80 @@ class RuntimeConfigSnapshot:
     auto_t0_detection_enabled: bool
 
 
+@dataclass(frozen=True)
+class EventSnapshot:
+    """Serializable roast event snapshot for MCP tool responses."""
+
+    kind: str
+    recorded_at_utc: str
+    monotonic_seconds: float
+    payload: dict[str, EventPayloadValue]
+
+
+@dataclass(frozen=True)
+class RoastSessionState:
+    """Serializable roast session state returned by MCP tools."""
+
+    session_id: str
+    active: bool
+    phase: RoastPhase
+    created_at_utc: str
+    stopped_at_utc: str | None
+    elapsed_monotonic_seconds: float
+    heat_level_percent: int
+    fan_level_percent: int
+    cooling_on: bool
+    beans_added_at_utc: str | None
+    first_crack_at_utc: str | None
+    beans_dropped_at_utc: str | None
+    cooling_started_at_utc: str | None
+    cooling_stopped_at_utc: str | None
+    faulted_at_utc: str | None
+    events: tuple[EventSnapshot, ...]
+    log_dir: str | None
+
+
+@dataclass(frozen=True)
+class StartRoastSessionResult:
+    """Result for starting one new roast session."""
+
+    session: RoastSessionState
+
+
+@dataclass(frozen=True)
+class ControlCommandResult:
+    """Result for one in-memory control update."""
+
+    session_id: str
+    phase: RoastPhase
+    heat_level_percent: int
+    fan_level_percent: int
+    cooling_on: bool
+
+
+@dataclass(frozen=True)
+class EventCommandResult:
+    """Result for one event-recording command."""
+
+    session_id: str
+    phase: RoastPhase
+    event: EventSnapshot
+    event_count: int
+
+
+@dataclass(frozen=True)
+class ExportRoastLogResult:
+    """Stub export manifest for the current pre-log-writer runtime."""
+
+    session_id: str
+    log_dir: str
+    jsonl_path: str
+    csv_path: str
+    summary_path: str
+    ready: bool
+    note: str
+
+
 def build_server_context(
     *,
     config_path: str | Path | None = None,
@@ -148,8 +227,9 @@ def create_mcp_server(
     mcp = FastMCP(
         name="RoastPilot",
         instructions=(
-            "Bootstrap-safe RoastPilot MCP server. "
-            "This E2-S1 tool surface exposes runtime introspection only."
+            "RoastPilot MCP server with a mock-safe session runtime. "
+            "This tool surface supports one in-process roast session and "
+            "basic mock-path controls before hardware drivers and log writers land."
         ),
         lifespan=server_lifespan,
     )
@@ -170,7 +250,21 @@ def create_mcp_server(
             roaster_driver=config.roaster.driver,
             first_crack_mode=config.first_crack.mode,
             bootstrap_safe=_is_bootstrap_safe(config),
-            available_bootstrap_tools=("get_server_info", "get_runtime_config"),
+            available_bootstrap_tools=(
+                "get_server_info",
+                "get_runtime_config",
+                "start_roast_session",
+                "get_roast_state",
+                "set_heat",
+                "set_fan",
+                "mark_beans_added",
+                "mark_first_crack",
+                "drop_beans",
+                "start_cooling",
+                "stop_cooling",
+                "export_roast_log",
+                "emergency_stop",
+            ),
             started_at_utc=server_context.started_at_utc.isoformat(),
         )
 
@@ -196,6 +290,142 @@ def create_mcp_server(
             sample_interval_seconds=config.logging.sample_interval_seconds,
             auto_t0_detection_enabled=config.session.auto_t0_detection_enabled,
         )
+
+    @mcp.tool()
+    def start_roast_session(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+    ) -> StartRoastSessionResult:
+        """Start one new authoritative roast session."""
+        server_context = ctx.request_context.lifespan_context
+        session = server_context.session_store.start_session_snapshot()
+        return StartRoastSessionResult(session=_serialize_session_state(session))
+
+    @mcp.tool()
+    def get_roast_state(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+        session_id: str | None = None,
+    ) -> RoastSessionState:
+        """Return the current authoritative roast session state."""
+        server_context = ctx.request_context.lifespan_context
+        session = _resolve_session(server_context, session_id=session_id)
+        return _serialize_session_state(session)
+
+    @mcp.tool()
+    def set_heat(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+        heat_level_percent: int,
+    ) -> ControlCommandResult:
+        """Set in-memory heat for the active mock session."""
+        server_context = ctx.request_context.lifespan_context
+        session = _require_active_session(server_context)
+        snapshot = server_context.session_store.set_heat_snapshot(
+            session,
+            heat_level_percent=heat_level_percent,
+        )
+        return _serialize_control_result(snapshot)
+
+    @mcp.tool()
+    def set_fan(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+        fan_level_percent: int,
+    ) -> ControlCommandResult:
+        """Set in-memory fan for the active mock session."""
+        server_context = ctx.request_context.lifespan_context
+        session = _require_active_session(server_context)
+        snapshot = server_context.session_store.set_fan_snapshot(
+            session,
+            fan_level_percent=fan_level_percent,
+        )
+        return _serialize_control_result(snapshot)
+
+    @mcp.tool()
+    def mark_beans_added(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+    ) -> EventCommandResult:
+        """Record the authoritative beans-added event."""
+        return _record_session_event(ctx, "beans_added")
+
+    @mcp.tool()
+    def mark_first_crack(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+    ) -> EventCommandResult:
+        """Record the authoritative first-crack event."""
+        server_context = ctx.request_context.lifespan_context
+        if not server_context.config.first_crack.allow_manual_override:
+            raise ValueError("Manual first-crack override is disabled by configuration.")
+        return _record_session_event(ctx, "first_crack_detected")
+
+    @mcp.tool()
+    def drop_beans(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+    ) -> EventCommandResult:
+        """Record bean drop and let the event timeline force heat off."""
+        server_context = ctx.request_context.lifespan_context
+        session = _require_active_session(server_context)
+        event, snapshot = server_context.session_store.record_event_snapshot(
+            session, "beans_dropped"
+        )
+        return _serialize_event_result(snapshot=snapshot, event=event)
+
+    @mcp.tool()
+    def start_cooling(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+    ) -> EventCommandResult:
+        """Start cooling in the mock session state and record the event."""
+        server_context = ctx.request_context.lifespan_context
+        session = _require_active_session(server_context)
+        event, snapshot = server_context.session_store.start_cooling_snapshot(session)
+        return _serialize_event_result(snapshot=snapshot, event=event)
+
+    @mcp.tool()
+    def stop_cooling(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+    ) -> EventCommandResult:
+        """Stop cooling in the mock session state and record the event."""
+        server_context = ctx.request_context.lifespan_context
+        session = _require_active_session(server_context)
+        event, snapshot = server_context.session_store.stop_cooling_snapshot(session)
+        return _serialize_event_result(snapshot=snapshot, event=event)
+
+    @mcp.tool()
+    def export_roast_log(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+        session_id: str | None = None,
+    ) -> ExportRoastLogResult:
+        """Return the planned export targets for one roast session.
+
+        Log writing itself lands in Epic 5. This tool only exposes the expected
+        output paths so the MCP surface can stabilize before the writers exist.
+        """
+        server_context = ctx.request_context.lifespan_context
+        session = _resolve_session(server_context, session_id=session_id)
+        log_dir = _require_log_dir(session).resolve()
+        return ExportRoastLogResult(
+            session_id=session.id,
+            log_dir=str(log_dir),
+            jsonl_path=str(log_dir / "roast.jsonl"),
+            csv_path=str(log_dir / "roast.csv"),
+            summary_path=str(log_dir / "summary.json"),
+            ready=False,
+            note=(
+                "Export writers land in Epic 5. "
+                "This tool currently returns the planned manifest only."
+            ),
+        )
+
+    @mcp.tool()
+    def emergency_stop(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+        reason: str = "manual emergency stop",
+    ) -> EventCommandResult:
+        """Apply mock-safe emergency-stop state and record a fault event."""
+        server_context = ctx.request_context.lifespan_context
+        session = _require_active_session(server_context)
+        event, snapshot = server_context.session_store.emergency_stop_snapshot(
+            session,
+            reason=reason,
+        )
+        return _serialize_event_result(snapshot=snapshot, event=event)
 
     return mcp
 
@@ -223,3 +453,113 @@ def _is_bootstrap_safe(config: AppConfig) -> bool:
         "disabled",
         "manual",
     }
+
+
+def _require_active_session(server_context: ServerContext) -> RoastSession:
+    """Return the active session or fail clearly when none exists."""
+    session = server_context.session_store.get_active_session()
+    if session is None:
+        raise ValueError("No active roast session exists.")
+    return session
+
+
+def _resolve_session(server_context: ServerContext, *, session_id: str | None) -> RoastSession:
+    """Resolve one session for read or export operations."""
+    return _snapshot_session(server_context, session_id=session_id)
+
+
+def _record_session_event(
+    ctx: Context[ServerSession, ServerContext],
+    kind: Literal["beans_added", "first_crack_detected"],
+) -> EventCommandResult:
+    """Record one core event against the active session."""
+    server_context = ctx.request_context.lifespan_context
+    session = _require_active_session(server_context)
+    event, snapshot = server_context.session_store.record_event_snapshot(session, kind)
+    return _serialize_event_result(snapshot=snapshot, event=event)
+
+
+def _snapshot_session(
+    server_context: ServerContext,
+    *,
+    session_id: str | None = None,
+) -> RoastSession:
+    """Return a locked deep-copied session snapshot."""
+    try:
+        return server_context.session_store.get_session_snapshot(session_id=session_id)
+    except SessionLifecycleError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _serialize_session_state(
+    session: RoastSession,
+) -> RoastSessionState:
+    """Convert one in-memory session into an MCP-safe snapshot."""
+    return RoastSessionState(
+        session_id=session.id,
+        active=session.active,
+        phase=session.phase,
+        created_at_utc=session.created_at_utc.isoformat(),
+        stopped_at_utc=_iso_or_none(session.stopped_at_utc),
+        elapsed_monotonic_seconds=round(session.elapsed_monotonic_seconds(time.monotonic), 3),
+        heat_level_percent=session.heat_level_percent,
+        fan_level_percent=session.fan_level_percent,
+        cooling_on=session.cooling_on,
+        beans_added_at_utc=_iso_or_none(session.beans_added_at_utc),
+        first_crack_at_utc=_iso_or_none(session.first_crack_at_utc),
+        beans_dropped_at_utc=_iso_or_none(session.beans_dropped_at_utc),
+        cooling_started_at_utc=_iso_or_none(session.cooling_started_at_utc),
+        cooling_stopped_at_utc=_iso_or_none(session.cooling_stopped_at_utc),
+        faulted_at_utc=_iso_or_none(session.faulted_at_utc),
+        events=tuple(_serialize_event(event) for event in session.event_timeline),
+        log_dir=str(session.log_writer.log_dir.resolve())
+        if session.log_writer is not None
+        else None,
+    )
+
+
+def _serialize_control_result(session: RoastSession) -> ControlCommandResult:
+    """Convert one control mutation into a stable tool response."""
+    return ControlCommandResult(
+        session_id=session.id,
+        phase=session.phase,
+        heat_level_percent=session.heat_level_percent,
+        fan_level_percent=session.fan_level_percent,
+        cooling_on=session.cooling_on,
+    )
+
+
+def _serialize_event_result(
+    *,
+    snapshot: RoastSession,
+    event: RoastEvent,
+) -> EventCommandResult:
+    """Serialize the specific event produced or resolved for one command."""
+    return EventCommandResult(
+        session_id=snapshot.id,
+        phase=snapshot.phase,
+        event=_serialize_event(event),
+        event_count=len(snapshot.event_timeline),
+    )
+
+
+def _serialize_event(event: RoastEvent) -> EventSnapshot:
+    """Convert one roast event into a serializable snapshot."""
+    return EventSnapshot(
+        kind=event.kind,
+        recorded_at_utc=event.recorded_at_utc.isoformat(),
+        monotonic_seconds=event.monotonic_seconds,
+        payload=dict(event.payload),
+    )
+
+
+def _iso_or_none(value: datetime | None) -> str | None:
+    """Return one ISO8601 string when a datetime exists."""
+    return value.isoformat() if value is not None else None
+
+
+def _require_log_dir(session: RoastSession) -> Path:
+    """Return the session log directory when configured."""
+    if session.log_writer is None:
+        raise ValueError("Session log target is unavailable.")
+    return session.log_writer.log_dir

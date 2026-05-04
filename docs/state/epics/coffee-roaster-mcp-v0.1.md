@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E2-S4`
-- Current target: Implement the first roast-session MCP tools on top of the authoritative session core
+- Active story: `E2-S5`
+- Current target: Make roast-session phase transitions deterministic across the new MCP tool flow
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -34,6 +34,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E2-S1` keeps the initial MCP tool surface bootstrap-safe with `get_server_info` and `get_runtime_config`. Roast-session lifecycle and roast-control tools remain later Epic 2 work.
 - `E2-S2` uses one in-process `RoastSessionStore` with at most one active `RoastSession` at a time. Session state now owns monotonic timing, phase, event timeline storage, telemetry retention, and log-writer references before tool wiring lands.
 - `E2-S3` keeps event writes behind `RoastSessionStore.record_event(...)`. The session timeline now records deterministic append order, authoritative UTC plus monotonic timestamps for core roast events, and idempotent singleton handling for beans added, first crack, bean drop, and cooling transitions.
+- `E2-S4` now exposes the first roast-session MCP tools on top of the mock path. `export_roast_log` currently returns the planned manifest only, while the real JSONL, CSV, and summary writers stay in Epic 5.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
 - The `coffee-first-crack-detection` repo remains the source of truth for training, ONNX export, Hugging Face sync, model cards, and dataset cards.
@@ -112,7 +113,7 @@ Goal: implement one authoritative roast session runtime and MCP tool surface.
 - [x] `E2-S3` Implement core event timeline.
   - Done when `beans_added`, `first_crack_detected`, `beans_dropped`, `cooling_started`, `cooling_stopped`, and `fault` can be recorded with timestamps.
 
-- [ ] `E2-S4` Implement core MCP tools.
+- [x] `E2-S4` Implement core MCP tools.
   - Done when `start_roast_session`, `get_roast_state`, `set_heat`, `set_fan`, `mark_beans_added`, `mark_first_crack`, `drop_beans`, `start_cooling`, `stop_cooling`, `export_roast_log`, and `emergency_stop` exist.
 
 - [ ] `E2-S5` Implement phase transitions.
@@ -363,6 +364,7 @@ After completing a story:
 - E2-S1 added the first local stdio FastMCP entrypoint, `coffee-roaster-mcp serve`, and a bootstrap-safe runtime tool surface with `get_server_info` and `get_runtime_config`. It keeps roast-session lifecycle and roast-control tools out of the entrypoint story.
 - E2-S2 added `session.py` with an authoritative `RoastSession` model and `RoastSessionStore`. Session lifecycle now has stable ids, monotonic start/stop timing, explicit phase, event-timeline storage, telemetry-buffer retention, log-writer references, and clean single-owner start/stop behavior.
 - E2-S3 extended `session.py` with store-owned event recording. The authoritative session now records `beans_added`, `first_crack_detected`, `beans_dropped`, `cooling_started`, `cooling_stopped`, and `fault` in deterministic timeline order while also keeping authoritative UTC and monotonic timestamps for core roast milestones.
+- E2-S4 extended the FastMCP runtime with the first real roast-session tool surface. The mock path now supports starting a session, reading state, setting in-memory heat and fan values, recording core events, starting and stopping cooling, returning a planned export manifest, and recording emergency-stop faults through one authoritative session owner.
 - Validation run for E1-S8:
   - Reviewed issue #15 acceptance criteria against `AGENTS.md`, the active epic, and the overall plan.
   - Added `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, and `.claude/skills/release-registry` using the existing repo-local skill format.
@@ -432,6 +434,15 @@ After completing a story:
   - Kept singleton event writes idempotent for `beans_added`, `first_crack_detected`, `beans_dropped`, `cooling_started`, and `cooling_stopped` while allowing `fault` timeline rows.
   - Added `tests/test_session.py` coverage for deterministic event ordering, authoritative timestamp updates, singleton idempotency, and rejecting stopped-session event writes.
   - Ran `./.venv/bin/python -m pytest`: 32 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E2-S4:
+  - Extended `src/coffee_roaster_mcp/mcp_server.py` with the first roast-session MCP tools on top of the authoritative session core.
+  - Extended `src/coffee_roaster_mcp/session.py` with in-memory mock control state for heat, fan, and cooling plus store-owned mutation helpers used by the MCP tools.
+  - Added `tests/test_package.py` coverage for tool registration and a basic end-to-end mock tool flow over stdio MCP, including session start, control updates, event recording, state reads, export-manifest response, and emergency-stop fault recording.
+  - Updated `README.md` and `.claude/skills/mock-roast/SKILL.md` so they no longer describe the MCP runtime as introspection-only.
+  - Ran `./.venv/bin/python -m pytest`: 35 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -149,6 +150,9 @@ class RoastSession:
         cooling_stopped_monotonic_seconds: Monotonic elapsed seconds for cooling stop.
         faulted_at_utc: Wall-clock UTC timestamp for the first recorded fault.
         faulted_monotonic_seconds: Monotonic elapsed seconds for the first fault.
+        heat_level_percent: Latest in-memory heat setting for the active mock path.
+        fan_level_percent: Latest in-memory fan setting for the active mock path.
+        cooling_on: Whether cooling is currently active in the session state.
         event_timeline: Shared ordered event timeline for future runtime stories.
         telemetry_buffer: Rolling telemetry sample buffer.
         log_writer: Append-only log writer reference when available.
@@ -172,6 +176,9 @@ class RoastSession:
     cooling_stopped_monotonic_seconds: float | None = None
     faulted_at_utc: datetime | None = None
     faulted_monotonic_seconds: float | None = None
+    heat_level_percent: int = 0
+    fan_level_percent: int = 0
+    cooling_on: bool = False
     event_timeline: list[RoastEvent] = field(default_factory=_event_timeline_default)
     telemetry_buffer: deque[TelemetrySample] = field(default_factory=_telemetry_buffer_default)
     log_writer: LogWriterReference | None = None
@@ -239,6 +246,7 @@ class RoastSessionStore:
         self,
         *,
         telemetry_buffer_limit: int = 300,
+        session_history_limit: int = 8,
         utc_now: Callable[[], datetime] | None = None,
         monotonic_now: Callable[[], float] | None = None,
         session_id_factory: Callable[[], str] | None = None,
@@ -248,6 +256,7 @@ class RoastSessionStore:
 
         Args:
             telemetry_buffer_limit: Maximum retained telemetry samples per session.
+            session_history_limit: Maximum retained sessions addressable by id.
             utc_now: Optional UTC timestamp supplier.
             monotonic_now: Optional monotonic clock supplier.
             session_id_factory: Optional session id supplier.
@@ -257,14 +266,19 @@ class RoastSessionStore:
 
         if telemetry_buffer_limit < 0:
             raise ValueError("telemetry_buffer_limit must be >= 0.")
+        if session_history_limit < 1:
+            raise ValueError("session_history_limit must be >= 1.")
 
         self._telemetry_buffer_limit = telemetry_buffer_limit
+        self._session_history_limit = session_history_limit
         self._utc_now = utc_now or (lambda: datetime.now(UTC))
         self._monotonic_now = monotonic_now or time.monotonic
         self._session_id_factory = session_id_factory or _generate_session_id
         self._default_log_dir = default_log_dir
         self._lock = RLock()
         self._latest_session: RoastSession | None = None
+        self._sessions_by_id: dict[str, RoastSession] = {}
+        self._session_id_order: deque[str] = deque()
 
     def start_session(self) -> RoastSession:
         """Start one new active session.
@@ -290,7 +304,16 @@ class RoastSessionStore:
                 ),
             )
             self._latest_session = session
+            self._sessions_by_id[session_id] = session
+            self._session_id_order.append(session_id)
+            self._prune_session_history_locked()
             return session
+
+    def start_session_snapshot(self) -> RoastSession:
+        """Start one new session and return an atomic lightweight snapshot."""
+        with self._lock:
+            session = self.start_session()
+            return _copy_session_for_read(session)
 
     def stop_session(self, *, phase: RoastPhase = "complete") -> RoastSession | None:
         """Stop the active session if one exists.
@@ -333,6 +356,97 @@ class RoastSessionStore:
                 max_samples=self._telemetry_buffer_limit,
             )
 
+    def set_heat(
+        self,
+        session: RoastSession,
+        *,
+        heat_level_percent: int,
+    ) -> RoastSession:
+        """Set the latest in-memory heat value for one active session."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            validated_heat = _validate_control_percent(
+                heat_level_percent,
+                label="heat_level_percent",
+            )
+            if session.faulted_at_utc is not None and validated_heat > 0:
+                raise SessionLifecycleError("Heat cannot be increased after a fault.")
+            session.heat_level_percent = validated_heat
+            return session
+
+    def set_heat_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        heat_level_percent: int,
+    ) -> RoastSession:
+        """Apply heat and return an atomic lightweight snapshot."""
+        with self._lock:
+            self.set_heat(session, heat_level_percent=heat_level_percent)
+            return _copy_session_for_read(session)
+
+    def set_fan(
+        self,
+        session: RoastSession,
+        *,
+        fan_level_percent: int,
+    ) -> RoastSession:
+        """Set the latest in-memory fan value for one active session."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            session.fan_level_percent = _validate_control_percent(
+                fan_level_percent,
+                label="fan_level_percent",
+            )
+            return session
+
+    def set_fan_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        fan_level_percent: int,
+    ) -> RoastSession:
+        """Apply fan and return an atomic lightweight snapshot."""
+        with self._lock:
+            self.set_fan(session, fan_level_percent=fan_level_percent)
+            return _copy_session_for_read(session)
+
+    def start_cooling(self, session: RoastSession) -> RoastEvent:
+        """Start cooling for one active session."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            if session.beans_dropped_at_utc is None:
+                raise SessionLifecycleError("Cooling can only start after beans are dropped.")
+            return self.record_event(session, "cooling_started")
+
+    def start_cooling_snapshot(self, session: RoastSession) -> tuple[RoastEvent, RoastSession]:
+        """Start cooling and return the event plus an atomic lightweight snapshot."""
+        with self._lock:
+            event = self.start_cooling(session)
+            return event, _copy_session_for_read(session)
+
+    def stop_cooling(self, session: RoastSession) -> RoastEvent:
+        """Stop cooling for one active session."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            if session.beans_dropped_at_utc is None:
+                raise SessionLifecycleError("Cooling cannot stop before beans are dropped.")
+            if session.cooling_started_at_utc is None or not session.cooling_on:
+                raise SessionLifecycleError("Cooling must be started before it can be stopped.")
+            event = self.record_event(session, "cooling_stopped")
+            session.stop(
+                utc_now=self._utc_now,
+                monotonic_now=self._monotonic_now,
+                phase="complete",
+            )
+            return event
+
+    def stop_cooling_snapshot(self, session: RoastSession) -> tuple[RoastEvent, RoastSession]:
+        """Stop cooling and return the event plus an atomic lightweight snapshot."""
+        with self._lock:
+            event = self.stop_cooling(session)
+            return event, _copy_session_for_read(session)
+
     def record_event(
         self,
         session: RoastSession,
@@ -357,6 +471,8 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
+            if session.faulted_at_utc is not None and kind != "fault":
+                raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
 
             existing_event = self._get_existing_singleton_event(session, kind)
             if existing_event is not None:
@@ -374,6 +490,49 @@ class RoastSessionStore:
             _apply_event_timestamp(session, event)
             return event
 
+    def record_event_snapshot(
+        self,
+        session: RoastSession,
+        kind: RoastEventKind,
+        *,
+        payload: dict[str, EventPayloadValue] | None = None,
+    ) -> tuple[RoastEvent, RoastSession]:
+        """Record one event and return the event plus an atomic lightweight snapshot."""
+        with self._lock:
+            event = self.record_event(session, kind, payload=payload)
+            return event, _copy_session_for_read(session)
+
+    def emergency_stop(
+        self,
+        session: RoastSession,
+        *,
+        reason: str,
+    ) -> RoastEvent:
+        """Apply mock-safe emergency-stop state and finalize the session."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            session.heat_level_percent = 0
+            session.fan_level_percent = 100
+            session.cooling_on = True
+            event = self.record_event(session, "fault", payload={"reason": reason})
+            session.stop(
+                utc_now=self._utc_now,
+                monotonic_now=self._monotonic_now,
+                phase="fault",
+            )
+            return event
+
+    def emergency_stop_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        reason: str,
+    ) -> tuple[RoastEvent, RoastSession]:
+        """Apply emergency stop and return the event plus an atomic lightweight snapshot."""
+        with self._lock:
+            event = self.emergency_stop(session, reason=reason)
+            return event, _copy_session_for_read(session)
+
     def get_active_session(self) -> RoastSession | None:
         """Return the current active session when present."""
         with self._lock:
@@ -385,6 +544,30 @@ class RoastSessionStore:
         """Return the latest session whether active or stopped."""
         with self._lock:
             return self._latest_session
+
+    def get_session_snapshot(
+        self,
+        *,
+        session_id: str | None = None,
+        active_only: bool = False,
+    ) -> RoastSession:
+        """Return a deep-copied session snapshot under store-owned locking."""
+        with self._lock:
+            if self._latest_session is None:
+                raise SessionLifecycleError("No roast session exists.")
+            session = self._latest_session
+            if session_id is not None:
+                session = self._sessions_by_id.get(session_id)
+                if session is None:
+                    raise SessionLifecycleError(f"Unknown session_id: {session_id}")
+            if active_only and not session.active:
+                raise SessionLifecycleError("No active roast session exists.")
+            return _copy_session_for_read(session)
+
+    def copy_session(self, session: RoastSession) -> RoastSession:
+        """Return a deep-copied snapshot of one known session object under the store lock."""
+        with self._lock:
+            return _copy_session_for_read(session)
 
     @property
     def telemetry_buffer_limit(self) -> int:
@@ -411,30 +594,50 @@ class RoastSessionStore:
                 return event
         return None
 
+    def _prune_session_history_locked(self) -> None:
+        """Evict oldest completed sessions once retained history exceeds the limit."""
+        while len(self._session_id_order) > self._session_history_limit:
+            oldest_session_id = self._session_id_order[0]
+            oldest_session = self._sessions_by_id.get(oldest_session_id)
+            if oldest_session is not None and oldest_session.active:
+                break
+            self._session_id_order.popleft()
+            if oldest_session is not None:
+                del self._sessions_by_id[oldest_session_id]
+
 
 def _apply_event_timestamp(session: RoastSession, event: RoastEvent) -> None:
     """Update authoritative event timestamp fields from one timeline event."""
     if event.kind == "beans_added":
+        session.phase = "roasting"
         session.beans_added_at_utc = event.recorded_at_utc
         session.beans_added_monotonic_seconds = event.monotonic_seconds
         return
     if event.kind == "first_crack_detected":
+        session.phase = "development"
         session.first_crack_at_utc = event.recorded_at_utc
         session.first_crack_monotonic_seconds = event.monotonic_seconds
         return
     if event.kind == "beans_dropped":
+        session.phase = "dropped"
+        session.heat_level_percent = 0
         session.beans_dropped_at_utc = event.recorded_at_utc
         session.beans_dropped_monotonic_seconds = event.monotonic_seconds
         return
     if event.kind == "cooling_started":
+        session.phase = "cooling"
+        session.cooling_on = True
         session.cooling_started_at_utc = event.recorded_at_utc
         session.cooling_started_monotonic_seconds = event.monotonic_seconds
         return
     if event.kind == "cooling_stopped":
+        session.cooling_on = False
+        session.phase = "complete" if session.beans_dropped_at_utc is not None else "pre_roast"
         session.cooling_stopped_at_utc = event.recorded_at_utc
         session.cooling_stopped_monotonic_seconds = event.monotonic_seconds
         return
     if event.kind == "fault" and session.faulted_at_utc is None:
+        session.phase = "fault"
         session.faulted_at_utc = event.recorded_at_utc
         session.faulted_monotonic_seconds = event.monotonic_seconds
 
@@ -442,3 +645,42 @@ def _apply_event_timestamp(session: RoastSession, event: RoastEvent) -> None:
 def _generate_session_id() -> str:
     """Return a stable opaque session identifier."""
     return uuid4().hex
+
+
+def _copy_session_for_read(session: RoastSession) -> RoastSession:
+    """Return a lightweight read snapshot without telemetry buffer retention."""
+    return RoastSession(
+        id=session.id,
+        created_at_utc=session.created_at_utc,
+        monotonic_start=session.monotonic_start,
+        phase=session.phase,
+        beans_added_at_utc=session.beans_added_at_utc,
+        beans_added_monotonic_seconds=session.beans_added_monotonic_seconds,
+        first_crack_at_utc=session.first_crack_at_utc,
+        first_crack_monotonic_seconds=session.first_crack_monotonic_seconds,
+        beans_dropped_at_utc=session.beans_dropped_at_utc,
+        beans_dropped_monotonic_seconds=session.beans_dropped_monotonic_seconds,
+        cooling_started_at_utc=session.cooling_started_at_utc,
+        cooling_started_monotonic_seconds=session.cooling_started_monotonic_seconds,
+        cooling_stopped_at_utc=session.cooling_stopped_at_utc,
+        cooling_stopped_monotonic_seconds=session.cooling_stopped_monotonic_seconds,
+        faulted_at_utc=session.faulted_at_utc,
+        faulted_monotonic_seconds=session.faulted_monotonic_seconds,
+        heat_level_percent=session.heat_level_percent,
+        fan_level_percent=session.fan_level_percent,
+        cooling_on=session.cooling_on,
+        event_timeline=deepcopy(session.event_timeline),
+        telemetry_buffer=deque(),
+        log_writer=session.log_writer,
+        stopped_at_utc=session.stopped_at_utc,
+        monotonic_stop=session.monotonic_stop,
+    )
+
+
+def _validate_control_percent(value: object, *, label: str) -> int:
+    """Validate one percentage-like control input."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{label} must be an integer between 0 and 100.")
+    if not 0 <= value <= 100:
+        raise ValueError(f"{label} must be between 0 and 100.")
+    return value
