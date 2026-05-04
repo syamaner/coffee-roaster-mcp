@@ -803,7 +803,7 @@ def _elapsed_since(
     start_seconds: float | None,
     monotonic_now: Callable[[], float],
 ) -> float | None:
-    """Return elapsed session seconds from one event timestamp to stop or now."""
+    """Return elapsed seconds from one event to drop, stop, or now."""
     if start_seconds is None:
         return None
     if session.beans_dropped_monotonic_seconds is not None:
