@@ -55,6 +55,7 @@ _ALLOWED_PHASES_BY_EVENT: dict[RoastEventKind, frozenset[RoastPhase]] = {
             "development",
             "dropped",
             "cooling",
+            "complete",
             "fault",
         }
     ),
@@ -663,7 +664,9 @@ def _apply_event_timestamp(session: RoastSession, event: RoastEvent) -> None:
 
 def _validate_event_transition(session: RoastSession, kind: RoastEventKind) -> None:
     """Validate that one new event is allowed from the current session phase."""
-    allowed_phases = _ALLOWED_PHASES_BY_EVENT[kind]
+    allowed_phases = _ALLOWED_PHASES_BY_EVENT.get(kind)
+    if allowed_phases is None:
+        raise SessionLifecycleError(f"Unknown roast event kind: {kind}.")
     if session.phase not in allowed_phases:
         allowed_phase_list = ", ".join(sorted(allowed_phases))
         raise SessionLifecycleError(

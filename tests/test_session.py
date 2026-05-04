@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -361,6 +362,48 @@ def test_emergency_stop_faults_and_stops_session() -> None:
     assert session.monotonic_stop == 130.0
 
 
+def test_emergency_stop_faults_active_complete_session() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
+    clock.monotonic_value = 115.0
+    store.record_event(session, "beans_dropped")
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 3, tzinfo=UTC)
+    clock.monotonic_value = 125.0
+    store.record_event(session, "cooling_started")
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 4, tzinfo=UTC)
+    clock.monotonic_value = 135.0
+    store.record_event(session, "cooling_stopped")
+
+    assert session.active is True
+    assert session.phase == "complete"
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 5, tzinfo=UTC)
+    clock.monotonic_value = 145.0
+    event = store.emergency_stop(session, reason="post-complete-fault")
+
+    assert event.kind == "fault"
+    assert event.payload == {"reason": "post-complete-fault"}
+    assert session.phase == "fault"
+    assert session.active is False
+    assert session.heat_level_percent == 0
+    assert session.fan_level_percent == 100
+    assert session.cooling_on is True
+    assert session.stopped_at_utc == datetime(2026, 5, 4, 12, 5, tzinfo=UTC)
+    assert session.monotonic_stop == 145.0
+
+
 def test_set_heat_rejects_faulted_session() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
@@ -575,6 +618,18 @@ def test_record_event_is_idempotent_for_singleton_event_kinds() -> None:
     assert len(session.event_timeline) == 1
     assert session.beans_added_at_utc == datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
     assert session.beans_added_monotonic_seconds == 5.0
+
+
+def test_record_event_rejects_unknown_event_kind_with_lifecycle_error() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    with pytest.raises(SessionLifecycleError, match="Unknown roast event kind: drum_started"):
+        store.record_event(session, cast(RoastEventKind, "drum_started"))
 
 
 def test_record_event_rejects_stopped_session() -> None:

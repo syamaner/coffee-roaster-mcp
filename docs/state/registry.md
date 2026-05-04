@@ -24,7 +24,7 @@ RoastPilot is being bootstrapped as a standalone Python MCP server that owns roa
 
 E2-S5 is complete. RoastPilot now enforces deterministic roast-session phase transitions on the mock MCP path, rejecting impossible event ordering while keeping the current one-session store boundary and E2-S4 MCP response semantics intact.
 
-The next story is E2-S6: implement emergency stop and fault recording.
+The next story is E2-S6: extend emergency-stop and fault handling into driver-owned safety behavior.
 
 The first implementation milestone remains a thin mock vertical slice: install the package, start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
