@@ -358,7 +358,7 @@ def test_emergency_stop_faults_and_stops_session() -> None:
     assert session.heat_level_percent == 0
     assert session.fan_level_percent == 100
     assert session.cooling_on is True
-    assert event.payload["driver_safety_method_called"] is True
+    assert event.payload["driver_safety_method_called"] is False
     assert session.stopped_at_utc == datetime(2026, 5, 4, 12, 4, tzinfo=UTC)
     assert session.monotonic_stop == 130.0
 
@@ -455,7 +455,7 @@ def test_emergency_stop_faults_active_complete_session() -> None:
 
     assert event.kind == "fault"
     assert event.payload["reason"] == "post-complete-fault"
-    assert event.payload["driver_safety_method_called"] is True
+    assert event.payload["driver_safety_method_called"] is False
     assert session.phase == "fault"
     assert session.active is False
     assert session.heat_level_percent == 0

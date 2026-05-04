@@ -14,7 +14,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
 from coffee_roaster_mcp import __version__
-from coffee_roaster_mcp.config import AppConfig, load_config
+from coffee_roaster_mcp.config import AppConfig, ConfigError, load_config
 from coffee_roaster_mcp.drivers import RoasterSafetyDriver, create_roaster_safety_driver
 from coffee_roaster_mcp.session import (
     EventPayloadValue,
@@ -199,11 +199,15 @@ def build_server_context(
         The initialized server context used by the MCP lifespan.
     """
     config = load_config(path=config_path)
+    try:
+        roaster_driver = create_roaster_safety_driver(config.roaster.driver)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
     return ServerContext(
         config=config,
         transport=transport,
         session_store=RoastSessionStore(default_log_dir=config.logging.log_dir / "roasts"),
-        roaster_driver=create_roaster_safety_driver(config.roaster.driver),
+        roaster_driver=roaster_driver,
         started_at_utc=datetime.now(UTC),
     )
 

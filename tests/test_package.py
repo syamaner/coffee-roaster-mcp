@@ -13,6 +13,7 @@ from mcp.client.stdio import stdio_client
 
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.cli import build_parser, main
+from coffee_roaster_mcp.config import ConfigError
 from coffee_roaster_mcp.mcp_server import build_server_context, run_driver_emergency_stop
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -379,6 +380,14 @@ def test_stdio_server_uses_configured_log_root_for_session_store(tmp_path: Path)
 
     assert session.log_writer is not None
     assert session.log_writer.log_dir == Path("custom-logs/roasts") / session.id
+
+
+def test_build_server_context_wraps_unknown_driver_as_config_error(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("roaster:\n  driver: missing-driver\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="missing-driver"):
+        build_server_context(config_path=config_path)
 
 
 def test_driver_emergency_stop_failure_returns_fail_closed_payload() -> None:

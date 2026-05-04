@@ -542,7 +542,6 @@ class RoastSessionStore:
         """Apply driver-owned emergency-stop behavior and finalize the session."""
         with self._lock:
             self._assert_latest_active_session(session)
-            _validate_event_transition(session, "fault")
             normalized_safety_payload = (
                 _default_emergency_safety_payload()
                 if safety_payload is None
@@ -711,7 +710,7 @@ def _default_emergency_safety_payload() -> dict[str, EventPayloadValue]:
     return {
         "driver": "store-default",
         "driver_safety_method": "emergency_stop",
-        "driver_safety_method_called": True,
+        "driver_safety_method_called": False,
         "heat_level_percent": 0,
         "fan_level_percent": 100,
         "cooling_on": True,
