@@ -61,6 +61,16 @@ _ALLOWED_PHASES_BY_EVENT: dict[RoastEventKind, frozenset[RoastPhase]] = {
     ),
 }
 
+_PHASE_PROGRESSION_ORDER: tuple[RoastPhase, ...] = (
+    "pre_roast",
+    "roasting",
+    "development",
+    "dropped",
+    "cooling",
+    "complete",
+    "fault",
+)
+
 
 def _event_payload_default() -> dict[str, EventPayloadValue]:
     """Return an empty typed event payload mapping."""
@@ -668,7 +678,9 @@ def _validate_event_transition(session: RoastSession, kind: RoastEventKind) -> N
     if allowed_phases is None:
         raise SessionLifecycleError(f"Unknown roast event kind: {kind}.")
     if session.phase not in allowed_phases:
-        allowed_phase_list = ", ".join(sorted(allowed_phases))
+        allowed_phase_list = ", ".join(
+            phase for phase in _PHASE_PROGRESSION_ORDER if phase in allowed_phases
+        )
         raise SessionLifecycleError(
             f"{kind} cannot be recorded while phase is {session.phase}; "
             f"allowed phases: {allowed_phase_list}."

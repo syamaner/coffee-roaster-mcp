@@ -332,7 +332,7 @@ async def _assert_invalid_phase_transitions(tmp_path: Path) -> None:
         )
         assert drop_result.isError is True
         assert drop_result.content is not None
-        assert "development, roasting" in drop_result.content[0].text
+        assert "roasting, development" in drop_result.content[0].text
 
         await _call_with_timeout(session.call_tool("mark_beans_added", {}))
         await _call_with_timeout(session.call_tool("drop_beans", {}))

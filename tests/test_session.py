@@ -243,7 +243,7 @@ def test_start_cooling_rejects_session_before_bean_drop() -> None:
     ("kind", "match"),
     [
         ("first_crack_detected", "allowed phases: roasting"),
-        ("beans_dropped", "allowed phases: development, roasting"),
+        ("beans_dropped", "allowed phases: roasting, development"),
     ],
 )
 def test_record_event_rejects_invalid_pre_roast_transitions(
