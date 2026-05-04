@@ -353,7 +353,7 @@ class RoastSessionStore:
                 heat_level_percent,
                 label="heat_level_percent",
             )
-            if session.phase == "fault" and validated_heat > 0:
+            if session.faulted_at_utc is not None and validated_heat > 0:
                 raise SessionLifecycleError("Heat cannot be increased after a fault.")
             session.heat_level_percent = validated_heat
             return session
@@ -379,8 +379,6 @@ class RoastSessionStore:
             self._assert_latest_active_session(session)
             if session.beans_dropped_at_utc is None:
                 raise SessionLifecycleError("Cooling can only start after beans are dropped.")
-            session.cooling_on = True
-            session.phase = "cooling"
             return self.record_event(session, "cooling_started")
 
     def stop_cooling(self, session: RoastSession) -> RoastEvent:
@@ -423,7 +421,7 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
-            if session.phase == "fault" and kind != "fault":
+            if session.faulted_at_utc is not None and kind != "fault":
                 raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
 
             existing_event = self._get_existing_singleton_event(session, kind)
@@ -489,6 +487,11 @@ class RoastSessionStore:
             if active_only and not self._latest_session.active:
                 raise SessionLifecycleError("No active roast session exists.")
             return deepcopy(self._latest_session)
+
+    def copy_session(self, session: RoastSession) -> RoastSession:
+        """Return a deep-copied snapshot of one known session object under the store lock."""
+        with self._lock:
+            return deepcopy(session)
 
     @property
     def telemetry_buffer_limit(self) -> int:

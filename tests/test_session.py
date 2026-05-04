@@ -254,6 +254,23 @@ def test_record_event_rejects_non_fault_events_after_fault() -> None:
         store.record_event(session, "beans_dropped")
 
 
+def test_start_cooling_rejects_session_that_has_faulted() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_dropped")
+    store.record_event(session, "fault", payload={"reason": "test"})
+
+    with pytest.raises(SessionLifecycleError, match="No non-fault events"):
+        store.start_cooling(session)
+
+
 def test_stop_cooling_rejects_session_when_cooling_not_started() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(

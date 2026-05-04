@@ -15,7 +15,13 @@ from mcp.server.session import ServerSession
 
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.config import AppConfig, load_config
-from coffee_roaster_mcp.session import RoastEvent, RoastPhase, RoastSession, RoastSessionStore
+from coffee_roaster_mcp.session import (
+    RoastEvent,
+    RoastPhase,
+    RoastSession,
+    RoastSessionStore,
+    SessionLifecycleError,
+)
 
 
 @dataclass(frozen=True)
@@ -48,7 +54,8 @@ class ServerInfo:
         roaster_driver: Configured roaster driver.
         first_crack_mode: Configured first-crack mode.
         bootstrap_safe: Whether the current defaults stay hardware-free.
-        available_bootstrap_tools: Minimal tool surface exposed in `E2-S1`.
+        available_bootstrap_tools: Tools available while RoastPilot stays on the
+            bootstrap-safe mock path.
         started_at_utc: UTC timestamp when this server process started.
     """
 
@@ -291,7 +298,7 @@ def create_mcp_server(
         session = server_context.session_store.start_session()
         return StartRoastSessionResult(
             session=_serialize_session_state(
-                _snapshot_session(server_context, session_id=session.id),
+                _snapshot_known_session(server_context, session),
                 server_context,
             )
         )
@@ -315,7 +322,7 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
         server_context.session_store.set_heat(session, heat_level_percent=heat_level_percent)
-        return _serialize_control_result(_snapshot_session(server_context, session_id=session.id))
+        return _serialize_control_result(_snapshot_known_session(server_context, session))
 
     @mcp.tool()
     def set_fan(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -326,7 +333,7 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
         server_context.session_store.set_fan(session, fan_level_percent=fan_level_percent)
-        return _serialize_control_result(_snapshot_session(server_context, session_id=session.id))
+        return _serialize_control_result(_snapshot_known_session(server_context, session))
 
     @mcp.tool()
     def mark_beans_added(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -356,7 +363,7 @@ def create_mcp_server(
         event = server_context.session_store.record_event(session, "beans_dropped")
         return _serialize_event_result_for_command(
             server_context,
-            session_id=session.id,
+            session=session,
             event=event,
         )
 
@@ -370,7 +377,7 @@ def create_mcp_server(
         event = server_context.session_store.start_cooling(session)
         return _serialize_event_result_for_command(
             server_context,
-            session_id=session.id,
+            session=session,
             event=event,
         )
 
@@ -384,7 +391,7 @@ def create_mcp_server(
         event = server_context.session_store.stop_cooling(session)
         return _serialize_event_result_for_command(
             server_context,
-            session_id=session.id,
+            session=session,
             event=event,
         )
 
@@ -425,7 +432,7 @@ def create_mcp_server(
         event = server_context.session_store.emergency_stop(session, reason=reason)
         return _serialize_event_result_for_command(
             server_context,
-            session_id=session.id,
+            session=session,
             event=event,
         )
 
@@ -480,7 +487,7 @@ def _record_session_event(
     event = server_context.session_store.record_event(session, kind)
     return _serialize_event_result_for_command(
         server_context,
-        session_id=session.id,
+        session=session,
         event=event,
     )
 
@@ -493,8 +500,13 @@ def _snapshot_session(
     """Return a locked deep-copied session snapshot."""
     try:
         return server_context.session_store.get_session_snapshot(session_id=session_id)
-    except Exception as exc:
+    except SessionLifecycleError as exc:
         raise ValueError(str(exc)) from exc
+
+
+def _snapshot_known_session(server_context: ServerContext, session: RoastSession) -> RoastSession:
+    """Return a deep-copied snapshot for one known session object."""
+    return server_context.session_store.copy_session(session)
 
 
 def _serialize_session_state(
@@ -537,11 +549,11 @@ def _serialize_control_result(session: RoastSession) -> ControlCommandResult:
 def _serialize_event_result_for_command(
     server_context: ServerContext,
     *,
-    session_id: str,
+    session: RoastSession,
     event: RoastEvent,
 ) -> EventCommandResult:
     """Serialize the specific event produced or resolved for one command."""
-    snapshot = _snapshot_session(server_context, session_id=session_id)
+    snapshot = _snapshot_known_session(server_context, session)
     return EventCommandResult(
         session_id=snapshot.id,
         phase=snapshot.phase,
