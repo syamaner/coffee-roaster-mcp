@@ -23,6 +23,7 @@ from coffee_roaster_mcp.session import (
     RoastSession,
     RoastSessionStore,
     SessionLifecycleError,
+    default_emergency_safety_payload,
 )
 
 
@@ -434,6 +435,7 @@ def create_mcp_server(
             session,
             reason=reason,
             safety_payload=safety_payload,
+            allow_stopped_latest=True,
         )
         return _serialize_event_result(snapshot=snapshot, event=event)
 
@@ -498,15 +500,10 @@ def run_driver_emergency_stop(
     try:
         return server_context.roaster_driver.emergency_stop(reason=reason).as_event_payload()
     except Exception as exc:
-        return {
-            "driver": server_context.config.roaster.driver,
-            "driver_safety_method": "emergency_stop",
-            "driver_safety_method_called": False,
-            "driver_error": f"{type(exc).__name__}: {exc}",
-            "heat_level_percent": 0,
-            "fan_level_percent": 100,
-            "cooling_on": True,
-        }
+        return default_emergency_safety_payload(
+            driver=server_context.config.roaster.driver,
+            driver_error=f"{type(exc).__name__}: {exc}",
+        )
 
 
 def _snapshot_session(

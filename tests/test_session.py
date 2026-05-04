@@ -422,6 +422,45 @@ def test_emergency_stop_preserves_core_reason_when_driver_payload_collides() -> 
     assert session.cooling_on is False
 
 
+def test_emergency_stop_can_fault_latest_session_stopped_after_driver_call() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.stop_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
+    clock.monotonic_value = 115.0
+    event, snapshot = store.emergency_stop_snapshot(
+        session,
+        reason="driver-already-ran",
+        safety_payload={
+            "driver": "test-driver",
+            "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+        allow_stopped_latest=True,
+    )
+
+    assert event.kind == "fault"
+    assert event.payload["reason"] == "driver-already-ran"
+    assert event.payload["driver_safety_method_called"] is True
+    assert session.active is False
+    assert session.phase == "fault"
+    assert session.stopped_at_utc == datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    assert session.monotonic_stop == 105.0
+    assert snapshot.phase == "fault"
+    assert snapshot.event_timeline[-1].kind == "fault"
+
+
 def test_emergency_stop_faults_active_complete_session() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
