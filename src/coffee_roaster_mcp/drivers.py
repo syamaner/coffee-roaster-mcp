@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
-from coffee_roaster_mcp.session import EventPayloadValue, RoastSession
+from coffee_roaster_mcp.session import EventPayloadValue
 
 
 @dataclass(frozen=True)
@@ -41,8 +41,8 @@ class EmergencyStopResult:
 class RoasterSafetyDriver(Protocol):
     """Minimal driver protocol needed before the full E3 driver contract lands."""
 
-    def emergency_stop(self, session: RoastSession, *, reason: str) -> EmergencyStopResult:
-        """Apply the safest available stop behavior for one active session."""
+    def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
+        """Apply the safest available driver-owned stop behavior."""
         ...
 
 
@@ -51,18 +51,15 @@ class MockRoasterDriver:
 
     name = "mock"
 
-    def emergency_stop(self, session: RoastSession, *, reason: str) -> EmergencyStopResult:
-        """Apply mock-safe emergency stop controls to one session."""
+    def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
+        """Return deterministic mock-safe emergency stop controls."""
         _ = reason
-        session.heat_level_percent = 0
-        session.fan_level_percent = 100
-        session.cooling_on = True
         return EmergencyStopResult(
             driver=self.name,
             safety_method="emergency_stop",
-            heat_level_percent=session.heat_level_percent,
-            fan_level_percent=session.fan_level_percent,
-            cooling_on=session.cooling_on,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
         )
 
 

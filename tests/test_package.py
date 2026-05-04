@@ -13,7 +13,7 @@ from mcp.client.stdio import stdio_client
 
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.cli import build_parser, main
-from coffee_roaster_mcp.mcp_server import build_server_context
+from coffee_roaster_mcp.mcp_server import build_server_context, run_driver_emergency_stop
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _T = TypeVar("_T")
@@ -379,6 +379,30 @@ def test_stdio_server_uses_configured_log_root_for_session_store(tmp_path: Path)
 
     assert session.log_writer is not None
     assert session.log_writer.log_dir == Path("custom-logs/roasts") / session.id
+
+
+def test_driver_emergency_stop_failure_returns_fail_closed_payload() -> None:
+    server_context = build_server_context()
+    object.__setattr__(server_context, "roaster_driver", _FailingSafetyDriver())
+
+    payload = run_driver_emergency_stop(server_context, reason="unit-test")
+
+    assert payload["driver"] == "mock"
+    assert payload["driver_safety_method"] == "emergency_stop"
+    assert payload["driver_safety_method_called"] is False
+    assert payload["driver_error"] == "RuntimeError: driver offline"
+    assert payload["heat_level_percent"] == 0
+    assert payload["fan_level_percent"] == 100
+    assert payload["cooling_on"] is True
+
+
+class _FailingSafetyDriver:
+    """Test driver that simulates an emergency-stop I/O failure."""
+
+    def emergency_stop(self, *, reason: str) -> object:
+        """Raise a deterministic driver failure."""
+        _ = reason
+        raise RuntimeError("driver offline")
 
 
 def _build_clean_server_env(overrides: dict[str, str] | None = None) -> dict[str, str]:

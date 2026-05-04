@@ -422,16 +422,14 @@ def create_mcp_server(
         ctx: Context[ServerSession, ServerContext],
         reason: str = "manual emergency stop",
     ) -> EventCommandResult:
-        """Apply mock-safe emergency-stop state and record a fault event."""
+        """Call the configured driver safety method and record a fault event."""
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
+        safety_payload = run_driver_emergency_stop(server_context, reason=reason)
         event, snapshot = server_context.session_store.emergency_stop_snapshot(
             session,
             reason=reason,
-            safety_action=lambda active_session: server_context.roaster_driver.emergency_stop(
-                active_session,
-                reason=reason,
-            ).as_event_payload(),
+            safety_payload=safety_payload,
         )
         return _serialize_event_result(snapshot=snapshot, event=event)
 
@@ -485,6 +483,26 @@ def _record_session_event(
     session = _require_active_session(server_context)
     event, snapshot = server_context.session_store.record_event_snapshot(session, kind)
     return _serialize_event_result(snapshot=snapshot, event=event)
+
+
+def run_driver_emergency_stop(
+    server_context: ServerContext,
+    *,
+    reason: str,
+) -> dict[str, EventPayloadValue]:
+    """Run driver-owned emergency stop before taking the session-store lock."""
+    try:
+        return server_context.roaster_driver.emergency_stop(reason=reason).as_event_payload()
+    except Exception as exc:
+        return {
+            "driver": server_context.config.roaster.driver,
+            "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": False,
+            "driver_error": f"{type(exc).__name__}: {exc}",
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        }
 
 
 def _snapshot_session(

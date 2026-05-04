@@ -460,8 +460,9 @@ After completing a story:
 - Validation run for E2-S6:
   - Added `src/coffee_roaster_mcp/drivers.py` with a minimal `RoasterSafetyDriver` protocol and `MockRoasterDriver` emergency-stop safety method.
   - Routed the MCP `emergency_stop` tool through the configured mock driver safety method while keeping `RoastSessionStore` responsible for fault recording, session stop semantics, and snapshots.
-  - Added unit coverage for the mock driver emergency-stop behavior, store-supplied driver safety callbacks, and MCP fault payload visibility through `get_roast_state`.
-  - Ran `./.venv/bin/python -m pytest`: 58 passed.
+  - Added unit coverage for the mock driver emergency-stop behavior, store-owned safety payload application, driver failure fail-closed fallback, payload collision handling, and MCP fault payload visibility through `get_roast_state`.
+  - Review hardening moved driver emergency-stop execution outside the store lock, falls back to safe controls when the driver call raises, and preserves core fault payload fields such as `reason`.
+  - Ran `./.venv/bin/python -m pytest`: 60 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

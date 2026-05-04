@@ -537,19 +537,22 @@ class RoastSessionStore:
         session: RoastSession,
         *,
         reason: str,
-        safety_action: Callable[[RoastSession], Mapping[str, EventPayloadValue]] | None = None,
+        safety_payload: Mapping[str, EventPayloadValue] | None = None,
     ) -> RoastEvent:
         """Apply driver-owned emergency-stop behavior and finalize the session."""
         with self._lock:
             self._assert_latest_active_session(session)
             _validate_event_transition(session, "fault")
-            safety_payload = (
-                _default_emergency_safety_action(session)
-                if safety_action is None
-                else dict(safety_action(session))
+            normalized_safety_payload = (
+                _default_emergency_safety_payload()
+                if safety_payload is None
+                else dict(safety_payload)
             )
-            event_payload: dict[str, EventPayloadValue] = {"reason": reason}
-            event_payload.update(safety_payload)
+            _apply_emergency_safety_payload(session, normalized_safety_payload)
+            event_payload = _build_emergency_fault_payload(
+                reason=reason,
+                safety_payload=normalized_safety_payload,
+            )
             event = self.record_event(session, "fault", payload=event_payload)
             session.stop(
                 utc_now=self._utc_now,
@@ -563,14 +566,14 @@ class RoastSessionStore:
         session: RoastSession,
         *,
         reason: str,
-        safety_action: Callable[[RoastSession], Mapping[str, EventPayloadValue]] | None = None,
+        safety_payload: Mapping[str, EventPayloadValue] | None = None,
     ) -> tuple[RoastEvent, RoastSession]:
         """Apply emergency stop and return the event plus an atomic lightweight snapshot."""
         with self._lock:
             event = self.emergency_stop(
                 session,
                 reason=reason,
-                safety_action=safety_action,
+                safety_payload=safety_payload,
             )
             return event, _copy_session_for_read(session)
 
@@ -703,21 +706,73 @@ def _generate_session_id() -> str:
     return uuid4().hex
 
 
-def _default_emergency_safety_action(
-    session: RoastSession,
-) -> dict[str, EventPayloadValue]:
-    """Apply legacy mock-safe stop state when no driver callback is supplied."""
-    session.heat_level_percent = 0
-    session.fan_level_percent = 100
-    session.cooling_on = True
+def _default_emergency_safety_payload() -> dict[str, EventPayloadValue]:
+    """Return fail-closed safety state when driver safety behavior is unavailable."""
     return {
         "driver": "store-default",
         "driver_safety_method": "emergency_stop",
         "driver_safety_method_called": True,
-        "heat_level_percent": session.heat_level_percent,
-        "fan_level_percent": session.fan_level_percent,
-        "cooling_on": session.cooling_on,
+        "heat_level_percent": 0,
+        "fan_level_percent": 100,
+        "cooling_on": True,
     }
+
+
+def _apply_emergency_safety_payload(
+    session: RoastSession,
+    safety_payload: Mapping[str, EventPayloadValue],
+) -> None:
+    """Apply fail-closed emergency safety state from a driver payload."""
+    session.heat_level_percent = _payload_control_percent(
+        safety_payload,
+        key="heat_level_percent",
+        default=0,
+    )
+    session.fan_level_percent = _payload_control_percent(
+        safety_payload,
+        key="fan_level_percent",
+        default=100,
+    )
+    cooling_on = safety_payload.get("cooling_on", True)
+    session.cooling_on = cooling_on if isinstance(cooling_on, bool) else True
+
+
+def _build_emergency_fault_payload(
+    *,
+    reason: str,
+    safety_payload: Mapping[str, EventPayloadValue],
+) -> dict[str, EventPayloadValue]:
+    """Build a fault payload without allowing drivers to override core keys."""
+    event_payload = dict(safety_payload)
+    event_payload["reason"] = reason
+    event_payload["heat_level_percent"] = _payload_control_percent(
+        safety_payload,
+        key="heat_level_percent",
+        default=0,
+    )
+    event_payload["fan_level_percent"] = _payload_control_percent(
+        safety_payload,
+        key="fan_level_percent",
+        default=100,
+    )
+    cooling_on = safety_payload.get("cooling_on", True)
+    event_payload["cooling_on"] = cooling_on if isinstance(cooling_on, bool) else True
+    return event_payload
+
+
+def _payload_control_percent(
+    payload: Mapping[str, EventPayloadValue],
+    *,
+    key: str,
+    default: int,
+) -> int:
+    """Return a valid control percentage from driver payload or a safe default."""
+    value = payload.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    if not 0 <= value <= 100:
+        return default
+    return value
 
 
 def _copy_session_for_read(session: RoastSession) -> RoastSession:
