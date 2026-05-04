@@ -289,7 +289,12 @@ def create_mcp_server(
         """Start one new authoritative roast session."""
         server_context = ctx.request_context.lifespan_context
         session = server_context.session_store.start_session()
-        return StartRoastSessionResult(session=_serialize_session_state(session, server_context))
+        return StartRoastSessionResult(
+            session=_serialize_session_state(
+                _snapshot_session(server_context, session_id=session.id),
+                server_context,
+            )
+        )
 
     @mcp.tool()
     def get_roast_state(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -310,7 +315,7 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
         server_context.session_store.set_heat(session, heat_level_percent=heat_level_percent)
-        return _serialize_control_result(session)
+        return _serialize_control_result(_snapshot_session(server_context, session_id=session.id))
 
     @mcp.tool()
     def set_fan(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -321,7 +326,7 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
         server_context.session_store.set_fan(session, fan_level_percent=fan_level_percent)
-        return _serialize_control_result(session)
+        return _serialize_control_result(_snapshot_session(server_context, session_id=session.id))
 
     @mcp.tool()
     def mark_beans_added(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -348,8 +353,8 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
         server_context.session_store.set_heat(session, heat_level_percent=0)
-        event = server_context.session_store.record_event(session, "beans_dropped")
-        return _serialize_event_result(session, event)
+        server_context.session_store.record_event(session, "beans_dropped")
+        return _serialize_latest_event_result(server_context, session_id=session.id)
 
     @mcp.tool()
     def start_cooling(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -358,8 +363,8 @@ def create_mcp_server(
         """Start cooling in the mock session state and record the event."""
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
-        event = server_context.session_store.start_cooling(session)
-        return _serialize_event_result(session, event)
+        server_context.session_store.start_cooling(session)
+        return _serialize_latest_event_result(server_context, session_id=session.id)
 
     @mcp.tool()
     def stop_cooling(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -368,8 +373,8 @@ def create_mcp_server(
         """Stop cooling in the mock session state and record the event."""
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
-        event = server_context.session_store.stop_cooling(session)
-        return _serialize_event_result(session, event)
+        server_context.session_store.stop_cooling(session)
+        return _serialize_latest_event_result(server_context, session_id=session.id)
 
     @mcp.tool()
     def export_roast_log(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -384,7 +389,6 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
         log_dir = _require_log_dir(session)
-        log_dir.mkdir(parents=True, exist_ok=True)
         return ExportRoastLogResult(
             session_id=session.id,
             log_dir=str(log_dir),
@@ -406,15 +410,8 @@ def create_mcp_server(
         """Apply mock-safe emergency-stop state and record a fault event."""
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
-        server_context.session_store.set_heat(session, heat_level_percent=0)
-        server_context.session_store.set_fan(session, fan_level_percent=100)
-        session.cooling_on = True
-        event = server_context.session_store.record_event(
-            session,
-            "fault",
-            payload={"reason": reason},
-        )
-        return _serialize_event_result(session, event)
+        server_context.session_store.emergency_stop(session, reason=reason)
+        return _serialize_latest_event_result(server_context, session_id=session.id)
 
     return mcp
 
@@ -454,12 +451,7 @@ def _require_active_session(server_context: ServerContext) -> RoastSession:
 
 def _resolve_session(server_context: ServerContext, *, session_id: str | None) -> RoastSession:
     """Resolve one session for read or export operations."""
-    session = server_context.session_store.get_latest_session()
-    if session is None:
-        raise ValueError("No roast session exists.")
-    if session_id is not None and session.id != session_id:
-        raise ValueError(f"Unknown session_id: {session_id}")
-    return session
+    return _snapshot_session(server_context, session_id=session_id)
 
 
 def _record_session_event(
@@ -469,8 +461,20 @@ def _record_session_event(
     """Record one core event against the active session."""
     server_context = ctx.request_context.lifespan_context
     session = _require_active_session(server_context)
-    event = server_context.session_store.record_event(session, kind)
-    return _serialize_event_result(session, event)
+    server_context.session_store.record_event(session, kind)
+    return _serialize_latest_event_result(server_context, session_id=session.id)
+
+
+def _snapshot_session(
+    server_context: ServerContext,
+    *,
+    session_id: str | None = None,
+) -> RoastSession:
+    """Return a locked deep-copied session snapshot."""
+    try:
+        return server_context.session_store.get_session_snapshot(session_id=session_id)
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _serialize_session_state(
@@ -518,6 +522,18 @@ def _serialize_event_result(session: RoastSession, event: RoastEvent) -> EventCo
         event=_serialize_event(event),
         event_count=len(session.event_timeline),
     )
+
+
+def _serialize_latest_event_result(
+    server_context: ServerContext,
+    *,
+    session_id: str,
+) -> EventCommandResult:
+    """Serialize the latest event from a locked session snapshot."""
+    snapshot = _snapshot_session(server_context, session_id=session_id)
+    if not snapshot.event_timeline:
+        raise ValueError("No roast events exist for this session.")
+    return _serialize_event_result(snapshot, snapshot.event_timeline[-1])
 
 
 def _serialize_event(event: RoastEvent) -> EventSnapshot:

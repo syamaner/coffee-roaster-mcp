@@ -206,6 +206,54 @@ def test_stop_cooling_marks_session_complete_and_stopped() -> None:
     assert store.get_active_session() is None
 
 
+def test_emergency_stop_faults_and_stops_session() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 4, tzinfo=UTC)
+    clock.monotonic_value = 130.0
+    event = store.emergency_stop(session, reason="test-fault")
+
+    assert event.kind == "fault"
+    assert session.phase == "fault"
+    assert session.active is False
+    assert session.heat_level_percent == 0
+    assert session.fan_level_percent == 100
+    assert session.cooling_on is True
+    assert session.stopped_at_utc == datetime(2026, 5, 4, 12, 4, tzinfo=UTC)
+    assert session.monotonic_stop == 130.0
+
+
+def test_set_heat_rejects_faulted_session() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+    store.emergency_stop(session, reason="test-fault")
+
+    with pytest.raises(SessionLifecycleError, match="Stopped sessions"):
+        store.set_heat(session, heat_level_percent=50)
+
+
+def test_record_event_rejects_non_fault_events_after_fault() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+    store.emergency_stop(session, reason="test-fault")
+
+    with pytest.raises(SessionLifecycleError, match="Stopped sessions"):
+        store.record_event(session, "beans_dropped")
+
+
 def test_stop_cooling_rejects_session_when_cooling_not_started() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
@@ -220,6 +268,17 @@ def test_stop_cooling_rejects_session_when_cooling_not_started() -> None:
 
     with pytest.raises(SessionLifecycleError, match="must be started"):
         store.stop_cooling(session)
+
+
+def test_set_heat_rejects_non_integer_values() -> None:
+    store = RoastSessionStore()
+    session = store.start_session()
+
+    with pytest.raises(TypeError, match="integer"):
+        store.set_heat(session, heat_level_percent=True)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="integer"):
+        store.set_heat(session, heat_level_percent=12.5)  # type: ignore[arg-type]
 
 
 def test_store_append_telemetry_rejects_non_latest_session() -> None:

@@ -200,6 +200,7 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert export_result.structuredContent["session_id"] == session_id
         assert export_result.structuredContent["ready"] is False
         assert export_result.structuredContent["jsonl_path"].endswith("/roast.jsonl")
+        assert not Path(export_result.structuredContent["log_dir"]).exists()
 
         second_start_result = cast(
             Any,
@@ -215,6 +216,21 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert emergency_stop_result.structuredContent["session_id"] == second_session_id
         assert emergency_stop_result.structuredContent["event"]["kind"] == "fault"
         assert emergency_stop_result.structuredContent["phase"] == "fault"
+
+        faulted_state_result = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool("get_roast_state", {"session_id": second_session_id})
+            ),
+        )
+        assert faulted_state_result.structuredContent["active"] is False
+        assert faulted_state_result.structuredContent["phase"] == "fault"
+
+        third_start_result = cast(
+            Any,
+            await _call_with_timeout(session.call_tool("start_roast_session", {})),
+        )
+        assert third_start_result.structuredContent["session"]["session_id"] != second_session_id
 
 
 def test_stdio_server_rejects_manual_first_crack_override_when_disabled(tmp_path: Path) -> None:

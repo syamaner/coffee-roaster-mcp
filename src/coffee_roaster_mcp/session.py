@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -348,10 +349,13 @@ class RoastSessionStore:
         """Set the latest in-memory heat value for one active session."""
         with self._lock:
             self._assert_latest_active_session(session)
-            session.heat_level_percent = _validate_control_percent(
+            validated_heat = _validate_control_percent(
                 heat_level_percent,
                 label="heat_level_percent",
             )
+            if session.phase == "fault" and validated_heat > 0:
+                raise SessionLifecycleError("Heat cannot be increased after a fault.")
+            session.heat_level_percent = validated_heat
             return session
 
     def set_fan(
@@ -419,6 +423,8 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
+            if session.phase == "fault" and kind != "fault":
+                raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
 
             existing_event = self._get_existing_singleton_event(session, kind)
             if existing_event is not None:
@@ -436,6 +442,26 @@ class RoastSessionStore:
             _apply_event_timestamp(session, event)
             return event
 
+    def emergency_stop(
+        self,
+        session: RoastSession,
+        *,
+        reason: str,
+    ) -> RoastEvent:
+        """Apply mock-safe emergency-stop state and finalize the session."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            session.heat_level_percent = 0
+            session.fan_level_percent = 100
+            session.cooling_on = True
+            event = self.record_event(session, "fault", payload={"reason": reason})
+            session.stop(
+                utc_now=self._utc_now,
+                monotonic_now=self._monotonic_now,
+                phase="fault",
+            )
+            return event
+
     def get_active_session(self) -> RoastSession | None:
         """Return the current active session when present."""
         with self._lock:
@@ -447,6 +473,22 @@ class RoastSessionStore:
         """Return the latest session whether active or stopped."""
         with self._lock:
             return self._latest_session
+
+    def get_session_snapshot(
+        self,
+        *,
+        session_id: str | None = None,
+        active_only: bool = False,
+    ) -> RoastSession:
+        """Return a deep-copied session snapshot under store-owned locking."""
+        with self._lock:
+            if self._latest_session is None:
+                raise SessionLifecycleError("No roast session exists.")
+            if session_id is not None and self._latest_session.id != session_id:
+                raise SessionLifecycleError(f"Unknown session_id: {session_id}")
+            if active_only and not self._latest_session.active:
+                raise SessionLifecycleError("No active roast session exists.")
+            return deepcopy(self._latest_session)
 
     @property
     def telemetry_buffer_limit(self) -> int:
@@ -515,8 +557,10 @@ def _generate_session_id() -> str:
     return uuid4().hex
 
 
-def _validate_control_percent(value: int, *, label: str) -> int:
+def _validate_control_percent(value: object, *, label: str) -> int:
     """Validate one percentage-like control input."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{label} must be an integer between 0 and 100.")
     if not 0 <= value <= 100:
         raise ValueError(f"{label} must be between 0 and 100.")
     return value
