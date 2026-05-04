@@ -230,7 +230,7 @@ class RoastSessionStore:
         self._session_id_factory = session_id_factory or _generate_session_id
         self._default_log_dir = default_log_dir
         self._lock = RLock()
-        self._active_session: RoastSession | None = None
+        self._latest_session: RoastSession | None = None
 
     def start_session(self) -> RoastSession:
         """Start one new active session.
@@ -242,7 +242,7 @@ class RoastSessionStore:
             SessionLifecycleError: If an active session already exists.
         """
         with self._lock:
-            if self._active_session is not None and self._active_session.active:
+            if self._latest_session is not None and self._latest_session.active:
                 raise SessionLifecycleError("An active roast session already exists.")
 
             session_id = self._session_id_factory()
@@ -255,7 +255,7 @@ class RoastSessionStore:
                     log_dir=self._default_log_dir / session_id,
                 ),
             )
-            self._active_session = session
+            self._latest_session = session
             return session
 
     def stop_session(self, *, phase: RoastPhase = "complete") -> RoastSession | None:
@@ -268,14 +268,14 @@ class RoastSessionStore:
             The active session after stopping, or `None` when no active session exists.
         """
         with self._lock:
-            if self._active_session is None or not self._active_session.active:
+            if self._latest_session is None or not self._latest_session.active:
                 return None
-            self._active_session.stop(
+            self._latest_session.stop(
                 utc_now=self._utc_now,
                 monotonic_now=self._monotonic_now,
                 phase=phase,
             )
-            return self._active_session
+            return self._latest_session
 
     def append_telemetry(
         self,
@@ -292,7 +292,7 @@ class RoastSessionStore:
             SessionLifecycleError: If the session is not the latest session in this store.
         """
         with self._lock:
-            if self._active_session is not session:
+            if self._latest_session is not session:
                 raise SessionLifecycleError("Telemetry can only be appended to the latest session.")
             _append_telemetry_with_limit(
                 session,
@@ -303,14 +303,14 @@ class RoastSessionStore:
     def get_active_session(self) -> RoastSession | None:
         """Return the current active session when present."""
         with self._lock:
-            if self._active_session is None or not self._active_session.active:
+            if self._latest_session is None or not self._latest_session.active:
                 return None
-            return self._active_session
+            return self._latest_session
 
     def get_latest_session(self) -> RoastSession | None:
         """Return the latest session whether active or stopped."""
         with self._lock:
-            return self._active_session
+            return self._latest_session
 
     @property
     def telemetry_buffer_limit(self) -> int:
