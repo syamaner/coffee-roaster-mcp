@@ -204,6 +204,7 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
             "cooling_started",
             "cooling_stopped",
         ]
+        assert state_result.structuredContent["events"][2]["payload"] == {}
 
         export_result = cast(
             Any,
@@ -230,6 +231,9 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert emergency_stop_result.structuredContent["session_id"] == second_session_id
         assert emergency_stop_result.structuredContent["event"]["kind"] == "fault"
         assert emergency_stop_result.structuredContent["phase"] == "fault"
+        assert emergency_stop_result.structuredContent["event"]["payload"] == {
+            "reason": "test-path"
+        }
 
         faulted_state_result = cast(
             Any,
@@ -239,12 +243,24 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         )
         assert faulted_state_result.structuredContent["active"] is False
         assert faulted_state_result.structuredContent["phase"] == "fault"
+        assert faulted_state_result.structuredContent["events"][-1]["payload"] == {
+            "reason": "test-path"
+        }
 
         third_start_result = cast(
             Any,
             await _call_with_timeout(session.call_tool("start_roast_session", {})),
         )
         assert third_start_result.structuredContent["session"]["session_id"] != second_session_id
+
+        old_session_state_after_rollover = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool("get_roast_state", {"session_id": session_id})
+            ),
+        )
+        assert old_session_state_after_rollover.structuredContent["session_id"] == session_id
+        assert old_session_state_after_rollover.structuredContent["active"] is False
 
 
 def test_stdio_server_rejects_manual_first_crack_override_when_disabled(tmp_path: Path) -> None:

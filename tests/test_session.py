@@ -165,6 +165,33 @@ def test_start_session_allows_new_session_after_previous_stop() -> None:
     assert store.get_latest_session() is second_session
 
 
+def test_get_session_snapshot_supports_completed_session_after_rollover() -> None:
+    clock = ClockHarness()
+    issued_ids = iter(["session-001", "session-002"])
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        session_id_factory=lambda: next(issued_ids),
+    )
+
+    first_session = store.start_session()
+    clock.utc_value = datetime(2026, 5, 4, 12, 5, tzinfo=UTC)
+    clock.monotonic_value = 120.0
+    store.stop_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 6, tzinfo=UTC)
+    clock.monotonic_value = 121.0
+    second_session = store.start_session()
+
+    first_snapshot = store.get_session_snapshot(session_id=first_session.id)
+    second_snapshot = store.get_session_snapshot(session_id=second_session.id)
+
+    assert first_snapshot.id == first_session.id
+    assert first_snapshot.active is False
+    assert second_snapshot.id == second_session.id
+    assert second_snapshot.active is True
+
+
 def test_start_cooling_rejects_session_before_bean_drop() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(

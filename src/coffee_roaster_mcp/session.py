@@ -272,6 +272,7 @@ class RoastSessionStore:
         self._default_log_dir = default_log_dir
         self._lock = RLock()
         self._latest_session: RoastSession | None = None
+        self._sessions_by_id: dict[str, RoastSession] = {}
 
     def start_session(self) -> RoastSession:
         """Start one new active session.
@@ -297,6 +298,7 @@ class RoastSessionStore:
                 ),
             )
             self._latest_session = session
+            self._sessions_by_id[session_id] = session
             return session
 
     def stop_session(self, *, phase: RoastPhase = "complete") -> RoastSession | None:
@@ -482,11 +484,14 @@ class RoastSessionStore:
         with self._lock:
             if self._latest_session is None:
                 raise SessionLifecycleError("No roast session exists.")
-            if session_id is not None and self._latest_session.id != session_id:
-                raise SessionLifecycleError(f"Unknown session_id: {session_id}")
-            if active_only and not self._latest_session.active:
+            session = self._latest_session
+            if session_id is not None:
+                session = self._sessions_by_id.get(session_id)
+                if session is None:
+                    raise SessionLifecycleError(f"Unknown session_id: {session_id}")
+            if active_only and not session.active:
                 raise SessionLifecycleError("No active roast session exists.")
-            return deepcopy(self._latest_session)
+            return deepcopy(session)
 
     def copy_session(self, session: RoastSession) -> RoastSession:
         """Return a deep-copied snapshot of one known session object under the store lock."""

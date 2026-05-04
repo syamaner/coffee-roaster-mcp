@@ -16,6 +16,7 @@ from mcp.server.session import ServerSession
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.config import AppConfig, load_config
 from coffee_roaster_mcp.session import (
+    EventPayloadValue,
     RoastEvent,
     RoastPhase,
     RoastSession,
@@ -113,6 +114,7 @@ class EventSnapshot:
     kind: str
     recorded_at_utc: str
     monotonic_seconds: float
+    payload: dict[str, EventPayloadValue]
 
 
 @dataclass(frozen=True)
@@ -356,10 +358,9 @@ def create_mcp_server(
     def drop_beans(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
     ) -> EventCommandResult:
-        """Record bean drop and force heat off in the mock session state."""
+        """Record bean drop and let the event timeline force heat off."""
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
-        server_context.session_store.set_heat(session, heat_level_percent=0)
         event = server_context.session_store.record_event(session, "beans_dropped")
         return _serialize_event_result_for_command(
             server_context,
@@ -568,6 +569,7 @@ def _serialize_event(event: RoastEvent) -> EventSnapshot:
         kind=event.kind,
         recorded_at_utc=event.recorded_at_utc.isoformat(),
         monotonic_seconds=event.monotonic_seconds,
+        payload=dict(event.payload),
     )
 
 
