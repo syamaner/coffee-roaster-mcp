@@ -302,6 +302,11 @@ async def _assert_manual_override_disabled(tmp_path: Path) -> None:
 
 
 async def _assert_invalid_phase_transitions(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "first_crack:\n  allow_manual_override: true\n",
+        encoding="utf-8",
+    )
     server_params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "coffee_roaster_mcp.cli", "serve"],
