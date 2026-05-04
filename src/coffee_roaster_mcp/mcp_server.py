@@ -179,7 +179,7 @@ class EventCommandResult:
 
 @dataclass(frozen=True)
 class ExportRoastLogResult:
-    """Stub export manifest for the current pre-log-writer runtime."""
+    """Result for one snapshot roast-log export."""
 
     session_id: str
     log_dir: str

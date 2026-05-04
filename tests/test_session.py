@@ -738,6 +738,29 @@ def test_compute_roast_metrics_returns_none_before_beans_added() -> None:
     assert metrics.development_percent is None
 
 
+def test_compute_roast_metrics_uses_clock_for_active_session() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+
+    clock.monotonic_value = 120.0
+    store.record_event(session, "first_crack_detected")
+
+    clock.monotonic_value = 150.0
+    metrics = compute_roast_metrics(session, monotonic_now=clock.monotonic_now)
+
+    assert session.active is True
+    assert metrics.roast_elapsed_seconds == 45.0
+    assert metrics.development_time_seconds == 30.0
+    assert metrics.development_percent == 66.667
+
+
 def test_record_event_is_idempotent_for_singleton_event_kinds() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
