@@ -77,7 +77,7 @@ src/coffee_roaster_mcp/
   cli.py          - console entrypoint
   config.py       - typed configuration loading from defaults, YAML, and env vars
   mcp_server.py   - FastMCP stdio entrypoint and bootstrap-safe tools
-  session.py      - authoritative roast session lifecycle and active-session owner
+  session.py      - authoritative roast session lifecycle, event timeline, and active-session owner
 tests/
   test_package.py - package and CLI smoke coverage
   test_config.py  - config defaults, YAML, env override, and validation coverage

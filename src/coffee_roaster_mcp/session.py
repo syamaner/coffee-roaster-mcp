@@ -1,4 +1,4 @@
-"""Roast session lifecycle models for RoastPilot."""
+"""Roast session lifecycle and event-timeline models for RoastPilot."""
 
 from __future__ import annotations
 
@@ -30,6 +30,16 @@ RoastEventKind = Literal[
     "fault",
 ]
 EventPayloadValue = str | int | float | bool | None
+
+_SINGLETON_EVENT_KINDS: frozenset[RoastEventKind] = frozenset(
+    {
+        "beans_added",
+        "first_crack_detected",
+        "beans_dropped",
+        "cooling_started",
+        "cooling_stopped",
+    }
+)
 
 
 def _event_payload_default() -> dict[str, EventPayloadValue]:
@@ -127,6 +137,18 @@ class RoastSession:
         created_at_utc: Wall-clock UTC creation time.
         monotonic_start: Monotonic clock value captured when the session starts.
         phase: Current roast phase.
+        beans_added_at_utc: Wall-clock UTC timestamp for the authoritative T0 event.
+        beans_added_monotonic_seconds: Monotonic elapsed seconds for T0.
+        first_crack_at_utc: Wall-clock UTC timestamp for the first-crack event.
+        first_crack_monotonic_seconds: Monotonic elapsed seconds for first crack.
+        beans_dropped_at_utc: Wall-clock UTC timestamp for bean drop.
+        beans_dropped_monotonic_seconds: Monotonic elapsed seconds for bean drop.
+        cooling_started_at_utc: Wall-clock UTC timestamp for cooling start.
+        cooling_started_monotonic_seconds: Monotonic elapsed seconds for cooling start.
+        cooling_stopped_at_utc: Wall-clock UTC timestamp for cooling stop.
+        cooling_stopped_monotonic_seconds: Monotonic elapsed seconds for cooling stop.
+        faulted_at_utc: Wall-clock UTC timestamp for the first recorded fault.
+        faulted_monotonic_seconds: Monotonic elapsed seconds for the first fault.
         event_timeline: Shared ordered event timeline for future runtime stories.
         telemetry_buffer: Rolling telemetry sample buffer.
         log_writer: Append-only log writer reference when available.
@@ -138,6 +160,18 @@ class RoastSession:
     created_at_utc: datetime
     monotonic_start: float
     phase: RoastPhase = "pre_roast"
+    beans_added_at_utc: datetime | None = None
+    beans_added_monotonic_seconds: float | None = None
+    first_crack_at_utc: datetime | None = None
+    first_crack_monotonic_seconds: float | None = None
+    beans_dropped_at_utc: datetime | None = None
+    beans_dropped_monotonic_seconds: float | None = None
+    cooling_started_at_utc: datetime | None = None
+    cooling_started_monotonic_seconds: float | None = None
+    cooling_stopped_at_utc: datetime | None = None
+    cooling_stopped_monotonic_seconds: float | None = None
+    faulted_at_utc: datetime | None = None
+    faulted_monotonic_seconds: float | None = None
     event_timeline: list[RoastEvent] = field(default_factory=_event_timeline_default)
     telemetry_buffer: deque[TelemetrySample] = field(default_factory=_telemetry_buffer_default)
     log_writer: LogWriterReference | None = None
@@ -300,6 +334,47 @@ class RoastSessionStore:
                 max_samples=self._telemetry_buffer_limit,
             )
 
+    def record_event(
+        self,
+        session: RoastSession,
+        kind: RoastEventKind,
+        *,
+        payload: dict[str, EventPayloadValue] | None = None,
+    ) -> RoastEvent:
+        """Record one authoritative session event under store-owned locking.
+
+        Args:
+            session: Session to mutate.
+            kind: Event kind to record.
+            payload: Optional structured event details.
+
+        Returns:
+            The recorded event. For singleton event kinds, repeated calls return
+            the already-recorded event instead of appending a duplicate row.
+
+        Raises:
+            SessionLifecycleError: If the session is not the latest active
+                session in this store.
+        """
+        with self._lock:
+            self._assert_latest_active_session(session)
+
+            existing_event = self._get_existing_singleton_event(session, kind)
+            if existing_event is not None:
+                return existing_event
+
+            recorded_at_utc = self._utc_now()
+            monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+            event = RoastEvent(
+                kind=kind,
+                recorded_at_utc=recorded_at_utc,
+                monotonic_seconds=monotonic_seconds,
+                payload={} if payload is None else dict(payload),
+            )
+            session.event_timeline.append(event)
+            _apply_event_timestamp(session, event)
+            return event
+
     def get_active_session(self) -> RoastSession | None:
         """Return the current active session when present."""
         with self._lock:
@@ -316,6 +391,53 @@ class RoastSessionStore:
     def telemetry_buffer_limit(self) -> int:
         """Return the per-session telemetry retention limit."""
         return self._telemetry_buffer_limit
+
+    def _assert_latest_active_session(self, session: RoastSession) -> None:
+        """Validate that one session is the current mutable active session."""
+        if self._latest_session is not session:
+            raise SessionLifecycleError("Only the latest session can be mutated.")
+        if not session.active:
+            raise SessionLifecycleError("Stopped sessions cannot be mutated.")
+
+    def _get_existing_singleton_event(
+        self,
+        session: RoastSession,
+        kind: RoastEventKind,
+    ) -> RoastEvent | None:
+        """Return an existing singleton event when this kind is idempotent."""
+        if kind not in _SINGLETON_EVENT_KINDS:
+            return None
+        for event in session.event_timeline:
+            if event.kind == kind:
+                return event
+        return None
+
+
+def _apply_event_timestamp(session: RoastSession, event: RoastEvent) -> None:
+    """Update authoritative event timestamp fields from one timeline event."""
+    if event.kind == "beans_added":
+        session.beans_added_at_utc = event.recorded_at_utc
+        session.beans_added_monotonic_seconds = event.monotonic_seconds
+        return
+    if event.kind == "first_crack_detected":
+        session.first_crack_at_utc = event.recorded_at_utc
+        session.first_crack_monotonic_seconds = event.monotonic_seconds
+        return
+    if event.kind == "beans_dropped":
+        session.beans_dropped_at_utc = event.recorded_at_utc
+        session.beans_dropped_monotonic_seconds = event.monotonic_seconds
+        return
+    if event.kind == "cooling_started":
+        session.cooling_started_at_utc = event.recorded_at_utc
+        session.cooling_started_monotonic_seconds = event.monotonic_seconds
+        return
+    if event.kind == "cooling_stopped":
+        session.cooling_stopped_at_utc = event.recorded_at_utc
+        session.cooling_stopped_monotonic_seconds = event.monotonic_seconds
+        return
+    if event.kind == "fault" and session.faulted_at_utc is None:
+        session.faulted_at_utc = event.recorded_at_utc
+        session.faulted_monotonic_seconds = event.monotonic_seconds
 
 
 def _generate_session_id() -> str:
