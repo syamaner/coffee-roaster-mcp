@@ -11,6 +11,7 @@ from coffee_roaster_mcp.session import (
     RoastSessionStore,
     SessionLifecycleError,
     TelemetrySample,
+    compute_roast_metrics,
 )
 
 
@@ -696,6 +697,68 @@ def test_record_event_updates_timeline_order_and_authoritative_timestamps() -> N
         "cooling_started",
         "cooling_stopped",
     ]
+
+
+def test_compute_roast_metrics_from_event_timestamps() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+
+    clock.monotonic_value = 140.0
+    store.record_event(session, "first_crack_detected")
+
+    clock.monotonic_value = 155.0
+    store.record_event(session, "beans_dropped")
+
+    metrics = compute_roast_metrics(session, monotonic_now=clock.monotonic_now)
+
+    assert metrics.roast_elapsed_seconds == 50.0
+    assert metrics.development_time_seconds == 15.0
+    assert metrics.development_percent == 30.0
+
+
+def test_compute_roast_metrics_returns_none_before_beans_added() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    metrics = compute_roast_metrics(session, monotonic_now=clock.monotonic_now)
+
+    assert metrics.roast_elapsed_seconds is None
+    assert metrics.development_time_seconds is None
+    assert metrics.development_percent is None
+
+
+def test_compute_roast_metrics_uses_clock_for_active_session() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+
+    clock.monotonic_value = 120.0
+    store.record_event(session, "first_crack_detected")
+
+    clock.monotonic_value = 150.0
+    metrics = compute_roast_metrics(session, monotonic_now=clock.monotonic_now)
+
+    assert session.active is True
+    assert metrics.roast_elapsed_seconds == 45.0
+    assert metrics.development_time_seconds == 30.0
+    assert metrics.development_percent == 66.667
 
 
 def test_record_event_is_idempotent_for_singleton_event_kinds() -> None:

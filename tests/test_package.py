@@ -1,6 +1,7 @@
 """Package and CLI smoke coverage for RoastPilot."""
 
 import asyncio
+import json
 import os
 import sys
 from collections.abc import Awaitable
@@ -198,6 +199,9 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert state_result.structuredContent["heat_level_percent"] == 0
         assert state_result.structuredContent["fan_level_percent"] == 35
         assert state_result.structuredContent["cooling_on"] is False
+        assert state_result.structuredContent["roast_elapsed_seconds"] is not None
+        assert state_result.structuredContent["development_time_seconds"] is not None
+        assert state_result.structuredContent["development_percent"] is not None
         assert [event["kind"] for event in state_result.structuredContent["events"]] == [
             "beans_added",
             "first_crack_detected",
@@ -214,13 +218,36 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
             ),
         )
         assert export_result.structuredContent["session_id"] == session_id
-        assert export_result.structuredContent["ready"] is False
+        assert export_result.structuredContent["ready"] is True
         export_log_dir = Path(export_result.structuredContent["log_dir"])
         export_jsonl_path = Path(export_result.structuredContent["jsonl_path"])
+        export_csv_path = Path(export_result.structuredContent["csv_path"])
+        export_summary_path = Path(export_result.structuredContent["summary_path"])
         assert export_log_dir.is_absolute()
         assert export_jsonl_path.is_absolute()
         assert export_jsonl_path.name == "roast.jsonl"
-        assert not export_log_dir.exists()
+        assert export_csv_path.name == "roast.csv"
+        assert export_summary_path.name == "summary.json"
+        assert export_log_dir.exists()
+        assert export_jsonl_path.exists()
+        assert export_csv_path.exists()
+        assert export_summary_path.exists()
+        exported_events = [
+            json.loads(line) for line in export_jsonl_path.read_text(encoding="utf-8").splitlines()
+        ]
+        assert [event["kind"] for event in exported_events] == [
+            "beans_added",
+            "first_crack_detected",
+            "beans_dropped",
+            "cooling_started",
+            "cooling_stopped",
+        ]
+        export_summary = json.loads(export_summary_path.read_text(encoding="utf-8"))
+        assert export_summary["session_id"] == session_id
+        assert export_summary["phase"] == "complete"
+        assert export_summary["event_count"] == 5
+        assert export_summary["metrics"]["roast_elapsed_seconds"] is not None
+        assert export_summary["metrics"]["development_time_seconds"] is not None
 
         second_start_result = cast(
             Any,
