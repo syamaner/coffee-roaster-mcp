@@ -22,9 +22,9 @@
 
 RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.
 
-E3-S2 is complete. The mock driver now implements deterministic fixed-step telemetry against the `RoasterDriver` contract while preserving mock-safe controls, fail-closed emergency-stop behavior, and the current MCP/session-store boundary.
+E3-S3 is complete. `RoasterState` now validates normalized driver-boundary state for driver id, connection and cooling booleans, finite Celsius temperatures, heat and fan percentages, and raw vendor diagnostic payload shape.
 
-The next story is E3-S3: implement the normalized roaster state model details needed before Hottop driver work.
+The next story is E3-S4: implement the Hottop serial connection lifecycle.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

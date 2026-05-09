@@ -1,11 +1,14 @@
 """Roaster driver contract, capability, and safety behavior coverage."""
 
+from typing import cast
+
 import pytest
 
 from coffee_roaster_mcp.drivers import (
     CommandStreaming,
     MockRoasterDriver,
     RoasterDriver,
+    RoasterState,
     create_roaster_driver,
     create_roaster_safety_driver,
 )
@@ -103,6 +106,116 @@ def test_create_roaster_driver_rejects_unsupported_driver() -> None:
 
 def test_mock_driver_satisfies_roaster_driver_contract() -> None:
     _assert_roaster_driver_contract(MockRoasterDriver())
+
+
+def test_roaster_state_normalizes_integer_temperatures_and_copies_raw_vendor_data() -> None:
+    raw_vendor_data: dict[str, str | int | float | bool | None] = {"vendor_code": 7}
+
+    state = RoasterState(
+        driver="mock",
+        connected=True,
+        bean_temp_c=20,
+        env_temp_c=21,
+        heat_level_percent=10,
+        fan_level_percent=20,
+        cooling_on=False,
+        raw_vendor_data=raw_vendor_data,
+    )
+    raw_vendor_data["vendor_code"] = 8
+
+    assert state.bean_temp_c == 20.0
+    assert state.env_temp_c == 21.0
+    assert state.raw_vendor_data == {"vendor_code": 7}
+
+
+@pytest.mark.parametrize("driver", ["", "   "])
+def test_roaster_state_rejects_empty_driver(driver: str) -> None:
+    with pytest.raises(ValueError, match="driver"):
+        RoasterState(
+            driver=driver,
+            connected=True,
+            bean_temp_c=20.0,
+            env_temp_c=21.0,
+            heat_level_percent=10,
+            fan_level_percent=20,
+            cooling_on=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value", "error_type", "match"),
+    [
+        ("connected", 1, TypeError, "connected"),
+        ("cooling_on", 0, TypeError, "cooling_on"),
+        ("bean_temp_c", True, TypeError, "bean_temp_c"),
+        ("env_temp_c", "21.0", TypeError, "env_temp_c"),
+        ("bean_temp_c", float("nan"), ValueError, "bean_temp_c"),
+        ("env_temp_c", float("inf"), ValueError, "env_temp_c"),
+        ("heat_level_percent", -1, ValueError, "heat_level_percent"),
+        ("fan_level_percent", 101, ValueError, "fan_level_percent"),
+        ("heat_level_percent", True, TypeError, "heat_level_percent"),
+        ("fan_level_percent", False, TypeError, "fan_level_percent"),
+    ],
+)
+def test_roaster_state_rejects_invalid_normalized_fields(
+    field_name: str,
+    field_value: object,
+    error_type: type[Exception],
+    match: str,
+) -> None:
+    kwargs: dict[str, object] = {
+        "driver": "mock",
+        "connected": True,
+        "bean_temp_c": 20.0,
+        "env_temp_c": 21.0,
+        "heat_level_percent": 10,
+        "fan_level_percent": 20,
+        "cooling_on": False,
+    }
+    kwargs[field_name] = field_value
+
+    with pytest.raises(error_type, match=match):
+        RoasterState(**kwargs)  # pyright: ignore[reportArgumentType]
+
+
+def test_roaster_state_rejects_non_dict_raw_vendor_data() -> None:
+    with pytest.raises(TypeError, match="raw_vendor_data"):
+        RoasterState(
+            driver="mock",
+            connected=True,
+            bean_temp_c=20.0,
+            env_temp_c=21.0,
+            heat_level_percent=10,
+            fan_level_percent=20,
+            cooling_on=False,
+            raw_vendor_data=cast(dict[str, str | int | float | bool | None], []),
+        )
+
+
+def test_roaster_state_rejects_invalid_raw_vendor_data() -> None:
+    with pytest.raises(TypeError, match="keys"):
+        RoasterState(
+            driver="mock",
+            connected=True,
+            bean_temp_c=20.0,
+            env_temp_c=21.0,
+            heat_level_percent=10,
+            fan_level_percent=20,
+            cooling_on=False,
+            raw_vendor_data=cast(dict[str, str | int | float | bool | None], {1: "value"}),
+        )
+
+    with pytest.raises(TypeError, match="values"):
+        RoasterState(
+            driver="mock",
+            connected=True,
+            bean_temp_c=20.0,
+            env_temp_c=21.0,
+            heat_level_percent=10,
+            fan_level_percent=20,
+            cooling_on=False,
+            raw_vendor_data=cast(dict[str, str | int | float | bool | None], {"nested": {}}),
+        )
 
 
 def test_mock_driver_returns_reproducible_telemetry_sequence() -> None:

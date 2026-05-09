@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E3-S3`
-- Current target: Implement normalized roaster state model details before Hottop driver work
+- Active story: `E3-S4`
+- Current target: Implement Hottop serial connection lifecycle
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -41,6 +41,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E2-S8` completed the final Epic 2 hardening story before broader driver contract work. Pull-request CI now runs tests with coverage for `coffee_roaster_mcp`, writes an easy-to-read GitHub Actions Markdown summary, and uploads an `html-coverage-report` artifact without adding an external hosted coverage service.
 - `E3-S1` defines the broader `RoasterDriver` contract without changing MCP tool semantics. Drivers now expose connection lifecycle, normalized state reads, heat and fan controls, drop, cooling, driver-owned emergency stop, and static capabilities for ranges, supported actions, sensor units, and command-streaming requirements. The current mock driver implements this contract while preserving E2 emergency-stop fail-closed behavior.
 - `E3-S2` keeps the mock driver deterministic and local-only by advancing a fixed one-second thermal sample on `read_state`. Mock heat raises environment temperature, fan and cooling reduce it, bean temperature follows environment temperature with lag, and control commands return the current state without advancing telemetry. This preserves the current one-session MCP/store semantics while giving later stories a stable driver telemetry source.
+- `E3-S3` hardens `RoasterState` as the normalized driver-boundary model. State construction now validates non-empty driver ids, exact boolean connection/cooling flags, finite Celsius temperatures, heat and fan control percentages, and flat raw-vendor diagnostic payloads.
 - The old `coffee-roasting` prototype was checked as a behavioral reference for E3-S1. It confirmed the need to model Hottop command streaming, temperature-unit normalization, compound drop/cooling behavior, and cleanup through driver lifecycle methods. Drum control remains an internal driver concern for now because E3-S1 and issue #23 do not require a public drum command.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
@@ -155,7 +156,7 @@ Goal: support multiple roasters behind one driver contract while preserving curr
 - [x] `E3-S2` Implement mock driver.
   - Done when the mock driver supports deterministic telemetry and passes contract tests.
 
-- [ ] `E3-S3` Implement normalized roaster state model.
+- [x] `E3-S3` Implement normalized roaster state model.
   - Done when driver state includes bean temp C, env temp C, heat %, fan %, cooling on/off, connected, and raw vendor data.
 
 - [ ] `E3-S4` Implement Hottop serial connection lifecycle.
@@ -517,4 +518,13 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest`: 82 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed after applying `ruff format`.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E3-S3:
+  - Hardened `RoasterState` with construction-time validation for normalized driver-boundary state.
+  - State validation now rejects empty driver ids, non-boolean connection and cooling flags, non-finite or non-numeric Celsius temperatures, invalid heat and fan percentages, and nested or non-string-key raw vendor diagnostics.
+  - Kept the existing `RoasterDriver` contract and mock-driver control behavior unchanged; this story only tightened normalized state model invariants.
+  - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 34 passed.
+  - Ran `./.venv/bin/python -m pytest`: 97 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
