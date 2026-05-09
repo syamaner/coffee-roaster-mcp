@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
+from coffee_roaster_mcp.controls import validate_control_percent
 from coffee_roaster_mcp.session import EventPayloadValue
 
 ReportedTemperatureUnit = Literal["celsius", "unknown"]
@@ -79,6 +80,17 @@ class CommandStreaming:
 
     required: bool
     interval_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        """Validate streaming settings are internally consistent."""
+        if self.required and self.interval_seconds is None:
+            raise ValueError("interval_seconds is required when command streaming is required.")
+        if not self.required and self.interval_seconds is not None:
+            raise ValueError(
+                "interval_seconds must be None when command streaming is not required."
+            )
+        if self.interval_seconds is not None and self.interval_seconds <= 0:
+            raise ValueError("interval_seconds must be greater than 0.")
 
 
 @dataclass(frozen=True)
@@ -264,7 +276,7 @@ class MockRoasterDriver:
 
     def set_heat(self, *, heat_level_percent: int) -> RoasterState:
         """Set mock heat and return normalized state."""
-        self._heat_level_percent = _validate_control_percent(
+        self._heat_level_percent = validate_control_percent(
             heat_level_percent,
             label="heat_level_percent",
         )
@@ -272,7 +284,7 @@ class MockRoasterDriver:
 
     def set_fan(self, *, fan_level_percent: int) -> RoasterState:
         """Set mock fan and return normalized state."""
-        self._fan_level_percent = _validate_control_percent(
+        self._fan_level_percent = validate_control_percent(
             fan_level_percent,
             label="fan_level_percent",
         )
@@ -331,12 +343,3 @@ def create_roaster_driver(driver_name: str) -> RoasterDriver:
 def create_roaster_safety_driver(driver_name: str) -> RoasterDriver:
     """Create the configured roaster driver for E2 compatibility."""
     return create_roaster_driver(driver_name)
-
-
-def _validate_control_percent(value: object, *, label: str) -> int:
-    """Validate one percentage control input."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"{label} must be an integer between 0 and 100.")
-    if not 0 <= value <= 100:
-        raise ValueError(f"{label} must be between 0 and 100.")
-    return value

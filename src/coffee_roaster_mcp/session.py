@@ -12,6 +12,8 @@ from threading import RLock
 from typing import Literal
 from uuid import uuid4
 
+from coffee_roaster_mcp.controls import validate_control_percent
+
 RoastPhase = Literal[
     "pre_roast",
     "roasting",
@@ -450,7 +452,7 @@ class RoastSessionStore:
         """Set the latest in-memory heat value for one active session."""
         with self._lock:
             self._assert_latest_active_session(session)
-            validated_heat = _validate_control_percent(
+            validated_heat = validate_control_percent(
                 heat_level_percent,
                 label="heat_level_percent",
             )
@@ -479,7 +481,7 @@ class RoastSessionStore:
         """Set the latest in-memory fan value for one active session."""
         with self._lock:
             self._assert_latest_active_session(session)
-            session.fan_level_percent = _validate_control_percent(
+            session.fan_level_percent = validate_control_percent(
                 fan_level_percent,
                 label="fan_level_percent",
             )
@@ -924,12 +926,3 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         stopped_at_utc=session.stopped_at_utc,
         monotonic_stop=session.monotonic_stop,
     )
-
-
-def _validate_control_percent(value: object, *, label: str) -> int:
-    """Validate one percentage-like control input."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"{label} must be an integer between 0 and 100.")
-    if not 0 <= value <= 100:
-        raise ValueError(f"{label} must be between 0 and 100.")
-    return value

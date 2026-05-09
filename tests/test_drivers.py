@@ -3,6 +3,7 @@
 import pytest
 
 from coffee_roaster_mcp.drivers import (
+    CommandStreaming,
     MockRoasterDriver,
     RoasterDriver,
     create_roaster_driver,
@@ -82,6 +83,31 @@ def test_create_roaster_driver_rejects_unsupported_driver() -> None:
 
 def test_mock_driver_satisfies_roaster_driver_contract() -> None:
     _assert_roaster_driver_contract(MockRoasterDriver())
+
+
+def test_command_streaming_allows_required_positive_interval() -> None:
+    streaming = CommandStreaming(required=True, interval_seconds=0.3)
+
+    assert streaming.required is True
+    assert streaming.interval_seconds == 0.3
+
+
+@pytest.mark.parametrize(
+    ("required", "interval_seconds", "match"),
+    [
+        (True, None, "required when command streaming is required"),
+        (True, 0.0, "greater than 0"),
+        (True, -0.1, "greater than 0"),
+        (False, 0.3, "must be None"),
+    ],
+)
+def test_command_streaming_rejects_inconsistent_values(
+    required: bool,
+    interval_seconds: float | None,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        CommandStreaming(required=required, interval_seconds=interval_seconds)
 
 
 @pytest.mark.parametrize(
