@@ -1,4 +1,4 @@
-"""Roaster driver safety behavior coverage."""
+"""Roaster driver contract, capability, and safety behavior coverage."""
 
 import pytest
 

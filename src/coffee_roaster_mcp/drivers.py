@@ -7,7 +7,7 @@ from typing import Literal, Protocol
 
 from coffee_roaster_mcp.session import EventPayloadValue
 
-TemperatureUnit = Literal["celsius", "fahrenheit", "unknown"]
+ReportedTemperatureUnit = Literal["celsius", "unknown"]
 
 
 def _raw_vendor_data_default() -> dict[str, EventPayloadValue]:
@@ -53,15 +53,19 @@ class SupportedActions:
 
 @dataclass(frozen=True)
 class SensorUnits:
-    """Temperature units reported by one roaster driver.
+    """Temperature units emitted by normalized driver state.
+
+    Raw hardware may report Celsius or Fahrenheit, but `RoasterState`
+    temperature fields are normalized to Celsius before crossing the driver
+    boundary. `unknown` is reserved for drivers that cannot provide a sensor.
 
     Attributes:
         bean_temperature: Unit for normalized bean temperature readings.
         environment_temperature: Unit for normalized environment temperature readings.
     """
 
-    bean_temperature: TemperatureUnit
-    environment_temperature: TemperatureUnit
+    bean_temperature: ReportedTemperatureUnit
+    environment_temperature: ReportedTemperatureUnit
 
 
 @dataclass(frozen=True)
