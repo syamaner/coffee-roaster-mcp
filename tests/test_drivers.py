@@ -1,6 +1,7 @@
 """Roaster driver contract, capability, and safety behavior coverage."""
 
 import time
+from threading import Event
 from typing import cast
 
 import pytest
@@ -11,6 +12,7 @@ from coffee_roaster_mcp.drivers import (
     MockRoasterDriver,
     RoasterDriver,
     RoasterState,
+    SerialTransportFactory,
     create_roaster_driver,
     create_roaster_safety_driver,
 )
@@ -38,6 +40,34 @@ class FakeSerialFactory:
     def __call__(self, *args: object, **kwargs: object) -> FakeSerialTransport:
         self.calls.append((args, kwargs))
         return self.transport
+
+
+class StuckHottopRoasterDriver(HottopRoasterDriver):
+    """Hottop test driver with a command loop that ignores stop signals."""
+
+    def __init__(
+        self,
+        *,
+        port: str,
+        command_interval_seconds: float,
+        join_timeout_seconds: float,
+        serial_factory: SerialTransportFactory,
+    ) -> None:
+        super().__init__(
+            port=port,
+            command_interval_seconds=command_interval_seconds,
+            join_timeout_seconds=join_timeout_seconds,
+            serial_factory=serial_factory,
+        )
+        self._release_command_loop = Event()
+
+    def release_command_loop(self) -> None:
+        """Allow the test command loop to exit."""
+        self._release_command_loop.set()
+
+    def _command_loop(self) -> None:
+        """Keep running so disconnect timeout handling can be tested."""
+        self._release_command_loop.wait()
 
 
 def _assert_roaster_driver_contract(driver: RoasterDriver) -> None:
@@ -152,11 +182,21 @@ def test_hottop_driver_capabilities_require_command_streaming() -> None:
     assert capabilities.driver == "hottop_kn8828b_2k_plus"
     assert capabilities.command_streaming.required is True
     assert capabilities.command_streaming.interval_seconds == 0.05
-    assert capabilities.actions.heat_control is True
-    assert capabilities.actions.fan_control is True
-    assert capabilities.actions.bean_drop is True
-    assert capabilities.actions.cooling_control is True
-    assert capabilities.actions.emergency_stop is True
+    assert capabilities.actions.heat_control is False
+    assert capabilities.actions.fan_control is False
+    assert capabilities.actions.bean_drop is False
+    assert capabilities.actions.cooling_control is False
+    assert capabilities.actions.emergency_stop is False
+
+
+def test_hottop_driver_connect_requires_explicit_port() -> None:
+    serial_factory = FakeSerialFactory()
+    driver = HottopRoasterDriver(serial_factory=serial_factory)
+
+    with pytest.raises(ValueError, match="serial port"):
+        driver.connect()
+
+    assert serial_factory.calls == []
 
 
 def test_hottop_driver_connect_opens_serial_and_starts_command_loop() -> None:
@@ -224,6 +264,49 @@ def test_hottop_driver_disconnect_is_idempotent() -> None:
     driver.disconnect()
 
     assert serial_factory.transport.close_calls == 1
+
+
+def test_hottop_driver_disconnect_closes_serial_when_command_loop_times_out() -> None:
+    serial_factory = FakeSerialFactory()
+    driver = StuckHottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        join_timeout_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+    driver.connect()
+
+    try:
+        with pytest.raises(RuntimeError, match="did not stop"):
+            driver.disconnect()
+
+        assert serial_factory.transport.is_open is False
+        assert serial_factory.transport.close_calls == 1
+    finally:
+        driver.release_command_loop()
+        driver.disconnect()
+
+
+def test_hottop_driver_blocks_reconnect_while_previous_loop_is_running() -> None:
+    serial_factory = FakeSerialFactory()
+    driver = StuckHottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        join_timeout_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+    driver.connect()
+    try:
+        with pytest.raises(RuntimeError, match="did not stop"):
+            driver.disconnect()
+
+        with pytest.raises(RuntimeError, match="still stopping"):
+            driver.connect()
+
+        assert len(serial_factory.calls) == 1
+    finally:
+        driver.release_command_loop()
+        driver.disconnect()
 
 
 def _wait_for_command_loop_iteration(driver: HottopRoasterDriver) -> None:

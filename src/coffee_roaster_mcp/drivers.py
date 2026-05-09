@@ -461,7 +461,7 @@ class HottopRoasterDriver:
             raise ValueError("command_interval_seconds must be greater than 0.")
         if join_timeout_seconds <= 0:
             raise ValueError("join_timeout_seconds must be greater than 0.")
-        self._port = port or "/dev/tty.usbserial-DN016OJ3"
+        self._port = port
         self._baudrate = baudrate
         self._command_interval_seconds = command_interval_seconds
         self._serial_factory = serial_factory or _create_pyserial_transport
@@ -470,6 +470,7 @@ class HottopRoasterDriver:
         self._connected = False
         self._stop_event = Event()
         self._command_thread: Thread | None = None
+        self._lifecycle_lock = Lock()
         self._state_lock = Lock()
         self._command_loop_iterations = 0
 
@@ -481,11 +482,11 @@ class HottopRoasterDriver:
             heat=ControlRange(minimum=0, maximum=100, step=1),
             fan=ControlRange(minimum=0, maximum=100, step=1),
             actions=SupportedActions(
-                heat_control=True,
-                fan_control=True,
-                bean_drop=True,
-                cooling_control=True,
-                emergency_stop=True,
+                heat_control=False,
+                fan_control=False,
+                bean_drop=False,
+                cooling_control=False,
+                emergency_stop=False,
             ),
             sensor_units=SensorUnits(
                 bean_temperature="celsius",
@@ -499,9 +500,13 @@ class HottopRoasterDriver:
 
     def connect(self) -> None:
         """Open serial transport and start the Hottop command-loop lifecycle."""
-        with self._state_lock:
+        with self._lifecycle_lock, self._state_lock:
             if self._connected:
                 return
+            if self._command_thread is not None and self._command_thread.is_alive():
+                raise RuntimeError("Previous Hottop command loop is still stopping.")
+            if self._port is None:
+                raise ValueError("Hottop serial port is required before connect.")
             self._serial = self._serial_factory(
                 self._port,
                 baudrate=self._baudrate,
@@ -521,22 +526,29 @@ class HottopRoasterDriver:
 
     def disconnect(self) -> None:
         """Stop command loop and close serial transport."""
-        command_thread: Thread | None
-        serial_transport: SerialTransport | None
-        with self._state_lock:
-            self._connected = False
-            self._stop_event.set()
-            command_thread = self._command_thread
-            serial_transport = self._serial
-            self._command_thread = None
-            self._serial = None
+        with self._lifecycle_lock:
+            command_thread: Thread | None
+            serial_transport: SerialTransport | None
+            with self._state_lock:
+                self._connected = False
+                self._stop_event.set()
+                command_thread = self._command_thread
+                serial_transport = self._serial
 
-        if command_thread is not None and command_thread.is_alive():
-            command_thread.join(timeout=self._join_timeout_seconds)
-        if command_thread is not None and command_thread.is_alive():
-            raise RuntimeError("Hottop command loop did not stop during disconnect.")
-        if serial_transport is not None and serial_transport.is_open:
-            serial_transport.close()
+            if command_thread is not None and command_thread.is_alive():
+                command_thread.join(timeout=self._join_timeout_seconds)
+            command_loop_still_running = command_thread is not None and command_thread.is_alive()
+
+            if serial_transport is not None and serial_transport.is_open:
+                serial_transport.close()
+
+            with self._state_lock:
+                if not command_loop_still_running:
+                    self._command_thread = None
+                self._serial = None
+
+            if command_loop_still_running:
+                raise RuntimeError("Hottop command loop did not stop during disconnect.")
 
     def read_state(self) -> RoasterState:
         """Return the current normalized Hottop lifecycle state."""
@@ -658,11 +670,20 @@ def _create_pyserial_transport(*args: object, **kwargs: object) -> SerialTranspo
     return cast(SerialTransport, transport)
 
 
-def create_roaster_driver(driver_name: str) -> RoasterDriver:
+def create_roaster_driver(
+    driver_name: str,
+    *,
+    port: str | None = None,
+    baudrate: int = 115_200,
+    command_interval_seconds: float = 0.3,
+) -> RoasterDriver:
     """Create the configured roaster driver.
 
     Args:
         driver_name: Roaster driver name from configuration.
+        port: Optional roaster serial port.
+        baudrate: Configured roaster baudrate.
+        command_interval_seconds: Configured command interval.
 
     Returns:
         Driver adapter for the configured driver.
@@ -673,7 +694,11 @@ def create_roaster_driver(driver_name: str) -> RoasterDriver:
     if driver_name == "mock":
         return MockRoasterDriver()
     if driver_name == HOTTOP_DRIVER_NAME:
-        return HottopRoasterDriver()
+        return HottopRoasterDriver(
+            port=port,
+            baudrate=baudrate,
+            command_interval_seconds=command_interval_seconds,
+        )
     raise ValueError(
         f"Roaster driver {driver_name!r} is not implemented in this bootstrap runtime."
     )
