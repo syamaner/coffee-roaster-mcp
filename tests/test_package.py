@@ -417,6 +417,30 @@ def test_build_server_context_wraps_unknown_driver_as_config_error(tmp_path: Pat
         build_server_context(config_path=config_path)
 
 
+def test_build_server_context_passes_hottop_serial_config_to_driver(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "roaster:",
+                "  driver: hottop_kn8828b_2k_plus",
+                "  port: /dev/test-hottop",
+                "  baudrate: 57600",
+                "  command_interval_seconds: 0.2",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    server_context = build_server_context(config_path=config_path)
+    driver_state = server_context.roaster_driver.read_state()
+
+    assert driver_state.driver == "hottop_kn8828b_2k_plus"
+    assert driver_state.raw_vendor_data["port"] == "/dev/test-hottop"
+    assert driver_state.raw_vendor_data["baudrate"] == 57_600
+    assert driver_state.raw_vendor_data["command_interval_seconds"] == 0.2
+
+
 def test_driver_emergency_stop_failure_returns_fail_closed_payload() -> None:
     server_context = build_server_context()
     object.__setattr__(server_context, "roaster_driver", _FailingSafetyDriver())

@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from importlib import import_module
 from math import isfinite
+from threading import Event, Lock, Thread
 from typing import Literal, Protocol, cast
 
 from coffee_roaster_mcp.controls import validate_control_percent
 from coffee_roaster_mcp.session import EventPayloadValue
 
 ReportedTemperatureUnit = Literal["celsius", "unknown"]
+HOTTOP_DRIVER_NAME = "hottop_kn8828b_2k_plus"
 
 
 def _raw_vendor_data_default() -> dict[str, EventPayloadValue]:
@@ -257,6 +261,22 @@ class RoasterDriver(Protocol):
 RoasterSafetyDriver = RoasterDriver
 
 
+class SerialTransport(Protocol):
+    """Minimal serial transport surface used by the Hottop lifecycle."""
+
+    @property
+    def is_open(self) -> bool:
+        """Return whether the serial transport is open."""
+        ...
+
+    def close(self) -> None:
+        """Close the serial transport."""
+        ...
+
+
+SerialTransportFactory = Callable[..., SerialTransport]
+
+
 class MockRoasterDriver:
     """Mock roaster driver with deterministic local-only telemetry and controls."""
 
@@ -409,6 +429,201 @@ class MockRoasterDriver:
         return (heat_effect - fan_effect - cooling_effect) * self._SAMPLE_INTERVAL_SECONDS
 
 
+class HottopRoasterDriver:
+    """Hottop KN-8828B-2K+ driver lifecycle skeleton.
+
+    This story intentionally implements only connection ownership and command
+    loop cleanup. Packet construction, status parsing, and hardware commands
+    land in later Epic 3 stories.
+    """
+
+    name = HOTTOP_DRIVER_NAME
+
+    def __init__(
+        self,
+        *,
+        port: str | None = None,
+        baudrate: int = 115_200,
+        command_interval_seconds: float = 0.3,
+        serial_factory: SerialTransportFactory | None = None,
+        join_timeout_seconds: float = 1.0,
+        command_loop_iteration_hook: Callable[[], None] | None = None,
+    ) -> None:
+        """Initialize Hottop lifecycle dependencies.
+
+        Args:
+            port: Serial port path for the Hottop controller.
+            baudrate: Serial baudrate.
+            command_interval_seconds: Command-loop cadence.
+            serial_factory: Optional injectable serial transport factory for tests.
+            join_timeout_seconds: Maximum disconnect wait for command-loop cleanup.
+            command_loop_iteration_hook: Optional hook called after a loop iteration.
+        """
+        if command_interval_seconds <= 0:
+            raise ValueError("command_interval_seconds must be greater than 0.")
+        if join_timeout_seconds <= 0:
+            raise ValueError("join_timeout_seconds must be greater than 0.")
+        self._port = port
+        self._baudrate = baudrate
+        self._command_interval_seconds = command_interval_seconds
+        self._serial_factory = serial_factory or _create_pyserial_transport
+        self._join_timeout_seconds = join_timeout_seconds
+        self._serial: SerialTransport | None = None
+        self._connected = False
+        self._stop_event = Event()
+        self._command_thread: Thread | None = None
+        self._lifecycle_lock = Lock()
+        self._state_lock = Lock()
+        self._command_loop_iterations = 0
+        self._command_loop_iteration_hook = command_loop_iteration_hook
+
+    @property
+    def capabilities(self) -> RoasterCapabilities:
+        """Return static Hottop capabilities for lifecycle validation."""
+        return RoasterCapabilities(
+            driver=self.name,
+            heat=ControlRange(minimum=0, maximum=100, step=1),
+            fan=ControlRange(minimum=0, maximum=100, step=1),
+            actions=SupportedActions(
+                heat_control=False,
+                fan_control=False,
+                bean_drop=False,
+                cooling_control=False,
+                emergency_stop=False,
+            ),
+            sensor_units=SensorUnits(
+                bean_temperature="celsius",
+                environment_temperature="celsius",
+            ),
+            command_streaming=CommandStreaming(
+                required=True,
+                interval_seconds=self._command_interval_seconds,
+            ),
+        )
+
+    def connect(self) -> None:
+        """Open serial transport and start the Hottop command-loop lifecycle."""
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if self._connected:
+                    return
+                if self._command_thread is not None and self._command_thread.is_alive():
+                    raise RuntimeError("Previous Hottop command loop is still stopping.")
+                if self._port is None:
+                    raise ValueError("Hottop serial port is required before connect.")
+                port = self._port
+
+            serial_transport = self._serial_factory(
+                port,
+                baudrate=self._baudrate,
+                bytesize=8,
+                parity="N",
+                stopbits=1,
+                timeout=0.5,
+            )
+
+            with self._state_lock:
+                self._serial = serial_transport
+                self._connected = True
+                self._stop_event.clear()
+                self._command_thread = Thread(
+                    target=self._command_loop,
+                    daemon=True,
+                    name="HottopCommandLoop",
+                )
+                self._command_thread.start()
+
+    def disconnect(self) -> None:
+        """Stop command loop and close serial transport."""
+        with self._lifecycle_lock:
+            command_thread: Thread | None
+            serial_transport: SerialTransport | None
+            with self._state_lock:
+                self._connected = False
+                self._stop_event.set()
+                command_thread = self._command_thread
+                serial_transport = self._serial
+
+            if command_thread is not None and command_thread.is_alive():
+                command_thread.join(timeout=self._join_timeout_seconds)
+            command_loop_still_running = command_thread is not None and command_thread.is_alive()
+
+            if serial_transport is not None and serial_transport.is_open:
+                serial_transport.close()
+
+            with self._state_lock:
+                if not command_loop_still_running:
+                    self._command_thread = None
+                self._serial = None
+
+            if command_loop_still_running:
+                raise RuntimeError("Hottop command loop did not stop during disconnect.")
+
+    def read_state(self) -> RoasterState:
+        """Return the current normalized Hottop lifecycle state."""
+        with self._state_lock:
+            command_loop_running = (
+                self._command_thread is not None and self._command_thread.is_alive()
+            )
+            return RoasterState(
+                driver=self.name,
+                connected=self._connected,
+                bean_temp_c=None,
+                env_temp_c=None,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+                raw_vendor_data={
+                    "port": self._port,
+                    "baudrate": self._baudrate,
+                    "command_interval_seconds": self._command_interval_seconds,
+                    "command_loop_running": command_loop_running,
+                    "command_loop_iterations": self._command_loop_iterations,
+                },
+            )
+
+    def set_heat(self, *, heat_level_percent: int) -> RoasterState:
+        """Reject Hottop heat control until packet commands land."""
+        validate_control_percent(heat_level_percent, label="heat_level_percent")
+        raise NotImplementedError("Hottop heat control lands in E3-S7.")
+
+    def set_fan(self, *, fan_level_percent: int) -> RoasterState:
+        """Reject Hottop fan control until packet commands land."""
+        validate_control_percent(fan_level_percent, label="fan_level_percent")
+        raise NotImplementedError("Hottop fan control lands in E3-S7.")
+
+    def drop_beans(self) -> RoasterState:
+        """Reject Hottop bean drop until packet commands land."""
+        raise NotImplementedError("Hottop bean drop lands in E3-S7.")
+
+    def start_cooling(self) -> RoasterState:
+        """Reject Hottop cooling control until packet commands land."""
+        raise NotImplementedError("Hottop cooling control lands in E3-S7.")
+
+    def stop_cooling(self) -> RoasterState:
+        """Reject Hottop cooling control until packet commands land."""
+        raise NotImplementedError("Hottop cooling control lands in E3-S7.")
+
+    def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
+        """Return safe Hottop emergency-stop payload until packet commands land."""
+        _ = reason
+        return EmergencyStopResult(
+            driver=self.name,
+            safety_method="emergency_stop_not_yet_hardware_commanded",
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
+        )
+
+    def _command_loop(self) -> None:
+        """Run the lifecycle loop until disconnect requests shutdown."""
+        while not self._stop_event.wait(self._command_interval_seconds):
+            with self._state_lock:
+                self._command_loop_iterations += 1
+            if self._command_loop_iteration_hook is not None:
+                self._command_loop_iteration_hook()
+
+
 def _clamp_float(value: float, *, minimum: float, maximum: float) -> float:
     """Clamp a float and keep telemetry output stable at one decimal place."""
     return round(max(minimum, min(maximum, value)), 1)
@@ -458,11 +673,28 @@ def _validate_raw_vendor_data(
     return copied
 
 
-def create_roaster_driver(driver_name: str) -> RoasterDriver:
+def _create_pyserial_transport(*args: object, **kwargs: object) -> SerialTransport:
+    """Create a pyserial transport lazily for the Hottop driver."""
+    serial_module = import_module("serial")
+    serial_class = serial_module.Serial
+    transport = serial_class(*args, **kwargs)
+    return cast(SerialTransport, transport)
+
+
+def create_roaster_driver(
+    driver_name: str,
+    *,
+    port: str | None = None,
+    baudrate: int = 115_200,
+    command_interval_seconds: float = 0.3,
+) -> RoasterDriver:
     """Create the configured roaster driver.
 
     Args:
         driver_name: Roaster driver name from configuration.
+        port: Optional roaster serial port.
+        baudrate: Configured roaster baudrate.
+        command_interval_seconds: Configured command interval.
 
     Returns:
         Driver adapter for the configured driver.
@@ -472,6 +704,12 @@ def create_roaster_driver(driver_name: str) -> RoasterDriver:
     """
     if driver_name == "mock":
         return MockRoasterDriver()
+    if driver_name == HOTTOP_DRIVER_NAME:
+        return HottopRoasterDriver(
+            port=port,
+            baudrate=baudrate,
+            command_interval_seconds=command_interval_seconds,
+        )
     raise ValueError(
         f"Roaster driver {driver_name!r} is not implemented in this bootstrap runtime."
     )

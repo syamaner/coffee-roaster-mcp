@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E3-S4`
-- Current target: Implement Hottop serial connection lifecycle
+- Active story: `E3-S5`
+- Current target: Implement Hottop command loop
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -42,6 +42,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E3-S1` defines the broader `RoasterDriver` contract without changing MCP tool semantics. Drivers now expose connection lifecycle, normalized state reads, heat and fan controls, drop, cooling, driver-owned emergency stop, and static capabilities for ranges, supported actions, sensor units, and command-streaming requirements. The current mock driver implements this contract while preserving E2 emergency-stop fail-closed behavior.
 - `E3-S2` keeps the mock driver deterministic and local-only by advancing a fixed one-second thermal sample on `read_state`. Mock heat raises environment temperature, fan and cooling reduce it, bean temperature follows environment temperature with lag, and control commands return the current state without advancing telemetry. This preserves the current one-session MCP/store semantics while giving later stories a stable driver telemetry source.
 - `E3-S3` hardens `RoasterState` as the normalized driver-boundary model. State construction now validates non-empty driver ids, exact boolean connection/cooling flags, finite Celsius temperatures, heat and fan control percentages, and flat raw-vendor diagnostic payloads.
+- `E3-S4` adds the first Hottop driver lifecycle slice. The driver can be constructed for `hottop_kn8828b_2k_plus`, requires an explicit serial port before connect, opens serial transport lazily through pyserial without holding the state-read lock, starts a command-loop lifecycle thread on connect, and disconnects by signalling the loop, joining it, closing serial transport, and clearing runtime references. Review hardening keeps Hottop capabilities accurate while controls are not implemented, passes configured port/baudrate/command interval into the driver, closes serial even when join times out, blocks reconnect while a prior command loop is still alive, and uses deterministic test synchronization for loop iteration tests. Packet sending and hardware commands remain later Epic 3 stories.
 - The old `coffee-roasting` prototype was checked as a behavioral reference for E3-S1. It confirmed the need to model Hottop command streaming, temperature-unit normalization, compound drop/cooling behavior, and cleanup through driver lifecycle methods. Drum control remains an internal driver concern for now because E3-S1 and issue #23 do not require a public drum command.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
@@ -159,7 +160,7 @@ Goal: support multiple roasters behind one driver contract while preserving curr
 - [x] `E3-S3` Implement normalized roaster state model.
   - Done when driver state includes bean temp C, env temp C, heat %, fan %, cooling on/off, connected, and raw vendor data.
 
-- [ ] `E3-S4` Implement Hottop serial connection lifecycle.
+- [x] `E3-S4` Implement Hottop serial connection lifecycle.
   - Done when the Hottop driver can connect, disconnect, and clean up without leaving command loops running.
 
 - [ ] `E3-S5` Implement Hottop command loop.
@@ -525,6 +526,17 @@ After completing a story:
   - Kept the existing `RoasterDriver` contract and mock-driver control behavior unchanged; this story only tightened normalized state model invariants.
   - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 34 passed.
   - Ran `./.venv/bin/python -m pytest`: 97 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E3-S4:
+  - Added `HottopRoasterDriver` for `hottop_kn8828b_2k_plus` with lazy pyserial transport creation, command-loop thread startup, lifecycle state reporting, idempotent disconnect, thread join, serial close, and runtime reference cleanup.
+  - Added `pyserial>=3.5` as a declared runtime dependency because the Hottop lifecycle now owns serial transport creation.
+  - Kept packet construction, status parsing, and Hottop heat/fan/drop/cooling command behavior out of scope for later Epic 3 stories.
+  - Checked the old `coffee-roasting` Hottop prototype as a behavioral reference for connect, command-loop startup, disconnect, thread join, and serial close cleanup, but kept this implementation test-injectable and scoped to lifecycle only.
+  - Review hardening corrected Hottop capability flags for not-yet-implemented controls, threaded configured port/baudrate/command interval through `build_server_context`, removed the host-specific default port, guaranteed serial close on join timeout, blocked reconnect until a previous command loop is fully stopped, moved slow serial open out from under `_state_lock`, and replaced timing-based loop tests with event-based synchronization.
+  - Ran `./.venv/bin/python -m pytest tests/test_drivers.py tests/test_package.py`: 57 passed.
+  - Ran `./.venv/bin/python -m pytest`: 107 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

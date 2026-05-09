@@ -206,7 +206,12 @@ def build_server_context(
     """
     config = load_config(path=config_path)
     try:
-        roaster_driver = create_roaster_driver(config.roaster.driver)
+        roaster_driver = create_roaster_driver(
+            config.roaster.driver,
+            port=config.roaster.port,
+            baudrate=config.roaster.baudrate,
+            command_interval_seconds=config.roaster.command_interval_seconds,
+        )
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     return ServerContext(
