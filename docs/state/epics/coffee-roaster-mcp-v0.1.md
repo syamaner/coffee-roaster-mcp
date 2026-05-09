@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E3-S1`
-- Current target: Define the broader roaster driver interface and capabilities model
+- Active story: `E3-S2`
+- Current target: Implement the mock driver against the broader driver contract
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -39,6 +39,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E2-S6` keeps `RoastSessionStore` as the one-session mutation boundary but moves emergency-stop safety behavior behind the configured driver boundary. The current mock driver fail-closes heat to `0`, fan to `100`, and cooling to `on`; the store records the resulting fault event and stops the session, and MCP responses expose the fault payload plus final session state.
 - `E2-S7` completes the first one-process mock vertical slice. `export_roast_log` now writes snapshot JSONL, CSV, and summary files from the current session state, and `get_roast_state` exposes minimal timestamp-derived roast and development metrics. Append-only telemetry writers and final export schemas remain Epic 5 work.
 - `E2-S8` completed the final Epic 2 hardening story before broader driver contract work. Pull-request CI now runs tests with coverage for `coffee_roaster_mcp`, writes an easy-to-read GitHub Actions Markdown summary, and uploads an `html-coverage-report` artifact without adding an external hosted coverage service.
+- `E3-S1` defines the broader `RoasterDriver` contract without changing MCP tool semantics. Drivers now expose connection lifecycle, normalized state reads, heat and fan controls, drop, cooling, driver-owned emergency stop, and static capabilities for ranges, supported actions, sensor units, and command-streaming requirements. The current mock driver implements this contract while preserving E2 emergency-stop fail-closed behavior.
+- The old `coffee-roasting` prototype was checked as a behavioral reference for E3-S1. It confirmed the need to model Hottop command streaming, temperature-unit normalization, compound drop/cooling behavior, and cleanup through driver lifecycle methods. Drum control remains an internal driver concern for now because E3-S1 and issue #23 do not require a public drum command.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
 - The `coffee-first-crack-detection` repo remains the source of truth for training, ONNX export, Hugging Face sync, model cards, and dataset cards.
@@ -146,7 +148,7 @@ Goal: support multiple roasters behind one driver contract while preserving curr
 
 ### Stories
 
-- [ ] `E3-S1` Define `RoasterDriver` interface and capabilities model.
+- [x] `E3-S1` Define `RoasterDriver` interface and capabilities model.
   - Done when drivers expose connection lifecycle, read state, heat/fan control, drop, cooling, emergency stop, and capabilities.
 
 - [ ] `E3-S2` Implement mock driver.
@@ -493,4 +495,15 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest`: 65 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed after applying `ruff format`.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E3-S1:
+  - Replaced the E2 safety-only driver shape with a typed `RoasterDriver` protocol covering connection lifecycle, state reads, heat and fan control, bean drop, cooling control, emergency stop, and capabilities.
+  - Added capability models for control ranges, supported actions, sensor units, and command-streaming requirements, plus a normalized `RoasterState` return type.
+  - Extended `MockRoasterDriver` to satisfy the full contract while preserving the existing emergency-stop event payload and fail-closed heat `0`, fan `100`, cooling `on` behavior.
+  - Kept normal MCP heat, fan, drop, and cooling semantics on the existing one-session store boundary; only the server's configured driver type and factory moved to the broader contract.
+  - Checked the old `coffee-roasting` prototype as a behavioral reference and kept drum motor behavior internal to future Hottop driver implementation rather than adding it to the public E3-S1 contract.
+  - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 11 passed.
+  - Ran `./.venv/bin/python -m pytest`: 74 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
