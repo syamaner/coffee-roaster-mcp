@@ -46,6 +46,7 @@ Context usage notes:
 - Context was spent on repeated branch hygiene from merged PRs, durable state reads, GitHub issue reads, implementation, validation, PR creation, and post-review fixes.
 - E3-S2 and E3-S3 had no PR review comments to address after CI passed.
 - E3-S4 consumed the most context because it included both Copilot and Codex review threads, thread-aware review fetching, review classification, targeted fixes, expanded regression tests, PR body updates, durable state refreshes, and CI rechecks.
+- E3-S4 had a second Copilot review round after the first hardening pass. That added two targeted fixes and another validation/push cycle.
 - The old `coffee-roasting` prototype was used only as a behavioral reference. It informed Hottop lifecycle cleanup and command-loop concerns, not architecture.
 
 ## Story Outcomes
@@ -140,12 +141,14 @@ Review-hardened implementation:
 - Hottop connect now requires an explicit serial port instead of using a host-specific default.
 - Disconnect closes serial transport even if the command-loop join times out.
 - Reconnect is blocked while a previous command loop is still alive.
+- Serial open now happens outside `_state_lock` so slow OS/device open does not block `read_state()`.
+- Command-loop tests now use deterministic event synchronization instead of wall-clock polling.
 - Durable state and PR body were updated to reflect the review-hardened behavior and validation counts.
 
 Validation after review fixes:
 
-- `./.venv/bin/python -m pytest tests/test_drivers.py tests/test_package.py`: 56 passed
-- `./.venv/bin/python -m pytest`: 106 passed
+- `./.venv/bin/python -m pytest tests/test_drivers.py tests/test_package.py`: 57 passed
+- `./.venv/bin/python -m pytest`: 107 passed
 - `./.venv/bin/python -m ruff check .`: passed
 - `./.venv/bin/python -m ruff format --check .`: passed
 - `./.venv/bin/python -m pyright`: 0 errors
@@ -194,6 +197,8 @@ Copilot found several contract and configuration correctness issues:
 - The tests asserted those inaccurate capability flags.
 - `create_roaster_driver()` ignored configured `port`, `baudrate`, and `command_interval_seconds`.
 - The Hottop driver embedded a machine-specific default serial port.
+- Second review round: `connect()` opened serial transport while holding `_state_lock`, which could block concurrent `read_state()` calls.
+- Second review round: `_wait_for_command_loop_iteration()` used wall-clock polling and `time.sleep()`, which could be flaky under CI load.
 
 Response:
 
@@ -202,10 +207,14 @@ Response:
 - `create_roaster_driver()` accepts serial config fields and `build_server_context()` passes them from `RoasterConfig`.
 - Hottop connect now requires explicit `port`.
 - Added tests proving configured serial fields reach the Hottop driver.
+- Refactored `connect()` to perform the potentially blocking serial open under `_lifecycle_lock` but outside `_state_lock`, then publish runtime state under `_state_lock`.
+- Added a test that blocks the fake serial factory and proves `read_state()` remains responsive during serial open.
+- Added an optional command-loop iteration hook and changed the lifecycle test to wait on an `Event` instead of polling elapsed wall-clock time.
 
 Value:
 
 - High. These findings prevented contract drift and avoided confusing runtime behavior when moving from mock-safe development toward real Hottop lifecycle work.
+- The second review round was also high-value because it caught a responsiveness issue and removed a possible CI flake before E3-S5 adds real command-loop behavior.
 
 ## Review Value Summary
 
@@ -215,6 +224,7 @@ Value:
 - Copilot was strongest on capability/config contract correctness.
 - Codex was strongest on lifecycle concurrency risk.
 - Both overlapped on serial cleanup on timeout, which increased confidence that the fix was necessary.
+- The second Copilot round caught responsiveness and test-determinism concerns after the first hardening pass. These were worth fixing before the command-loop story.
 
 ## Current Handoff State
 
@@ -230,6 +240,8 @@ Latest pushed commits on PR branch:
 
 - `c670e7b` - `feat: add hottop serial lifecycle`
 - `f1070f8` - `fix: harden hottop lifecycle review issues`
+- `8a59276` - `docs: add e3 driver lifecycle session summary`
+- A follow-up review-fix commit after `8a59276` records the second Copilot review fixes and this summary refresh.
 
 Current durable state:
 

@@ -1,7 +1,6 @@
 """Roaster driver contract, capability, and safety behavior coverage."""
 
-import time
-from threading import Event
+from threading import Event, Thread
 from typing import cast
 
 import pytest
@@ -39,6 +38,21 @@ class FakeSerialFactory:
 
     def __call__(self, *args: object, **kwargs: object) -> FakeSerialTransport:
         self.calls.append((args, kwargs))
+        return self.transport
+
+
+class BlockingSerialFactory:
+    """Serial factory that blocks until the test releases it."""
+
+    def __init__(self) -> None:
+        self.transport = FakeSerialTransport()
+        self.started = Event()
+        self.release = Event()
+
+    def __call__(self, *args: object, **kwargs: object) -> FakeSerialTransport:
+        _ = args, kwargs
+        self.started.set()
+        self.release.wait(timeout=1.0)
         return self.transport
 
 
@@ -201,11 +215,13 @@ def test_hottop_driver_connect_requires_explicit_port() -> None:
 
 def test_hottop_driver_connect_opens_serial_and_starts_command_loop() -> None:
     serial_factory = FakeSerialFactory()
+    command_loop_iterated = Event()
     driver = HottopRoasterDriver(
         port="/dev/test-hottop",
         baudrate=115_200,
         command_interval_seconds=0.01,
         serial_factory=serial_factory,
+        command_loop_iteration_hook=command_loop_iterated.set,
     )
 
     driver.connect()
@@ -232,15 +248,39 @@ def test_hottop_driver_connect_opens_serial_and_starts_command_loop() -> None:
         driver.disconnect()
 
 
-def test_hottop_driver_disconnect_stops_command_loop_and_closes_serial() -> None:
-    serial_factory = FakeSerialFactory()
+def test_hottop_driver_connect_does_not_block_state_reads_during_serial_open() -> None:
+    serial_factory = BlockingSerialFactory()
     driver = HottopRoasterDriver(
         port="/dev/test-hottop",
         command_interval_seconds=0.01,
         serial_factory=serial_factory,
     )
+    connect_thread = Thread(target=driver.connect)
+
+    connect_thread.start()
+    try:
+        assert serial_factory.started.wait(timeout=1.0)
+        state = driver.read_state()
+
+        assert state.connected is False
+        assert state.raw_vendor_data["command_loop_running"] is False
+    finally:
+        serial_factory.release.set()
+        connect_thread.join(timeout=1.0)
+        driver.disconnect()
+
+
+def test_hottop_driver_disconnect_stops_command_loop_and_closes_serial() -> None:
+    serial_factory = FakeSerialFactory()
+    command_loop_iterated = Event()
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+        command_loop_iteration_hook=command_loop_iterated.set,
+    )
     driver.connect()
-    _wait_for_command_loop_iteration(driver)
+    assert command_loop_iterated.wait(timeout=1.0)
 
     driver.disconnect()
     disconnected_state = driver.read_state()
@@ -307,19 +347,6 @@ def test_hottop_driver_blocks_reconnect_while_previous_loop_is_running() -> None
     finally:
         driver.release_command_loop()
         driver.disconnect()
-
-
-def _wait_for_command_loop_iteration(driver: HottopRoasterDriver) -> None:
-    """Wait briefly for the lifecycle thread to record one loop iteration."""
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline:
-        state = driver.read_state()
-        command_loop_iterations = state.raw_vendor_data["command_loop_iterations"]
-        assert isinstance(command_loop_iterations, int)
-        if command_loop_iterations > 0:
-            return
-        time.sleep(0.01)
-    raise AssertionError("Hottop command loop did not run.")
 
 
 def test_roaster_state_normalizes_integer_temperatures_and_copies_raw_vendor_data() -> None:

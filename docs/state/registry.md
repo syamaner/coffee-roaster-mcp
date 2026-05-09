@@ -22,7 +22,7 @@
 
 RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.
 
-E3-S4 is complete. The Hottop driver now owns serial connection lifecycle with explicit serial port configuration, lazy pyserial transport creation, command-loop thread startup, idempotent disconnect, thread join, serial cleanup, and reconnect race protection covered by mocked transport tests.
+E3-S4 is complete. The Hottop driver now owns serial connection lifecycle with explicit serial port configuration, lazy pyserial transport creation outside the state-read lock, command-loop thread startup, idempotent disconnect, thread join, serial cleanup, reconnect race protection, and deterministic lifecycle tests.
 
 The next story is E3-S5: implement the Hottop command loop.
 
