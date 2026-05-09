@@ -220,17 +220,29 @@ RoasterSafetyDriver = RoasterDriver
 
 
 class MockRoasterDriver:
-    """Mock roaster driver with deterministic local-only control behavior."""
+    """Mock roaster driver with deterministic local-only telemetry and controls."""
 
     name = "mock"
+    _SAMPLE_INTERVAL_SECONDS = 1.0
+    _INITIAL_TEMP_C = 20.0
+    _MIN_TEMP_C = 15.0
+    _MAX_ENV_TEMP_C = 300.0
+    _MAX_BEAN_TEMP_C = 250.0
+    _MAX_HEAT_RATE_C_PER_SEC = 2.0
+    _MAX_FAN_COOLING_C_PER_SEC = 0.5
+    _COOLING_MODE_RATE_C_PER_SEC = 5.0
+    _BEAN_THERMAL_LAG_FACTOR = 0.1
 
     def __init__(self) -> None:
         """Initialize deterministic mock roaster state."""
         self._connected = False
+        self._bean_temp_c = self._INITIAL_TEMP_C
+        self._env_temp_c = self._INITIAL_TEMP_C
         self._heat_level_percent = 0
         self._fan_level_percent = 0
         self._cooling_on = False
         self._beans_dropped = False
+        self._sample_index = 0
 
     @property
     def capabilities(self) -> RoasterCapabilities:
@@ -263,15 +275,24 @@ class MockRoasterDriver:
 
     def read_state(self) -> RoasterState:
         """Return deterministic mock roaster state."""
+        self._advance_telemetry()
+        return self._state_snapshot()
+
+    def _state_snapshot(self) -> RoasterState:
+        """Return the current mock roaster state without advancing telemetry."""
         return RoasterState(
             driver=self.name,
             connected=self._connected,
-            bean_temp_c=None,
-            env_temp_c=None,
+            bean_temp_c=self._bean_temp_c,
+            env_temp_c=self._env_temp_c,
             heat_level_percent=self._heat_level_percent,
             fan_level_percent=self._fan_level_percent,
             cooling_on=self._cooling_on,
-            raw_vendor_data={"beans_dropped": self._beans_dropped},
+            raw_vendor_data={
+                "beans_dropped": self._beans_dropped,
+                "sample_index": self._sample_index,
+                "telemetry_model": "fixed_step_thermal_v1",
+            },
         )
 
     def set_heat(self, *, heat_level_percent: int) -> RoasterState:
@@ -280,7 +301,7 @@ class MockRoasterDriver:
             heat_level_percent,
             label="heat_level_percent",
         )
-        return self.read_state()
+        return self._state_snapshot()
 
     def set_fan(self, *, fan_level_percent: int) -> RoasterState:
         """Set mock fan and return normalized state."""
@@ -288,23 +309,23 @@ class MockRoasterDriver:
             fan_level_percent,
             label="fan_level_percent",
         )
-        return self.read_state()
+        return self._state_snapshot()
 
     def drop_beans(self) -> RoasterState:
         """Record a mock bean drop and force heat off."""
         self._beans_dropped = True
         self._heat_level_percent = 0
-        return self.read_state()
+        return self._state_snapshot()
 
     def start_cooling(self) -> RoasterState:
         """Start mock cooling and return normalized state."""
         self._cooling_on = True
-        return self.read_state()
+        return self._state_snapshot()
 
     def stop_cooling(self) -> RoasterState:
         """Stop mock cooling and return normalized state."""
         self._cooling_on = False
-        return self.read_state()
+        return self._state_snapshot()
 
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
         """Return deterministic mock-safe emergency stop controls."""
@@ -319,6 +340,40 @@ class MockRoasterDriver:
             fan_level_percent=self._fan_level_percent,
             cooling_on=self._cooling_on,
         )
+
+    def _advance_telemetry(self) -> None:
+        """Advance one deterministic mock telemetry sample."""
+        self._sample_index += 1
+        env_delta_c = self._environment_delta_c()
+        self._env_temp_c = _clamp_float(
+            self._env_temp_c + env_delta_c,
+            minimum=self._MIN_TEMP_C,
+            maximum=self._MAX_ENV_TEMP_C,
+        )
+
+        bean_target_c = self._env_temp_c
+        bean_delta_c = (
+            (bean_target_c - self._bean_temp_c)
+            * self._BEAN_THERMAL_LAG_FACTOR
+            * self._SAMPLE_INTERVAL_SECONDS
+        )
+        self._bean_temp_c = _clamp_float(
+            self._bean_temp_c + bean_delta_c,
+            minimum=self._MIN_TEMP_C,
+            maximum=self._MAX_BEAN_TEMP_C,
+        )
+
+    def _environment_delta_c(self) -> float:
+        """Return one fixed-step environment temperature delta."""
+        heat_effect = (self._heat_level_percent / 100.0) * self._MAX_HEAT_RATE_C_PER_SEC
+        fan_effect = (self._fan_level_percent / 100.0) * self._MAX_FAN_COOLING_C_PER_SEC
+        cooling_effect = self._COOLING_MODE_RATE_C_PER_SEC if self._cooling_on else 0.0
+        return (heat_effect - fan_effect - cooling_effect) * self._SAMPLE_INTERVAL_SECONDS
+
+
+def _clamp_float(value: float, *, minimum: float, maximum: float) -> float:
+    """Clamp a float and keep telemetry output stable at one decimal place."""
+    return round(max(minimum, min(maximum, value)), 1)
 
 
 def create_roaster_driver(driver_name: str) -> RoasterDriver:

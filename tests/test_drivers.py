@@ -33,25 +33,32 @@ def _assert_roaster_driver_contract(driver: RoasterDriver) -> None:
     initial_state = driver.read_state()
     assert initial_state.driver == "mock"
     assert initial_state.connected is False
+    assert initial_state.bean_temp_c == 20.0
+    assert initial_state.env_temp_c == 20.0
     assert initial_state.heat_level_percent == 0
     assert initial_state.fan_level_percent == 0
     assert initial_state.cooling_on is False
+    assert initial_state.raw_vendor_data["sample_index"] == 1
 
     driver.connect()
     connected_state = driver.read_state()
     assert connected_state.connected is True
+    assert connected_state.raw_vendor_data["sample_index"] == 2
 
     heat_state = driver.set_heat(heat_level_percent=55)
     assert heat_state.heat_level_percent == 55
     assert heat_state.fan_level_percent == 0
+    assert heat_state.raw_vendor_data["sample_index"] == 2
 
     fan_state = driver.set_fan(fan_level_percent=35)
     assert fan_state.heat_level_percent == 55
     assert fan_state.fan_level_percent == 35
+    assert fan_state.raw_vendor_data["sample_index"] == 2
 
     dropped_state = driver.drop_beans()
     assert dropped_state.heat_level_percent == 0
     assert dropped_state.raw_vendor_data["beans_dropped"] is True
+    assert dropped_state.raw_vendor_data["sample_index"] == 2
 
     cooling_state = driver.start_cooling()
     assert cooling_state.cooling_on is True
@@ -62,6 +69,19 @@ def _assert_roaster_driver_contract(driver: RoasterDriver) -> None:
     driver.disconnect()
     disconnected_state = driver.read_state()
     assert disconnected_state.connected is False
+
+
+def _read_temperature_sequence(
+    driver: RoasterDriver,
+    *,
+    sample_count: int,
+) -> list[tuple[float | None, float | None]]:
+    """Read a deterministic sequence of bean and environment temperatures."""
+    sequence: list[tuple[float | None, float | None]] = []
+    for _ in range(sample_count):
+        state = driver.read_state()
+        sequence.append((state.bean_temp_c, state.env_temp_c))
+    return sequence
 
 
 def test_create_roaster_driver_returns_mock_driver() -> None:
@@ -83,6 +103,62 @@ def test_create_roaster_driver_rejects_unsupported_driver() -> None:
 
 def test_mock_driver_satisfies_roaster_driver_contract() -> None:
     _assert_roaster_driver_contract(MockRoasterDriver())
+
+
+def test_mock_driver_returns_reproducible_telemetry_sequence() -> None:
+    first_driver = MockRoasterDriver()
+    second_driver = MockRoasterDriver()
+
+    for driver in (first_driver, second_driver):
+        driver.connect()
+        driver.set_heat(heat_level_percent=100)
+        driver.set_fan(fan_level_percent=0)
+
+    first_sequence = _read_temperature_sequence(first_driver, sample_count=3)
+    second_sequence = _read_temperature_sequence(second_driver, sample_count=3)
+
+    assert first_sequence == second_sequence
+
+
+def test_mock_driver_telemetry_responds_to_heat_and_cooling() -> None:
+    driver = MockRoasterDriver()
+    driver.connect()
+
+    initial_state = driver.read_state()
+    assert initial_state.bean_temp_c == 20.0
+    assert initial_state.env_temp_c == 20.0
+
+    driver.set_heat(heat_level_percent=100)
+    heating_state = driver.read_state()
+    assert heating_state.env_temp_c == 22.0
+    assert heating_state.bean_temp_c == 20.2
+
+    hotter_state = driver.read_state()
+    assert hotter_state.env_temp_c == 24.0
+    assert hotter_state.bean_temp_c == 20.6
+
+    driver.start_cooling()
+    cooling_state = driver.read_state()
+    assert cooling_state.cooling_on is True
+    assert cooling_state.env_temp_c == 21.0
+    assert cooling_state.bean_temp_c == 20.6
+
+
+def test_mock_driver_control_commands_do_not_advance_telemetry() -> None:
+    driver = MockRoasterDriver()
+    driver.connect()
+    sampled_state = driver.read_state()
+
+    heat_state = driver.set_heat(heat_level_percent=70)
+    fan_state = driver.set_fan(fan_level_percent=30)
+    drop_state = driver.drop_beans()
+
+    assert sampled_state.raw_vendor_data["sample_index"] == 1
+    assert heat_state.raw_vendor_data["sample_index"] == 1
+    assert fan_state.raw_vendor_data["sample_index"] == 1
+    assert drop_state.raw_vendor_data["sample_index"] == 1
+    assert drop_state.bean_temp_c == sampled_state.bean_temp_c
+    assert drop_state.env_temp_c == sampled_state.env_temp_c
 
 
 def test_command_streaming_allows_required_positive_interval() -> None:
