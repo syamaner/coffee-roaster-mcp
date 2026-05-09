@@ -241,13 +241,21 @@ Latest pushed commits on PR branch:
 - `c670e7b` - `feat: add hottop serial lifecycle`
 - `f1070f8` - `fix: harden hottop lifecycle review issues`
 - `8a59276` - `docs: add e3 driver lifecycle session summary`
-- A follow-up review-fix commit after `8a59276` records the second Copilot review fixes and this summary refresh.
+- `411cf23` - `fix: address hottop lifecycle followup review`
 
 Current durable state:
 
 - E3-S4 marked complete.
 - Active story moved to E3-S5.
 - Next target: Hottop command loop.
+
+Additional late-cycle context snapshot:
+
+- Context window: `9% left (235K used / 258K)`
+- 5h limit: `95% left (resets 03:37)`
+- Weekly limit: `99% left (resets 20:39 on 13 May)`
+- GPT-5.3-Codex-Spark 5h limit: `100% left (resets 05:11)`
+- GPT-5.3-Codex-Spark weekly limit: `100% left (resets 00:11 on 17 May)`
 
 Recommended next step after PR `#82` is merged:
 
