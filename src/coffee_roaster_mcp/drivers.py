@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from math import isfinite
+from typing import Literal, Protocol, cast
 
 from coffee_roaster_mcp.controls import validate_control_percent
 from coffee_roaster_mcp.session import EventPayloadValue
@@ -137,6 +138,43 @@ class RoasterState:
     fan_level_percent: int
     cooling_on: bool
     raw_vendor_data: dict[str, EventPayloadValue] = field(default_factory=_raw_vendor_data_default)
+
+    def __post_init__(self) -> None:
+        """Validate normalized roaster state at the driver boundary."""
+        _validate_driver_name(self.driver)
+        _validate_exact_bool(self.connected, label="connected")
+        _validate_exact_bool(self.cooling_on, label="cooling_on")
+        object.__setattr__(
+            self,
+            "bean_temp_c",
+            _validate_optional_temperature_c(self.bean_temp_c, label="bean_temp_c"),
+        )
+        object.__setattr__(
+            self,
+            "env_temp_c",
+            _validate_optional_temperature_c(self.env_temp_c, label="env_temp_c"),
+        )
+        object.__setattr__(
+            self,
+            "heat_level_percent",
+            validate_control_percent(
+                self.heat_level_percent,
+                label="heat_level_percent",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "fan_level_percent",
+            validate_control_percent(
+                self.fan_level_percent,
+                label="fan_level_percent",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "raw_vendor_data",
+            _validate_raw_vendor_data(self.raw_vendor_data),
+        )
 
 
 @dataclass(frozen=True)
@@ -374,6 +412,50 @@ class MockRoasterDriver:
 def _clamp_float(value: float, *, minimum: float, maximum: float) -> float:
     """Clamp a float and keep telemetry output stable at one decimal place."""
     return round(max(minimum, min(maximum, value)), 1)
+
+
+def _validate_exact_bool(value: object, *, label: str) -> None:
+    """Validate that a state field is exactly a bool."""
+    if not isinstance(value, bool):
+        raise TypeError(f"{label} must be a boolean.")
+
+
+def _validate_driver_name(value: object) -> None:
+    """Validate the stable driver identifier on normalized state."""
+    if not isinstance(value, str) or value.strip() == "":
+        raise ValueError("driver must be a non-empty string.")
+
+
+def _validate_optional_temperature_c(value: object, *, label: str) -> float | None:
+    """Validate one normalized Celsius temperature value."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{label} must be a finite Celsius temperature or None.")
+    normalized = float(value)
+    if not isfinite(normalized):
+        raise ValueError(f"{label} must be finite.")
+    return normalized
+
+
+def _validate_raw_vendor_data(
+    raw_vendor_data: object,
+) -> dict[str, EventPayloadValue]:
+    """Validate and copy raw vendor diagnostics for normalized state."""
+    if not isinstance(raw_vendor_data, dict):
+        raise TypeError("raw_vendor_data must be a dictionary.")
+    raw_vendor_mapping = cast(dict[object, object], raw_vendor_data)
+    copied: dict[str, EventPayloadValue] = {}
+    allowed_value_types = (str, int, float, bool, type(None))
+    for key, value in raw_vendor_mapping.items():
+        if not isinstance(key, str):
+            raise TypeError("raw_vendor_data keys must be strings.")
+        if not isinstance(value, allowed_value_types):
+            raise TypeError(
+                "raw_vendor_data values must be strings, integers, floats, booleans, or None."
+            )
+        copied[key] = value
+    return copied
 
 
 def create_roaster_driver(driver_name: str) -> RoasterDriver:
