@@ -15,7 +15,7 @@ from mcp.server.session import ServerSession
 
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.config import AppConfig, ConfigError, load_config
-from coffee_roaster_mcp.drivers import RoasterSafetyDriver, create_roaster_safety_driver
+from coffee_roaster_mcp.drivers import RoasterDriver, create_roaster_driver
 from coffee_roaster_mcp.exports import export_roast_snapshot
 from coffee_roaster_mcp.session import (
     EventPayloadValue,
@@ -37,14 +37,14 @@ class ServerContext:
         config: Loaded RoastPilot configuration.
         transport: Actual MCP transport used by this server process.
         session_store: Authoritative in-process roast session owner.
-        roaster_driver: Configured driver safety boundary.
+        roaster_driver: Configured driver boundary.
         started_at_utc: UTC time when the MCP process initialized.
     """
 
     config: AppConfig
     transport: str
     session_store: RoastSessionStore
-    roaster_driver: RoasterSafetyDriver
+    roaster_driver: RoasterDriver
     started_at_utc: datetime
 
 
@@ -206,7 +206,7 @@ def build_server_context(
     """
     config = load_config(path=config_path)
     try:
-        roaster_driver = create_roaster_safety_driver(config.roaster.driver)
+        roaster_driver = create_roaster_driver(config.roaster.driver)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     return ServerContext(

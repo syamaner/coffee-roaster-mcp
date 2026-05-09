@@ -22,12 +22,12 @@
 
 RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.
 
-E2-S8 is complete. RoastPilot pull-request CI now runs tests with coverage for `coffee_roaster_mcp`, writes a readable Markdown coverage summary in GitHub Actions, and uploads an HTML coverage artifact for file-by-file drill-down.
+E3-S1 is complete. RoastPilot now has a typed `RoasterDriver` contract covering connection lifecycle, normalized state reads, heat and fan control, drop, cooling, driver-owned emergency stop, and static capabilities.
 
-The next story is E3-S1: define the broader roaster driver interface and capabilities model.
+The next story is E3-S2: implement the mock driver against the broader driver contract with deterministic telemetry and contract tests.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
-Epic 2 is complete enough to move into Epic 3 driver contract work. Coverage output is visible in GitHub Actions through a concise Markdown job summary and an `html-coverage-report` artifact.
+Epic 2 is complete and Epic 3 driver contract work has started. Coverage output is visible in GitHub Actions through a concise Markdown job summary and an `html-coverage-report` artifact.
 
 For Epic 2 implementation, the old `coffee-roasting` repository is a behavioral reference only. Reuse proven roast-session and stdio MCP patterns, but do not recreate the old two-server, Auth0, SSE, or `n8n` architecture.
