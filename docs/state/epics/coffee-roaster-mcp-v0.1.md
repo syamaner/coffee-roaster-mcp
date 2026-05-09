@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E3-S2`
-- Current target: Implement the mock driver against the broader driver contract
+- Active story: `E3-S3`
+- Current target: Implement normalized roaster state model details before Hottop driver work
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -40,6 +40,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E2-S7` completes the first one-process mock vertical slice. `export_roast_log` now writes snapshot JSONL, CSV, and summary files from the current session state, and `get_roast_state` exposes minimal timestamp-derived roast and development metrics. Append-only telemetry writers and final export schemas remain Epic 5 work.
 - `E2-S8` completed the final Epic 2 hardening story before broader driver contract work. Pull-request CI now runs tests with coverage for `coffee_roaster_mcp`, writes an easy-to-read GitHub Actions Markdown summary, and uploads an `html-coverage-report` artifact without adding an external hosted coverage service.
 - `E3-S1` defines the broader `RoasterDriver` contract without changing MCP tool semantics. Drivers now expose connection lifecycle, normalized state reads, heat and fan controls, drop, cooling, driver-owned emergency stop, and static capabilities for ranges, supported actions, sensor units, and command-streaming requirements. The current mock driver implements this contract while preserving E2 emergency-stop fail-closed behavior.
+- `E3-S2` keeps the mock driver deterministic and local-only by advancing a fixed one-second thermal sample on `read_state`. Mock heat raises environment temperature, fan and cooling reduce it, bean temperature follows environment temperature with lag, and control commands return the current state without advancing telemetry. This preserves the current one-session MCP/store semantics while giving later stories a stable driver telemetry source.
 - The old `coffee-roasting` prototype was checked as a behavioral reference for E3-S1. It confirmed the need to model Hottop command streaming, temperature-unit normalization, compound drop/cooling behavior, and cleanup through driver lifecycle methods. Drum control remains an internal driver concern for now because E3-S1 and issue #23 do not require a public drum command.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
@@ -151,7 +152,7 @@ Goal: support multiple roasters behind one driver contract while preserving curr
 - [x] `E3-S1` Define `RoasterDriver` interface and capabilities model.
   - Done when drivers expose connection lifecycle, read state, heat/fan control, drop, cooling, emergency stop, and capabilities.
 
-- [ ] `E3-S2` Implement mock driver.
+- [x] `E3-S2` Implement mock driver.
   - Done when the mock driver supports deterministic telemetry and passes contract tests.
 
 - [ ] `E3-S3` Implement normalized roaster state model.
@@ -506,4 +507,14 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest`: 74 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E3-S2:
+  - Extended `MockRoasterDriver` with deterministic fixed-step telemetry for normalized bean and environment temperatures.
+  - Mock `read_state` advances one sample at a time and records `sample_index` plus the telemetry model in raw vendor diagnostics.
+  - Mock heat, fan, drop, cooling, stop cooling, and emergency stop keep their E3-S1 control semantics; command methods return the current state without advancing telemetry.
+  - Checked the old `coffee-roasting` mock roaster as a behavioral reference for heat/fan/cooling temperature effects and bean-temperature lag, but kept this implementation simpler and contract-focused.
+  - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 19 passed.
+  - Ran `./.venv/bin/python -m pytest`: 82 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed after applying `ruff format`.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
