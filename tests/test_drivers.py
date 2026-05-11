@@ -82,6 +82,22 @@ class BlockingWriteSerialTransport(FakeSerialTransport):
         return len(data)
 
 
+class BlockingWriteFailingCloseTransport(BlockingWriteSerialTransport):
+    """Blocking write transport whose first close attempt raises."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._close_failures_remaining = 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self._close_failures_remaining > 0:
+            self._close_failures_remaining -= 1
+            raise OSError("serial close failed")
+        self.is_open = False
+        self.closed.set()
+
+
 class RaisingHook:
     """Command-loop hook that raises after proving it ran."""
 
@@ -535,6 +551,36 @@ def test_hottop_driver_disconnect_closes_serial_when_write_is_blocked() -> None:
             driver.disconnect()
 
         assert transport.close_calls == 1
+        assert transport.is_open is False
+    finally:
+        transport.release.set()
+        driver.disconnect()
+
+
+def test_hottop_driver_disconnect_publishes_stop_when_blocked_close_fails() -> None:
+    transport = BlockingWriteFailingCloseTransport()
+    serial_factory = FakeSerialFactory(transport=transport)
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        join_timeout_seconds=0.01,
+        serial_factory=serial_factory,
+        command_frame_provider=lambda: b"safe-test-frame",
+    )
+    driver.connect()
+    assert transport.started.wait(timeout=1.0)
+
+    try:
+        with pytest.raises(RuntimeError, match="did not stop"):
+            driver.disconnect()
+
+        state = driver.read_state()
+        error_count = state.raw_vendor_data["command_loop_error_count"]
+        assert state.connected is False
+        assert isinstance(error_count, int)
+        assert error_count >= 1
+        assert state.raw_vendor_data["last_command_write_size"] == 0
+        assert transport.close_calls == 2
         assert transport.is_open is False
     finally:
         transport.release.set()

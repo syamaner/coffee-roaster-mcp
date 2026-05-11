@@ -20,7 +20,7 @@ Non-PII Codex status snapshot provided near the end of the story:
 - Collaboration mode: Default
 - Context window: 11% left, 232K used / 258K
 
-Context consumption was high because this story included initial implementation, full validation, PR creation, and seven Copilot review-fix rounds on concurrency, shutdown, write diagnostics, and test determinism. The most expensive parts were repeatedly fetching thread-aware PR review state, reasoning about race windows in the command-loop shutdown path, updating regression tests, rerunning local validation, pushing follow-up commits, and waiting for GitHub CI after each push.
+Context consumption was high because this story included initial implementation, full validation, PR creation, and eight Copilot review-fix rounds on concurrency, shutdown, write diagnostics, and test determinism. The most expensive parts were repeatedly fetching thread-aware PR review state, reasoning about race windows in the command-loop shutdown path, updating regression tests, rerunning local validation, pushing follow-up commits, and waiting for GitHub CI after each push.
 
 ## Implementation Summary
 
@@ -43,7 +43,7 @@ The initial PR body included `Closes #27`.
 
 ## Copilot Review Cycle
 
-Copilot reviewed PR `#83` seven times and produced 14 actionable comments. All were addressed with targeted follow-up commits and validation. The review loop took seven review-fix turns after the initial implementation turn.
+Copilot reviewed PR `#83` eight times and produced 15 actionable comments. All were addressed with targeted follow-up commits and validation. The review loop took eight review-fix turns after the initial implementation turn.
 
 ### Turn 1: Type contract, diagnostics semantics, and disconnect/write race
 
@@ -179,6 +179,24 @@ Value:
 
 - High. This fixed the design issue behind the repeated comments: stop publication and command write permission now share one coordination boundary rather than depending on repeated flag checks around the write call.
 
+### Turn 8: Forced-close failure during blocked write shutdown
+
+Copilot raised 1 issue:
+
+- `_request_command_loop_stop()` could call `serial_transport.close()` before publishing `_disconnect_requested` / `_stop_event`; if that close raised, disconnect could abort while the command loop remained running and the driver still appeared connected
+
+Response:
+
+- wrapped the forced close in `try` / `except`
+- increments `command_loop_error_count` if the forced close fails
+- still publishes `_disconnect_requested`, `_connected = False`, and `_stop_event` after a close failure
+- resets `last_command_write_size` to `0` for the failed cleanup path
+- added regression coverage for a blocked write where the first close attempt raises
+
+Value:
+
+- High. This closed an exception-path safety gap: shutdown state must be published even if serial cleanup itself fails.
+
 ## Final Behavior After Review
 
 After the full review cycle, the Hottop command loop has these invariants:
@@ -190,6 +208,7 @@ After the full review cycle, the Hottop command loop has these invariants:
 - disconnect publishes stop intent through a dedicated helper that coordinates with the command write path
 - normal stop/close is serialized with the write path
 - blocked writes do not hang disconnect indefinitely
+- close failures during blocked-write cleanup still publish stop state
 - hook failures fail closed and close serial
 - stale write-size diagnostics are cleared after write exceptions
 
@@ -197,8 +216,8 @@ After the full review cycle, the Hottop command loop has these invariants:
 
 Final local validation after the last review-fix commit:
 
-- `./.venv/bin/python -m pytest tests/test_drivers.py`: 52 passed
-- `./.venv/bin/python -m pytest`: 116 passed
+- `./.venv/bin/python -m pytest tests/test_drivers.py`: 53 passed
+- `./.venv/bin/python -m pytest`: 117 passed
 - `./.venv/bin/python -m ruff check .`: passed
 - `./.venv/bin/python -m ruff format --check .`: passed
 - `./.venv/bin/python -m pyright`: 0 errors

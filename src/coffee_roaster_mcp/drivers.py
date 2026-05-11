@@ -580,9 +580,15 @@ class HottopRoasterDriver:
         with self._state_lock:
             serial_transport = self._serial
 
+        close_failed = False
         write_lock_acquired = self._command_write_lock.acquire(timeout=self._write_timeout_seconds)
         if not write_lock_acquired and serial_transport is not None and serial_transport.is_open:
-            serial_transport.close()
+            try:
+                serial_transport.close()
+            except Exception:
+                close_failed = True
+                with self._state_lock:
+                    self._command_loop_error_count += 1
             write_lock_acquired = self._command_write_lock.acquire(
                 timeout=self._write_timeout_seconds
             )
@@ -592,6 +598,8 @@ class HottopRoasterDriver:
                 self._disconnect_requested.set()
                 self._connected = False
                 self._stop_event.set()
+                if close_failed:
+                    self._last_command_write_size = 0
                 return self._command_thread, self._serial
         finally:
             if write_lock_acquired:
