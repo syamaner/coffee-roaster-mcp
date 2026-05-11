@@ -273,7 +273,7 @@ class SerialTransport(Protocol):
         """Close the serial transport."""
         ...
 
-    def write(self, data: bytes) -> object:
+    def write(self, data: bytes) -> int:
         """Write command bytes to the serial transport."""
         ...
 
@@ -483,7 +483,9 @@ class HottopRoasterDriver:
         self._command_thread: Thread | None = None
         self._lifecycle_lock = Lock()
         self._state_lock = Lock()
+        self._command_write_lock = Lock()
         self._command_loop_iterations = 0
+        self._command_frame_poll_count = 0
         self._command_send_attempts = 0
         self._command_write_count = 0
         self._last_command_write_size = 0
@@ -552,7 +554,7 @@ class HottopRoasterDriver:
         with self._lifecycle_lock:
             command_thread: Thread | None
             serial_transport: SerialTransport | None
-            with self._state_lock:
+            with self._command_write_lock, self._state_lock:
                 self._connected = False
                 self._stop_event.set()
                 command_thread = self._command_thread
@@ -593,6 +595,7 @@ class HottopRoasterDriver:
                     "command_interval_seconds": self._command_interval_seconds,
                     "command_loop_running": command_loop_running,
                     "command_loop_iterations": self._command_loop_iterations,
+                    "command_frame_poll_count": self._command_frame_poll_count,
                     "command_send_attempts": self._command_send_attempts,
                     "command_write_count": self._command_write_count,
                     "last_command_write_size": self._last_command_write_size,
@@ -643,20 +646,28 @@ class HottopRoasterDriver:
     def _send_command_frame(self) -> None:
         """Send one command-frame tick if packet construction is available."""
         try:
-            frame = self._command_frame_provider()
             with self._state_lock:
                 self._command_loop_iterations += 1
-                self._command_send_attempts += 1
-                serial_transport = self._serial
-                connected = self._connected
+                self._command_frame_poll_count += 1
+            frame = self._command_frame_provider()
             if frame is None:
                 return
-            if not connected or serial_transport is None or not serial_transport.is_open:
-                return
-            serial_transport.write(frame)
-            with self._state_lock:
-                self._command_write_count += 1
-                self._last_command_write_size = len(frame)
+            with self._command_write_lock:
+                with self._state_lock:
+                    serial_transport = self._serial
+                    stop_requested = self._stop_event.is_set()
+                    if (
+                        stop_requested
+                        or not self._connected
+                        or serial_transport is None
+                        or not serial_transport.is_open
+                    ):
+                        return
+                    self._command_send_attempts += 1
+                bytes_written = serial_transport.write(frame)
+                with self._state_lock:
+                    self._command_write_count += 1
+                    self._last_command_write_size = bytes_written
         except Exception:
             with self._state_lock:
                 self._command_loop_error_count += 1

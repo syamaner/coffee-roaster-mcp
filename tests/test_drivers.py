@@ -82,6 +82,20 @@ class LoopIterationProbe:
         return self._target_reached.wait(timeout=timeout)
 
 
+class BlockingFrameProvider:
+    """Command-frame provider that blocks until the test releases it."""
+
+    def __init__(self, frame: bytes) -> None:
+        self.frame = frame
+        self.started = Event()
+        self.release = Event()
+
+    def __call__(self) -> bytes:
+        self.started.set()
+        self.release.wait(timeout=1.0)
+        return self.frame
+
+
 class FakeSerialFactory:
     """Callable serial factory that records constructor arguments."""
 
@@ -321,12 +335,15 @@ def test_hottop_driver_command_loop_streams_injected_frames() -> None:
         assert len(serial_factory.transport.writes) >= 3
         assert all(write == frame for write in serial_factory.transport.writes)
         loop_iterations = streaming_state.raw_vendor_data["command_loop_iterations"]
+        frame_polls = streaming_state.raw_vendor_data["command_frame_poll_count"]
         send_attempts = streaming_state.raw_vendor_data["command_send_attempts"]
         write_count = streaming_state.raw_vendor_data["command_write_count"]
         assert isinstance(loop_iterations, int)
+        assert isinstance(frame_polls, int)
         assert isinstance(send_attempts, int)
         assert isinstance(write_count, int)
         assert loop_iterations >= 3
+        assert frame_polls >= 3
         assert send_attempts >= 3
         assert write_count == len(serial_factory.transport.writes)
         assert streaming_state.raw_vendor_data["last_command_write_size"] == len(frame)
@@ -351,9 +368,12 @@ def test_hottop_driver_command_loop_default_frame_provider_sends_no_unverified_b
         state = driver.read_state()
 
         assert serial_factory.transport.writes == []
+        frame_polls = state.raw_vendor_data["command_frame_poll_count"]
         send_attempts = state.raw_vendor_data["command_send_attempts"]
+        assert isinstance(frame_polls, int)
         assert isinstance(send_attempts, int)
-        assert send_attempts >= 1
+        assert frame_polls >= 1
+        assert send_attempts == 0
         assert state.raw_vendor_data["command_write_count"] == 0
         assert state.raw_vendor_data["last_command_write_size"] == 0
     finally:
@@ -386,6 +406,29 @@ def test_hottop_driver_command_loop_records_write_failures_without_blocking_disc
         assert error_count >= 1
     finally:
         driver.disconnect()
+
+
+def test_hottop_driver_disconnect_prevents_write_after_stop_is_requested() -> None:
+    serial_factory = FakeSerialFactory()
+    frame_provider = BlockingFrameProvider(b"safe-test-frame")
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+        command_frame_provider=frame_provider,
+    )
+    driver.connect()
+    assert frame_provider.started.wait(timeout=1.0)
+
+    disconnect_thread = Thread(target=driver.disconnect)
+    disconnect_thread.start()
+    frame_provider.release.set()
+    disconnect_thread.join(timeout=1.0)
+
+    assert not disconnect_thread.is_alive()
+    assert serial_factory.transport.writes == []
+    assert serial_factory.transport.close_calls == 1
+    assert driver.read_state().raw_vendor_data["command_write_count"] == 0
 
 
 def test_hottop_driver_connect_does_not_block_state_reads_during_serial_open() -> None:

@@ -22,7 +22,7 @@
 
 RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.
 
-E3-S5 is complete. The Hottop driver now owns a lifecycle-tested command loop that ticks at the configured cadence, can stream injectable command frames to the serial transport, records send/write/error counters in raw diagnostics, and defaults to sending no unverified hardware bytes until packet construction lands.
+E3-S5 is complete. The Hottop driver now owns a lifecycle-tested command loop that ticks at the configured cadence, can stream injectable command frames to the serial transport, records frame polls, send attempts, writes, and errors in raw diagnostics, and defaults to sending no unverified hardware bytes until packet construction lands.
 
 The next story is E3-S6: implement Hottop packet build/parse.
 
