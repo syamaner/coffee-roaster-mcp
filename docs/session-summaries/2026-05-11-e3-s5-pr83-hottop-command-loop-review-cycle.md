@@ -20,6 +20,15 @@ Non-PII Codex status snapshot provided near the end of the story:
 - Collaboration mode: Default
 - Context window: 11% left, 232K used / 258K
 
+Additional non-PII Codex status snapshot after the latest review fixes:
+
+- Context window: 53% left, 129K used / 258K
+- 5h limit: 96% left, resets 01:48 on 12 May
+- Weekly limit: 98% left, resets 20:39 on 13 May
+- GPT-5.3-Codex-Spark 5h limit: 100% left, resets 03:36 on 12 May
+- GPT-5.3-Codex-Spark weekly limit: 100% left, resets 22:36 on 18 May
+- Warning: limits may be stale; run `/status` again shortly
+
 Context consumption was high because this story included initial implementation, full validation, PR creation, and eight Copilot review-fix rounds on concurrency, shutdown, write diagnostics, and test determinism. The most expensive parts were repeatedly fetching thread-aware PR review state, reasoning about race windows in the command-loop shutdown path, updating regression tests, rerunning local validation, pushing follow-up commits, and waiting for GitHub CI after each push.
 
 ## Implementation Summary
@@ -197,6 +206,18 @@ Value:
 
 - High. This closed an exception-path safety gap: shutdown state must be published even if serial cleanup itself fails.
 
+### Late Review Back-And-Forth
+
+The late review cycle became more expensive because each fix exposed the next narrower shutdown edge case rather than a separate broad feature problem.
+
+- Copilot first identified that the final stop check before `write()` was not enough because disconnect could begin immediately after the check.
+- The initial response added a bounded write-lock acquisition in `disconnect()`, but that delayed publishing stop intent and therefore moved the race instead of eliminating it.
+- After reviewing that gap, the implementation changed direction: `_request_command_loop_stop()` now centralizes the stop transition and coordinates it with `_command_write_lock`.
+- Copilot then found the exception path in that helper: a forced serial `close()` could raise before stop state was published.
+- The final response wrapped that close attempt, records the cleanup failure, clears stale write-size diagnostics, and still publishes stop state.
+
+The review value was high. These comments were repetitive on the surface, but they forced the code away from incremental flag checks and toward a clearer ownership rule: shutdown state publication must happen even when serial write or close behavior is hostile.
+
 ## Final Behavior After Review
 
 After the full review cycle, the Hottop command loop has these invariants:
@@ -222,7 +243,7 @@ Final local validation after the last review-fix commit:
 - `./.venv/bin/python -m ruff format --check .`: passed
 - `./.venv/bin/python -m pyright`: 0 errors
 
-GitHub CI before the sixth local follow-up had passed. The sixth follow-up was locally validated and then pushed for PR CI rerun:
+GitHub CI after the latest pushed follow-up:
 
 - `Build Package`: passed
 - `Checks`: passed
