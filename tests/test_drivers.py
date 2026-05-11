@@ -375,7 +375,7 @@ def test_hottop_driver_connect_opens_serial_and_starts_command_loop() -> None:
                     "parity": "N",
                     "stopbits": 1,
                     "timeout": 0.5,
-                    "write_timeout": 1.0,
+                    "write_timeout": 0.01,
                 },
             )
         ]

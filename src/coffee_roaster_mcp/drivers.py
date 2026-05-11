@@ -480,10 +480,12 @@ class HottopRoasterDriver:
         self._serial: SerialTransport | None = None
         self._connected = False
         self._stop_event = Event()
+        self._disconnect_requested = Event()
         self._command_thread: Thread | None = None
         self._lifecycle_lock = Lock()
         self._state_lock = Lock()
         self._command_write_lock = Lock()
+        self._write_timeout_seconds = command_interval_seconds
         self._command_loop_iterations = 0
         self._command_frame_poll_count = 0
         self._command_send_attempts = 0
@@ -536,12 +538,13 @@ class HottopRoasterDriver:
                 parity="N",
                 stopbits=1,
                 timeout=0.5,
-                write_timeout=self._join_timeout_seconds,
+                write_timeout=self._write_timeout_seconds,
             )
 
             with self._state_lock:
                 self._serial = serial_transport
                 self._connected = True
+                self._disconnect_requested.clear()
                 self._stop_event.clear()
                 self._command_thread = Thread(
                     target=self._command_loop,
@@ -555,6 +558,7 @@ class HottopRoasterDriver:
         with self._lifecycle_lock:
             command_thread: Thread | None
             serial_transport: SerialTransport | None
+            self._disconnect_requested.set()
             write_lock_acquired = self._command_write_lock.acquire(blocking=False)
             try:
                 with self._state_lock:
@@ -690,6 +694,7 @@ class HottopRoasterDriver:
                     stop_requested = self._stop_event.is_set()
                     if (
                         stop_requested
+                        or self._disconnect_requested.is_set()
                         or not self._connected
                         or serial_transport is None
                         or not serial_transport.is_open
