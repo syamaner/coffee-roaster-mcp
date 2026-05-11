@@ -273,8 +273,13 @@ class SerialTransport(Protocol):
         """Close the serial transport."""
         ...
 
+    def write(self, data: bytes) -> object:
+        """Write command bytes to the serial transport."""
+        ...
+
 
 SerialTransportFactory = Callable[..., SerialTransport]
+HottopCommandFrameProvider = Callable[[], bytes | None]
 
 
 class MockRoasterDriver:
@@ -434,7 +439,9 @@ class HottopRoasterDriver:
 
     This story intentionally implements only connection ownership and command
     loop cleanup. Packet construction, status parsing, and hardware commands
-    land in later Epic 3 stories.
+    land in later Epic 3 stories. Until packet construction lands, the default
+    command-frame provider returns no frame so the command loop is lifecycle-
+    testable without sending unverified hardware bytes.
     """
 
     name = HOTTOP_DRIVER_NAME
@@ -448,6 +455,7 @@ class HottopRoasterDriver:
         serial_factory: SerialTransportFactory | None = None,
         join_timeout_seconds: float = 1.0,
         command_loop_iteration_hook: Callable[[], None] | None = None,
+        command_frame_provider: HottopCommandFrameProvider | None = None,
     ) -> None:
         """Initialize Hottop lifecycle dependencies.
 
@@ -458,6 +466,7 @@ class HottopRoasterDriver:
             serial_factory: Optional injectable serial transport factory for tests.
             join_timeout_seconds: Maximum disconnect wait for command-loop cleanup.
             command_loop_iteration_hook: Optional hook called after a loop iteration.
+            command_frame_provider: Optional command-frame source for each loop tick.
         """
         if command_interval_seconds <= 0:
             raise ValueError("command_interval_seconds must be greater than 0.")
@@ -475,7 +484,12 @@ class HottopRoasterDriver:
         self._lifecycle_lock = Lock()
         self._state_lock = Lock()
         self._command_loop_iterations = 0
+        self._command_send_attempts = 0
+        self._command_write_count = 0
+        self._last_command_write_size = 0
+        self._command_loop_error_count = 0
         self._command_loop_iteration_hook = command_loop_iteration_hook
+        self._command_frame_provider = command_frame_provider or self._no_command_frame
 
     @property
     def capabilities(self) -> RoasterCapabilities:
@@ -579,6 +593,10 @@ class HottopRoasterDriver:
                     "command_interval_seconds": self._command_interval_seconds,
                     "command_loop_running": command_loop_running,
                     "command_loop_iterations": self._command_loop_iterations,
+                    "command_send_attempts": self._command_send_attempts,
+                    "command_write_count": self._command_write_count,
+                    "last_command_write_size": self._last_command_write_size,
+                    "command_loop_error_count": self._command_loop_error_count,
                 },
             )
 
@@ -616,12 +634,36 @@ class HottopRoasterDriver:
         )
 
     def _command_loop(self) -> None:
-        """Run the lifecycle loop until disconnect requests shutdown."""
+        """Stream current Hottop command frames until disconnect requests shutdown."""
         while not self._stop_event.wait(self._command_interval_seconds):
-            with self._state_lock:
-                self._command_loop_iterations += 1
+            self._send_command_frame()
             if self._command_loop_iteration_hook is not None:
                 self._command_loop_iteration_hook()
+
+    def _send_command_frame(self) -> None:
+        """Send one command-frame tick if packet construction is available."""
+        try:
+            frame = self._command_frame_provider()
+            with self._state_lock:
+                self._command_loop_iterations += 1
+                self._command_send_attempts += 1
+                serial_transport = self._serial
+                connected = self._connected
+            if frame is None:
+                return
+            if not connected or serial_transport is None or not serial_transport.is_open:
+                return
+            serial_transport.write(frame)
+            with self._state_lock:
+                self._command_write_count += 1
+                self._last_command_write_size = len(frame)
+        except Exception:
+            with self._state_lock:
+                self._command_loop_error_count += 1
+
+    def _no_command_frame(self) -> bytes | None:
+        """Return no hardware frame until Hottop packet construction lands."""
+        return None
 
 
 def _clamp_float(value: float, *, minimum: float, maximum: float) -> float:
