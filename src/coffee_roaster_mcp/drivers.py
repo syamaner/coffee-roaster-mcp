@@ -273,8 +273,13 @@ class SerialTransport(Protocol):
         """Close the serial transport."""
         ...
 
+    def write(self, data: bytes) -> int:
+        """Write command bytes to the serial transport."""
+        ...
+
 
 SerialTransportFactory = Callable[..., SerialTransport]
+HottopCommandFrameProvider = Callable[[], bytes | None]
 
 
 class MockRoasterDriver:
@@ -434,7 +439,9 @@ class HottopRoasterDriver:
 
     This story intentionally implements only connection ownership and command
     loop cleanup. Packet construction, status parsing, and hardware commands
-    land in later Epic 3 stories.
+    land in later Epic 3 stories. Until packet construction lands, the default
+    command-frame provider returns no frame so the command loop is lifecycle-
+    testable without sending unverified hardware bytes.
     """
 
     name = HOTTOP_DRIVER_NAME
@@ -448,6 +455,7 @@ class HottopRoasterDriver:
         serial_factory: SerialTransportFactory | None = None,
         join_timeout_seconds: float = 1.0,
         command_loop_iteration_hook: Callable[[], None] | None = None,
+        command_frame_provider: HottopCommandFrameProvider | None = None,
     ) -> None:
         """Initialize Hottop lifecycle dependencies.
 
@@ -458,6 +466,7 @@ class HottopRoasterDriver:
             serial_factory: Optional injectable serial transport factory for tests.
             join_timeout_seconds: Maximum disconnect wait for command-loop cleanup.
             command_loop_iteration_hook: Optional hook called after a loop iteration.
+            command_frame_provider: Optional command-frame source for each loop tick.
         """
         if command_interval_seconds <= 0:
             raise ValueError("command_interval_seconds must be greater than 0.")
@@ -471,11 +480,20 @@ class HottopRoasterDriver:
         self._serial: SerialTransport | None = None
         self._connected = False
         self._stop_event = Event()
+        self._disconnect_requested = Event()
         self._command_thread: Thread | None = None
         self._lifecycle_lock = Lock()
         self._state_lock = Lock()
+        self._command_write_lock = Lock()
+        self._write_timeout_seconds = command_interval_seconds
         self._command_loop_iterations = 0
+        self._command_frame_poll_count = 0
+        self._command_send_attempts = 0
+        self._command_write_count = 0
+        self._last_command_write_size = 0
+        self._command_loop_error_count = 0
         self._command_loop_iteration_hook = command_loop_iteration_hook
+        self._command_frame_provider = command_frame_provider or self._no_command_frame
 
     @property
     def capabilities(self) -> RoasterCapabilities:
@@ -520,11 +538,13 @@ class HottopRoasterDriver:
                 parity="N",
                 stopbits=1,
                 timeout=0.5,
+                write_timeout=self._write_timeout_seconds,
             )
 
             with self._state_lock:
                 self._serial = serial_transport
                 self._connected = True
+                self._disconnect_requested.clear()
                 self._stop_event.clear()
                 self._command_thread = Thread(
                     target=self._command_loop,
@@ -536,20 +556,14 @@ class HottopRoasterDriver:
     def disconnect(self) -> None:
         """Stop command loop and close serial transport."""
         with self._lifecycle_lock:
-            command_thread: Thread | None
-            serial_transport: SerialTransport | None
-            with self._state_lock:
-                self._connected = False
-                self._stop_event.set()
-                command_thread = self._command_thread
-                serial_transport = self._serial
+            command_thread, serial_transport = self._request_command_loop_stop()
 
             if command_thread is not None and command_thread.is_alive():
                 command_thread.join(timeout=self._join_timeout_seconds)
             command_loop_still_running = command_thread is not None and command_thread.is_alive()
 
             if serial_transport is not None and serial_transport.is_open:
-                serial_transport.close()
+                self._close_serial_transport(serial_transport)
 
             with self._state_lock:
                 if not command_loop_still_running:
@@ -558,6 +572,49 @@ class HottopRoasterDriver:
 
             if command_loop_still_running:
                 raise RuntimeError("Hottop command loop did not stop during disconnect.")
+
+    def _request_command_loop_stop(
+        self,
+    ) -> tuple[Thread | None, SerialTransport | None]:
+        """Publish stop state while coordinating with the command write path."""
+        with self._state_lock:
+            serial_transport = self._serial
+
+        close_failed = False
+        write_lock_acquired = self._command_write_lock.acquire(timeout=self._write_timeout_seconds)
+        if not write_lock_acquired and serial_transport is not None and serial_transport.is_open:
+            try:
+                serial_transport.close()
+            except Exception:
+                close_failed = True
+                with self._state_lock:
+                    self._command_loop_error_count += 1
+            write_lock_acquired = self._command_write_lock.acquire(
+                timeout=self._write_timeout_seconds
+            )
+
+        try:
+            with self._state_lock:
+                self._disconnect_requested.set()
+                self._connected = False
+                self._stop_event.set()
+                if close_failed:
+                    self._last_command_write_size = 0
+                return self._command_thread, self._serial
+        finally:
+            if write_lock_acquired:
+                self._command_write_lock.release()
+
+    def _close_serial_transport(self, serial_transport: SerialTransport) -> None:
+        """Close serial transport without waiting behind a blocked write."""
+        if self._command_write_lock.acquire(blocking=False):
+            try:
+                if serial_transport.is_open:
+                    serial_transport.close()
+            finally:
+                self._command_write_lock.release()
+            return
+        serial_transport.close()
 
     def read_state(self) -> RoasterState:
         """Return the current normalized Hottop lifecycle state."""
@@ -579,6 +636,11 @@ class HottopRoasterDriver:
                     "command_interval_seconds": self._command_interval_seconds,
                     "command_loop_running": command_loop_running,
                     "command_loop_iterations": self._command_loop_iterations,
+                    "command_frame_poll_count": self._command_frame_poll_count,
+                    "command_send_attempts": self._command_send_attempts,
+                    "command_write_count": self._command_write_count,
+                    "last_command_write_size": self._last_command_write_size,
+                    "command_loop_error_count": self._command_loop_error_count,
                 },
             )
 
@@ -616,12 +678,64 @@ class HottopRoasterDriver:
         )
 
     def _command_loop(self) -> None:
-        """Run the lifecycle loop until disconnect requests shutdown."""
+        """Stream current Hottop command frames until disconnect requests shutdown."""
         while not self._stop_event.wait(self._command_interval_seconds):
+            self._send_command_frame()
+            self._run_command_loop_iteration_hook()
+
+    def _run_command_loop_iteration_hook(self) -> None:
+        """Run the optional test hook without letting it kill the loop."""
+        if self._command_loop_iteration_hook is None:
+            return
+        try:
+            self._command_loop_iteration_hook()
+        except Exception:
+            serial_transport: SerialTransport | None
+            with self._state_lock:
+                self._command_loop_error_count += 1
+                self._connected = False
+                self._stop_event.set()
+                serial_transport = self._serial
+            if serial_transport is not None and serial_transport.is_open:
+                self._close_serial_transport(serial_transport)
+
+    def _send_command_frame(self) -> None:
+        """Send one command-frame tick if packet construction is available."""
+        try:
             with self._state_lock:
                 self._command_loop_iterations += 1
-            if self._command_loop_iteration_hook is not None:
-                self._command_loop_iteration_hook()
+                self._command_frame_poll_count += 1
+            frame = self._command_frame_provider()
+            if frame is None:
+                return
+            with self._command_write_lock:
+                with self._state_lock:
+                    serial_transport = self._serial
+                    stop_requested = self._stop_event.is_set()
+                    if (
+                        stop_requested
+                        or self._disconnect_requested.is_set()
+                        or not self._connected
+                        or serial_transport is None
+                        or not serial_transport.is_open
+                    ):
+                        return
+                    self._command_send_attempts += 1
+                bytes_written = serial_transport.write(frame)
+                with self._state_lock:
+                    self._last_command_write_size = bytes_written
+                    if bytes_written == len(frame):
+                        self._command_write_count += 1
+                    else:
+                        self._command_loop_error_count += 1
+        except Exception:
+            with self._state_lock:
+                self._command_loop_error_count += 1
+                self._last_command_write_size = 0
+
+    def _no_command_frame(self) -> bytes | None:
+        """Return no hardware frame until Hottop packet construction lands."""
+        return None
 
 
 def _clamp_float(value: float, *, minimum: float, maximum: float) -> float:
