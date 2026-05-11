@@ -20,7 +20,7 @@ Non-PII Codex status snapshot provided near the end of the story:
 - Collaboration mode: Default
 - Context window: 11% left, 232K used / 258K
 
-Context consumption was high because this story included initial implementation, full validation, PR creation, and six Copilot review-fix rounds on concurrency, shutdown, write diagnostics, and test determinism. The most expensive parts were repeatedly fetching thread-aware PR review state, reasoning about race windows in the command-loop shutdown path, updating regression tests, rerunning local validation, pushing follow-up commits, and waiting for GitHub CI after each push.
+Context consumption was high because this story included initial implementation, full validation, PR creation, and seven Copilot review-fix rounds on concurrency, shutdown, write diagnostics, and test determinism. The most expensive parts were repeatedly fetching thread-aware PR review state, reasoning about race windows in the command-loop shutdown path, updating regression tests, rerunning local validation, pushing follow-up commits, and waiting for GitHub CI after each push.
 
 ## Implementation Summary
 
@@ -43,7 +43,7 @@ The initial PR body included `Closes #27`.
 
 ## Copilot Review Cycle
 
-Copilot reviewed PR `#83` six times and produced 13 actionable comments. All were addressed with targeted follow-up commits and validation. The review loop took six review-fix turns after the initial implementation turn.
+Copilot reviewed PR `#83` seven times and produced 14 actionable comments. All were addressed with targeted follow-up commits and validation. The review loop took seven review-fix turns after the initial implementation turn.
 
 ### Turn 1: Type contract, diagnostics semantics, and disconnect/write race
 
@@ -162,6 +162,23 @@ Value:
 
 - High for the disconnect/write race because Hottop command bytes must not be sent after stop has been requested. Low for the unused helper cleanup, but it kept the tests easier to reason about after the earlier deterministic-test refactor.
 
+### Turn 7: Replace incremental race fixes with a stop-transition helper
+
+Copilot raised 1 issue:
+
+- the sixth-round fix still had a possible visibility gap because the final stop check and `serial_transport.write(frame)` were separate operations, while `disconnect()` could publish stop state after that check
+
+Response:
+
+- replaced the incremental disconnect logic with `_request_command_loop_stop()`
+- the helper acquires `_command_write_lock` with the dedicated write-timeout before publishing `_disconnect_requested`, `_connected = False`, and `_stop_event`
+- if the write lock cannot be acquired because a write is already blocked, the helper closes the serial transport to unblock the write, retries the bounded lock acquisition, and then publishes stop state
+- `_send_command_frame()` now relies on the state check inside `_command_write_lock`; stop publication and write permission use the same lock boundary instead of a loose final event check
+
+Value:
+
+- High. This fixed the design issue behind the repeated comments: stop publication and command write permission now share one coordination boundary rather than depending on repeated flag checks around the write call.
+
 ## Final Behavior After Review
 
 After the full review cycle, the Hottop command loop has these invariants:
@@ -170,7 +187,7 @@ After the full review cycle, the Hottop command loop has these invariants:
 - command frames can be injected for deterministic lifecycle tests
 - serial writes report bytes written and partial writes are treated as errors
 - diagnostics distinguish frame polls, send attempts, successful writes, last write size, and errors
-- disconnect publishes stop intent while coordinated with the command write path when the write path is not already blocked
+- disconnect publishes stop intent through a dedicated helper that coordinates with the command write path
 - normal stop/close is serialized with the write path
 - blocked writes do not hang disconnect indefinitely
 - hook failures fail closed and close serial

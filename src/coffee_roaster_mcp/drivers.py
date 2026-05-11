@@ -556,21 +556,7 @@ class HottopRoasterDriver:
     def disconnect(self) -> None:
         """Stop command loop and close serial transport."""
         with self._lifecycle_lock:
-            command_thread: Thread | None
-            serial_transport: SerialTransport | None
-            write_lock_acquired = self._command_write_lock.acquire(
-                timeout=self._write_timeout_seconds
-            )
-            try:
-                with self._state_lock:
-                    self._disconnect_requested.set()
-                    self._connected = False
-                    self._stop_event.set()
-                    command_thread = self._command_thread
-                    serial_transport = self._serial
-            finally:
-                if write_lock_acquired:
-                    self._command_write_lock.release()
+            command_thread, serial_transport = self._request_command_loop_stop()
 
             if command_thread is not None and command_thread.is_alive():
                 command_thread.join(timeout=self._join_timeout_seconds)
@@ -586,6 +572,30 @@ class HottopRoasterDriver:
 
             if command_loop_still_running:
                 raise RuntimeError("Hottop command loop did not stop during disconnect.")
+
+    def _request_command_loop_stop(
+        self,
+    ) -> tuple[Thread | None, SerialTransport | None]:
+        """Publish stop state while coordinating with the command write path."""
+        with self._state_lock:
+            serial_transport = self._serial
+
+        write_lock_acquired = self._command_write_lock.acquire(timeout=self._write_timeout_seconds)
+        if not write_lock_acquired and serial_transport is not None and serial_transport.is_open:
+            serial_transport.close()
+            write_lock_acquired = self._command_write_lock.acquire(
+                timeout=self._write_timeout_seconds
+            )
+
+        try:
+            with self._state_lock:
+                self._disconnect_requested.set()
+                self._connected = False
+                self._stop_event.set()
+                return self._command_thread, self._serial
+        finally:
+            if write_lock_acquired:
+                self._command_write_lock.release()
 
     def _close_serial_transport(self, serial_transport: SerialTransport) -> None:
         """Close serial transport without waiting behind a blocked write."""
@@ -703,8 +713,6 @@ class HottopRoasterDriver:
                     ):
                         return
                     self._command_send_attempts += 1
-                if self._disconnect_requested.is_set() or self._stop_event.is_set():
-                    return
                 bytes_written = serial_transport.write(frame)
                 with self._state_lock:
                     self._last_command_write_size = bytes_written
