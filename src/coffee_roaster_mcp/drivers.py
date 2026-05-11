@@ -536,6 +536,7 @@ class HottopRoasterDriver:
                 parity="N",
                 stopbits=1,
                 timeout=0.5,
+                write_timeout=self._join_timeout_seconds,
             )
 
             with self._state_lock:
@@ -554,7 +555,7 @@ class HottopRoasterDriver:
         with self._lifecycle_lock:
             command_thread: Thread | None
             serial_transport: SerialTransport | None
-            with self._command_write_lock, self._state_lock:
+            with self._state_lock:
                 self._connected = False
                 self._stop_event.set()
                 command_thread = self._command_thread
@@ -640,8 +641,23 @@ class HottopRoasterDriver:
         """Stream current Hottop command frames until disconnect requests shutdown."""
         while not self._stop_event.wait(self._command_interval_seconds):
             self._send_command_frame()
-            if self._command_loop_iteration_hook is not None:
-                self._command_loop_iteration_hook()
+            self._run_command_loop_iteration_hook()
+
+    def _run_command_loop_iteration_hook(self) -> None:
+        """Run the optional test hook without letting it kill the loop."""
+        if self._command_loop_iteration_hook is None:
+            return
+        try:
+            self._command_loop_iteration_hook()
+        except Exception:
+            serial_transport: SerialTransport | None
+            with self._state_lock:
+                self._command_loop_error_count += 1
+                self._connected = False
+                self._stop_event.set()
+                serial_transport = self._serial
+            if serial_transport is not None and serial_transport.is_open:
+                serial_transport.close()
 
     def _send_command_frame(self) -> None:
         """Send one command-frame tick if packet construction is available."""
@@ -674,6 +690,7 @@ class HottopRoasterDriver:
         except Exception:
             with self._state_lock:
                 self._command_loop_error_count += 1
+                self._last_command_write_size = 0
 
     def _no_command_frame(self) -> bytes | None:
         """Return no hardware frame until Hottop packet construction lands."""
