@@ -666,8 +666,11 @@ class HottopRoasterDriver:
                     self._command_send_attempts += 1
                 bytes_written = serial_transport.write(frame)
                 with self._state_lock:
-                    self._command_write_count += 1
                     self._last_command_write_size = bytes_written
+                    if bytes_written == len(frame):
+                        self._command_write_count += 1
+                    else:
+                        self._command_loop_error_count += 1
         except Exception:
             with self._state_lock:
                 self._command_loop_error_count += 1

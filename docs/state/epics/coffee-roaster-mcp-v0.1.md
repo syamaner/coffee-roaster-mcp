@@ -546,10 +546,10 @@ After completing a story:
   - Kept hardware-safe defaults by returning no command frame until `E3-S6` implements and tests the Hottop packet format, so this story validates scheduling without sending unverified bytes.
   - Added raw diagnostic counters for command-loop iterations, frame polls, send attempts, successful writes, last write size, and write errors.
   - Added deterministic tests for repeated injected-frame streaming, no-frame safe default behavior, write-failure diagnostics, disconnect race protection, and clean disconnect behavior.
-  - Review hardening tightened the serial `write` contract to return bytes written, separated frame-poll diagnostics from actual send attempts, and coordinated disconnect with the write path so no command frame is written after stop has been requested.
+  - Review hardening tightened the serial `write` contract to return bytes written, separated frame-poll diagnostics from actual send attempts, coordinated disconnect with the write path so no command frame is written after stop has been requested, and records partial serial writes as errors instead of successful full-frame writes.
   - Checked the old `coffee-roasting` Hottop prototype as a behavioral reference for the 0.3s continuous-command requirement, while leaving 36-byte packet construction and parsing to `E3-S6`.
-  - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 47 passed.
-  - Ran `./.venv/bin/python -m pytest`: 111 passed.
+  - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 48 passed.
+  - Ran `./.venv/bin/python -m pytest`: 112 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

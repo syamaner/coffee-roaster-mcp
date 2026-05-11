@@ -57,6 +57,17 @@ class FailingSerialTransport(FakeSerialTransport):
         raise OSError("serial write failed")
 
 
+class PartialWriteSerialTransport(FakeSerialTransport):
+    """Fake serial transport that records partial writes."""
+
+    def write(self, data: bytes) -> int:
+        with self._write_lock:
+            self.writes.append(data)
+            if self._write_target > 0 and len(self.writes) >= self._write_target:
+                self._write_target_reached.set()
+        return len(data) - 1
+
+
 class LoopIterationProbe:
     """Thread-safe command-loop iteration probe for deterministic tests."""
 
@@ -330,26 +341,26 @@ def test_hottop_driver_command_loop_streams_injected_frames() -> None:
     driver.connect()
     try:
         assert command_loop_probe.wait_for_calls(3)
-        streaming_state = driver.read_state()
-
-        assert len(serial_factory.transport.writes) >= 3
-        assert all(write == frame for write in serial_factory.transport.writes)
-        loop_iterations = streaming_state.raw_vendor_data["command_loop_iterations"]
-        frame_polls = streaming_state.raw_vendor_data["command_frame_poll_count"]
-        send_attempts = streaming_state.raw_vendor_data["command_send_attempts"]
-        write_count = streaming_state.raw_vendor_data["command_write_count"]
-        assert isinstance(loop_iterations, int)
-        assert isinstance(frame_polls, int)
-        assert isinstance(send_attempts, int)
-        assert isinstance(write_count, int)
-        assert loop_iterations >= 3
-        assert frame_polls >= 3
-        assert send_attempts >= 3
-        assert write_count == len(serial_factory.transport.writes)
-        assert streaming_state.raw_vendor_data["last_command_write_size"] == len(frame)
-        assert streaming_state.raw_vendor_data["command_loop_error_count"] == 0
     finally:
         driver.disconnect()
+
+    streaming_state = driver.read_state()
+    assert len(serial_factory.transport.writes) >= 3
+    assert all(write == frame for write in serial_factory.transport.writes)
+    loop_iterations = streaming_state.raw_vendor_data["command_loop_iterations"]
+    frame_polls = streaming_state.raw_vendor_data["command_frame_poll_count"]
+    send_attempts = streaming_state.raw_vendor_data["command_send_attempts"]
+    write_count = streaming_state.raw_vendor_data["command_write_count"]
+    assert isinstance(loop_iterations, int)
+    assert isinstance(frame_polls, int)
+    assert isinstance(send_attempts, int)
+    assert isinstance(write_count, int)
+    assert loop_iterations >= 3
+    assert frame_polls >= 3
+    assert send_attempts >= 3
+    assert write_count == len(serial_factory.transport.writes)
+    assert streaming_state.raw_vendor_data["last_command_write_size"] == len(frame)
+    assert streaming_state.raw_vendor_data["command_loop_error_count"] == 0
 
 
 def test_hottop_driver_command_loop_default_frame_provider_sends_no_unverified_bytes() -> None:
@@ -404,6 +415,31 @@ def test_hottop_driver_command_loop_records_write_failures_without_blocking_disc
         assert state.raw_vendor_data["command_write_count"] == 0
         assert state.raw_vendor_data["last_command_write_size"] == 0
         assert error_count >= 1
+    finally:
+        driver.disconnect()
+
+
+def test_hottop_driver_command_loop_records_partial_writes_as_errors() -> None:
+    serial_factory = FakeSerialFactory(transport=PartialWriteSerialTransport())
+    command_loop_iterated = Event()
+    frame = b"safe-test-frame"
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+        command_loop_iteration_hook=command_loop_iterated.set,
+        command_frame_provider=lambda: frame,
+    )
+
+    driver.connect()
+    try:
+        assert command_loop_iterated.wait(timeout=1.0)
+        state = driver.read_state()
+
+        assert state.raw_vendor_data["command_send_attempts"] == 1
+        assert state.raw_vendor_data["command_write_count"] == 0
+        assert state.raw_vendor_data["last_command_write_size"] == len(frame) - 1
+        assert state.raw_vendor_data["command_loop_error_count"] == 1
     finally:
         driver.disconnect()
 
