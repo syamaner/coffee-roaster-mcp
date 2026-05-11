@@ -555,11 +555,16 @@ class HottopRoasterDriver:
         with self._lifecycle_lock:
             command_thread: Thread | None
             serial_transport: SerialTransport | None
-            with self._state_lock:
-                self._connected = False
-                self._stop_event.set()
-                command_thread = self._command_thread
-                serial_transport = self._serial
+            write_lock_acquired = self._command_write_lock.acquire(blocking=False)
+            try:
+                with self._state_lock:
+                    self._connected = False
+                    self._stop_event.set()
+                    command_thread = self._command_thread
+                    serial_transport = self._serial
+            finally:
+                if write_lock_acquired:
+                    self._command_write_lock.release()
 
             if command_thread is not None and command_thread.is_alive():
                 command_thread.join(timeout=self._join_timeout_seconds)
