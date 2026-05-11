@@ -677,7 +677,7 @@ class HottopRoasterDriver:
                 self._stop_event.set()
                 serial_transport = self._serial
             if serial_transport is not None and serial_transport.is_open:
-                serial_transport.close()
+                self._close_serial_transport(serial_transport)
 
     def _send_command_frame(self) -> None:
         """Send one command-frame tick if packet construction is available."""
