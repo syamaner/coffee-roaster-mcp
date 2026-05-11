@@ -149,6 +149,20 @@ class BlockingFrameProvider:
         return self.frame
 
 
+class StopAwareFrameProvider:
+    """Command-frame provider that lets the test request disconnect before write."""
+
+    def __init__(self, frame: bytes) -> None:
+        self.frame = frame
+        self.started = Event()
+        self.release = Event()
+
+    def __call__(self) -> bytes:
+        self.started.set()
+        self.release.wait(timeout=1.0)
+        return self.frame
+
+
 class FakeSerialFactory:
     """Callable serial factory that records constructor arguments."""
 
@@ -587,6 +601,31 @@ def test_hottop_driver_disconnect_prevents_write_after_stop_is_requested() -> No
     assert serial_factory.transport.writes == []
     assert serial_factory.transport.close_calls == 1
     assert driver.read_state().raw_vendor_data["command_write_count"] == 0
+
+
+def test_hottop_driver_disconnect_serializes_close_with_pending_write() -> None:
+    serial_factory = FakeSerialFactory()
+    frame_provider = StopAwareFrameProvider(b"safe-test-frame")
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+        command_frame_provider=frame_provider,
+    )
+    driver.connect()
+    assert frame_provider.started.wait(timeout=1.0)
+
+    disconnect_thread = Thread(target=driver.disconnect)
+    disconnect_thread.start()
+    frame_provider.release.set()
+    disconnect_thread.join(timeout=1.0)
+
+    assert not disconnect_thread.is_alive()
+    assert serial_factory.transport.close_calls == 1
+    assert serial_factory.transport.writes == []
+    state = driver.read_state()
+    assert state.raw_vendor_data["command_send_attempts"] == 0
+    assert state.raw_vendor_data["command_write_count"] == 0
 
 
 def test_hottop_driver_connect_does_not_block_state_reads_during_serial_open() -> None:

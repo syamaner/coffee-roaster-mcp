@@ -566,7 +566,7 @@ class HottopRoasterDriver:
             command_loop_still_running = command_thread is not None and command_thread.is_alive()
 
             if serial_transport is not None and serial_transport.is_open:
-                serial_transport.close()
+                self._close_serial_transport(serial_transport)
 
             with self._state_lock:
                 if not command_loop_still_running:
@@ -575,6 +575,17 @@ class HottopRoasterDriver:
 
             if command_loop_still_running:
                 raise RuntimeError("Hottop command loop did not stop during disconnect.")
+
+    def _close_serial_transport(self, serial_transport: SerialTransport) -> None:
+        """Close serial transport without waiting behind a blocked write."""
+        if self._command_write_lock.acquire(blocking=False):
+            try:
+                if serial_transport.is_open:
+                    serial_transport.close()
+            finally:
+                self._command_write_lock.release()
+            return
+        serial_transport.close()
 
     def read_state(self) -> RoasterState:
         """Return the current normalized Hottop lifecycle state."""
