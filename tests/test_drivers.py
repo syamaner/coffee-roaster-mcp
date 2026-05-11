@@ -26,8 +26,6 @@ class FakeSerialTransport:
         self.closed = Event()
         self.writes: list[bytes] = []
         self._write_lock = Lock()
-        self._write_target = 0
-        self._write_target_reached = Event()
 
     def close(self) -> None:
         self.close_calls += 1
@@ -37,18 +35,7 @@ class FakeSerialTransport:
     def write(self, data: bytes) -> int:
         with self._write_lock:
             self.writes.append(data)
-            if self._write_target > 0 and len(self.writes) >= self._write_target:
-                self._write_target_reached.set()
         return len(data)
-
-    def wait_for_writes(self, count: int, *, timeout: float = 1.0) -> bool:
-        """Wait until the fake serial transport records a target write count."""
-        with self._write_lock:
-            if len(self.writes) >= count:
-                return True
-            self._write_target = count
-            self._write_target_reached.clear()
-        return self._write_target_reached.wait(timeout=timeout)
 
 
 class FailingSerialTransport(FakeSerialTransport):
@@ -65,8 +52,6 @@ class OneSuccessThenFailSerialTransport(FakeSerialTransport):
     def write(self, data: bytes) -> int:
         with self._write_lock:
             self.writes.append(data)
-            if self._write_target > 0 and len(self.writes) >= self._write_target:
-                self._write_target_reached.set()
             if len(self.writes) == 1:
                 return len(data)
         raise OSError("serial write failed")
@@ -78,8 +63,6 @@ class PartialWriteSerialTransport(FakeSerialTransport):
     def write(self, data: bytes) -> int:
         with self._write_lock:
             self.writes.append(data)
-            if self._write_target > 0 and len(self.writes) >= self._write_target:
-                self._write_target_reached.set()
         return len(data) - 1
 
 

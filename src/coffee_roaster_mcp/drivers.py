@@ -558,10 +558,12 @@ class HottopRoasterDriver:
         with self._lifecycle_lock:
             command_thread: Thread | None
             serial_transport: SerialTransport | None
-            self._disconnect_requested.set()
-            write_lock_acquired = self._command_write_lock.acquire(blocking=False)
+            write_lock_acquired = self._command_write_lock.acquire(
+                timeout=self._write_timeout_seconds
+            )
             try:
                 with self._state_lock:
+                    self._disconnect_requested.set()
                     self._connected = False
                     self._stop_event.set()
                     command_thread = self._command_thread
@@ -701,6 +703,8 @@ class HottopRoasterDriver:
                     ):
                         return
                     self._command_send_attempts += 1
+                if self._disconnect_requested.is_set() or self._stop_event.is_set():
+                    return
                 bytes_written = serial_transport.write(frame)
                 with self._state_lock:
                     self._last_command_write_size = bytes_written

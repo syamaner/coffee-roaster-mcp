@@ -20,7 +20,7 @@ Non-PII Codex status snapshot provided near the end of the story:
 - Collaboration mode: Default
 - Context window: 11% left, 232K used / 258K
 
-Context consumption was high because this story included initial implementation, full validation, PR creation, and five Copilot review-fix rounds on concurrency, shutdown, write diagnostics, and test determinism. The most expensive parts were repeatedly fetching thread-aware PR review state, reasoning about race windows in the command-loop shutdown path, updating regression tests, rerunning local validation, pushing follow-up commits, and waiting for GitHub CI after each push.
+Context consumption was high because this story included initial implementation, full validation, PR creation, and six Copilot review-fix rounds on concurrency, shutdown, write diagnostics, and test determinism. The most expensive parts were repeatedly fetching thread-aware PR review state, reasoning about race windows in the command-loop shutdown path, updating regression tests, rerunning local validation, pushing follow-up commits, and waiting for GitHub CI after each push.
 
 ## Implementation Summary
 
@@ -43,7 +43,7 @@ The initial PR body included `Closes #27`.
 
 ## Copilot Review Cycle
 
-Copilot reviewed PR `#83` five times and produced 11 actionable comments. All were addressed with targeted follow-up commits and validation. The review loop took five review-fix turns after the initial implementation turn.
+Copilot reviewed PR `#83` six times and produced 13 actionable comments. All were addressed with targeted follow-up commits and validation. The review loop took six review-fix turns after the initial implementation turn.
 
 ### Turn 1: Type contract, diagnostics semantics, and disconnect/write race
 
@@ -144,6 +144,24 @@ Value:
 
 - High. This closed the final visible post-stop write race and separated two independent timing concerns.
 
+### Turn 6: Final disconnect/write serialization and unused test helper
+
+Copilot raised 2 issues:
+
+- a remaining disconnect/write race existed because the command loop could hold `_command_write_lock`, pass the stop checks, then write after `disconnect()` had begun but before disconnect could publish stop flags
+- `FakeSerialTransport.wait_for_writes()` and its target-state fields were unused after the earlier test cleanup
+
+Response:
+
+- tightened `disconnect()` by acquiring `_command_write_lock` with the dedicated write-timeout before publishing `_disconnect_requested`, `_connected = False`, and `_stop_event`
+- kept the bounded lock acquisition so disconnect still does not wait indefinitely behind a blocked serial write
+- added a final immediate `_disconnect_requested` / `_stop_event` check inside `_command_write_lock` immediately before `serial_transport.write(frame)`
+- removed the unused fake-transport write-target fields and `wait_for_writes()` helper
+
+Value:
+
+- High for the disconnect/write race because Hottop command bytes must not be sent after stop has been requested. Low for the unused helper cleanup, but it kept the tests easier to reason about after the earlier deterministic-test refactor.
+
 ## Final Behavior After Review
 
 After the full review cycle, the Hottop command loop has these invariants:
@@ -152,7 +170,7 @@ After the full review cycle, the Hottop command loop has these invariants:
 - command frames can be injected for deterministic lifecycle tests
 - serial writes report bytes written and partial writes are treated as errors
 - diagnostics distinguish frame polls, send attempts, successful writes, last write size, and errors
-- disconnect records stop intent immediately
+- disconnect publishes stop intent while coordinated with the command write path when the write path is not already blocked
 - normal stop/close is serialized with the write path
 - blocked writes do not hang disconnect indefinitely
 - hook failures fail closed and close serial
@@ -168,7 +186,7 @@ Final local validation after the last review-fix commit:
 - `./.venv/bin/python -m ruff format --check .`: passed
 - `./.venv/bin/python -m pyright`: 0 errors
 
-Final GitHub CI on PR `#83`:
+GitHub CI before the sixth local follow-up had passed. The sixth follow-up was locally validated and then pushed for PR CI rerun:
 
 - `Build Package`: passed
 - `Checks`: passed
