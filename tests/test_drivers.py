@@ -248,12 +248,13 @@ def _wait_for_hottop_write(
     transport: FakeSerialTransport,
     predicate: Callable[[bytes], bool],
     *,
+    start_index: int = 0,
     timeout: float = 1.0,
 ) -> bytes:
     """Wait for a Hottop serial write matching the expected command state."""
     deadline = monotonic() + timeout
     while monotonic() < deadline:
-        for write in transport.writes_snapshot():
+        for write in transport.writes_snapshot()[start_index:]:
             if predicate(write):
                 return write
         sleep(0.01)
@@ -749,6 +750,7 @@ def test_hottop_driver_drop_and_cooling_commands_stream_safe_compound_states() -
             ),
         )
 
+        stop_cooling_start_index = len(serial_factory.transport.writes_snapshot())
         stopped_state = driver.stop_cooling()
         stopped_packet = _wait_for_hottop_write(
             serial_factory.transport,
@@ -760,6 +762,7 @@ def test_hottop_driver_drop_and_cooling_commands_stream_safe_compound_states() -
                 and write[16] == 0
                 and write[18] == 0
             ),
+            start_index=stop_cooling_start_index,
         )
 
         assert drop_state.heat_level_percent == 0
