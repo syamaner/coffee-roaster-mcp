@@ -6,14 +6,21 @@ from typing import cast
 import pytest
 
 from coffee_roaster_mcp.drivers import (
+    HOTTOP_PACKET_LENGTH,
+    HOTTOP_PACKET_PREFIX,
     CommandStreaming,
     HottopRoasterDriver,
     MockRoasterDriver,
     RoasterDriver,
     RoasterState,
     SerialTransportFactory,
+    build_hottop_command_packet,
+    calculate_hottop_packet_checksum,
     create_roaster_driver,
     create_roaster_safety_driver,
+    find_hottop_status_packet,
+    parse_hottop_status_packet,
+    validate_hottop_packet_checksum,
 )
 
 
@@ -217,6 +224,18 @@ class StuckHottopRoasterDriver(HottopRoasterDriver):
         self._release_command_loop.wait()
 
 
+def _build_hottop_status_packet(*, env_temp_c: int, bean_temp_c: int) -> bytes:
+    """Build a minimal valid Hottop status packet for parser tests."""
+    packet = bytearray(HOTTOP_PACKET_LENGTH)
+    packet[: len(HOTTOP_PACKET_PREFIX)] = HOTTOP_PACKET_PREFIX
+    packet[23] = env_temp_c // 256
+    packet[24] = env_temp_c % 256
+    packet[25] = bean_temp_c // 256
+    packet[26] = bean_temp_c % 256
+    packet[35] = calculate_hottop_packet_checksum(packet)
+    return bytes(packet)
+
+
 def _assert_roaster_driver_contract(driver: RoasterDriver) -> None:
     """Exercise the E3 roaster driver contract against one implementation."""
     capabilities = driver.capabilities
@@ -334,6 +353,116 @@ def test_hottop_driver_capabilities_require_command_streaming() -> None:
     assert capabilities.actions.bean_drop is False
     assert capabilities.actions.cooling_control is False
     assert capabilities.actions.emergency_stop is False
+
+
+def test_build_hottop_command_packet_uses_expected_36_byte_layout() -> None:
+    packet = build_hottop_command_packet(
+        heat_level_percent=75,
+        fan_level_percent=55,
+        main_fan_level_percent=30,
+        solenoid_open=True,
+        drum_motor_on=True,
+        cooling_motor_on=False,
+    )
+
+    assert len(packet) == HOTTOP_PACKET_LENGTH
+    assert packet[:7] == bytes((0xA5, 0x96, 0xB0, 0xA0, 0x01, 0x01, 0x24))
+    assert packet[10] == 75
+    assert packet[11] == 6
+    assert packet[12] == 3
+    assert packet[16] == 1
+    assert packet[17] == 1
+    assert packet[18] == 0
+    assert validate_hottop_packet_checksum(packet) is True
+    assert packet[35] == sum(packet[:35]) & 0xFF
+
+
+def test_build_hottop_command_packet_defaults_to_safe_zero_state() -> None:
+    packet = build_hottop_command_packet()
+
+    assert len(packet) == HOTTOP_PACKET_LENGTH
+    assert packet[10] == 0
+    assert packet[11] == 0
+    assert packet[12] == 0
+    assert packet[16] == 0
+    assert packet[17] == 0
+    assert packet[18] == 0
+    assert validate_hottop_packet_checksum(packet) is True
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error_type", "match"),
+    [
+        ({"heat_level_percent": -1}, ValueError, "heat_level_percent"),
+        ({"fan_level_percent": 101}, ValueError, "fan_level_percent"),
+        ({"main_fan_level_percent": True}, TypeError, "main_fan_level_percent"),
+        ({"solenoid_open": 1}, TypeError, "solenoid_open"),
+        ({"drum_motor_on": 0}, TypeError, "drum_motor_on"),
+        ({"cooling_motor_on": "yes"}, TypeError, "cooling_motor_on"),
+    ],
+)
+def test_build_hottop_command_packet_rejects_invalid_fields(
+    kwargs: dict[str, object],
+    error_type: type[Exception],
+    match: str,
+) -> None:
+    with pytest.raises(error_type, match=match):
+        build_hottop_command_packet(**kwargs)  # pyright: ignore[reportArgumentType]
+
+
+def test_parse_hottop_status_packet_extracts_temperatures_and_preserves_raw_packet() -> None:
+    packet = _build_hottop_status_packet(env_temp_c=205, bean_temp_c=187)
+
+    status = parse_hottop_status_packet(packet)
+
+    assert status.env_temp_c == 205
+    assert status.bean_temp_c == 187
+    assert status.raw_packet == packet
+
+
+def test_find_hottop_status_packet_skips_noise_and_invalid_candidates() -> None:
+    invalid_packet = bytearray(_build_hottop_status_packet(env_temp_c=99, bean_temp_c=88))
+    invalid_packet[35] ^= 0x01
+    valid_packet = _build_hottop_status_packet(env_temp_c=205, bean_temp_c=187)
+    buffer = b"noise" + bytes(invalid_packet) + b"more-noise" + valid_packet + b"tail"
+
+    status = find_hottop_status_packet(buffer)
+
+    assert status is not None
+    assert status.env_temp_c == 205
+    assert status.bean_temp_c == 187
+    assert status.raw_packet == valid_packet
+
+
+def test_find_hottop_status_packet_returns_none_when_buffer_has_no_valid_packet() -> None:
+    invalid_packet = bytearray(_build_hottop_status_packet(env_temp_c=99, bean_temp_c=88))
+    invalid_packet[35] ^= 0x01
+
+    assert find_hottop_status_packet(b"noise" + bytes(invalid_packet)) is None
+
+
+@pytest.mark.parametrize(
+    ("packet", "match"),
+    [
+        (b"", "36 bytes"),
+        (bytes([0x00] * HOTTOP_PACKET_LENGTH), "A5 96"),
+    ],
+)
+def test_parse_hottop_status_packet_rejects_invalid_packet_shape(
+    packet: bytes,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        parse_hottop_status_packet(packet)
+
+
+def test_parse_hottop_status_packet_rejects_invalid_checksum() -> None:
+    packet = bytearray(_build_hottop_status_packet(env_temp_c=205, bean_temp_c=187))
+    packet[35] ^= 0x01
+
+    assert validate_hottop_packet_checksum(bytes(packet)) is False
+    with pytest.raises(ValueError, match="checksum"):
+        parse_hottop_status_packet(bytes(packet))
 
 
 def test_hottop_driver_connect_requires_explicit_port() -> None:
