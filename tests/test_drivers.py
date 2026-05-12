@@ -19,6 +19,7 @@ from coffee_roaster_mcp.drivers import (
     create_roaster_driver,
     create_roaster_safety_driver,
     find_hottop_status_packet,
+    is_hottop_command_packet,
     parse_hottop_status_packet,
     validate_hottop_packet_checksum,
 )
@@ -391,6 +392,36 @@ def test_build_hottop_command_packet_defaults_to_safe_zero_state() -> None:
 
 
 @pytest.mark.parametrize(
+    ("fan_level_percent", "expected_hottop_scale"),
+    [
+        (0, 0),
+        (5, 1),
+        (15, 2),
+        (25, 3),
+        (35, 4),
+        (45, 5),
+        (55, 6),
+        (65, 7),
+        (75, 8),
+        (85, 9),
+        (95, 10),
+        (100, 10),
+    ],
+)
+def test_build_hottop_command_packet_uses_half_up_fan_scale(
+    fan_level_percent: int,
+    expected_hottop_scale: int,
+) -> None:
+    packet = build_hottop_command_packet(
+        fan_level_percent=fan_level_percent,
+        main_fan_level_percent=fan_level_percent,
+    )
+
+    assert packet[11] == expected_hottop_scale
+    assert packet[12] == expected_hottop_scale
+
+
+@pytest.mark.parametrize(
     ("kwargs", "error_type", "match"),
     [
         ({"heat_level_percent": -1}, ValueError, "heat_level_percent"),
@@ -420,11 +451,47 @@ def test_parse_hottop_status_packet_extracts_temperatures_and_preserves_raw_pack
     assert status.raw_packet == packet
 
 
+def test_parse_hottop_status_packet_rejects_command_packet_echo() -> None:
+    packet = build_hottop_command_packet(
+        heat_level_percent=75,
+        fan_level_percent=55,
+        main_fan_level_percent=30,
+        solenoid_open=True,
+        drum_motor_on=True,
+        cooling_motor_on=False,
+    )
+
+    assert is_hottop_command_packet(packet) is True
+    assert validate_hottop_packet_checksum(packet) is True
+    with pytest.raises(ValueError, match="command header"):
+        parse_hottop_status_packet(packet)
+
+
 def test_find_hottop_status_packet_skips_noise_and_invalid_candidates() -> None:
     invalid_packet = bytearray(_build_hottop_status_packet(env_temp_c=99, bean_temp_c=88))
     invalid_packet[35] ^= 0x01
     valid_packet = _build_hottop_status_packet(env_temp_c=205, bean_temp_c=187)
     buffer = b"noise" + bytes(invalid_packet) + b"more-noise" + valid_packet + b"tail"
+
+    status = find_hottop_status_packet(buffer)
+
+    assert status is not None
+    assert status.env_temp_c == 205
+    assert status.bean_temp_c == 187
+    assert status.raw_packet == valid_packet
+
+
+def test_find_hottop_status_packet_skips_command_packet_echoes() -> None:
+    command_packet = build_hottop_command_packet(
+        heat_level_percent=75,
+        fan_level_percent=55,
+        main_fan_level_percent=30,
+        solenoid_open=True,
+        drum_motor_on=True,
+        cooling_motor_on=False,
+    )
+    valid_packet = _build_hottop_status_packet(env_temp_c=205, bean_temp_c=187)
+    buffer = b"noise" + command_packet + valid_packet
 
     status = find_hottop_status_packet(buffer)
 

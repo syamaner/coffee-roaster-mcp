@@ -557,11 +557,12 @@ After completing a story:
 - Validation run for E3-S6:
   - Added Hottop packet primitives for 36-byte command construction, checksum calculation, checksum validation, exact status-packet parsing, and serial-buffer scanning for the first valid status packet.
   - Command packets preserve the direct-serial behavioral reference layout: `A5 96 B0 A0 01 01 24` header fields, heat at byte `10`, roast fan and main fan on the Hottop `0-10` scale at bytes `11` and `12`, solenoid/drum/cooling bits at bytes `16` through `18`, and checksum at byte `35`.
-  - Status packet parsing validates length, `A5 96` prefix, and checksum before extracting raw Celsius environment temperature from bytes `23-24` and raw Celsius bean temperature from bytes `25-26`; buffer scanning skips leading noise and invalid checksum candidates.
+  - Status packet parsing validates length, `A5 96` prefix, rejects command-header echoes, and validates checksum before extracting raw Celsius environment temperature from bytes `23-24` and raw Celsius bean temperature from bytes `25-26`; buffer scanning skips leading noise, invalid checksum candidates, and echoed command packets.
+  - Review hardening replaced Python banker's rounding in fan-scale mapping with explicit half-up integer scaling and added boundary tests for `x5` percentages.
   - Kept command-loop safe defaults unchanged; E3-S6 does not enable heat, fan, drop, cooling, stop-cooling, or emergency-stop hardware commands.
   - Checked the old `coffee-roasting` Hottop prototype as a behavioral reference for packet layout and status temperature offsets, but kept the new implementation isolated and unit-testable.
-  - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 67 passed.
-  - Ran `./.venv/bin/python -m pytest`: 131 passed.
+  - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 81 passed.
+  - Ran `./.venv/bin/python -m pytest`: 145 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

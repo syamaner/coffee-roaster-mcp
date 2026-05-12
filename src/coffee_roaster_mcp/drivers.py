@@ -424,6 +424,8 @@ def find_hottop_status_packet(buffer: bytes) -> HottopStatusPacket | None:
         if not buffer.startswith(HOTTOP_PACKET_PREFIX, offset):
             continue
         candidate = buffer[offset : offset + HOTTOP_PACKET_LENGTH]
+        if is_hottop_command_packet(candidate):
+            continue
         if validate_hottop_packet_checksum(candidate):
             return parse_hottop_status_packet(candidate)
     return None
@@ -441,6 +443,11 @@ def validate_hottop_packet_checksum(packet: bytes) -> bool:
     if len(packet) != HOTTOP_PACKET_LENGTH:
         return False
     return packet[_HOTTOP_CHECKSUM_INDEX] == calculate_hottop_packet_checksum(packet)
+
+
+def is_hottop_command_packet(packet: bytes) -> bool:
+    """Return whether a packet has the Hottop command-frame header."""
+    return len(packet) == HOTTOP_PACKET_LENGTH and packet.startswith(_HOTTOP_COMMAND_HEADER)
 
 
 class MockRoasterDriver:
@@ -901,7 +908,7 @@ class HottopRoasterDriver:
 
 def _percent_to_hottop_fan_scale(value: int) -> int:
     """Map normalized fan percentage to the Hottop 0-10 byte scale."""
-    return int(round(value / 10.0))
+    return (value + 5) // 10
 
 
 def _validate_hottop_packet(packet: bytes) -> None:
@@ -910,6 +917,8 @@ def _validate_hottop_packet(packet: bytes) -> None:
         raise ValueError(f"Hottop packet must be {HOTTOP_PACKET_LENGTH} bytes.")
     if not packet.startswith(HOTTOP_PACKET_PREFIX):
         raise ValueError("Hottop packet must start with A5 96.")
+    if is_hottop_command_packet(packet):
+        raise ValueError("Hottop status packet must not use the command header.")
     if not validate_hottop_packet_checksum(packet):
         raise ValueError("Hottop packet checksum is invalid.")
 
