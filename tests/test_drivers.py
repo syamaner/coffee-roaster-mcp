@@ -569,6 +569,36 @@ def test_parse_hottop_status_packet_rejects_invalid_temperature_unit() -> None:
         )
 
 
+def test_parse_hottop_status_packet_rejects_non_string_temperature_unit() -> None:
+    packet = _build_hottop_status_packet(raw_env_temperature=205, raw_bean_temperature=187)
+
+    with pytest.raises(TypeError, match="temperature_unit"):
+        parse_hottop_status_packet(
+            packet,
+            temperature_unit=[],  # pyright: ignore[reportArgumentType]
+        )
+
+
+def test_parse_hottop_status_packet_normalizes_temperature_unit_token() -> None:
+    packet = _build_hottop_status_packet(raw_env_temperature=401, raw_bean_temperature=386)
+
+    status = parse_hottop_status_packet(packet, temperature_unit=" Fahrenheit ")  # pyright: ignore[reportArgumentType]
+
+    assert status.temperature_unit == "fahrenheit"
+    assert status.env_temp_c == 205.0
+    assert status.bean_temp_c == 196.7
+
+
+def test_hottop_driver_normalizes_temperature_unit_token() -> None:
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        temperature_unit=" Auto ",  # pyright: ignore[reportArgumentType]
+        serial_factory=FakeSerialFactory(),
+    )
+
+    assert driver.read_state().raw_vendor_data["temperature_unit"] == "auto"
+
+
 def test_parse_hottop_status_packet_rejects_command_packet_echo() -> None:
     packet = build_hottop_command_packet(
         heat_level_percent=75,

@@ -416,7 +416,7 @@ def parse_hottop_status_packet(
 ) -> HottopStatusPacket:
     """Parse and validate one exact Hottop 36-byte status packet."""
     _validate_hottop_packet(packet)
-    _validate_hottop_temperature_unit(temperature_unit)
+    normalized_temperature_unit = _validate_hottop_temperature_unit(temperature_unit)
     raw_env_temperature = _read_big_endian_uint16(
         packet,
         high_index=_HOTTOP_STATUS_ENV_TEMP_HIGH_INDEX,
@@ -430,14 +430,14 @@ def parse_hottop_status_packet(
     bean_temp_c, env_temp_c, resolved_unit = _normalize_hottop_temperatures(
         raw_bean_temperature=raw_bean_temperature,
         raw_env_temperature=raw_env_temperature,
-        temperature_unit=temperature_unit,
+        temperature_unit=normalized_temperature_unit,
     )
     return HottopStatusPacket(
         bean_temp_c=bean_temp_c,
         env_temp_c=env_temp_c,
         raw_bean_temperature=raw_bean_temperature,
         raw_env_temperature=raw_env_temperature,
-        temperature_unit=temperature_unit,
+        temperature_unit=normalized_temperature_unit,
         resolved_temperature_unit=resolved_unit,
         raw_packet=bytes(packet),
     )
@@ -464,7 +464,7 @@ def _find_hottop_status_packet_in_buffer(
     temperature_unit: HottopTemperatureUnit,
 ) -> tuple[HottopStatusPacket, int] | None:
     """Return the first valid Hottop packet plus its exclusive end offset."""
-    _validate_hottop_temperature_unit(temperature_unit)
+    normalized_temperature_unit = _validate_hottop_temperature_unit(temperature_unit)
     search_limit = len(buffer) - HOTTOP_PACKET_LENGTH + 1
     for offset in range(max(0, search_limit)):
         if not buffer.startswith(HOTTOP_PACKET_PREFIX, offset):
@@ -473,7 +473,10 @@ def _find_hottop_status_packet_in_buffer(
         if is_hottop_command_packet(candidate):
             continue
         if validate_hottop_packet_checksum(candidate):
-            status = parse_hottop_status_packet(candidate, temperature_unit=temperature_unit)
+            status = parse_hottop_status_packet(
+                candidate,
+                temperature_unit=normalized_temperature_unit,
+            )
             return status, offset + HOTTOP_PACKET_LENGTH
     return None
 
@@ -688,10 +691,10 @@ class HottopRoasterDriver:
             raise ValueError("command_interval_seconds must be greater than 0.")
         if join_timeout_seconds <= 0:
             raise ValueError("join_timeout_seconds must be greater than 0.")
-        _validate_hottop_temperature_unit(temperature_unit)
+        normalized_temperature_unit = _validate_hottop_temperature_unit(temperature_unit)
         self._port = port
         self._baudrate = baudrate
-        self._temperature_unit: HottopTemperatureUnit = temperature_unit
+        self._temperature_unit: HottopTemperatureUnit = normalized_temperature_unit
         self._command_interval_seconds = command_interval_seconds
         self._serial_factory = serial_factory or _create_pyserial_transport
         self._join_timeout_seconds = join_timeout_seconds
@@ -1138,10 +1141,14 @@ def _normalize_hottop_temperature(
     return round(temperature_c, 1)
 
 
-def _validate_hottop_temperature_unit(value: object) -> None:
+def _validate_hottop_temperature_unit(value: object) -> HottopTemperatureUnit:
     """Validate a configured Hottop temperature unit mode."""
-    if value not in {"celsius", "fahrenheit", "auto"}:
+    if not isinstance(value, str):
+        raise TypeError("temperature_unit must be a string.")
+    normalized = value.strip().lower()
+    if normalized not in {"celsius", "fahrenheit", "auto"}:
         raise ValueError("temperature_unit must be one of: celsius, fahrenheit, auto.")
+    return cast(HottopTemperatureUnit, normalized)
 
 
 def _validate_hottop_packet(packet: bytes) -> None:
