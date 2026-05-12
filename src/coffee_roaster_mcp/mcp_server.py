@@ -210,6 +210,7 @@ def build_server_context(
             config.roaster.driver,
             port=config.roaster.port,
             baudrate=config.roaster.baudrate,
+            temperature_unit=config.roaster.temperature_unit,
             command_interval_seconds=config.roaster.command_interval_seconds,
         )
     except ValueError as exc:

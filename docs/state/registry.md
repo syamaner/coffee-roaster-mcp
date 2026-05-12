@@ -22,9 +22,9 @@
 
 RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.
 
-E3-S7 is complete. The Hottop driver now owns conservative command state for heat, main fan, drop solenoid, drum motor, and cooling motor. When connected, the command loop streams verified 36-byte command packets from that state. Heat turns on the drum, fan updates the main-fan command, drop applies heat-off/drum-off/solenoid-open/cooling-on/main-fan-high behavior, stop-cooling clears cooling, solenoid, and main fan, and emergency stop applies heat-off/drum-off/cooling-on/main-fan-high with the solenoid closed.
+E3-S8 is complete. The Hottop driver now accepts configured `celsius`, `fahrenheit`, and `auto` raw temperature modes, normalizes plausible status-packet readings to Celsius before exposing `RoasterState`, and ignores startup zero or otherwise implausible telemetry until a plausible packet arrives. When connected, the command loop can consume available serial status bytes while preserving E3-S7 command-state safety behavior.
 
-The next story is E3-S8: implement Hottop temperature unit handling for `celsius`, `fahrenheit`, and `auto`.
+The next story is E3-S9: run the Hottop integration verification spike.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
