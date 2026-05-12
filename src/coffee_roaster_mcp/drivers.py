@@ -280,6 +280,174 @@ class SerialTransport(Protocol):
 
 SerialTransportFactory = Callable[..., SerialTransport]
 HottopCommandFrameProvider = Callable[[], bytes | None]
+HOTTOP_PACKET_LENGTH = 36
+HOTTOP_PACKET_PREFIX = bytes((0xA5, 0x96))
+_HOTTOP_COMMAND_HEADER = bytes((0xA5, 0x96, 0xB0, 0xA0, 0x01, 0x01, 0x24))
+_HOTTOP_COMMAND_HEAT_INDEX = 10
+_HOTTOP_COMMAND_FAN_INDEX = 11
+_HOTTOP_COMMAND_MAIN_FAN_INDEX = 12
+_HOTTOP_COMMAND_SOLENOID_INDEX = 16
+_HOTTOP_COMMAND_DRUM_MOTOR_INDEX = 17
+_HOTTOP_COMMAND_COOLING_MOTOR_INDEX = 18
+_HOTTOP_STATUS_ENV_TEMP_HIGH_INDEX = 23
+_HOTTOP_STATUS_ENV_TEMP_LOW_INDEX = 24
+_HOTTOP_STATUS_BEAN_TEMP_HIGH_INDEX = 25
+_HOTTOP_STATUS_BEAN_TEMP_LOW_INDEX = 26
+_HOTTOP_CHECKSUM_INDEX = HOTTOP_PACKET_LENGTH - 1
+
+
+@dataclass(frozen=True)
+class HottopCommandPacket:
+    """Hottop 36-byte command packet inputs.
+
+    Attributes:
+        heat_level_percent: Heater level in normalized 0-100 percent.
+        fan_level_percent: Roast fan level in normalized 0-100 percent.
+        main_fan_level_percent: Main fan level in normalized 0-100 percent.
+        solenoid_open: Whether the drop solenoid path is active.
+        drum_motor_on: Whether the drum motor command bit is active.
+        cooling_motor_on: Whether the cooling motor command bit is active.
+    """
+
+    heat_level_percent: int = 0
+    fan_level_percent: int = 0
+    main_fan_level_percent: int = 0
+    solenoid_open: bool = False
+    drum_motor_on: bool = False
+    cooling_motor_on: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate normalized Hottop command packet fields."""
+        object.__setattr__(
+            self,
+            "heat_level_percent",
+            validate_control_percent(
+                self.heat_level_percent,
+                label="heat_level_percent",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "fan_level_percent",
+            validate_control_percent(
+                self.fan_level_percent,
+                label="fan_level_percent",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "main_fan_level_percent",
+            validate_control_percent(
+                self.main_fan_level_percent,
+                label="main_fan_level_percent",
+            ),
+        )
+        _validate_exact_bool(self.solenoid_open, label="solenoid_open")
+        _validate_exact_bool(self.drum_motor_on, label="drum_motor_on")
+        _validate_exact_bool(self.cooling_motor_on, label="cooling_motor_on")
+
+    def to_bytes(self) -> bytes:
+        """Build the Hottop 36-byte command packet with checksum."""
+        packet = bytearray(HOTTOP_PACKET_LENGTH)
+        packet[: len(_HOTTOP_COMMAND_HEADER)] = _HOTTOP_COMMAND_HEADER
+        packet[_HOTTOP_COMMAND_HEAT_INDEX] = self.heat_level_percent
+        packet[_HOTTOP_COMMAND_FAN_INDEX] = _percent_to_hottop_fan_scale(self.fan_level_percent)
+        packet[_HOTTOP_COMMAND_MAIN_FAN_INDEX] = _percent_to_hottop_fan_scale(
+            self.main_fan_level_percent
+        )
+        packet[_HOTTOP_COMMAND_SOLENOID_INDEX] = int(self.solenoid_open)
+        packet[_HOTTOP_COMMAND_DRUM_MOTOR_INDEX] = int(self.drum_motor_on)
+        packet[_HOTTOP_COMMAND_COOLING_MOTOR_INDEX] = int(self.cooling_motor_on)
+        packet[_HOTTOP_CHECKSUM_INDEX] = calculate_hottop_packet_checksum(packet)
+        return bytes(packet)
+
+
+@dataclass(frozen=True)
+class HottopStatusPacket:
+    """Parsed Hottop 36-byte status packet.
+
+    Attributes:
+        bean_temp_c: Raw bean temperature reported by the roaster in Celsius.
+        env_temp_c: Raw environment temperature reported by the roaster in Celsius.
+        raw_packet: Original validated 36-byte status packet.
+    """
+
+    bean_temp_c: int
+    env_temp_c: int
+    raw_packet: bytes
+
+
+def build_hottop_command_packet(
+    *,
+    heat_level_percent: int = 0,
+    fan_level_percent: int = 0,
+    main_fan_level_percent: int = 0,
+    solenoid_open: bool = False,
+    drum_motor_on: bool = False,
+    cooling_motor_on: bool = False,
+) -> bytes:
+    """Build a Hottop 36-byte command packet from normalized controls."""
+    return HottopCommandPacket(
+        heat_level_percent=heat_level_percent,
+        fan_level_percent=fan_level_percent,
+        main_fan_level_percent=main_fan_level_percent,
+        solenoid_open=solenoid_open,
+        drum_motor_on=drum_motor_on,
+        cooling_motor_on=cooling_motor_on,
+    ).to_bytes()
+
+
+def parse_hottop_status_packet(packet: bytes) -> HottopStatusPacket:
+    """Parse and validate one exact Hottop 36-byte status packet."""
+    _validate_hottop_packet(packet)
+    env_temp_c = _read_big_endian_uint16(
+        packet,
+        high_index=_HOTTOP_STATUS_ENV_TEMP_HIGH_INDEX,
+        low_index=_HOTTOP_STATUS_ENV_TEMP_LOW_INDEX,
+    )
+    bean_temp_c = _read_big_endian_uint16(
+        packet,
+        high_index=_HOTTOP_STATUS_BEAN_TEMP_HIGH_INDEX,
+        low_index=_HOTTOP_STATUS_BEAN_TEMP_LOW_INDEX,
+    )
+    return HottopStatusPacket(
+        bean_temp_c=bean_temp_c,
+        env_temp_c=env_temp_c,
+        raw_packet=bytes(packet),
+    )
+
+
+def find_hottop_status_packet(buffer: bytes) -> HottopStatusPacket | None:
+    """Return the first valid Hottop status packet found in serial bytes."""
+    search_limit = len(buffer) - HOTTOP_PACKET_LENGTH + 1
+    for offset in range(max(0, search_limit)):
+        if not buffer.startswith(HOTTOP_PACKET_PREFIX, offset):
+            continue
+        candidate = buffer[offset : offset + HOTTOP_PACKET_LENGTH]
+        if is_hottop_command_packet(candidate):
+            continue
+        if validate_hottop_packet_checksum(candidate):
+            return parse_hottop_status_packet(candidate)
+    return None
+
+
+def calculate_hottop_packet_checksum(packet: bytes | bytearray) -> int:
+    """Calculate the Hottop checksum over the first 35 packet bytes."""
+    if len(packet) != HOTTOP_PACKET_LENGTH:
+        raise ValueError(f"Hottop packet must be {HOTTOP_PACKET_LENGTH} bytes.")
+    return sum(packet[:_HOTTOP_CHECKSUM_INDEX]) & 0xFF
+
+
+def validate_hottop_packet_checksum(packet: bytes) -> bool:
+    """Return whether a Hottop packet has a valid checksum byte."""
+    if len(packet) != HOTTOP_PACKET_LENGTH:
+        return False
+    return packet[_HOTTOP_CHECKSUM_INDEX] == calculate_hottop_packet_checksum(packet)
+
+
+def is_hottop_command_packet(packet: bytes) -> bool:
+    """Return whether a packet has the Hottop command-frame header."""
+    return len(packet) == HOTTOP_PACKET_LENGTH and packet.startswith(_HOTTOP_COMMAND_HEADER)
 
 
 class MockRoasterDriver:
@@ -736,6 +904,28 @@ class HottopRoasterDriver:
     def _no_command_frame(self) -> bytes | None:
         """Return no hardware frame until Hottop packet construction lands."""
         return None
+
+
+def _percent_to_hottop_fan_scale(value: int) -> int:
+    """Map normalized fan percentage to the Hottop 0-10 byte scale."""
+    return (value + 5) // 10
+
+
+def _validate_hottop_packet(packet: bytes) -> None:
+    """Validate exact Hottop status packet length, prefix, and checksum."""
+    if len(packet) != HOTTOP_PACKET_LENGTH:
+        raise ValueError(f"Hottop packet must be {HOTTOP_PACKET_LENGTH} bytes.")
+    if not packet.startswith(HOTTOP_PACKET_PREFIX):
+        raise ValueError("Hottop packet must start with A5 96.")
+    if is_hottop_command_packet(packet):
+        raise ValueError("Hottop status packet must not use the command header.")
+    if not validate_hottop_packet_checksum(packet):
+        raise ValueError("Hottop packet checksum is invalid.")
+
+
+def _read_big_endian_uint16(packet: bytes, *, high_index: int, low_index: int) -> int:
+    """Read one unsigned big-endian 16-bit value from packet bytes."""
+    return packet[high_index] * 256 + packet[low_index]
 
 
 def _clamp_float(value: float, *, minimum: float, maximum: float) -> float:
