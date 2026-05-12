@@ -252,14 +252,18 @@ class StuckHottopRoasterDriver(HottopRoasterDriver):
         self._release_command_loop.wait()
 
 
-def _build_hottop_status_packet(*, env_temp_c: int, bean_temp_c: int) -> bytes:
+def _build_hottop_status_packet(
+    *,
+    raw_env_temperature: int,
+    raw_bean_temperature: int,
+) -> bytes:
     """Build a minimal valid Hottop status packet for parser tests."""
     packet = bytearray(HOTTOP_PACKET_LENGTH)
     packet[: len(HOTTOP_PACKET_PREFIX)] = HOTTOP_PACKET_PREFIX
-    packet[23] = env_temp_c // 256
-    packet[24] = env_temp_c % 256
-    packet[25] = bean_temp_c // 256
-    packet[26] = bean_temp_c % 256
+    packet[23] = raw_env_temperature // 256
+    packet[24] = raw_env_temperature % 256
+    packet[25] = raw_bean_temperature // 256
+    packet[26] = raw_bean_temperature % 256
     packet[35] = calculate_hottop_packet_checksum(packet)
     return bytes(packet)
 
@@ -508,7 +512,7 @@ def test_build_hottop_command_packet_rejects_invalid_fields(
 
 
 def test_parse_hottop_status_packet_extracts_temperatures_and_preserves_raw_packet() -> None:
-    packet = _build_hottop_status_packet(env_temp_c=205, bean_temp_c=187)
+    packet = _build_hottop_status_packet(raw_env_temperature=205, raw_bean_temperature=187)
 
     status = parse_hottop_status_packet(packet)
 
@@ -522,7 +526,7 @@ def test_parse_hottop_status_packet_extracts_temperatures_and_preserves_raw_pack
 
 
 def test_parse_hottop_status_packet_converts_fahrenheit_to_celsius() -> None:
-    packet = _build_hottop_status_packet(env_temp_c=401, bean_temp_c=386)
+    packet = _build_hottop_status_packet(raw_env_temperature=401, raw_bean_temperature=386)
 
     status = parse_hottop_status_packet(packet, temperature_unit="fahrenheit")
 
@@ -534,7 +538,7 @@ def test_parse_hottop_status_packet_converts_fahrenheit_to_celsius() -> None:
 
 
 def test_parse_hottop_status_packet_auto_uses_plausible_fahrenheit_readings() -> None:
-    packet = _build_hottop_status_packet(env_temp_c=401, bean_temp_c=386)
+    packet = _build_hottop_status_packet(raw_env_temperature=401, raw_bean_temperature=386)
 
     status = parse_hottop_status_packet(packet, temperature_unit="auto")
 
@@ -544,7 +548,7 @@ def test_parse_hottop_status_packet_auto_uses_plausible_fahrenheit_readings() ->
 
 
 def test_parse_hottop_status_packet_ignores_startup_zero_temperatures() -> None:
-    packet = _build_hottop_status_packet(env_temp_c=0, bean_temp_c=0)
+    packet = _build_hottop_status_packet(raw_env_temperature=0, raw_bean_temperature=0)
 
     status = parse_hottop_status_packet(packet, temperature_unit="auto")
 
@@ -556,7 +560,7 @@ def test_parse_hottop_status_packet_ignores_startup_zero_temperatures() -> None:
 
 
 def test_parse_hottop_status_packet_rejects_invalid_temperature_unit() -> None:
-    packet = _build_hottop_status_packet(env_temp_c=205, bean_temp_c=187)
+    packet = _build_hottop_status_packet(raw_env_temperature=205, raw_bean_temperature=187)
 
     with pytest.raises(ValueError, match="temperature_unit"):
         parse_hottop_status_packet(
@@ -582,9 +586,11 @@ def test_parse_hottop_status_packet_rejects_command_packet_echo() -> None:
 
 
 def test_find_hottop_status_packet_skips_noise_and_invalid_candidates() -> None:
-    invalid_packet = bytearray(_build_hottop_status_packet(env_temp_c=99, bean_temp_c=88))
+    invalid_packet = bytearray(
+        _build_hottop_status_packet(raw_env_temperature=99, raw_bean_temperature=88)
+    )
     invalid_packet[35] ^= 0x01
-    valid_packet = _build_hottop_status_packet(env_temp_c=205, bean_temp_c=187)
+    valid_packet = _build_hottop_status_packet(raw_env_temperature=205, raw_bean_temperature=187)
     buffer = b"noise" + bytes(invalid_packet) + b"more-noise" + valid_packet + b"tail"
 
     status = find_hottop_status_packet(buffer)
@@ -604,7 +610,7 @@ def test_find_hottop_status_packet_skips_command_packet_echoes() -> None:
         drum_motor_on=True,
         cooling_motor_on=False,
     )
-    valid_packet = _build_hottop_status_packet(env_temp_c=205, bean_temp_c=187)
+    valid_packet = _build_hottop_status_packet(raw_env_temperature=205, raw_bean_temperature=187)
     buffer = b"noise" + command_packet + valid_packet
 
     status = find_hottop_status_packet(buffer)
@@ -616,7 +622,9 @@ def test_find_hottop_status_packet_skips_command_packet_echoes() -> None:
 
 
 def test_find_hottop_status_packet_returns_none_when_buffer_has_no_valid_packet() -> None:
-    invalid_packet = bytearray(_build_hottop_status_packet(env_temp_c=99, bean_temp_c=88))
+    invalid_packet = bytearray(
+        _build_hottop_status_packet(raw_env_temperature=99, raw_bean_temperature=88)
+    )
     invalid_packet[35] ^= 0x01
 
     assert find_hottop_status_packet(b"noise" + bytes(invalid_packet)) is None
@@ -638,7 +646,9 @@ def test_parse_hottop_status_packet_rejects_invalid_packet_shape(
 
 
 def test_parse_hottop_status_packet_rejects_invalid_checksum() -> None:
-    packet = bytearray(_build_hottop_status_packet(env_temp_c=205, bean_temp_c=187))
+    packet = bytearray(
+        _build_hottop_status_packet(raw_env_temperature=205, raw_bean_temperature=187)
+    )
     packet[35] ^= 0x01
 
     assert validate_hottop_packet_checksum(bytes(packet)) is False
@@ -775,7 +785,7 @@ def test_hottop_driver_command_loop_default_frame_provider_sends_safe_zero_packe
 def test_hottop_driver_command_loop_updates_latest_celsius_status_temperatures() -> None:
     serial_factory = FakeSerialFactory()
     serial_factory.transport.queue_read_data(
-        _build_hottop_status_packet(env_temp_c=205, bean_temp_c=187)
+        _build_hottop_status_packet(raw_env_temperature=205, raw_bean_temperature=187)
     )
     driver = HottopRoasterDriver(
         port="/dev/test-hottop",
@@ -801,7 +811,7 @@ def test_hottop_driver_command_loop_updates_latest_celsius_status_temperatures()
 def test_hottop_driver_command_loop_ignores_unready_temperatures_until_plausible() -> None:
     serial_factory = FakeSerialFactory()
     serial_factory.transport.queue_read_data(
-        _build_hottop_status_packet(env_temp_c=0, bean_temp_c=0)
+        _build_hottop_status_packet(raw_env_temperature=0, raw_bean_temperature=0)
     )
     driver = HottopRoasterDriver(
         port="/dev/test-hottop",
@@ -814,7 +824,7 @@ def test_hottop_driver_command_loop_ignores_unready_temperatures_until_plausible
     try:
         unready_state = _wait_for_hottop_status_count(driver, 1)
         serial_factory.transport.queue_read_data(
-            _build_hottop_status_packet(env_temp_c=401, bean_temp_c=386)
+            _build_hottop_status_packet(raw_env_temperature=401, raw_bean_temperature=386)
         )
         plausible_state = _wait_for_hottop_status_count(driver, 2)
 
@@ -826,6 +836,61 @@ def test_hottop_driver_command_loop_ignores_unready_temperatures_until_plausible
         assert plausible_state.raw_vendor_data["temperature_unit"] == "auto"
         assert plausible_state.raw_vendor_data["resolved_temperature_unit"] == "fahrenheit"
         assert plausible_state.raw_vendor_data["ignored_temperature_packet_count"] == 1
+    finally:
+        driver.disconnect()
+
+
+def test_hottop_driver_command_loop_processes_burst_status_packets() -> None:
+    serial_factory = FakeSerialFactory()
+    serial_factory.transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=205, raw_bean_temperature=187)
+        + _build_hottop_status_packet(raw_env_temperature=206, raw_bean_temperature=188)
+    )
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+
+    driver.connect()
+    try:
+        state = _wait_for_hottop_status_count(driver, 2)
+
+        assert state.env_temp_c == 206.0
+        assert state.bean_temp_c == 188.0
+        assert state.raw_vendor_data["raw_env_temperature"] == 206
+        assert state.raw_vendor_data["raw_bean_temperature"] == 188
+    finally:
+        driver.disconnect()
+
+
+def test_hottop_driver_command_loop_preserves_partial_status_packet_tail() -> None:
+    serial_factory = FakeSerialFactory()
+    first_packet = _build_hottop_status_packet(
+        raw_env_temperature=205,
+        raw_bean_temperature=187,
+    )
+    second_packet = _build_hottop_status_packet(
+        raw_env_temperature=207,
+        raw_bean_temperature=189,
+    )
+    serial_factory.transport.queue_read_data(first_packet + second_packet[:12])
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+
+    driver.connect()
+    try:
+        first_state = _wait_for_hottop_status_count(driver, 1)
+        serial_factory.transport.queue_read_data(second_packet[12:])
+        second_state = _wait_for_hottop_status_count(driver, 2)
+
+        assert first_state.env_temp_c == 205.0
+        assert first_state.bean_temp_c == 187.0
+        assert second_state.env_temp_c == 207.0
+        assert second_state.bean_temp_c == 189.0
     finally:
         driver.disconnect()
 

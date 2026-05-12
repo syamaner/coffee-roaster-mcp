@@ -449,6 +449,21 @@ def find_hottop_status_packet(
     temperature_unit: HottopTemperatureUnit = "celsius",
 ) -> HottopStatusPacket | None:
     """Return the first valid Hottop status packet found in serial bytes."""
+    result = _find_hottop_status_packet_in_buffer(
+        buffer,
+        temperature_unit=temperature_unit,
+    )
+    if result is None:
+        return None
+    return result[0]
+
+
+def _find_hottop_status_packet_in_buffer(
+    buffer: bytes,
+    *,
+    temperature_unit: HottopTemperatureUnit,
+) -> tuple[HottopStatusPacket, int] | None:
+    """Return the first valid Hottop packet plus its exclusive end offset."""
     _validate_hottop_temperature_unit(temperature_unit)
     search_limit = len(buffer) - HOTTOP_PACKET_LENGTH + 1
     for offset in range(max(0, search_limit)):
@@ -458,10 +473,8 @@ def find_hottop_status_packet(
         if is_hottop_command_packet(candidate):
             continue
         if validate_hottop_packet_checksum(candidate):
-            return parse_hottop_status_packet(
-                candidate,
-                temperature_unit=temperature_unit,
-            )
+            status = parse_hottop_status_packet(candidate, temperature_unit=temperature_unit)
+            return status, offset + HOTTOP_PACKET_LENGTH
     return None
 
 
@@ -1013,23 +1026,26 @@ class HottopRoasterDriver:
             if not isinstance(chunk, bytes) or len(chunk) == 0:
                 return
             with self._state_lock:
-                self._status_buffer = (self._status_buffer + chunk)[-HOTTOP_PACKET_LENGTH * 2 :]
-                status = find_hottop_status_packet(
-                    self._status_buffer,
-                    temperature_unit=self._temperature_unit,
-                )
-                if status is None:
-                    return
-                self._status_buffer = b""
-                self._status_packet_count += 1
-                self._latest_raw_bean_temperature = status.raw_bean_temperature
-                self._latest_raw_env_temperature = status.raw_env_temperature
-                if status.bean_temp_c is None or status.env_temp_c is None:
-                    self._ignored_temperature_packet_count += 1
-                    return
-                self._latest_bean_temp_c = status.bean_temp_c
-                self._latest_env_temp_c = status.env_temp_c
-                self._latest_resolved_temperature_unit = status.resolved_temperature_unit
+                self._status_buffer += chunk
+                while True:
+                    result = _find_hottop_status_packet_in_buffer(
+                        self._status_buffer,
+                        temperature_unit=self._temperature_unit,
+                    )
+                    if result is None:
+                        self._status_buffer = self._status_buffer[-(HOTTOP_PACKET_LENGTH - 1) :]
+                        return
+                    status, end_offset = result
+                    self._status_buffer = self._status_buffer[end_offset:]
+                    self._status_packet_count += 1
+                    self._latest_raw_bean_temperature = status.raw_bean_temperature
+                    self._latest_raw_env_temperature = status.raw_env_temperature
+                    if status.bean_temp_c is None or status.env_temp_c is None:
+                        self._ignored_temperature_packet_count += 1
+                        continue
+                    self._latest_bean_temp_c = status.bean_temp_c
+                    self._latest_env_temp_c = status.env_temp_c
+                    self._latest_resolved_temperature_unit = status.resolved_temperature_unit
         except Exception:
             with self._state_lock:
                 self._status_read_error_count += 1
