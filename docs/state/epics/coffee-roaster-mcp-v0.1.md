@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E3-S8`
-- Current target: Implement Hottop temperature unit handling for `celsius`, `fahrenheit`, and `auto`
+- Active story: `E3-S9`
+- Current target: Run the Hottop integration verification spike
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -46,6 +46,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E3-S5` keeps packet bytes and status parsing out of scope but completes the Hottop command-loop scheduler. The loop ticks at the configured cadence, can stream injectable command frames to the serial transport, records frame polls, send attempts, successful writes, last write size, and write errors in raw diagnostics, and defaults to sending no unverified hardware bytes until `E3-S6` implements the Hottop packet format.
 - `E3-S6` implements deterministic Hottop packet build/parse primitives without turning on live Hottop hardware commands. The driver module can build 36-byte command packets with checksum bytes, validate packet checksums, parse exact 36-byte status packets, and scan serial buffers for the first valid status packet with raw Celsius bean and environment temperatures. The command loop still keeps the safe no-default-frame behavior until `E3-S7` wires these packet primitives to explicit control commands.
 - `E3-S7` wires Hottop control methods to driver-owned command state and the E3-S6 packet builder. Connected Hottop loops now stream verified safe-zero packets by default and then stream the latest explicit heat, main fan, drop, cooling, stop-cooling, or emergency-stop command state. Command methods remain safe to call before connection because no serial bytes are written until the driver lifecycle is opened.
+- `E3-S8` adds Hottop temperature unit handling at the driver boundary. Configured `celsius`, `fahrenheit`, and `auto` raw status-packet modes now normalize plausible bean and environment readings to Celsius before `RoasterState` exposure, and startup zero or implausible packet values are ignored until plausible telemetry arrives.
 - The old `coffee-roasting` prototype was checked as a behavioral reference for E3-S1. It confirmed the need to model Hottop command streaming, temperature-unit normalization, compound drop/cooling behavior, and cleanup through driver lifecycle methods. Drum control remains an internal driver concern for now because E3-S1 and issue #23 do not require a public drum command.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
@@ -175,7 +176,7 @@ Goal: support multiple roasters behind one driver contract while preserving curr
 - [x] `E3-S7` Implement Hottop heat, fan, drop, cooling, stop cooling, and emergency stop.
   - Done when commands preserve safe defaults and known compound drop/cooling behavior.
 
-- [ ] `E3-S8` Implement Hottop temperature unit handling.
+- [x] `E3-S8` Implement Hottop temperature unit handling.
   - Done when `celsius`, `fahrenheit`, and `auto` modes are supported and tested with plausible readings.
 
 - [ ] `E3-S9` Run Hottop integration verification spike.
@@ -578,4 +579,16 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest`: 148 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E3-S8:
+  - Added Hottop status-packet temperature normalization for configured `celsius`, `fahrenheit`, and `auto` modes while keeping `RoasterState` temperatures Celsius-only at the driver boundary.
+  - The Hottop command loop now reads available serial status bytes after command writes, records raw temperature diagnostics, and updates latest normalized temperatures only after plausible packet values arrive.
+  - Startup zero and implausible readings are ignored by returning `None` temperatures and incrementing diagnostics instead of publishing misleading normalized telemetry.
+  - `auto` mode prefers plausible Celsius readings to preserve the old prototype's direct-Celsius behavior, then falls back to Fahrenheit conversion when Celsius values are implausible.
+  - Threaded configured `roaster.temperature_unit` from MCP server context into the Hottop driver factory without changing one-session store or MCP tool semantics.
+  - Checked the old `coffee-roasting` Hottop prototype as a behavioral reference for status packet offsets and big-endian temperature extraction, but kept this implementation in the new driver boundary.
+  - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 90 passed.
+  - Ran `./.venv/bin/python -m pytest`: 154 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed after applying `ruff format`.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

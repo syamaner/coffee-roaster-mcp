@@ -13,6 +13,8 @@ from coffee_roaster_mcp.controls import validate_control_percent
 from coffee_roaster_mcp.session import EventPayloadValue
 
 ReportedTemperatureUnit = Literal["celsius", "unknown"]
+HottopTemperatureUnit = Literal["celsius", "fahrenheit", "auto"]
+ResolvedHottopTemperatureUnit = Literal["celsius", "fahrenheit"]
 HOTTOP_DRIVER_NAME = "hottop_kn8828b_2k_plus"
 
 
@@ -294,6 +296,8 @@ _HOTTOP_STATUS_ENV_TEMP_LOW_INDEX = 24
 _HOTTOP_STATUS_BEAN_TEMP_HIGH_INDEX = 25
 _HOTTOP_STATUS_BEAN_TEMP_LOW_INDEX = 26
 _HOTTOP_CHECKSUM_INDEX = HOTTOP_PACKET_LENGTH - 1
+_HOTTOP_MIN_PLAUSIBLE_TEMP_C = 1.0
+_HOTTOP_MAX_PLAUSIBLE_TEMP_C = 320.0
 
 
 @dataclass(frozen=True)
@@ -367,13 +371,21 @@ class HottopStatusPacket:
     """Parsed Hottop 36-byte status packet.
 
     Attributes:
-        bean_temp_c: Raw bean temperature reported by the roaster in Celsius.
-        env_temp_c: Raw environment temperature reported by the roaster in Celsius.
+        bean_temp_c: Normalized plausible bean temperature in Celsius.
+        env_temp_c: Normalized plausible environment temperature in Celsius.
+        raw_bean_temperature: Raw bean temperature value from the packet.
+        raw_env_temperature: Raw environment temperature value from the packet.
+        temperature_unit: Configured Hottop raw temperature mode.
+        resolved_temperature_unit: Raw unit selected for this packet, when plausible.
         raw_packet: Original validated 36-byte status packet.
     """
 
-    bean_temp_c: int
-    env_temp_c: int
+    bean_temp_c: float | None
+    env_temp_c: float | None
+    raw_bean_temperature: int
+    raw_env_temperature: int
+    temperature_unit: HottopTemperatureUnit
+    resolved_temperature_unit: ResolvedHottopTemperatureUnit | None
     raw_packet: bytes
 
 
@@ -397,28 +409,47 @@ def build_hottop_command_packet(
     ).to_bytes()
 
 
-def parse_hottop_status_packet(packet: bytes) -> HottopStatusPacket:
+def parse_hottop_status_packet(
+    packet: bytes,
+    *,
+    temperature_unit: HottopTemperatureUnit = "celsius",
+) -> HottopStatusPacket:
     """Parse and validate one exact Hottop 36-byte status packet."""
     _validate_hottop_packet(packet)
-    env_temp_c = _read_big_endian_uint16(
+    _validate_hottop_temperature_unit(temperature_unit)
+    raw_env_temperature = _read_big_endian_uint16(
         packet,
         high_index=_HOTTOP_STATUS_ENV_TEMP_HIGH_INDEX,
         low_index=_HOTTOP_STATUS_ENV_TEMP_LOW_INDEX,
     )
-    bean_temp_c = _read_big_endian_uint16(
+    raw_bean_temperature = _read_big_endian_uint16(
         packet,
         high_index=_HOTTOP_STATUS_BEAN_TEMP_HIGH_INDEX,
         low_index=_HOTTOP_STATUS_BEAN_TEMP_LOW_INDEX,
     )
+    bean_temp_c, env_temp_c, resolved_unit = _normalize_hottop_temperatures(
+        raw_bean_temperature=raw_bean_temperature,
+        raw_env_temperature=raw_env_temperature,
+        temperature_unit=temperature_unit,
+    )
     return HottopStatusPacket(
         bean_temp_c=bean_temp_c,
         env_temp_c=env_temp_c,
+        raw_bean_temperature=raw_bean_temperature,
+        raw_env_temperature=raw_env_temperature,
+        temperature_unit=temperature_unit,
+        resolved_temperature_unit=resolved_unit,
         raw_packet=bytes(packet),
     )
 
 
-def find_hottop_status_packet(buffer: bytes) -> HottopStatusPacket | None:
+def find_hottop_status_packet(
+    buffer: bytes,
+    *,
+    temperature_unit: HottopTemperatureUnit = "celsius",
+) -> HottopStatusPacket | None:
     """Return the first valid Hottop status packet found in serial bytes."""
+    _validate_hottop_temperature_unit(temperature_unit)
     search_limit = len(buffer) - HOTTOP_PACKET_LENGTH + 1
     for offset in range(max(0, search_limit)):
         if not buffer.startswith(HOTTOP_PACKET_PREFIX, offset):
@@ -427,7 +458,10 @@ def find_hottop_status_packet(buffer: bytes) -> HottopStatusPacket | None:
         if is_hottop_command_packet(candidate):
             continue
         if validate_hottop_packet_checksum(candidate):
-            return parse_hottop_status_packet(candidate)
+            return parse_hottop_status_packet(
+                candidate,
+                temperature_unit=temperature_unit,
+            )
     return None
 
 
@@ -618,6 +652,7 @@ class HottopRoasterDriver:
         *,
         port: str | None = None,
         baudrate: int = 115_200,
+        temperature_unit: HottopTemperatureUnit = "celsius",
         command_interval_seconds: float = 0.3,
         serial_factory: SerialTransportFactory | None = None,
         join_timeout_seconds: float = 1.0,
@@ -629,6 +664,7 @@ class HottopRoasterDriver:
         Args:
             port: Serial port path for the Hottop controller.
             baudrate: Serial baudrate.
+            temperature_unit: Raw Hottop temperature unit mode.
             command_interval_seconds: Command-loop cadence.
             serial_factory: Optional injectable serial transport factory for tests.
             join_timeout_seconds: Maximum disconnect wait for command-loop cleanup.
@@ -639,8 +675,10 @@ class HottopRoasterDriver:
             raise ValueError("command_interval_seconds must be greater than 0.")
         if join_timeout_seconds <= 0:
             raise ValueError("join_timeout_seconds must be greater than 0.")
+        _validate_hottop_temperature_unit(temperature_unit)
         self._port = port
         self._baudrate = baudrate
+        self._temperature_unit: HottopTemperatureUnit = temperature_unit
         self._command_interval_seconds = command_interval_seconds
         self._serial_factory = serial_factory or _create_pyserial_transport
         self._join_timeout_seconds = join_timeout_seconds
@@ -667,6 +705,15 @@ class HottopRoasterDriver:
         self._solenoid_open = False
         self._drum_motor_on = False
         self._cooling_motor_on = False
+        self._latest_bean_temp_c: float | None = None
+        self._latest_env_temp_c: float | None = None
+        self._latest_raw_bean_temperature: int | None = None
+        self._latest_raw_env_temperature: int | None = None
+        self._latest_resolved_temperature_unit: ResolvedHottopTemperatureUnit | None = None
+        self._status_packet_count = 0
+        self._ignored_temperature_packet_count = 0
+        self._status_read_error_count = 0
+        self._status_buffer = b""
 
     @property
     def capabilities(self) -> RoasterCapabilities:
@@ -798,14 +845,21 @@ class HottopRoasterDriver:
             return RoasterState(
                 driver=self.name,
                 connected=self._connected,
-                bean_temp_c=None,
-                env_temp_c=None,
+                bean_temp_c=self._latest_bean_temp_c,
+                env_temp_c=self._latest_env_temp_c,
                 heat_level_percent=self._heat_level_percent,
                 fan_level_percent=self._main_fan_level_percent,
                 cooling_on=self._cooling_motor_on,
                 raw_vendor_data={
                     "port": self._port,
                     "baudrate": self._baudrate,
+                    "temperature_unit": self._temperature_unit,
+                    "resolved_temperature_unit": self._latest_resolved_temperature_unit,
+                    "raw_bean_temperature": self._latest_raw_bean_temperature,
+                    "raw_env_temperature": self._latest_raw_env_temperature,
+                    "status_packet_count": self._status_packet_count,
+                    "ignored_temperature_packet_count": self._ignored_temperature_packet_count,
+                    "status_read_error_count": self._status_read_error_count,
                     "command_interval_seconds": self._command_interval_seconds,
                     "command_loop_running": command_loop_running,
                     "command_loop_iterations": self._command_loop_iterations,
@@ -940,10 +994,45 @@ class HottopRoasterDriver:
                         self._command_write_count += 1
                     else:
                         self._command_loop_error_count += 1
+                self._read_status_packet(serial_transport)
         except Exception:
             with self._state_lock:
                 self._command_loop_error_count += 1
                 self._last_command_write_size = 0
+
+    def _read_status_packet(self, serial_transport: SerialTransport) -> None:
+        """Read available Hottop status bytes and update normalized temperatures."""
+        try:
+            waiting = getattr(serial_transport, "in_waiting", 0)
+            if not isinstance(waiting, int) or waiting <= 0:
+                return
+            read = getattr(serial_transport, "read", None)
+            if not callable(read):
+                return
+            chunk = read(waiting)
+            if not isinstance(chunk, bytes) or len(chunk) == 0:
+                return
+            with self._state_lock:
+                self._status_buffer = (self._status_buffer + chunk)[-HOTTOP_PACKET_LENGTH * 2 :]
+                status = find_hottop_status_packet(
+                    self._status_buffer,
+                    temperature_unit=self._temperature_unit,
+                )
+                if status is None:
+                    return
+                self._status_buffer = b""
+                self._status_packet_count += 1
+                self._latest_raw_bean_temperature = status.raw_bean_temperature
+                self._latest_raw_env_temperature = status.raw_env_temperature
+                if status.bean_temp_c is None or status.env_temp_c is None:
+                    self._ignored_temperature_packet_count += 1
+                    return
+                self._latest_bean_temp_c = status.bean_temp_c
+                self._latest_env_temp_c = status.env_temp_c
+                self._latest_resolved_temperature_unit = status.resolved_temperature_unit
+        except Exception:
+            with self._state_lock:
+                self._status_read_error_count += 1
 
     def _current_command_frame(self) -> bytes:
         """Return the current Hottop command-state packet."""
@@ -961,6 +1050,81 @@ class HottopRoasterDriver:
 def _percent_to_hottop_fan_scale(value: int) -> int:
     """Map normalized fan percentage to the Hottop 0-10 byte scale."""
     return (value + 5) // 10
+
+
+def _normalize_hottop_temperatures(
+    *,
+    raw_bean_temperature: int,
+    raw_env_temperature: int,
+    temperature_unit: HottopTemperatureUnit,
+) -> tuple[float | None, float | None, ResolvedHottopTemperatureUnit | None]:
+    """Normalize raw Hottop temperature readings to plausible Celsius values."""
+    if temperature_unit == "celsius":
+        return _normalize_explicit_hottop_temperatures(
+            raw_bean_temperature=raw_bean_temperature,
+            raw_env_temperature=raw_env_temperature,
+            resolved_unit="celsius",
+        )
+    if temperature_unit == "fahrenheit":
+        return _normalize_explicit_hottop_temperatures(
+            raw_bean_temperature=raw_bean_temperature,
+            raw_env_temperature=raw_env_temperature,
+            resolved_unit="fahrenheit",
+        )
+
+    celsius_values = _normalize_explicit_hottop_temperatures(
+        raw_bean_temperature=raw_bean_temperature,
+        raw_env_temperature=raw_env_temperature,
+        resolved_unit="celsius",
+    )
+    if celsius_values[2] is not None:
+        return celsius_values
+    return _normalize_explicit_hottop_temperatures(
+        raw_bean_temperature=raw_bean_temperature,
+        raw_env_temperature=raw_env_temperature,
+        resolved_unit="fahrenheit",
+    )
+
+
+def _normalize_explicit_hottop_temperatures(
+    *,
+    raw_bean_temperature: int,
+    raw_env_temperature: int,
+    resolved_unit: ResolvedHottopTemperatureUnit,
+) -> tuple[float | None, float | None, ResolvedHottopTemperatureUnit | None]:
+    """Normalize one explicit Hottop raw unit mode."""
+    bean_temp_c = _normalize_hottop_temperature(
+        raw_bean_temperature,
+        resolved_unit=resolved_unit,
+    )
+    env_temp_c = _normalize_hottop_temperature(
+        raw_env_temperature,
+        resolved_unit=resolved_unit,
+    )
+    if bean_temp_c is None or env_temp_c is None:
+        return None, None, None
+    return bean_temp_c, env_temp_c, resolved_unit
+
+
+def _normalize_hottop_temperature(
+    raw_temperature: int,
+    *,
+    resolved_unit: ResolvedHottopTemperatureUnit,
+) -> float | None:
+    """Normalize one raw Hottop temperature reading to plausible Celsius."""
+    if resolved_unit == "fahrenheit":
+        temperature_c = (raw_temperature - 32.0) * 5.0 / 9.0
+    else:
+        temperature_c = float(raw_temperature)
+    if not (_HOTTOP_MIN_PLAUSIBLE_TEMP_C <= temperature_c <= _HOTTOP_MAX_PLAUSIBLE_TEMP_C):
+        return None
+    return round(temperature_c, 1)
+
+
+def _validate_hottop_temperature_unit(value: object) -> None:
+    """Validate a configured Hottop temperature unit mode."""
+    if value not in {"celsius", "fahrenheit", "auto"}:
+        raise ValueError("temperature_unit must be one of: celsius, fahrenheit, auto.")
 
 
 def _validate_hottop_packet(packet: bytes) -> None:
@@ -1042,6 +1206,7 @@ def create_roaster_driver(
     *,
     port: str | None = None,
     baudrate: int = 115_200,
+    temperature_unit: HottopTemperatureUnit = "celsius",
     command_interval_seconds: float = 0.3,
 ) -> RoasterDriver:
     """Create the configured roaster driver.
@@ -1050,6 +1215,7 @@ def create_roaster_driver(
         driver_name: Roaster driver name from configuration.
         port: Optional roaster serial port.
         baudrate: Configured roaster baudrate.
+        temperature_unit: Configured roaster temperature unit.
         command_interval_seconds: Configured command interval.
 
     Returns:
@@ -1064,6 +1230,7 @@ def create_roaster_driver(
         return HottopRoasterDriver(
             port=port,
             baudrate=baudrate,
+            temperature_unit=temperature_unit,
             command_interval_seconds=command_interval_seconds,
         )
     raise ValueError(
