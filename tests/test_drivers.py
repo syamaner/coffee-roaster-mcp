@@ -840,6 +840,39 @@ def test_hottop_driver_command_loop_ignores_unready_temperatures_until_plausible
         driver.disconnect()
 
 
+def test_hottop_driver_command_loop_clears_resolved_unit_for_ignored_packet() -> None:
+    serial_factory = FakeSerialFactory()
+    serial_factory.transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=401, raw_bean_temperature=386)
+    )
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        temperature_unit="auto",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+
+    driver.connect()
+    try:
+        plausible_state = _wait_for_hottop_status_count(driver, 1)
+        serial_factory.transport.queue_read_data(
+            _build_hottop_status_packet(raw_env_temperature=0, raw_bean_temperature=0)
+        )
+        ignored_state = _wait_for_hottop_status_count(driver, 2)
+
+        assert plausible_state.env_temp_c == 205.0
+        assert plausible_state.bean_temp_c == 196.7
+        assert plausible_state.raw_vendor_data["resolved_temperature_unit"] == "fahrenheit"
+        assert ignored_state.env_temp_c == 205.0
+        assert ignored_state.bean_temp_c == 196.7
+        assert ignored_state.raw_vendor_data["raw_env_temperature"] == 0
+        assert ignored_state.raw_vendor_data["raw_bean_temperature"] == 0
+        assert ignored_state.raw_vendor_data["resolved_temperature_unit"] is None
+        assert ignored_state.raw_vendor_data["ignored_temperature_packet_count"] == 1
+    finally:
+        driver.disconnect()
+
+
 def test_hottop_driver_command_loop_processes_burst_status_packets() -> None:
     serial_factory = FakeSerialFactory()
     serial_factory.transport.queue_read_data(

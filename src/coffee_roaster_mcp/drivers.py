@@ -1042,6 +1042,7 @@ class HottopRoasterDriver:
                     self._latest_raw_env_temperature = status.raw_env_temperature
                     if status.bean_temp_c is None or status.env_temp_c is None:
                         self._ignored_temperature_packet_count += 1
+                        self._latest_resolved_temperature_unit = status.resolved_temperature_unit
                         continue
                     self._latest_bean_temp_c = status.bean_temp_c
                     self._latest_env_temp_c = status.env_temp_c
