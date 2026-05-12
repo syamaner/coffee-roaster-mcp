@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E3-S7`
-- Current target: Implement Hottop heat, fan, drop, cooling, stop cooling, and emergency stop
+- Active story: `E3-S8`
+- Current target: Implement Hottop temperature unit handling for `celsius`, `fahrenheit`, and `auto`
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -45,6 +45,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E3-S4` adds the first Hottop driver lifecycle slice. The driver can be constructed for `hottop_kn8828b_2k_plus`, requires an explicit serial port before connect, opens serial transport lazily through pyserial without holding the state-read lock, starts a command-loop lifecycle thread on connect, and disconnects by signalling the loop, joining it, closing serial transport, and clearing runtime references. Review hardening keeps Hottop capabilities accurate while controls are not implemented, passes configured port/baudrate/command interval into the driver, closes serial even when join times out, blocks reconnect while a prior command loop is still alive, and uses deterministic test synchronization for loop iteration tests. Packet sending and hardware commands remain later Epic 3 stories.
 - `E3-S5` keeps packet bytes and status parsing out of scope but completes the Hottop command-loop scheduler. The loop ticks at the configured cadence, can stream injectable command frames to the serial transport, records frame polls, send attempts, successful writes, last write size, and write errors in raw diagnostics, and defaults to sending no unverified hardware bytes until `E3-S6` implements the Hottop packet format.
 - `E3-S6` implements deterministic Hottop packet build/parse primitives without turning on live Hottop hardware commands. The driver module can build 36-byte command packets with checksum bytes, validate packet checksums, parse exact 36-byte status packets, and scan serial buffers for the first valid status packet with raw Celsius bean and environment temperatures. The command loop still keeps the safe no-default-frame behavior until `E3-S7` wires these packet primitives to explicit control commands.
+- `E3-S7` wires Hottop control methods to driver-owned command state and the E3-S6 packet builder. Connected Hottop loops now stream verified safe-zero packets by default and then stream the latest explicit heat, main fan, drop, cooling, stop-cooling, or emergency-stop command state. Command methods remain safe to call before connection because no serial bytes are written until the driver lifecycle is opened.
 - The old `coffee-roasting` prototype was checked as a behavioral reference for E3-S1. It confirmed the need to model Hottop command streaming, temperature-unit normalization, compound drop/cooling behavior, and cleanup through driver lifecycle methods. Drum control remains an internal driver concern for now because E3-S1 and issue #23 do not require a public drum command.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
@@ -171,7 +172,7 @@ Goal: support multiple roasters behind one driver contract while preserving curr
 - [x] `E3-S6` Implement Hottop packet build/parse.
   - Done when 36-byte packet construction, status parsing, and checksum validation are unit tested.
 
-- [ ] `E3-S7` Implement Hottop heat, fan, drop, cooling, stop cooling, and emergency stop.
+- [x] `E3-S7` Implement Hottop heat, fan, drop, cooling, stop cooling, and emergency stop.
   - Done when commands preserve safe defaults and known compound drop/cooling behavior.
 
 - [ ] `E3-S8` Implement Hottop temperature unit handling.
@@ -563,6 +564,18 @@ After completing a story:
   - Checked the old `coffee-roasting` Hottop prototype as a behavioral reference for packet layout and status temperature offsets, but kept the new implementation isolated and unit-testable.
   - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 81 passed.
   - Ran `./.venv/bin/python -m pytest`: 145 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E3-S7:
+  - Replaced the Hottop driver's unsupported control stubs with driver-owned command state for heat, roast fan, main fan, solenoid, drum motor, and cooling motor.
+  - The default connected command loop now streams verified E3-S6 Hottop command packets from safe-zero state instead of sending no frame; injected frame providers remain supported for scheduler tests.
+  - Hottop heat turns on the drum when heat is nonzero, fan controls the main-fan packet byte, drop forces heat off, drum off, solenoid open, cooling on, and main fan high, stop-cooling clears cooling, solenoid, and main fan, and emergency stop forces heat off, drum off, solenoid closed, cooling on, and main fan high.
+  - Commands are safe to call before `connect()` because they only mutate driver state; serial writes happen only through the connected command loop.
+  - Added mocked-serial tests proving safe-zero packet streaming, heat/fan packet state, compound drop/cooling packet state, and emergency-stop packet state.
+  - Checked the old `coffee-roasting` Hottop prototype as a behavioral reference for compound drop/cooling behavior and command-state packet fields, but kept this implementation inside the existing driver abstraction.
+  - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 84 passed.
+  - Ran `./.venv/bin/python -m pytest`: 148 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
