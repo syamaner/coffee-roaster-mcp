@@ -35,6 +35,7 @@ class FakeSerialTransport:
         self.close_calls = 0
         self.closed = Event()
         self.writes: list[bytes] = []
+        self.read_sizes: list[int] = []
         self._read_buffer = bytearray()
         self._write_lock = Lock()
         self._read_lock = Lock()
@@ -63,6 +64,7 @@ class FakeSerialTransport:
     def read(self, size: int) -> bytes:
         """Read queued bytes from the fake transport."""
         with self._read_lock:
+            self.read_sizes.append(size)
             chunk = bytes(self._read_buffer[:size])
             del self._read_buffer[:size]
             return chunk
@@ -923,6 +925,34 @@ def test_hottop_driver_command_loop_processes_burst_status_packets() -> None:
         assert state.bean_temp_c == 188.0
         assert state.raw_vendor_data["raw_env_temperature"] == 206
         assert state.raw_vendor_data["raw_bean_temperature"] == 188
+    finally:
+        driver.disconnect()
+
+
+def test_hottop_driver_command_loop_caps_status_read_size() -> None:
+    serial_factory = FakeSerialFactory()
+    queued_packets = b"".join(
+        _build_hottop_status_packet(
+            raw_env_temperature=205 + index,
+            raw_bean_temperature=187 + index,
+        )
+        for index in range(6)
+    )
+    serial_factory.transport.queue_read_data(queued_packets)
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+
+    driver.connect()
+    try:
+        state = _wait_for_hottop_status_count(driver, 6)
+
+        assert state.env_temp_c == 210.0
+        assert state.bean_temp_c == 192.0
+        assert max(serial_factory.transport.read_sizes) <= HOTTOP_PACKET_LENGTH * 4
+        assert serial_factory.transport.read_sizes[0] == HOTTOP_PACKET_LENGTH * 4
     finally:
         driver.disconnect()
 

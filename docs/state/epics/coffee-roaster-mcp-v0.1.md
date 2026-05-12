@@ -587,9 +587,9 @@ After completing a story:
   - `auto` mode prefers plausible Celsius readings to preserve the old prototype's direct-Celsius behavior, then falls back to Fahrenheit conversion when Celsius values are implausible.
   - Threaded configured `roaster.temperature_unit` from MCP server context into the Hottop driver factory without changing one-session store or MCP tool semantics.
   - Checked the old `coffee-roasting` Hottop prototype as a behavioral reference for status packet offsets and big-endian temperature extraction, but kept this implementation in the new driver boundary.
-  - Review hardening preserved unread status-buffer bytes across burst and partial serial reads, processed multiple valid status packets from one read, renamed status-packet test helper fields from Celsius-specific names to raw-temperature names, clears the resolved raw unit diagnostic when the latest raw packet is ignored as implausible, and makes Hottop temperature-unit validation deterministic for non-string and mixed-case inputs.
-  - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 96 passed.
-  - Ran `./.venv/bin/python -m pytest`: 160 passed.
+  - Review hardening preserved unread status-buffer bytes across burst and partial serial reads, processed multiple valid status packets from one read, renamed status-packet test helper fields from Celsius-specific names to raw-temperature names, clears the resolved raw unit diagnostic when the latest raw packet is ignored as implausible, makes Hottop temperature-unit validation deterministic for non-string and mixed-case inputs, releases the command write lock before status reads, caps per-loop status reads, and parses status buffers outside the state lock before publishing results.
+  - Ran `./.venv/bin/python -m pytest tests/test_drivers.py`: 97 passed.
+  - Ran `./.venv/bin/python -m pytest`: 161 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed after applying `ruff format`.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

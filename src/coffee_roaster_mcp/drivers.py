@@ -298,6 +298,7 @@ _HOTTOP_STATUS_BEAN_TEMP_LOW_INDEX = 26
 _HOTTOP_CHECKSUM_INDEX = HOTTOP_PACKET_LENGTH - 1
 _HOTTOP_MIN_PLAUSIBLE_TEMP_C = 1.0
 _HOTTOP_MAX_PLAUSIBLE_TEMP_C = 320.0
+_HOTTOP_STATUS_READ_MAX_BYTES = HOTTOP_PACKET_LENGTH * 4
 
 
 @dataclass(frozen=True)
@@ -479,6 +480,26 @@ def _find_hottop_status_packet_in_buffer(
             )
             return status, offset + HOTTOP_PACKET_LENGTH
     return None
+
+
+def _parse_hottop_status_buffer(
+    buffer: bytes,
+    *,
+    temperature_unit: HottopTemperatureUnit,
+) -> tuple[list[HottopStatusPacket], bytes]:
+    """Parse all complete Hottop status packets and return the unconsumed tail."""
+    statuses: list[HottopStatusPacket] = []
+    remaining = buffer
+    while True:
+        result = _find_hottop_status_packet_in_buffer(
+            remaining,
+            temperature_unit=temperature_unit,
+        )
+        if result is None:
+            return statuses, remaining[-(HOTTOP_PACKET_LENGTH - 1) :]
+        status, end_offset = result
+        statuses.append(status)
+        remaining = remaining[end_offset:]
 
 
 def calculate_hottop_packet_checksum(packet: bytes | bytearray) -> int:
@@ -1010,7 +1031,7 @@ class HottopRoasterDriver:
                         self._command_write_count += 1
                     else:
                         self._command_loop_error_count += 1
-                self._read_status_packet(serial_transport)
+            self._read_status_packet(serial_transport)
         except Exception:
             with self._state_lock:
                 self._command_loop_error_count += 1
@@ -1025,21 +1046,19 @@ class HottopRoasterDriver:
             read = getattr(serial_transport, "read", None)
             if not callable(read):
                 return
-            chunk = read(waiting)
+            chunk = read(min(waiting, _HOTTOP_STATUS_READ_MAX_BYTES))
             if not isinstance(chunk, bytes) or len(chunk) == 0:
                 return
             with self._state_lock:
-                self._status_buffer += chunk
-                while True:
-                    result = _find_hottop_status_packet_in_buffer(
-                        self._status_buffer,
-                        temperature_unit=self._temperature_unit,
-                    )
-                    if result is None:
-                        self._status_buffer = self._status_buffer[-(HOTTOP_PACKET_LENGTH - 1) :]
-                        return
-                    status, end_offset = result
-                    self._status_buffer = self._status_buffer[end_offset:]
+                status_buffer = self._status_buffer + chunk
+                temperature_unit = self._temperature_unit
+            statuses, remaining_buffer = _parse_hottop_status_buffer(
+                status_buffer,
+                temperature_unit=temperature_unit,
+            )
+            with self._state_lock:
+                self._status_buffer = remaining_buffer
+                for status in statuses:
                     self._status_packet_count += 1
                     self._latest_raw_bean_temperature = status.raw_bean_temperature
                     self._latest_raw_env_temperature = status.raw_env_temperature
