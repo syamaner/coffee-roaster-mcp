@@ -1,6 +1,8 @@
 """Roaster driver contract, capability, and safety behavior coverage."""
 
+from collections.abc import Callable
 from threading import Event, Lock, Thread
+from time import monotonic, sleep
 from typing import cast
 
 import pytest
@@ -44,6 +46,11 @@ class FakeSerialTransport:
         with self._write_lock:
             self.writes.append(data)
         return len(data)
+
+    def writes_snapshot(self) -> list[bytes]:
+        """Return command writes recorded by the fake transport."""
+        with self._write_lock:
+            return list(self.writes)
 
 
 class FailingSerialTransport(FakeSerialTransport):
@@ -237,6 +244,22 @@ def _build_hottop_status_packet(*, env_temp_c: int, bean_temp_c: int) -> bytes:
     return bytes(packet)
 
 
+def _wait_for_hottop_write(
+    transport: FakeSerialTransport,
+    predicate: Callable[[bytes], bool],
+    *,
+    timeout: float = 1.0,
+) -> bytes:
+    """Wait for a Hottop serial write matching the expected command state."""
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        for write in transport.writes_snapshot():
+            if predicate(write):
+                return write
+        sleep(0.01)
+    pytest.fail("Timed out waiting for expected Hottop command write.")
+
+
 def _assert_roaster_driver_contract(driver: RoasterDriver) -> None:
     """Exercise the E3 roaster driver contract against one implementation."""
     capabilities = driver.capabilities
@@ -349,11 +372,11 @@ def test_hottop_driver_capabilities_require_command_streaming() -> None:
     assert capabilities.driver == "hottop_kn8828b_2k_plus"
     assert capabilities.command_streaming.required is True
     assert capabilities.command_streaming.interval_seconds == 0.05
-    assert capabilities.actions.heat_control is False
-    assert capabilities.actions.fan_control is False
-    assert capabilities.actions.bean_drop is False
-    assert capabilities.actions.cooling_control is False
-    assert capabilities.actions.emergency_stop is False
+    assert capabilities.actions.heat_control is True
+    assert capabilities.actions.fan_control is True
+    assert capabilities.actions.bean_drop is True
+    assert capabilities.actions.cooling_control is True
+    assert capabilities.actions.emergency_stop is True
 
 
 def test_build_hottop_command_packet_uses_expected_36_byte_layout() -> None:
@@ -615,7 +638,7 @@ def test_hottop_driver_command_loop_streams_injected_frames() -> None:
     assert streaming_state.raw_vendor_data["command_loop_error_count"] == 0
 
 
-def test_hottop_driver_command_loop_default_frame_provider_sends_no_unverified_bytes() -> None:
+def test_hottop_driver_command_loop_default_frame_provider_sends_safe_zero_packet() -> None:
     serial_factory = FakeSerialFactory()
     command_loop_iterated = Event()
     driver = HottopRoasterDriver(
@@ -630,15 +653,163 @@ def test_hottop_driver_command_loop_default_frame_provider_sends_no_unverified_b
         assert command_loop_iterated.wait(timeout=1.0)
         state = driver.read_state()
 
-        assert serial_factory.transport.writes == []
+        safe_packet = _wait_for_hottop_write(
+            serial_factory.transport,
+            lambda write: (
+                is_hottop_command_packet(write)
+                and validate_hottop_packet_checksum(write)
+                and write[10] == 0
+                and write[11] == 0
+                and write[12] == 0
+                and write[16] == 0
+                and write[17] == 0
+                and write[18] == 0
+            ),
+        )
+        assert len(safe_packet) == HOTTOP_PACKET_LENGTH
         frame_polls = state.raw_vendor_data["command_frame_poll_count"]
         send_attempts = state.raw_vendor_data["command_send_attempts"]
+        write_count = state.raw_vendor_data["command_write_count"]
         assert isinstance(frame_polls, int)
         assert isinstance(send_attempts, int)
+        assert isinstance(write_count, int)
         assert frame_polls >= 1
-        assert send_attempts == 0
-        assert state.raw_vendor_data["command_write_count"] == 0
-        assert state.raw_vendor_data["last_command_write_size"] == 0
+        assert send_attempts >= 1
+        assert write_count >= 1
+        assert state.raw_vendor_data["last_command_write_size"] == HOTTOP_PACKET_LENGTH
+    finally:
+        driver.disconnect()
+
+
+def test_hottop_driver_heat_and_fan_commands_stream_current_packet_state() -> None:
+    serial_factory = FakeSerialFactory()
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+    driver.connect()
+    try:
+        heat_state = driver.set_heat(heat_level_percent=70)
+        heat_packet = _wait_for_hottop_write(
+            serial_factory.transport,
+            lambda write: (
+                is_hottop_command_packet(write)
+                and validate_hottop_packet_checksum(write)
+                and write[10] == 70
+                and write[12] == 0
+                and write[17] == 1
+            ),
+        )
+
+        fan_state = driver.set_fan(fan_level_percent=35)
+        fan_packet = _wait_for_hottop_write(
+            serial_factory.transport,
+            lambda write: (
+                is_hottop_command_packet(write)
+                and validate_hottop_packet_checksum(write)
+                and write[10] == 70
+                and write[11] == 0
+                and write[12] == 4
+                and write[17] == 1
+            ),
+        )
+
+        assert heat_state.heat_level_percent == 70
+        assert heat_state.raw_vendor_data["drum_motor_on"] is True
+        assert fan_state.fan_level_percent == 35
+        assert fan_state.raw_vendor_data["main_fan_level_percent"] == 35
+        assert heat_packet[35] == sum(heat_packet[:35]) & 0xFF
+        assert fan_packet[35] == sum(fan_packet[:35]) & 0xFF
+    finally:
+        driver.disconnect()
+
+
+def test_hottop_driver_drop_and_cooling_commands_stream_safe_compound_states() -> None:
+    serial_factory = FakeSerialFactory()
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+    driver.connect()
+    try:
+        driver.set_heat(heat_level_percent=80)
+        drop_state = driver.drop_beans()
+        drop_packet = _wait_for_hottop_write(
+            serial_factory.transport,
+            lambda write: (
+                is_hottop_command_packet(write)
+                and validate_hottop_packet_checksum(write)
+                and write[10] == 0
+                and write[12] == 10
+                and write[16] == 1
+                and write[17] == 0
+                and write[18] == 1
+            ),
+        )
+
+        stopped_state = driver.stop_cooling()
+        stopped_packet = _wait_for_hottop_write(
+            serial_factory.transport,
+            lambda write: (
+                is_hottop_command_packet(write)
+                and validate_hottop_packet_checksum(write)
+                and write[10] == 0
+                and write[12] == 0
+                and write[16] == 0
+                and write[18] == 0
+            ),
+        )
+
+        assert drop_state.heat_level_percent == 0
+        assert drop_state.fan_level_percent == 100
+        assert drop_state.cooling_on is True
+        assert drop_state.raw_vendor_data["solenoid_open"] is True
+        assert drop_state.raw_vendor_data["drum_motor_on"] is False
+        assert stopped_state.cooling_on is False
+        assert stopped_state.fan_level_percent == 0
+        assert stopped_state.raw_vendor_data["solenoid_open"] is False
+        assert drop_packet[35] == sum(drop_packet[:35]) & 0xFF
+        assert stopped_packet[35] == sum(stopped_packet[:35]) & 0xFF
+    finally:
+        driver.disconnect()
+
+
+def test_hottop_driver_emergency_stop_streams_safe_stop_state() -> None:
+    serial_factory = FakeSerialFactory()
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+    driver.connect()
+    try:
+        driver.set_heat(heat_level_percent=80)
+        driver.set_fan(fan_level_percent=20)
+
+        result = driver.emergency_stop(reason="unit-test")
+        stop_packet = _wait_for_hottop_write(
+            serial_factory.transport,
+            lambda write: (
+                is_hottop_command_packet(write)
+                and validate_hottop_packet_checksum(write)
+                and write[10] == 0
+                and write[12] == 10
+                and write[16] == 0
+                and write[17] == 0
+                and write[18] == 1
+            ),
+        )
+        state = driver.read_state()
+
+        assert result.safety_method == "emergency_stop"
+        assert result.heat_level_percent == 0
+        assert result.fan_level_percent == 100
+        assert result.cooling_on is True
+        assert state.raw_vendor_data["drum_motor_on"] is False
+        assert state.raw_vendor_data["solenoid_open"] is False
+        assert stop_packet[35] == sum(stop_packet[:35]) & 0xFF
     finally:
         driver.disconnect()
 

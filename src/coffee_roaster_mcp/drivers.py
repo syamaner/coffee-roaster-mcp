@@ -603,13 +603,12 @@ class MockRoasterDriver:
 
 
 class HottopRoasterDriver:
-    """Hottop KN-8828B-2K+ driver lifecycle skeleton.
+    """Hottop KN-8828B-2K+ driver lifecycle and command-state owner.
 
-    This story intentionally implements only connection ownership and command
-    loop cleanup. Packet construction, status parsing, and hardware commands
-    land in later Epic 3 stories. Until packet construction lands, the default
-    command-frame provider returns no frame so the command loop is lifecycle-
-    testable without sending unverified hardware bytes.
+    The driver owns Hottop command state and streams the latest verified packet
+    whenever the serial command loop is connected. Command methods are safe to
+    call before connect; no serial bytes are written until the lifecycle is
+    explicitly opened.
     """
 
     name = HOTTOP_DRIVER_NAME
@@ -661,21 +660,27 @@ class HottopRoasterDriver:
         self._last_command_write_size = 0
         self._command_loop_error_count = 0
         self._command_loop_iteration_hook = command_loop_iteration_hook
-        self._command_frame_provider = command_frame_provider or self._no_command_frame
+        self._command_frame_provider = command_frame_provider or self._current_command_frame
+        self._heat_level_percent = 0
+        self._roast_fan_level_percent = 0
+        self._main_fan_level_percent = 0
+        self._solenoid_open = False
+        self._drum_motor_on = False
+        self._cooling_motor_on = False
 
     @property
     def capabilities(self) -> RoasterCapabilities:
-        """Return static Hottop capabilities for lifecycle validation."""
+        """Return static Hottop capabilities for command validation."""
         return RoasterCapabilities(
             driver=self.name,
             heat=ControlRange(minimum=0, maximum=100, step=1),
             fan=ControlRange(minimum=0, maximum=100, step=1),
             actions=SupportedActions(
-                heat_control=False,
-                fan_control=False,
-                bean_drop=False,
-                cooling_control=False,
-                emergency_stop=False,
+                heat_control=True,
+                fan_control=True,
+                bean_drop=True,
+                cooling_control=True,
+                emergency_stop=True,
             ),
             sensor_units=SensorUnits(
                 bean_temperature="celsius",
@@ -795,9 +800,9 @@ class HottopRoasterDriver:
                 connected=self._connected,
                 bean_temp_c=None,
                 env_temp_c=None,
-                heat_level_percent=0,
-                fan_level_percent=0,
-                cooling_on=False,
+                heat_level_percent=self._heat_level_percent,
+                fan_level_percent=self._main_fan_level_percent,
+                cooling_on=self._cooling_motor_on,
                 raw_vendor_data={
                     "port": self._port,
                     "baudrate": self._baudrate,
@@ -809,40 +814,79 @@ class HottopRoasterDriver:
                     "command_write_count": self._command_write_count,
                     "last_command_write_size": self._last_command_write_size,
                     "command_loop_error_count": self._command_loop_error_count,
+                    "roast_fan_level_percent": self._roast_fan_level_percent,
+                    "main_fan_level_percent": self._main_fan_level_percent,
+                    "solenoid_open": self._solenoid_open,
+                    "drum_motor_on": self._drum_motor_on,
+                    "cooling_motor_on": self._cooling_motor_on,
                 },
             )
 
     def set_heat(self, *, heat_level_percent: int) -> RoasterState:
-        """Reject Hottop heat control until packet commands land."""
-        validate_control_percent(heat_level_percent, label="heat_level_percent")
-        raise NotImplementedError("Hottop heat control lands in E3-S7.")
+        """Set Hottop heater command state and return normalized state."""
+        heat_level = validate_control_percent(
+            heat_level_percent,
+            label="heat_level_percent",
+        )
+        with self._state_lock:
+            self._heat_level_percent = heat_level
+            if heat_level > 0:
+                self._drum_motor_on = True
+        return self.read_state()
 
     def set_fan(self, *, fan_level_percent: int) -> RoasterState:
-        """Reject Hottop fan control until packet commands land."""
-        validate_control_percent(fan_level_percent, label="fan_level_percent")
-        raise NotImplementedError("Hottop fan control lands in E3-S7.")
+        """Set Hottop main-fan command state and return normalized state."""
+        fan_level = validate_control_percent(
+            fan_level_percent,
+            label="fan_level_percent",
+        )
+        with self._state_lock:
+            self._main_fan_level_percent = fan_level
+        return self.read_state()
 
     def drop_beans(self) -> RoasterState:
-        """Reject Hottop bean drop until packet commands land."""
-        raise NotImplementedError("Hottop bean drop lands in E3-S7.")
+        """Apply Hottop compound bean-drop command state."""
+        with self._state_lock:
+            self._heat_level_percent = 0
+            self._drum_motor_on = False
+            self._solenoid_open = True
+            self._cooling_motor_on = True
+            self._main_fan_level_percent = 100
+        return self.read_state()
 
     def start_cooling(self) -> RoasterState:
-        """Reject Hottop cooling control until packet commands land."""
-        raise NotImplementedError("Hottop cooling control lands in E3-S7.")
+        """Start Hottop cooling motor and main fan."""
+        with self._state_lock:
+            self._cooling_motor_on = True
+            self._main_fan_level_percent = 100
+        return self.read_state()
 
     def stop_cooling(self) -> RoasterState:
-        """Reject Hottop cooling control until packet commands land."""
-        raise NotImplementedError("Hottop cooling control lands in E3-S7.")
+        """Stop Hottop cooling, close drop path, and clear main fan."""
+        with self._state_lock:
+            self._cooling_motor_on = False
+            self._solenoid_open = False
+            self._main_fan_level_percent = 0
+        return self.read_state()
 
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
-        """Return safe Hottop emergency-stop payload until packet commands land."""
+        """Apply safe Hottop emergency-stop command state."""
         _ = reason
+        with self._state_lock:
+            self._heat_level_percent = 0
+            self._drum_motor_on = False
+            self._solenoid_open = False
+            self._cooling_motor_on = True
+            self._main_fan_level_percent = 100
+            heat_level_percent = self._heat_level_percent
+            fan_level_percent = self._main_fan_level_percent
+            cooling_on = self._cooling_motor_on
         return EmergencyStopResult(
             driver=self.name,
-            safety_method="emergency_stop_not_yet_hardware_commanded",
-            heat_level_percent=0,
-            fan_level_percent=100,
-            cooling_on=True,
+            safety_method="emergency_stop",
+            heat_level_percent=heat_level_percent,
+            fan_level_percent=fan_level_percent,
+            cooling_on=cooling_on,
         )
 
     def _command_loop(self) -> None:
@@ -901,9 +945,17 @@ class HottopRoasterDriver:
                 self._command_loop_error_count += 1
                 self._last_command_write_size = 0
 
-    def _no_command_frame(self) -> bytes | None:
-        """Return no hardware frame until Hottop packet construction lands."""
-        return None
+    def _current_command_frame(self) -> bytes:
+        """Return the current Hottop command-state packet."""
+        with self._state_lock:
+            return build_hottop_command_packet(
+                heat_level_percent=self._heat_level_percent,
+                fan_level_percent=self._roast_fan_level_percent,
+                main_fan_level_percent=self._main_fan_level_percent,
+                solenoid_open=self._solenoid_open,
+                drum_motor_on=self._drum_motor_on,
+                cooling_motor_on=self._cooling_motor_on,
+            )
 
 
 def _percent_to_hottop_fan_scale(value: int) -> int:
