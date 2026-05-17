@@ -40,7 +40,7 @@ class ResolvedArtifact:
         repo_id: Hugging Face repository that supplied the artifact.
         revision: Configured repository revision, or `None` for the Hub default.
         filename: Repository-relative artifact path.
-        local_path: Local cache path returned by the Hugging Face Hub client.
+        local_path: Local filesystem path for the resolved artifact.
     """
 
     repo_id: str
@@ -55,10 +55,10 @@ def resolve_hugging_face_artifact(
     *,
     downloader: HuggingFaceDownloader | None = None,
 ) -> ResolvedArtifact:
-    """Resolve one released first-crack artifact from Hugging Face Hub.
+    """Resolve one released first-crack artifact from local storage or Hugging Face Hub.
 
     Args:
-        config: First-crack configuration containing the model repo and revision.
+        config: First-crack configuration containing local directory, model repo, and revision.
         filename: Repository-relative artifact path to resolve.
         downloader: Optional test double for the Hugging Face download call.
 
@@ -69,6 +69,15 @@ def resolve_hugging_face_artifact(
         ArtifactResolutionError: If the filename is invalid or the download fails.
     """
     normalized_filename = _validate_hub_filename(filename)
+    if config.local_model_dir is not None:
+        local_path = _resolve_local_artifact(config.local_model_dir, normalized_filename)
+        return ResolvedArtifact(
+            repo_id=config.repo_id,
+            revision=config.revision,
+            filename=normalized_filename,
+            local_path=local_path,
+        )
+
     download = _hf_hub_download if downloader is None else downloader
 
     try:
@@ -144,6 +153,17 @@ def _validate_hub_filename(filename: str) -> str:
             "Hugging Face artifact filename must be a repository-relative path."
         )
     return path.as_posix()
+
+
+def _resolve_local_artifact(local_model_dir: Path, filename: str) -> Path:
+    local_path = local_model_dir.joinpath(*PurePosixPath(filename).parts)
+    if not local_path.is_file():
+        raise ArtifactResolutionError(
+            "Could not resolve local first-crack artifact "
+            f"{filename!r} from local_model_dir {str(local_model_dir)!r}: "
+            f"{local_path} is not a file."
+        )
+    return local_path
 
 
 def _hf_hub_download(

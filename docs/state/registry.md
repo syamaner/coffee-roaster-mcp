@@ -30,14 +30,18 @@ drop and emergency stop included. A follow-up 60-second stability test also held
 fan at `10%`, heat at `40%` for 30 seconds, then heat at `100%` for 30 seconds
 with continuous command streaming and no command-loop or status-read errors.
 
-E4-S3 is complete. The first-crack path now resolves the configured ONNX model
+E4-S4 is complete. The first-crack path now resolves the configured ONNX model
 artifact for both supported real-model precisions: `int8` selects
 `onnx/int8/model_quantized.onnx`, and `fp32` selects `onnx/fp32/model.onnx`
-through the Hugging Face artifact resolver. This does not add model training,
-export, sync, detector startup, audio capture, local offline directories, or MCP
-session behavior.
+through the artifact resolver. When `first_crack.local_model_dir` is configured,
+the same repository-relative artifact names resolve from that local directory
+without Hugging Face network access, and missing local files fail with a clear
+artifact resolution error. This does not add model training, export, sync,
+detector startup, audio capture, broad artifact validation, or MCP session
+behavior.
 
-The next story is E4-S4: support local offline model directory.
+The next story is E4-S5: validate required detector artifacts before detection
+starts.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4-S4`
-- Current target: Support local offline model directory
+- Active story: `E4-S5`
+- Current target: Validate required detector artifacts before detection starts
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -58,6 +58,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E4-S1` adds only a narrow Hugging Face Hub artifact resolver. It resolves repository-relative released files from the configured first-crack repo and revision, uses `huggingface_hub` as a declared runtime dependency, and leaves precision-specific ONNX selection, local offline directories, artifact validation, detector startup, and session-timeline integration to later Epic 4 stories.
 - `E4-S2` resolves the configured first-crack ONNX model for default `int8` precision by selecting `onnx/int8/model_quantized.onnx` through the E4-S1 Hugging Face artifact resolver. FP32 selection, local offline directories, artifact validation, detector startup, audio capture, and session-timeline integration remain later Epic 4 work.
 - `E4-S3` resolves the configured first-crack ONNX model for `fp32` precision by selecting `onnx/fp32/model.onnx` through the E4-S1/E4-S2 resolver boundary. Local offline directories, artifact validation, detector startup, audio capture, and session-timeline integration remain later Epic 4 work.
+- `E4-S4` resolves configured first-crack artifacts from `first_crack.local_model_dir` before any Hugging Face Hub download. The local path uses the same repository-relative artifact names as the released Hub layout, fails clearly when the target local file is missing, and leaves broader detector artifact validation, detector startup, audio capture, and session-timeline integration to later Epic 4 work.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -210,7 +211,7 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - [x] `E4-S3` Load FP32 ONNX by config.
   - Done when `onnx/fp32/model.onnx` is selected for `precision: fp32`.
 
-- [ ] `E4-S4` Support local offline model directory.
+- [x] `E4-S4` Support local offline model directory.
   - Done when `local_model_dir` works without Hugging Face network access.
 
 - [ ] `E4-S5` Validate required detector artifacts before detection starts.
@@ -680,3 +681,9 @@ After completing a story:
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4-S4:
+  - Updated the first-crack artifact resolver to prefer `FirstCrackConfig.local_model_dir` when configured, resolving the same repository-relative artifact filenames from local storage before any Hugging Face Hub download.
+  - Missing local artifacts now raise `ArtifactResolutionError` with the repository-relative filename, configured local directory, and computed local path.
+  - Preserved existing Hugging Face Hub behavior when `local_model_dir` is unset and kept model training, ONNX export, Hugging Face sync, detector startup, audio capture, broad artifact validation, and MCP/session integration out of scope.
+  - Added offline resolver tests for default INT8 local model selection, FP32 local model selection, and missing local model failures before downloader use.
+  - Ran `./.venv/bin/python -m pytest tests/test_artifacts.py`: 18 passed.
