@@ -256,6 +256,45 @@ def test_missing_local_detector_onnx_model_fails_before_feature_extractor(
     assert downloader.calls == []
 
 
+def test_missing_hub_detector_onnx_model_fails_before_feature_extractor() -> None:
+    calls: list[dict[str, str | None]] = []
+
+    def missing_onnx_downloader(
+        *,
+        repo_id: str,
+        filename: str,
+        revision: str | None,
+    ) -> str:
+        calls.append(
+            {
+                "repo_id": repo_id,
+                "filename": filename,
+                "revision": revision,
+            }
+        )
+        if filename == INT8_ONNX_MODEL_FILENAME:
+            raise RuntimeError("not found")
+        return "/tmp/hf-cache/preprocessor_config.json"
+
+    with pytest.raises(ArtifactResolutionError) as exc_info:
+        resolve_first_crack_detector_artifacts(
+            FirstCrackConfig(revision="pinned-release"),
+            downloader=missing_onnx_downloader,
+        )
+
+    message = str(exc_info.value)
+    assert "onnx/int8/model_quantized.onnx" in message
+    assert "syamaner/coffee-first-crack-detection" in message
+    assert "pinned-release" in message
+    assert calls == [
+        {
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "filename": "onnx/int8/model_quantized.onnx",
+            "revision": "pinned-release",
+        },
+    ]
+
+
 def test_missing_local_feature_extractor_fails_before_download(tmp_path: Path) -> None:
     local_model_path = tmp_path / "onnx" / "int8" / "model_quantized.onnx"
     local_model_path.parent.mkdir(parents=True)
