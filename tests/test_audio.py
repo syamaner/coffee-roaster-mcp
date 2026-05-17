@@ -104,8 +104,17 @@ class FakeRawInputStream:
         self.closed = True
 
 
+class StartFailingRawInputStream(FakeRawInputStream):
+    def start(self) -> None:
+        raise RuntimeError("device busy")
+
+
 class FakeSoundDeviceModule:
     RawInputStream = FakeRawInputStream
+
+
+class StartFailingSoundDeviceModule:
+    RawInputStream = StartFailingRawInputStream
 
 
 class ClockHarness:
@@ -239,6 +248,19 @@ def test_microphone_audio_input_reports_overflow() -> None:
             audio_input.read_samples(1)
     finally:
         audio_input.close()
+
+
+def test_microphone_audio_input_closes_stream_when_start_fails() -> None:
+    FakeRawInputStream.created.clear()
+    settings = audio_capture_settings_from_config(
+        AudioConfig(source="microphone", input_device="busy-mic", sample_rate=4)
+    )
+
+    with pytest.raises(AudioCaptureError, match="device busy"):
+        MicrophoneAudioInput(settings, sounddevice_module=StartFailingSoundDeviceModule())
+
+    stream = FakeRawInputStream.created[0]
+    assert stream.closed is True
 
 
 def test_wav_and_microphone_sources_feed_same_window_contract(tmp_path: Path) -> None:

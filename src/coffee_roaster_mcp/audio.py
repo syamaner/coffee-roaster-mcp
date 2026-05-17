@@ -8,6 +8,7 @@ import struct
 import time
 import wave
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -250,17 +251,23 @@ class MicrophoneAudioInput:
         _validate_settings(settings)
         self._settings = settings
         sounddevice = sounddevice_module or _load_sounddevice()
+        stream: Any | None = None
         try:
             stream_factory = sounddevice.RawInputStream
-            self._stream = stream_factory(
+            created_stream = stream_factory(
                 samplerate=settings.sample_rate,
                 device=settings.input_device,
                 channels=1,
                 dtype="float32",
                 blocksize=0,
             )
-            self._stream.start()
+            stream = created_stream
+            self._stream: Any = created_stream
+            created_stream.start()
         except Exception as exc:  # noqa: BLE001 - backend exceptions vary by platform.
+            if stream is not None:
+                with suppress(Exception):
+                    stream.close()
             raise AudioCaptureError(f"Could not open microphone audio source: {exc}") from exc
 
     def read_samples(self, sample_count: int) -> Sequence[float]:
