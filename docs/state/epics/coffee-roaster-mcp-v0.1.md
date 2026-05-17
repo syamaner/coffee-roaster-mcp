@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4-S10`
-- Current target: Harden first-crack and MCP coverage before next epic
+- Active story: `E5-S1`
+- Current target: Implement rolling telemetry buffer
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -94,10 +94,15 @@ The first implementation milestone is a mock vertical slice that requires no roa
   disconnected from detector writes, and allows automatic detection even when
   manual override is disabled.
 - `E4-S10` closes Epic 4 with targeted test hardening before the next epic.
-  It should reduce coverage gaps around the assembled first-crack path,
-  MCP-facing behavior, current export surfaces, and mock-safe failure modes.
-  Real microphone validation can be added only as an explicit opt-in manual path
-  that is skipped by default and never required for normal CI.
+  Direct in-process MCP tool tests now cover the registered FastMCP tool bodies
+  for the current mock-safe session/control surface, including manual
+  first-crack behavior, audio-mode bootstrap reporting, error propagation, and
+  export through the public tool. Export tests prove automatic first-crack
+  detector metadata is preserved in current JSONL and CSV event exports, while
+  `summary.json` remains limited to first-crack timestamps and metrics until
+  Epic 5 finalizes schemas. Coverage now has a stable `90%` package floor, with
+  local branch-aware coverage at `91.73%`. Normal CI remains mock-safe with no
+  microphone, Hottop hardware, model download, or network requirement.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -268,7 +273,7 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - [x] `E4-S9` Integrate first crack with session timeline.
   - Done when mocked detector output creates exactly one `first_crack_detected` event.
 
-- [ ] `E4-S10` Harden first-crack and MCP coverage before next epic.
+- [x] `E4-S10` Harden first-crack and MCP coverage before next epic.
   - Done when automated tests cover the assembled first-crack path, MCP-facing behavior, current export surfaces, duplicate/no-confirmation/error cases, disabled/manual modes, missing artifacts, and materially reduce `mcp_server.py`, `exports.py`, and Epic 4 coverage gaps.
   - Manual real-microphone validation may be added only behind an explicit opt-in gate and must be skipped by default unless a microphone is configured and ready.
 
@@ -856,3 +861,24 @@ After completing a story:
     `./.venv/bin/python -m ruff check .`: passed,
     `./.venv/bin/python -m ruff format --check .`: passed, and
     `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4-S10:
+  - Added direct in-process MCP tool coverage for the registered FastMCP tool
+    bodies so local coverage measures the same public tool logic already
+    exercised by stdio smoke tests.
+  - Covered current MCP-facing behavior for server info, runtime config,
+    session start/state, heat/fan controls, beans added, manual first crack,
+    drop, cooling, export, audio-mode bootstrap safety reporting, missing active
+    session errors, disabled manual override errors, and unknown session lookup.
+  - Added export coverage proving automatic first-crack detector metadata is
+    preserved in JSONL and CSV event exports while `summary.json` keeps the
+    current timestamp and metrics surface until Epic 5 finalizes log schemas.
+  - Reviewed the current MCP completion boundary: mock/session device control
+    and manual first-crack MCP behavior are covered, live Hottop command wiring
+    remains a deliberate future MCP integration story, and automatic
+    first-crack detector startup is not yet a runtime MCP loop.
+  - Added a stable `90%` package coverage floor in `pyproject.toml`; local
+    branch-aware coverage is `91.73%`.
+  - Ran `./.venv/bin/python -m pytest tests/test_exports.py tests/test_mcp_server.py tests/test_first_crack_integration.py tests/test_package.py`:
+    27 passed.
+  - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
+    241 passed, required coverage `90.0%` reached, total coverage `91.73%`.

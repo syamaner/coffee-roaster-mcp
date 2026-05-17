@@ -71,6 +71,7 @@ source = ["coffee_roaster_mcp"]
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
+fail_under = 90
 
 [tool.coverage.html]
 directory = "htmlcov"
