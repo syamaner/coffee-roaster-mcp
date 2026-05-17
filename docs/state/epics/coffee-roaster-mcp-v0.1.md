@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4-S5`
-- Current target: Validate required detector artifacts before detection starts
+- Active story: `E4-S6`
+- Current target: Add audio capture pipeline
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -59,6 +59,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E4-S2` resolves the configured first-crack ONNX model for default `int8` precision by selecting `onnx/int8/model_quantized.onnx` through the E4-S1 Hugging Face artifact resolver. FP32 selection, local offline directories, artifact validation, detector startup, audio capture, and session-timeline integration remain later Epic 4 work.
 - `E4-S3` resolves the configured first-crack ONNX model for `fp32` precision by selecting `onnx/fp32/model.onnx` through the E4-S1/E4-S2 resolver boundary. Local offline directories, artifact validation, detector startup, audio capture, and session-timeline integration remain later Epic 4 work.
 - `E4-S4` resolves configured first-crack artifacts from `first_crack.local_model_dir` before any Hugging Face Hub download. The local path uses the same repository-relative artifact names as the released Hub layout, fails clearly when the target local file is missing, and leaves broader detector artifact validation, detector startup, audio capture, and session-timeline integration to later Epic 4 work.
+- `E4-S5` validates the required first-crack detector artifact set through the existing resolver boundary before audio detection begins. The validation resolves the configured ONNX model plus `onnx/int8/preprocessor_config.json` or `onnx/fp32/preprocessor_config.json`, depending on precision, and keeps detector startup, audio capture, artifact content validation, and session-timeline integration out of scope.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -214,7 +215,7 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - [x] `E4-S4` Support local offline model directory.
   - Done when `local_model_dir` works without Hugging Face network access.
 
-- [ ] `E4-S5` Validate required detector artifacts before detection starts.
+- [x] `E4-S5` Validate required detector artifacts before detection starts.
   - Done when missing ONNX model or feature extractor files fail clearly before audio detection begins.
 
 - [ ] `E4-S6` Add audio capture pipeline.
@@ -687,3 +688,9 @@ After completing a story:
   - Preserved existing Hugging Face Hub behavior when `local_model_dir` is unset and kept model training, ONNX export, Hugging Face sync, detector startup, audio capture, broad artifact validation, and MCP/session integration out of scope.
   - Added offline resolver tests for default INT8 local model selection, FP32 local model selection, and missing local model failures before downloader use.
   - Ran `./.venv/bin/python -m pytest tests/test_artifacts.py`: 18 passed.
+- Validation run for E4-S5:
+  - Added `ResolvedDetectorArtifacts` and `resolve_first_crack_detector_artifacts(...)` as the narrow pre-audio detector artifact validation entry point.
+  - The detector artifact resolver validates the configured ONNX model plus the precision-specific feature extractor preprocessor config: `onnx/int8/preprocessor_config.json` for INT8 and `onnx/fp32/preprocessor_config.json` for FP32.
+  - Missing ONNX models fail before feature extractor resolution, and missing feature extractor configs fail with repository, revision, and filename context while preserving local offline directory behavior.
+  - Kept model training, ONNX export, Hugging Face sync, detector startup beyond validation prerequisites, audio capture, local directory sync behavior, artifact content validation, and MCP/session integration out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_artifacts.py`: 24 passed.
