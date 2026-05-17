@@ -59,6 +59,7 @@ Milestone: `v0.1`
 - #38 E4-S7: Add detector adapter
 - #97 E4-S8: Add microphone and WAV audio input adapters
 - #39 E4-S9: Integrate first crack with session timeline
+- #99 E4-S10: Harden first-crack and MCP coverage before next epic
 
 ## Epic 5 Stories
 
