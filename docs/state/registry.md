@@ -30,7 +30,12 @@ drop and emergency stop included. A follow-up 60-second stability test also held
 fan at `10%`, heat at `40%` for 30 seconds, then heat at `100%` for 30 seconds
 with continuous command streaming and no command-loop or status-read errors.
 
-The next story is E4-S1: add the Hugging Face artifact resolver.
+E4-S1 is complete. The first-crack path now has a narrow Hugging Face Hub
+artifact resolver that downloads released files from the configured repository
+and revision without adding model training, export, sync, detector startup, or
+MCP session behavior.
+
+The next story is E4-S2: load INT8 ONNX by default.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
