@@ -73,10 +73,15 @@ The first implementation milestone is a mock vertical slice that requires no roa
   `AudioInput` boundary. `audio.source: microphone` opens a lazy
   PortAudio-backed `sounddevice` raw input stream with configured device and
   sample rate, keeping platform-specific macOS/Linux/Raspberry Pi behavior
-  behind the adapter. `audio.source: wav` reads PCM WAV files with stdlib
-  decoding, requires the WAV sample rate to match `audio.sample_rate`, converts
-  multi-channel files to mono, and returns the same mono float sample contract
-  as live microphone capture.
+  behind the adapter. Leaving `audio.input_device` as `null` uses the system
+  default input. Operators can pin a specific microphone with a
+  PortAudio-resolvable device name or platform identifier; on Linux/Raspberry Pi
+  `arecord -l` / `arecord -L` should be used during manual setup, and
+  `plughw:...` identifiers are often more forgiving than raw `hw:...` devices.
+  `audio.source: wav` reads PCM WAV files with stdlib decoding, requires the WAV
+  sample rate to match `audio.sample_rate`, converts multi-channel files to
+  mono, and returns the same mono float sample contract as live microphone
+  capture.
 - `E4-S10` closes Epic 4 with targeted test hardening before the next epic.
   It should reduce coverage gaps around the assembled first-crack path,
   MCP-facing behavior, current export surfaces, and mock-safe failure modes.

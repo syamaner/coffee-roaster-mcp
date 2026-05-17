@@ -240,6 +240,16 @@ replay uses PCM `.wav` files, converts channels to the same mono float sample
 contract as microphone capture, and requires the file sample rate to match
 `audio.sample_rate`.
 
+For microphone capture, `audio.input_device: null` uses the system default input
+device. To pin a specific microphone, set `audio.input_device` to a
+PortAudio-resolvable device name or platform device identifier. On Linux and
+Raspberry Pi, use `arecord -l` and `arecord -L` to inspect ALSA devices; values
+such as `plughw:1,0` are often more forgiving than raw `hw:1,0` because ALSA can
+perform format conversion. On macOS, use the system sound settings or a
+`sounddevice` device listing during manual validation. Real microphone checks
+are optional and should be run only when `first_crack.mode: audio` and
+`audio.source: microphone` are deliberately configured.
+
 `HF_HOME` is consumed by Hugging Face tooling directly rather than copied into the RoastPilot config object.
 
 ## Hugging Face Model Boundary
