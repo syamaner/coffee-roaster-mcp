@@ -21,7 +21,7 @@ Complete these gates in order before any Hottop hardware session.
 ### 1. Story And Source Readiness
 
 - Confirm E3-S4 through E3-S8 are complete in `docs/state/epics/coffee-roaster-mcp-v0.1.md`.
-- Confirm E3-S9 is the active verification story, not a broader driver redesign.
+- Confirm the current Hottop validation story or release-readiness task is active, not a broader driver redesign.
 - Confirm unit and integration coverage exists in `tests/test_drivers.py` and `tests/test_hottop_validation.py`.
 - Confirm fail-closed behavior in `src/coffee_roaster_mcp/drivers.py`.
 

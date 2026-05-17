@@ -6,11 +6,13 @@ import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from math import isfinite
 from pathlib import Path
 from time import sleep
 from typing import Literal
 
 from coffee_roaster_mcp.config import load_config
+from coffee_roaster_mcp.controls import validate_control_percent
 from coffee_roaster_mcp.drivers import (
     HOTTOP_DRIVER_NAME,
     RoasterDriver,
@@ -19,7 +21,7 @@ from coffee_roaster_mcp.drivers import (
 )
 from coffee_roaster_mcp.session import EventPayloadValue
 
-ValidationStatus = Literal["passed", "skipped", "needs_review"]
+ValidationStatus = Literal["passed", "skipped", "needs_review", "failed"]
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,7 @@ class HottopValidationReport:
     steps: tuple[HottopValidationStep, ...]
     final_driver_decisions: tuple[str, ...]
     hardware_ready_release_label_allowed: bool
+    error: str | None = None
 
 
 def run_hottop_validation(
@@ -102,10 +105,11 @@ def run_hottop_validation(
     """
     if not options.hardware_acknowledged:
         raise ValueError("Hottop validation requires explicit hardware acknowledgement.")
-    if options.step_duration_seconds < 0:
-        raise ValueError("step_duration_seconds must be >= 0.")
-    if options.telemetry_wait_seconds < 0:
-        raise ValueError("telemetry_wait_seconds must be >= 0.")
+    _validate_duration(options.step_duration_seconds, label="step_duration_seconds")
+    _validate_duration(options.telemetry_wait_seconds, label="telemetry_wait_seconds")
+    heat_percent = validate_control_percent(options.heat_percent, label="heat_percent")
+    fan_percent = validate_control_percent(options.fan_percent, label="fan_percent")
+    _preflight_output_path(options.output_path)
 
     config = load_config(path=options.config_path)
     if config.roaster.driver != HOTTOP_DRIVER_NAME:
@@ -123,83 +127,112 @@ def run_hottop_validation(
 
     started_at_utc = _utc_now()
     steps: list[HottopValidationStep] = []
+    error: str | None = None
+    disconnect_error: str | None = None
     try:
         driver.connect()
         steps.append(_capture_step("connect", "passed", "Driver connected.", driver.read_state()))
 
         sleeper(options.telemetry_wait_seconds)
+        telemetry_state = driver.read_state()
+        telemetry_status = _telemetry_status(telemetry_state)
         steps.append(
             _capture_step(
                 "stable_telemetry",
-                _telemetry_status(driver.read_state()),
+                telemetry_status,
                 "Captured post-connect telemetry and raw diagnostics.",
-                driver.read_state(),
+                telemetry_state,
             )
         )
+        if telemetry_status != "passed":
+            raise RuntimeError("Stable telemetry did not pass; aborting before control commands.")
 
-        driver.set_heat(heat_level_percent=options.heat_percent)
+        driver.set_heat(heat_level_percent=heat_percent)
         sleeper(options.step_duration_seconds)
+        heat_state = driver.read_state()
         steps.append(
             _capture_step(
                 "heat",
-                "passed",
-                f"Set heat to {options.heat_percent} percent.",
-                driver.read_state(),
+                _control_step_status(heat_state),
+                f"Set heat to {heat_percent} percent.",
+                heat_state,
             )
         )
 
         driver.set_heat(heat_level_percent=0)
         sleeper(options.step_duration_seconds)
-        steps.append(
-            _capture_step("heat_off", "passed", "Set heat back to zero.", driver.read_state())
-        )
-
-        driver.set_fan(fan_level_percent=options.fan_percent)
-        sleeper(options.step_duration_seconds)
+        heat_off_state = driver.read_state()
         steps.append(
             _capture_step(
-                "fan",
-                "passed",
-                f"Set fan to {options.fan_percent} percent.",
-                driver.read_state(),
+                "heat_off",
+                _control_step_status(heat_off_state),
+                "Set heat back to zero.",
+                heat_off_state,
             )
         )
 
-        driver.start_cooling()
+        driver.set_fan(fan_level_percent=fan_percent)
         sleeper(options.step_duration_seconds)
+        fan_state = driver.read_state()
         steps.append(
-            _capture_step("cooling_start", "passed", "Started cooling.", driver.read_state())
+            _capture_step(
+                "fan",
+                _control_step_status(fan_state),
+                f"Set fan to {fan_percent} percent.",
+                fan_state,
+            )
         )
 
         if options.include_drop:
+            driver.set_fan(fan_level_percent=0)
+            sleeper(options.step_duration_seconds)
             driver.drop_beans()
             sleeper(options.step_duration_seconds)
+            drop_state = driver.read_state()
             steps.append(
                 _capture_step(
                     "drop",
-                    "passed",
+                    _drop_step_status(drop_state),
                     "Triggered bean drop command.",
-                    driver.read_state(),
+                    drop_state,
                 )
             )
         else:
             steps.append(_skipped_step("drop", "Skipped; rerun with --include-drop."))
+            driver.start_cooling()
+            sleeper(options.step_duration_seconds)
+            cooling_start_state = driver.read_state()
+            steps.append(
+                _capture_step(
+                    "cooling_start",
+                    _cooling_start_status(cooling_start_state),
+                    "Started cooling.",
+                    cooling_start_state,
+                )
+            )
 
         driver.stop_cooling()
         sleeper(options.step_duration_seconds)
+        cooling_stop_state = driver.read_state()
         steps.append(
-            _capture_step("cooling_stop", "passed", "Stopped cooling.", driver.read_state())
+            _capture_step(
+                "cooling_stop",
+                _cooling_stop_status(cooling_stop_state),
+                "Stopped cooling.",
+                cooling_stop_state,
+            )
         )
 
         if options.include_emergency_stop:
             driver.emergency_stop(reason="manual Hottop validation")
             sleeper(options.step_duration_seconds)
+            emergency_stop_state = driver.read_state()
             steps.append(
                 _capture_step(
                     "emergency_stop",
-                    "passed",
+                    _emergency_stop_status(emergency_stop_state),
                     "Triggered emergency-stop command.",
-                    driver.read_state(),
+                    emergency_stop_state,
                 )
             )
         else:
@@ -209,29 +242,64 @@ def run_hottop_validation(
                     "Skipped; rerun with --include-emergency-stop.",
                 )
             )
+            driver.emergency_stop(reason="hottop validation safe cleanup")
+            sleeper(options.step_duration_seconds)
+            safe_cleanup_state = driver.read_state()
+            steps.append(
+                _capture_step(
+                    "safe_cleanup",
+                    _safe_cleanup_status(safe_cleanup_state),
+                    "Applied emergency-stop cleanup after skipped emergency-stop validation.",
+                    safe_cleanup_state,
+                )
+            )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        steps.append(
+            HottopValidationStep(
+                name="validation_error",
+                status="failed",
+                recorded_at_utc=_utc_now(),
+                note=error,
+                state={},
+            )
+        )
+        raise
     finally:
-        driver.disconnect()
+        try:
+            driver.disconnect()
+        except Exception as exc:
+            disconnect_error = f"{type(exc).__name__}: {exc}"
+            steps.append(
+                HottopValidationStep(
+                    name="disconnect",
+                    status="failed",
+                    recorded_at_utc=_utc_now(),
+                    note=disconnect_error,
+                    state={},
+                )
+            )
+            if error is None:
+                error = disconnect_error
+                raise
+        finally:
+            report = _build_report(
+                config_source=str(config.source_path) if config.source_path is not None else None,
+                driver=config.roaster.driver,
+                port=config.roaster.port,
+                baudrate=config.roaster.baudrate,
+                temperature_unit=config.roaster.temperature_unit,
+                command_interval_seconds=config.roaster.command_interval_seconds,
+                heat_percent=heat_percent,
+                fan_percent=fan_percent,
+                step_duration_seconds=options.step_duration_seconds,
+                telemetry_wait_seconds=options.telemetry_wait_seconds,
+                started_at_utc=started_at_utc,
+                steps=steps,
+                error=error,
+            )
+            _write_report_if_requested(report, options.output_path)
 
-    report = HottopValidationReport(
-        started_at_utc=started_at_utc,
-        completed_at_utc=_utc_now(),
-        config_source=str(config.source_path) if config.source_path is not None else None,
-        driver=config.roaster.driver,
-        port=config.roaster.port,
-        baudrate=config.roaster.baudrate,
-        temperature_unit=config.roaster.temperature_unit,
-        command_interval_seconds=config.roaster.command_interval_seconds,
-        heat_percent=options.heat_percent,
-        fan_percent=options.fan_percent,
-        step_duration_seconds=options.step_duration_seconds,
-        telemetry_wait_seconds=options.telemetry_wait_seconds,
-        steps=tuple(steps),
-        final_driver_decisions=_driver_decisions(steps),
-        hardware_ready_release_label_allowed=_all_required_steps_passed(steps),
-    )
-    if options.output_path is not None:
-        options.output_path.parent.mkdir(parents=True, exist_ok=True)
-        options.output_path.write_text(_report_to_json(report), encoding="utf-8")
     return report
 
 
@@ -281,8 +349,72 @@ def _state_to_evidence(state: RoasterState) -> dict[str, EventPayloadValue]:
 
 
 def _telemetry_status(state: RoasterState) -> ValidationStatus:
+    if _raw_int(state, "status_read_error_count") > 0:
+        return "failed"
+    if _raw_int(state, "status_packet_count") <= 0:
+        return "needs_review"
     if state.bean_temp_c is None or state.env_temp_c is None:
         return "needs_review"
+    return "passed"
+
+
+def _control_step_status(state: RoasterState) -> ValidationStatus:
+    if _has_driver_errors(state):
+        return "failed"
+    if _raw_int(state, "command_write_count") <= 0:
+        return "failed"
+    return "passed"
+
+
+def _drop_step_status(state: RoasterState) -> ValidationStatus:
+    if _control_step_status(state) == "failed":
+        return "failed"
+    if (
+        state.heat_level_percent != 0
+        or not state.cooling_on
+        or state.fan_level_percent != 100
+        or _raw_bool(state, "drum_motor_on")
+        or not _raw_bool(state, "solenoid_open")
+    ):
+        return "failed"
+    return "passed"
+
+
+def _cooling_start_status(state: RoasterState) -> ValidationStatus:
+    if _control_step_status(state) == "failed":
+        return "failed"
+    if not state.cooling_on or state.fan_level_percent != 100:
+        return "failed"
+    return "passed"
+
+
+def _cooling_stop_status(state: RoasterState) -> ValidationStatus:
+    if _control_step_status(state) == "failed":
+        return "failed"
+    if state.cooling_on or state.fan_level_percent != 0 or _raw_bool(state, "solenoid_open"):
+        return "failed"
+    return "passed"
+
+
+def _emergency_stop_status(state: RoasterState) -> ValidationStatus:
+    if _control_step_status(state) == "failed":
+        return "failed"
+    if (
+        state.heat_level_percent != 0
+        or state.fan_level_percent != 100
+        or not state.cooling_on
+        or _raw_bool(state, "drum_motor_on")
+        or _raw_bool(state, "solenoid_open")
+    ):
+        return "failed"
+    return "passed"
+
+
+def _safe_cleanup_status(state: RoasterState) -> ValidationStatus:
+    if _control_step_status(state) == "failed":
+        return "failed"
+    if state.heat_level_percent != 0 or _raw_bool(state, "drum_motor_on"):
+        return "failed"
     return "passed"
 
 
@@ -306,12 +438,89 @@ def _all_required_steps_passed(steps: list[HottopValidationStep]) -> bool:
         "heat_off",
         "fan",
         "drop",
-        "cooling_start",
         "cooling_stop",
         "emergency_stop",
     }
     statuses_by_name = {step.name: step.status for step in steps}
-    return all(statuses_by_name.get(name) == "passed" for name in required_names)
+    return all(statuses_by_name.get(name) == "passed" for name in required_names) and all(
+        step.status != "failed" for step in steps
+    )
+
+
+def _build_report(
+    *,
+    config_source: str | None,
+    driver: str,
+    port: str,
+    baudrate: int,
+    temperature_unit: str,
+    command_interval_seconds: float,
+    heat_percent: int,
+    fan_percent: int,
+    step_duration_seconds: float,
+    telemetry_wait_seconds: float,
+    started_at_utc: str,
+    steps: list[HottopValidationStep],
+    error: str | None,
+) -> HottopValidationReport:
+    return HottopValidationReport(
+        started_at_utc=started_at_utc,
+        completed_at_utc=_utc_now(),
+        config_source=config_source,
+        driver=driver,
+        port=port,
+        baudrate=baudrate,
+        temperature_unit=temperature_unit,
+        command_interval_seconds=command_interval_seconds,
+        heat_percent=heat_percent,
+        fan_percent=fan_percent,
+        step_duration_seconds=step_duration_seconds,
+        telemetry_wait_seconds=telemetry_wait_seconds,
+        steps=tuple(steps),
+        final_driver_decisions=_driver_decisions(steps),
+        hardware_ready_release_label_allowed=_all_required_steps_passed(steps),
+        error=error,
+    )
+
+
+def _write_report_if_requested(
+    report: HottopValidationReport,
+    output_path: Path | None,
+) -> None:
+    if output_path is None:
+        return
+    output_path.write_text(_report_to_json(report), encoding="utf-8")
+
+
+def _preflight_output_path(output_path: Path | None) -> None:
+    if output_path is None:
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("a", encoding="utf-8"):
+        pass
+
+
+def _validate_duration(value: float, *, label: str) -> None:
+    if not isfinite(value) or value < 0:
+        raise ValueError(f"{label} must be finite and >= 0.")
+
+
+def _has_driver_errors(state: RoasterState) -> bool:
+    return (
+        _raw_int(state, "command_loop_error_count") > 0
+        or _raw_int(state, "status_read_error_count") > 0
+        or _raw_int(state, "last_command_write_size") not in {0, 36}
+    )
+
+
+def _raw_int(state: RoasterState, key: str) -> int:
+    value = state.raw_vendor_data.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _raw_bool(state: RoasterState, key: str) -> bool:
+    value = state.raw_vendor_data.get(key)
+    return value if isinstance(value, bool) else False
 
 
 def _report_to_json(report: HottopValidationReport) -> str:

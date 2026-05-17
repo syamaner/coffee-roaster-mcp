@@ -610,7 +610,7 @@ After completing a story:
 - Non-destructive connected-Hottop validation for E3-S9:
   - Used config source `/tmp/coffee-roaster-mcp-hottop.yaml` with driver `hottop_kn8828b_2k_plus`, port `/dev/cu.usbserial-DN016OJ3`, baudrate `115200`, `temperature_unit: auto`, and command interval `0.3`.
   - Ran `./.venv/bin/coffee-roaster-mcp hottop-validate --config /tmp/coffee-roaster-mcp-hottop.yaml --output /tmp/hottop-e3-s9-non-destructive.json --i-understand-this-controls-hardware`.
-  - Evidence file: `/tmp/hottop-e3-s9-non-destructive.json`.
+  - Evidence file: `/tmp/hottop-e3-s9-non-destructive.json`; SHA-256 `eafc565eb11b8db4bc9b813894714f67732b4d57867a970fc2a7dd64a40571e0`.
   - Connected successfully and streamed command frames at the configured cadence. By the final cooling-stop step the run recorded `49` command-loop iterations, `49` send attempts, `49` successful writes, last write size `36`, and `0` command-loop errors.
   - Stable telemetry passed. The run recorded plausible room-temperature telemetry at `23.0 C` bean and `23.0 C` environment, `151` status packets by the final cooling-stop step, `0` ignored temperature packets, `0` status-read errors, and resolved `auto` mode to `celsius`.
   - Heat validation passed at conservative `10%` heat, then heat-off returned heat to `0%`.
@@ -620,7 +620,7 @@ After completing a story:
 - Full connected-Hottop validation for E3-S9:
   - Used the same config source `/tmp/coffee-roaster-mcp-hottop.yaml` with driver `hottop_kn8828b_2k_plus`, port `/dev/cu.usbserial-DN016OJ3`, baudrate `115200`, `temperature_unit: auto`, and command interval `0.3`.
   - Ran `./.venv/bin/coffee-roaster-mcp hottop-validate --config /tmp/coffee-roaster-mcp-hottop.yaml --output /tmp/hottop-e3-s9-full.json --i-understand-this-controls-hardware --heat-percent 100 --fan-percent 100 --include-drop --include-emergency-stop`.
-  - Evidence file: `/tmp/hottop-e3-s9-full.json`.
+  - Evidence file: `/tmp/hottop-e3-s9-full.json`; SHA-256 `3756dc9a3481d3859f0767b10940ae481cbef5a4e3544357bd76121d5e0a22a1`.
   - Connected successfully and streamed command frames at the configured cadence. By the emergency-stop step the run recorded `62` command-loop iterations, `62` send attempts, `62` successful writes, last write size `36`, and `0` command-loop errors.
   - Stable telemetry passed. The run recorded plausible room-temperature telemetry at `23.0 C` bean and `23.0 C` environment, `191` status packets by the emergency-stop step, `0` ignored temperature packets, `0` status-read errors, and resolved `auto` mode to `celsius`.
   - Heat validation passed at `100%` heat, then heat-off returned heat to `0%`.
@@ -631,8 +631,18 @@ After completing a story:
   - The validation report set `hardware_ready_release_label_allowed` to `true` for the Hottop driver boundary.
 - 60-second connected-Hottop stability test for E3-S9:
   - Ran a supervised live stability test on `/dev/cu.usbserial-DN016OJ3` with fan held at `10%`, heat at `40%` for 30 seconds, then heat at `100%` for 30 seconds.
-  - Evidence file: `/tmp/hottop-e3-s9-60s-stability.json`.
+  - Evidence file: `/tmp/hottop-e3-s9-60s-stability.json`; SHA-256 `2887c42c301ce08f01b353b40c8ed8ab96137e21baef7f734708c10539e4a4cf`.
   - Command streaming stayed continuous for the full run. At the 60-second sample the driver reported `197` command-loop iterations, `197` send attempts, `197` successful writes, last write size `36`, and `0` command-loop errors.
   - Status reads stayed clean. At the 60-second sample the driver reported `607` status packets, `0` status-read errors, and resolved `auto` mode to `celsius`.
   - Telemetry remained plausible during the short test: bean and environment readings stayed at `23.0 C` during the one-minute hold, then read `24.0 C` in the final safe-zero sample.
   - After setting heat and fan to `0`, the command state still reported `drum_motor_on: true` because `set_heat(0)` does not clear a drum command that was enabled by prior nonzero heat. A follow-up safe-stop sequence used emergency stop, then cooling stop and zero heat/fan, and ended with heat `0%`, fan `0%`, cooling off, solenoid closed, drum motor off, and `0` command-loop/status-read errors.
+- PR review hardening for E3-S9:
+  - Codex review found that aborted validation runs could lose the most important partial evidence, and that stable-telemetry status and evidence could come from different concurrent state snapshots.
+  - Copilot review found additional hardware-safety and auditability gaps: telemetry `needs_review` did not abort before actuation, heat/fan CLI values were validated too late, disconnect failures could mask earlier failures, output paths were not preflighted before hardware commands, drop validation was partially masked by earlier cooling, readiness ignored raw diagnostics, non-destructive cleanup could leave the drum command on, reusable runbook text still assumed E3-S9 was active, registry status text conflicted, and `/tmp` evidence lacked durable checksums.
+  - Hardened the validation harness to validate heat/fan/durations and output path before connecting, require finite durations, capture one stable-telemetry snapshot, abort before controls when telemetry does not pass, write partial failure reports before re-raising, record disconnect failures, drop before cooling-stop validation in full runs, apply a safe-cleanup step in non-destructive runs, and base readiness on required passed steps plus no failed steps.
+  - Added SHA-256 checksums for all three hardware evidence files instead of committing raw JSON evidence.
+  - Updated the session summary with review quality, overlap, and response details.
+  - Ran `./.venv/bin/python -m pytest`: 170 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.

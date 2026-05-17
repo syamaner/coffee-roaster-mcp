@@ -34,6 +34,6 @@ The next story is E4-S1: add the Hugging Face artifact resolver.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
-Epic 2 is complete and Epic 3 driver contract work has started. Coverage output is visible in GitHub Actions through a concise Markdown job summary and an `html-coverage-report` artifact.
+Epic 2 and Epic 3 are complete. Coverage output is visible in GitHub Actions through a concise Markdown job summary and an `html-coverage-report` artifact.
 
 For Epic 2 implementation, the old `coffee-roasting` repository is a behavioral reference only. Reuse proven roast-session and stdio MCP patterns, but do not recreate the old two-server, Auth0, SSE, or `n8n` architecture.

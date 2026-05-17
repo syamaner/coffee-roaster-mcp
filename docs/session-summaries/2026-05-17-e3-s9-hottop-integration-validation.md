@@ -79,6 +79,7 @@ Command:
 Evidence:
 
 - `/tmp/hottop-e3-s9-non-destructive.json`
+- SHA-256: `eafc565eb11b8db4bc9b813894714f67732b4d57867a970fc2a7dd64a40571e0`
 
 Result:
 
@@ -101,6 +102,7 @@ Command:
 Evidence:
 
 - `/tmp/hottop-e3-s9-full.json`
+- SHA-256: `3756dc9a3481d3859f0767b10940ae481cbef5a4e3544357bd76121d5e0a22a1`
 
 Result:
 
@@ -127,6 +129,7 @@ The operator reported that the old prototype had a control bug where the machine
 Evidence:
 
 - `/tmp/hottop-e3-s9-60s-stability.json`
+- SHA-256: `2887c42c301ce08f01b353b40c8ed8ab96137e21baef7f734708c10539e4a4cf`
 
 Result:
 
@@ -146,12 +149,53 @@ This nuance was recorded in durable epic state because operational stop procedur
 
 ## Review Value
 
-There was no GitHub PR review yet for this branch during the session. The meaningful review input came from the operator and local diagnostics:
+The first useful review input came from the operator and local diagnostics:
 
 - Operator feedback improved the Hottop validation skill from a safety warning into an actionable runbook with evidence criteria and recovery paths.
 - Cognitive-load diagnostics caught that the first runbook hardening had too many independent constraints and nested decision paths.
 - Ambiguity diagnostics caught vague evidence-sanitization wording.
 - Live hardware testing caught the drum-state nuance that mock tests and static review would not have exposed.
+
+After PR `#90` opened, automated GitHub review added a second review round.
+
+Codex review `4305393897` produced two focused code-quality findings:
+
+- failure evidence was not persisted when validation aborted before the final report object was built
+- stable telemetry status and evidence could be internally inconsistent because two concurrent `read_state()` calls were used
+
+Copilot review `4305396411` was broader and found operational safety gaps:
+
+- telemetry `needs_review` did not abort before heat, fan, drop, or emergency-stop commands
+- invalid heat or fan CLI percentages were validated too late, after some hardware actuation could already have happened
+- disconnect failures could mask earlier validation failures and prevent partial evidence from being written
+- output-path writability was not preflighted before hardware commands ran
+- drop validation was partly masked by starting cooling before drop
+- readiness was based on step labels rather than raw diagnostics such as command-loop errors, partial writes, status-read errors, or zero write counts
+- the non-destructive path could finish with drum command state still on after prior heat
+- the reusable Hottop skill still said E3-S9 must be active even though this PR marks E3-S9 complete
+- registry text still said Epic 3 had started after the same PR marked Epic 3 complete
+- evidence paths were ephemeral `/tmp` paths without durable checksums
+
+Review quality comparison:
+
+- Codex was concise and high-signal. Its two comments both identified real correctness risks in the validation evidence model.
+- Copilot had broader coverage and found more hardware-safety edge cases. Several comments overlapped with Codex on evidence reliability, but Copilot added important independent issues around input validation, output preflight, readiness criteria, drop masking, and state-doc drift.
+- The overlap was strongest on evidence integrity: both reviews noticed that the validation record could become unreliable exactly when hardware validation most needs auditability.
+- Copilot's suppressed low-confidence notes about `/tmp` evidence were still useful after classification. Rather than committing raw hardware JSON, the durable docs now record SHA-256 checksums for the local evidence files.
+
+Review response:
+
+- validation now preflights output-path writability before connecting to hardware
+- heat and fan percentages plus durations are validated before connecting
+- durations must be finite and non-negative
+- stable telemetry uses one state snapshot and aborts before control commands unless telemetry passes
+- partial failure reports are written before re-raising validation errors
+- disconnect failures are recorded without silently losing the original failure context
+- full validation now drops before cooling-stop validation so drop behavior is not masked by prior cooling
+- non-destructive validation adds an explicit safe-cleanup step when emergency-stop validation is skipped
+- hardware readiness now requires required steps to pass and no failed steps to appear
+- durable state and session summary now include SHA-256 checksums for the hardware evidence files
+- skill and registry stale-state wording was corrected
 
 These were high-value fixes because this story is about reducing real hardware uncertainty, not just making code paths pass tests.
 
@@ -159,7 +203,7 @@ These were high-value fixes because this story is about reducing real hardware u
 
 Local checks after implementation and state updates:
 
-- `./.venv/bin/python -m pytest`: `165 passed`
+- `./.venv/bin/python -m pytest`: `170 passed`
 - `./.venv/bin/python -m ruff check .`: passed
 - `./.venv/bin/python -m ruff format --check .`: passed
 - `./.venv/bin/python -m pyright`: `0 errors`
