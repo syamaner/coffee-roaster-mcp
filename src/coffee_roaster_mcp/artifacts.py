@@ -11,6 +11,7 @@ from typing import Protocol, cast
 from coffee_roaster_mcp.config import FirstCrackConfig
 
 INT8_ONNX_MODEL_FILENAME = "onnx/int8/model_quantized.onnx"
+FP32_ONNX_MODEL_FILENAME = "onnx/fp32/model.onnx"
 
 
 class ArtifactResolutionError(RuntimeError):
@@ -106,18 +107,24 @@ def resolve_first_crack_onnx_model(
         Metadata for the resolved local ONNX model artifact path.
 
     Raises:
-        ArtifactResolutionError: If the configured precision is not supported yet
-            or the artifact cannot be resolved.
+        ArtifactResolutionError: If the configured precision is unsupported or
+            the artifact cannot be resolved.
     """
-    if config.precision != "int8":
-        raise ArtifactResolutionError(
-            "Only first-crack precision 'int8' is supported for ONNX model resolution "
-            "until FP32 selection lands in E4-S3."
-        )
+    precision = str(config.precision)
+    match precision:
+        case "int8":
+            filename = INT8_ONNX_MODEL_FILENAME
+        case "fp32":
+            filename = FP32_ONNX_MODEL_FILENAME
+        case unsupported_precision:
+            raise ArtifactResolutionError(
+                "Unsupported first-crack ONNX precision "
+                f"{unsupported_precision!r}; expected 'int8' or 'fp32'."
+            )
 
     return resolve_hugging_face_artifact(
         config,
-        INT8_ONNX_MODEL_FILENAME,
+        filename,
         downloader=downloader,
     )
 

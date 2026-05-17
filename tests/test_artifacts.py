@@ -1,14 +1,16 @@
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from coffee_roaster_mcp.artifacts import (
+    FP32_ONNX_MODEL_FILENAME,
     INT8_ONNX_MODEL_FILENAME,
     ArtifactResolutionError,
     resolve_first_crack_onnx_model,
     resolve_hugging_face_artifact,
 )
-from coffee_roaster_mcp.config import FirstCrackConfig
+from coffee_roaster_mcp.config import FirstCrackConfig, ModelPrecision
 
 
 class RecordingDownloader:
@@ -90,12 +92,32 @@ def test_resolves_int8_onnx_model_for_explicit_int8_precision() -> None:
     ]
 
 
-def test_fp32_onnx_model_resolution_is_deferred_to_e4_s3() -> None:
+def test_resolves_fp32_onnx_model_for_configured_precision() -> None:
+    downloader = RecordingDownloader("/tmp/hf-cache/model.onnx")
+
+    artifact = resolve_first_crack_onnx_model(
+        FirstCrackConfig(precision="fp32", revision="v0.1.0"),
+        downloader=downloader,
+    )
+
+    assert artifact.filename == FP32_ONNX_MODEL_FILENAME
+    assert artifact.revision == "v0.1.0"
+    assert artifact.local_path == Path("/tmp/hf-cache/model.onnx")
+    assert downloader.calls == [
+        {
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "filename": "onnx/fp32/model.onnx",
+            "revision": "v0.1.0",
+        }
+    ]
+
+
+def test_unsupported_onnx_precision_fails_before_download() -> None:
     downloader = RecordingDownloader()
 
-    with pytest.raises(ArtifactResolutionError, match="E4-S3"):
+    with pytest.raises(ArtifactResolutionError, match="Unsupported.*precision"):
         resolve_first_crack_onnx_model(
-            FirstCrackConfig(precision="fp32"),
+            FirstCrackConfig(precision=cast(ModelPrecision, "INT8")),
             downloader=downloader,
         )
 
