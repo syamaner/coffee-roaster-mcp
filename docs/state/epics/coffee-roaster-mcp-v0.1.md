@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4-S9`
-- Current target: Integrate first crack with session timeline
+- Active story: `E4-S10`
+- Current target: Harden first-crack and MCP coverage before next epic
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -82,6 +82,14 @@ The first implementation milestone is a mock vertical slice that requires no roa
   sample rate to match `audio.sample_rate`, converts multi-channel files to
   mono, and returns the same mono float sample contract as live microphone
   capture.
+- `E4-S9` integrates confirmed detector output with the authoritative session
+  timeline through an explicit helper that keeps mutation behind
+  `RoastSessionStore`. The integration is gated to `first_crack.mode: audio`,
+  writes detector metadata as the first-crack event payload, leaves disabled and
+  manual modes disconnected from detector writes, allows automatic detection even
+  when manual override is disabled, and relies on the store singleton event
+  behavior so repeated detector confirmations do not append duplicate
+  `first_crack_detected` rows.
 - `E4-S10` closes Epic 4 with targeted test hardening before the next epic.
   It should reduce coverage gaps around the assembled first-crack path,
   MCP-facing behavior, current export surfaces, and mock-safe failure modes.
@@ -254,7 +262,7 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - [x] `E4-S8` Add microphone and WAV audio input adapters.
   - Done when configured microphone and recorded WAV inputs can feed the detector window pipeline through the same audio source boundary.
 
-- [ ] `E4-S9` Integrate first crack with session timeline.
+- [x] `E4-S9` Integrate first crack with session timeline.
   - Done when mocked detector output creates exactly one `first_crack_detected` event.
 
 - [ ] `E4-S10` Harden first-crack and MCP coverage before next epic.
@@ -791,6 +799,31 @@ After completing a story:
     broad coverage hardening, and live Hottop control changes out of scope.
   - Ran `./.venv/bin/python -m pytest tests/test_audio.py tests/test_config.py`: 30 passed.
   - Ran `./.venv/bin/python -m pytest`: 226 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4-S9:
+  - Added an explicit detector-to-session integration helper in
+    `src/coffee_roaster_mcp/detector.py` that processes one `AudioWindow` with
+    the existing detector adapter and records confirmed output as an
+    authoritative `first_crack_detected` event through `RoastSessionStore`.
+  - The integration is gated to `first_crack.mode: audio`; disabled and manual
+    modes do not call the detector adapter or mutate the timeline.
+  - Confirmed detector payloads include detector source, detected monotonic
+    timestamp, precision, revision, repository id, resolved ONNX artifact,
+    feature-extractor artifact, source window sequence number, and optional
+    confidence.
+  - Repeated detector confirmations and detector confirmations after a manual
+    first-crack event return the existing singleton first-crack event without
+    appending duplicate timeline rows.
+  - Automatic detector integration remains independent of manual override
+    permission, so `allow_manual_override: false` only disables the manual MCP
+    override path.
+  - Kept model training, ONNX export, Hugging Face sync, local directory sync,
+    detector startup, audio capture startup, broad coverage hardening, and live
+    Hottop control changes out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_first_crack_integration.py tests/test_detector.py`: 13 passed.
+  - Ran `./.venv/bin/python -m pytest`: 234 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

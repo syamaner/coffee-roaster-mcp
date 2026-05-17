@@ -30,7 +30,7 @@ drop and emergency stop included. A follow-up 60-second stability test also held
 fan at `10%`, heat at `40%` for 30 seconds, then heat at `100%` for 30 seconds
 with continuous command streaming and no command-loop or status-read errors.
 
-E4-S8 is complete. The first-crack path now resolves the configured ONNX model
+E4-S9 is complete. The first-crack path now resolves the configured ONNX model
 artifact for both supported real-model precisions: `int8` selects
 `onnx/int8/model_quantized.onnx`, and `fp32` selects `onnx/fp32/model.onnx`
 through the artifact resolver. When `first_crack.local_model_dir` is configured,
@@ -53,8 +53,14 @@ E4-S6 `AudioInput` boundary: microphone capture uses a lazy PortAudio-backed
 uses stdlib PCM decoding, channel-to-mono conversion, and the same mono float
 sample contract as live capture. Real microphone validation remains optional
 and gated; normal CI uses mocked microphone backends and generated WAV fixtures.
+Confirmed detector output in `first_crack.mode: audio` now writes one
+`first_crack_detected` event into the authoritative `RoastSessionStore`
+timeline with detector metadata payload. Disabled and manual modes do not let
+detector output mutate the session, automatic detection does not require manual
+override permission, and repeated detector confirmations return the original
+first-crack singleton event instead of appending duplicates.
 
-The next story is E4-S9: integrate first crack with the session timeline.
+The next story is E4-S10: harden first-crack and MCP coverage before the next epic.
 Epic 4 includes E4-S10 as a closing test-hardening story before the next epic,
 focused on first-crack integration, MCP-facing behavior, export assertions,
 mock-safe failure modes, and coverage gaps. Real microphone validation is
