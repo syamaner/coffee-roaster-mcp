@@ -109,12 +109,36 @@ class StartFailingRawInputStream(FakeRawInputStream):
         raise RuntimeError("device busy")
 
 
+class OverflowingRawInputStream(FakeRawInputStream):
+    def __init__(
+        self,
+        *,
+        samplerate: int,
+        device: str | None,
+        channels: int,
+        dtype: str,
+        blocksize: int,
+    ) -> None:
+        super().__init__(
+            samplerate=samplerate,
+            device=device,
+            channels=channels,
+            dtype=dtype,
+            blocksize=blocksize,
+        )
+        self.overflowed = True
+
+
 class FakeSoundDeviceModule:
     RawInputStream = FakeRawInputStream
 
 
 class StartFailingSoundDeviceModule:
     RawInputStream = StartFailingRawInputStream
+
+
+class OverflowingSoundDeviceModule:
+    RawInputStream = OverflowingRawInputStream
 
 
 class ClockHarness:
@@ -222,7 +246,10 @@ def test_microphone_audio_input_uses_configured_portaudio_stream() -> None:
         AudioConfig(source="microphone", input_device="hw:1,0", sample_rate=4)
     )
 
-    with MicrophoneAudioInput(settings, sounddevice_module=FakeSoundDeviceModule()) as audio_input:
+    audio_input = MicrophoneAudioInput(settings, sounddevice_module=FakeSoundDeviceModule())
+    assert FakeRawInputStream.created == []
+
+    with audio_input:
         samples = audio_input.read_samples(3)
 
     stream = FakeRawInputStream.created[0]
@@ -240,8 +267,7 @@ def test_microphone_audio_input_uses_configured_portaudio_stream() -> None:
 def test_microphone_audio_input_reports_overflow() -> None:
     FakeRawInputStream.created.clear()
     settings = audio_capture_settings_from_config(AudioConfig(source="microphone", sample_rate=4))
-    audio_input = MicrophoneAudioInput(settings, sounddevice_module=FakeSoundDeviceModule())
-    FakeRawInputStream.created[0].overflowed = True
+    audio_input = MicrophoneAudioInput(settings, sounddevice_module=OverflowingSoundDeviceModule())
 
     try:
         with pytest.raises(AudioCaptureError, match="overflowed"):
@@ -257,7 +283,10 @@ def test_microphone_audio_input_closes_stream_when_start_fails() -> None:
     )
 
     with pytest.raises(AudioCaptureError, match="device busy"):
-        MicrophoneAudioInput(settings, sounddevice_module=StartFailingSoundDeviceModule())
+        MicrophoneAudioInput(
+            settings,
+            sounddevice_module=StartFailingSoundDeviceModule(),
+        ).read_samples(1)
 
     stream = FakeRawInputStream.created[0]
     assert stream.closed is True
@@ -291,9 +320,12 @@ def test_wav_and_microphone_sources_feed_same_window_contract(tmp_path: Path) ->
 
     wav_window = wav_pipeline.drain_windows()[0]
     microphone_window = microphone_pipeline.drain_windows()[0]
+    microphone_stream = FakeRawInputStream.created[-1]
     assert wav_window.sample_rate == microphone_window.sample_rate == 4
     assert len(wav_window.samples) == len(microphone_window.samples) == 4
     assert wav_window.duration_seconds == microphone_window.duration_seconds == 1.0
+    assert microphone_stream.stopped is True
+    assert microphone_stream.closed is True
 
 
 def test_audio_capture_pipeline_feeds_detector_windows_from_mock_input() -> None:

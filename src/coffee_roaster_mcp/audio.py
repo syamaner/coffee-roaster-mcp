@@ -181,32 +181,48 @@ class WavAudioInput:
         if sample_rate <= 0:
             raise AudioCaptureError("audio.sample_rate must be > 0.")
         self._path = Path(path)
+        self._wav: Any | None = None
+        self._frame_position = 0
+        self._channel_count = 0
+        self._sample_width = 0
+        self._sample_rate = sample_rate
+        self._open_wav()
+
+    def _open_wav(self) -> None:
         try:
-            self._wav = wave.open(str(self._path), "rb")  # noqa: SIM115 - input owns the handle.
+            wav_file = wave.open(str(self._path), "rb")  # noqa: SIM115 - input owns the handle.
         except (OSError, wave.Error) as exc:
             raise AudioCaptureError(f"Could not open WAV audio source {self._path}: {exc}") from exc
 
-        self._channel_count = self._wav.getnchannels()
-        self._sample_width = self._wav.getsampwidth()
-        wav_sample_rate = self._wav.getframerate()
+        self._wav = wav_file
+        self._channel_count = wav_file.getnchannels()
+        self._sample_width = wav_file.getsampwidth()
+        wav_sample_rate = wav_file.getframerate()
         if self._channel_count < 1:
             self.close()
             raise AudioCaptureError("WAV audio source must have at least one channel.")
         if self._sample_width not in {1, 2, 3, 4}:
             self.close()
             raise AudioCaptureError("WAV audio source must use 8, 16, 24, or 32-bit PCM samples.")
-        if wav_sample_rate != sample_rate:
+        if wav_sample_rate != self._sample_rate:
             self.close()
             raise AudioCaptureError(
                 "WAV audio source sample rate "
-                f"{wav_sample_rate} does not match configured audio.sample_rate {sample_rate}."
+                f"{wav_sample_rate} does not match configured audio.sample_rate "
+                f"{self._sample_rate}."
             )
+        wav_file.setpos(self._frame_position)
 
     def read_samples(self, sample_count: int) -> Sequence[float]:
         """Read up to `sample_count` mono floating-point samples from the WAV file."""
         if sample_count <= 0:
             return ()
+        if self._wav is None:
+            self._open_wav()
+        if self._wav is None:
+            raise AudioCaptureError("WAV audio source is not open.")
         raw_frames = self._wav.readframes(sample_count)
+        self._frame_position = self._wav.tell()
         if not raw_frames:
             return ()
         return _decode_pcm_frames(
@@ -217,7 +233,12 @@ class WavAudioInput:
 
     def close(self) -> None:
         """Close the underlying WAV file."""
+        if self._wav is None:
+            return
+        with suppress(Exception):
+            self._frame_position = self._wav.tell()
         self._wav.close()
+        self._wav = None
 
     def __enter__(self) -> Self:
         """Return this WAV input as a context manager."""
@@ -242,7 +263,7 @@ class MicrophoneAudioInput:
         *,
         sounddevice_module: Any | None = None,
     ) -> None:
-        """Open a PortAudio-backed microphone stream.
+        """Configure a microphone input that opens lazily on first read.
 
         Args:
             settings: Validated audio capture settings.
@@ -250,32 +271,39 @@ class MicrophoneAudioInput:
         """
         _validate_settings(settings)
         self._settings = settings
-        sounddevice = sounddevice_module or _load_sounddevice()
+        self._sounddevice = sounddevice_module or _load_sounddevice()
+        self._stream: Any | None = None
+
+    def _ensure_stream(self) -> Any:
+        if self._stream is not None:
+            return self._stream
         stream: Any | None = None
         try:
-            stream_factory = sounddevice.RawInputStream
+            stream_factory = self._sounddevice.RawInputStream
             created_stream = stream_factory(
-                samplerate=settings.sample_rate,
-                device=settings.input_device,
+                samplerate=self._settings.sample_rate,
+                device=self._settings.input_device,
                 channels=1,
                 dtype="float32",
                 blocksize=0,
             )
             stream = created_stream
-            self._stream: Any = created_stream
+            self._stream = created_stream
             created_stream.start()
         except Exception as exc:  # noqa: BLE001 - backend exceptions vary by platform.
             if stream is not None:
                 with suppress(Exception):
                     stream.close()
             raise AudioCaptureError(f"Could not open microphone audio source: {exc}") from exc
+        return self._stream
 
     def read_samples(self, sample_count: int) -> Sequence[float]:
         """Read up to `sample_count` mono floating-point samples from the microphone."""
         if sample_count <= 0:
             return ()
+        stream = self._ensure_stream()
         try:
-            raw_data, overflowed = self._stream.read(sample_count)
+            raw_data, overflowed = stream.read(sample_count)
         except Exception as exc:  # noqa: BLE001 - backend exceptions vary by platform.
             raise AudioCaptureError(f"Could not read microphone audio source: {exc}") from exc
         if overflowed:
@@ -284,10 +312,14 @@ class MicrophoneAudioInput:
 
     def close(self) -> None:
         """Stop and close the microphone stream."""
+        stream = self._stream
+        if stream is None:
+            return
         try:
-            self._stream.stop()
+            stream.stop()
         finally:
-            self._stream.close()
+            stream.close()
+            self._stream = None
 
     def __enter__(self) -> Self:
         """Return this microphone input as a context manager."""
@@ -368,12 +400,13 @@ class AudioCapturePipeline:
         thread = self._thread
         if thread is not None:
             thread.join(timeout=timeout_seconds)
-        return self.snapshot()
+        snapshot = self.snapshot()
+        _close_audio_input_if_supported(self._audio_input)
+        return snapshot
 
     def close(self) -> None:
         """Stop capture and close the underlying audio input when supported."""
         self.stop()
-        _close_audio_input_if_supported(self._audio_input)
 
     def get_window(
         self,
