@@ -10,6 +10,7 @@ from threading import Lock, Thread
 
 import pytest
 
+from coffee_roaster_mcp import audio as audio_module
 from coffee_roaster_mcp.audio import (
     AudioCaptureError,
     AudioCapturePipeline,
@@ -131,6 +132,10 @@ class OverflowingRawInputStream(FakeRawInputStream):
 
 class FakeSoundDeviceModule:
     RawInputStream = FakeRawInputStream
+
+
+class RecoveringSoundDeviceModule:
+    RawInputStream: type[FakeRawInputStream] = StartFailingRawInputStream
 
 
 class StartFailingSoundDeviceModule:
@@ -290,6 +295,41 @@ def test_microphone_audio_input_closes_stream_when_start_fails() -> None:
 
     stream = FakeRawInputStream.created[0]
     assert stream.closed is True
+
+
+def test_microphone_audio_input_retries_after_start_failure() -> None:
+    FakeRawInputStream.created.clear()
+    settings = audio_capture_settings_from_config(
+        AudioConfig(source="microphone", input_device="busy-once", sample_rate=4)
+    )
+    sounddevice = RecoveringSoundDeviceModule()
+    audio_input = MicrophoneAudioInput(settings, sounddevice_module=sounddevice)
+
+    with pytest.raises(AudioCaptureError, match="device busy"):
+        audio_input.read_samples(1)
+
+    sounddevice.RawInputStream = FakeRawInputStream
+    samples = audio_input.read_samples(1)
+
+    assert len(FakeRawInputStream.created) == 2
+    assert FakeRawInputStream.created[0].closed is True
+    assert FakeRawInputStream.created[1].started is True
+    assert samples == (0.25,)
+
+
+def test_microphone_audio_input_normalizes_missing_portaudio_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = audio_capture_settings_from_config(AudioConfig(source="microphone", sample_rate=4))
+
+    def fail_import(module_name: str) -> object:
+        assert module_name == "sounddevice"
+        raise OSError("PortAudio library not found")
+
+    monkeypatch.setattr(audio_module.importlib, "import_module", fail_import)
+
+    with pytest.raises(AudioCaptureError, match="PortAudio runtime"):
+        build_configured_audio_input(settings)
 
 
 def test_wav_and_microphone_sources_feed_same_window_contract(tmp_path: Path) -> None:

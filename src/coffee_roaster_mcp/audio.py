@@ -294,6 +294,7 @@ class MicrophoneAudioInput:
             if stream is not None:
                 with suppress(Exception):
                     stream.close()
+            self._stream = None
             raise AudioCaptureError(f"Could not open microphone audio source: {exc}") from exc
         return self._stream
 
@@ -525,7 +526,7 @@ def _normalize_sample(sample: float) -> float:
 def _load_sounddevice() -> Any:
     try:
         return importlib.import_module("sounddevice")
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         raise AudioCaptureError(
             "Microphone audio input requires the sounddevice package and PortAudio runtime."
         ) from exc
