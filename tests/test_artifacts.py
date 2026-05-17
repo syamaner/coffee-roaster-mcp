@@ -4,9 +4,12 @@ from typing import cast
 import pytest
 
 from coffee_roaster_mcp.artifacts import (
+    FP32_FEATURE_EXTRACTOR_FILENAME,
     FP32_ONNX_MODEL_FILENAME,
+    INT8_FEATURE_EXTRACTOR_FILENAME,
     INT8_ONNX_MODEL_FILENAME,
     ArtifactResolutionError,
+    resolve_first_crack_detector_artifacts,
     resolve_first_crack_onnx_model,
     resolve_hugging_face_artifact,
 )
@@ -146,6 +149,76 @@ def test_resolves_fp32_onnx_model_from_local_model_dir(tmp_path: Path) -> None:
     assert downloader.calls == []
 
 
+def test_resolves_detector_artifacts_for_default_int8_precision() -> None:
+    downloader = RecordingDownloader()
+
+    artifacts = resolve_first_crack_detector_artifacts(
+        FirstCrackConfig(revision="v0.1.0"),
+        downloader=downloader,
+    )
+
+    assert artifacts.onnx_model.filename == INT8_ONNX_MODEL_FILENAME
+    assert artifacts.feature_extractor_config.filename == INT8_FEATURE_EXTRACTOR_FILENAME
+    assert artifacts.onnx_model.revision == "v0.1.0"
+    assert artifacts.feature_extractor_config.revision == "v0.1.0"
+    assert downloader.calls == [
+        {
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "filename": "onnx/int8/model_quantized.onnx",
+            "revision": "v0.1.0",
+        },
+        {
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "filename": "onnx/int8/preprocessor_config.json",
+            "revision": "v0.1.0",
+        },
+    ]
+
+
+def test_resolves_detector_artifacts_for_configured_fp32_precision() -> None:
+    downloader = RecordingDownloader()
+
+    artifacts = resolve_first_crack_detector_artifacts(
+        FirstCrackConfig(precision="fp32"),
+        downloader=downloader,
+    )
+
+    assert artifacts.onnx_model.filename == FP32_ONNX_MODEL_FILENAME
+    assert artifacts.feature_extractor_config.filename == FP32_FEATURE_EXTRACTOR_FILENAME
+    assert downloader.calls == [
+        {
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "filename": "onnx/fp32/model.onnx",
+            "revision": None,
+        },
+        {
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "filename": "onnx/fp32/preprocessor_config.json",
+            "revision": None,
+        },
+    ]
+
+
+def test_resolves_detector_artifacts_from_local_model_dir_without_download(
+    tmp_path: Path,
+) -> None:
+    local_model_path = tmp_path / "onnx" / "int8" / "model_quantized.onnx"
+    local_preprocessor_path = tmp_path / "onnx" / "int8" / "preprocessor_config.json"
+    local_model_path.parent.mkdir(parents=True)
+    local_model_path.write_bytes(b"onnx")
+    local_preprocessor_path.write_text("{}", encoding="utf-8")
+    downloader = RecordingDownloader()
+
+    artifacts = resolve_first_crack_detector_artifacts(
+        FirstCrackConfig(local_model_dir=tmp_path),
+        downloader=downloader,
+    )
+
+    assert artifacts.onnx_model.local_path == local_model_path
+    assert artifacts.feature_extractor_config.local_path == local_preprocessor_path
+    assert downloader.calls == []
+
+
 def test_missing_local_onnx_model_fails_before_download(tmp_path: Path) -> None:
     downloader = RecordingDownloader()
 
@@ -160,6 +233,129 @@ def test_missing_local_onnx_model_fails_before_download(tmp_path: Path) -> None:
     assert "onnx/int8/model_quantized.onnx" in message
     assert str(tmp_path) in message
     assert downloader.calls == []
+
+
+def test_missing_local_detector_onnx_model_fails_before_feature_extractor(
+    tmp_path: Path,
+) -> None:
+    local_preprocessor_path = tmp_path / "onnx" / "int8" / "preprocessor_config.json"
+    local_preprocessor_path.parent.mkdir(parents=True)
+    local_preprocessor_path.write_text("{}", encoding="utf-8")
+    downloader = RecordingDownloader()
+
+    with pytest.raises(ArtifactResolutionError) as exc_info:
+        resolve_first_crack_detector_artifacts(
+            FirstCrackConfig(local_model_dir=tmp_path),
+            downloader=downloader,
+        )
+
+    message = str(exc_info.value)
+    assert "local first-crack artifact" in message
+    assert "onnx/int8/model_quantized.onnx" in message
+    assert "preprocessor_config.json" not in message
+    assert downloader.calls == []
+
+
+def test_missing_hub_detector_onnx_model_fails_before_feature_extractor() -> None:
+    calls: list[dict[str, str | None]] = []
+
+    def missing_onnx_downloader(
+        *,
+        repo_id: str,
+        filename: str,
+        revision: str | None,
+    ) -> str:
+        calls.append(
+            {
+                "repo_id": repo_id,
+                "filename": filename,
+                "revision": revision,
+            }
+        )
+        if filename == INT8_ONNX_MODEL_FILENAME:
+            raise RuntimeError("not found")
+        return "/tmp/hf-cache/preprocessor_config.json"
+
+    with pytest.raises(ArtifactResolutionError) as exc_info:
+        resolve_first_crack_detector_artifacts(
+            FirstCrackConfig(revision="pinned-release"),
+            downloader=missing_onnx_downloader,
+        )
+
+    message = str(exc_info.value)
+    assert "onnx/int8/model_quantized.onnx" in message
+    assert "syamaner/coffee-first-crack-detection" in message
+    assert "pinned-release" in message
+    assert calls == [
+        {
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "filename": "onnx/int8/model_quantized.onnx",
+            "revision": "pinned-release",
+        },
+    ]
+
+
+def test_missing_local_feature_extractor_fails_before_download(tmp_path: Path) -> None:
+    local_model_path = tmp_path / "onnx" / "int8" / "model_quantized.onnx"
+    local_model_path.parent.mkdir(parents=True)
+    local_model_path.write_bytes(b"onnx")
+    downloader = RecordingDownloader()
+
+    with pytest.raises(ArtifactResolutionError) as exc_info:
+        resolve_first_crack_detector_artifacts(
+            FirstCrackConfig(local_model_dir=tmp_path),
+            downloader=downloader,
+        )
+
+    message = str(exc_info.value)
+    assert "local first-crack artifact" in message
+    assert "onnx/int8/preprocessor_config.json" in message
+    assert str(tmp_path) in message
+    assert downloader.calls == []
+
+
+def test_missing_hub_feature_extractor_includes_artifact_context() -> None:
+    calls: list[dict[str, str | None]] = []
+
+    def missing_feature_extractor_downloader(
+        *,
+        repo_id: str,
+        filename: str,
+        revision: str | None,
+    ) -> str:
+        calls.append(
+            {
+                "repo_id": repo_id,
+                "filename": filename,
+                "revision": revision,
+            }
+        )
+        if filename == INT8_FEATURE_EXTRACTOR_FILENAME:
+            raise RuntimeError("not found")
+        return "/tmp/hf-cache/model_quantized.onnx"
+
+    with pytest.raises(ArtifactResolutionError) as exc_info:
+        resolve_first_crack_detector_artifacts(
+            FirstCrackConfig(revision="pinned-release"),
+            downloader=missing_feature_extractor_downloader,
+        )
+
+    message = str(exc_info.value)
+    assert "onnx/int8/preprocessor_config.json" in message
+    assert "syamaner/coffee-first-crack-detection" in message
+    assert "pinned-release" in message
+    assert calls == [
+        {
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "filename": "onnx/int8/model_quantized.onnx",
+            "revision": "pinned-release",
+        },
+        {
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "filename": "onnx/int8/preprocessor_config.json",
+            "revision": "pinned-release",
+        },
+    ]
 
 
 def test_unsupported_onnx_precision_fails_before_download() -> None:

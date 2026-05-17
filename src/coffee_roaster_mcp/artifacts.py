@@ -12,6 +12,8 @@ from coffee_roaster_mcp.config import FirstCrackConfig
 
 INT8_ONNX_MODEL_FILENAME = "onnx/int8/model_quantized.onnx"
 FP32_ONNX_MODEL_FILENAME = "onnx/fp32/model.onnx"
+INT8_FEATURE_EXTRACTOR_FILENAME = "onnx/int8/preprocessor_config.json"
+FP32_FEATURE_EXTRACTOR_FILENAME = "onnx/fp32/preprocessor_config.json"
 
 
 class ArtifactResolutionError(RuntimeError):
@@ -47,6 +49,20 @@ class ResolvedArtifact:
     revision: str | None
     filename: str
     local_path: Path
+
+
+@dataclass(frozen=True)
+class ResolvedDetectorArtifacts:
+    """Resolved first-crack detector artifact set.
+
+    Attributes:
+        onnx_model: Resolved ONNX model artifact for the configured precision.
+        feature_extractor_config: Resolved feature extractor preprocessor config
+            artifact for the configured precision.
+    """
+
+    onnx_model: ResolvedArtifact
+    feature_extractor_config: ResolvedArtifact
 
 
 def resolve_hugging_face_artifact(
@@ -136,6 +152,51 @@ def resolve_first_crack_onnx_model(
         filename,
         downloader=downloader,
     )
+
+
+def resolve_first_crack_detector_artifacts(
+    config: FirstCrackConfig,
+    *,
+    downloader: HuggingFaceDownloader | None = None,
+) -> ResolvedDetectorArtifacts:
+    """Resolve required first-crack detector artifacts before detection starts.
+
+    Args:
+        config: First-crack configuration containing precision, repo, revision,
+            and optional local model directory.
+        downloader: Optional test double for the Hugging Face download call.
+
+    Returns:
+        Metadata for the resolved ONNX model and feature extractor artifacts.
+
+    Raises:
+        ArtifactResolutionError: If the configured precision is unsupported or
+            any required detector artifact cannot be resolved.
+    """
+    onnx_model = resolve_first_crack_onnx_model(config, downloader=downloader)
+    feature_extractor_config = resolve_hugging_face_artifact(
+        config,
+        _feature_extractor_filename_for_precision(config),
+        downloader=downloader,
+    )
+    return ResolvedDetectorArtifacts(
+        onnx_model=onnx_model,
+        feature_extractor_config=feature_extractor_config,
+    )
+
+
+def _feature_extractor_filename_for_precision(config: FirstCrackConfig) -> str:
+    precision = str(config.precision)
+    match precision:
+        case "int8":
+            return INT8_FEATURE_EXTRACTOR_FILENAME
+        case "fp32":
+            return FP32_FEATURE_EXTRACTOR_FILENAME
+        case unsupported_precision:
+            raise ArtifactResolutionError(
+                "Unsupported first-crack feature extractor precision "
+                f"{unsupported_precision!r}; expected 'int8' or 'fp32'."
+            )
 
 
 def _validate_hub_filename(filename: str) -> str:
