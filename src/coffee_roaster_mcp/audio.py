@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import importlib
 import math
+import struct
 import time
+import wave
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
-from typing import Protocol
+from types import TracebackType
+from typing import Any, Protocol, Self, cast
 
 from coffee_roaster_mcp.config import AudioConfig
 
@@ -44,6 +49,8 @@ class AudioCaptureSettings:
     Attributes:
         input_device: Optional configured audio input identifier.
         sample_rate: Audio sample rate in Hz.
+        source: Configured audio source type.
+        wav_path: Optional WAV source path when source is `wav`.
         window_seconds: Detector window duration in seconds.
         queue_limit: Maximum detector windows retained for downstream consumers.
         idle_sleep_seconds: Sleep duration when an input read returns no samples.
@@ -51,6 +58,8 @@ class AudioCaptureSettings:
 
     input_device: str | None
     sample_rate: int
+    source: str = "microphone"
+    wav_path: Path | None = None
     window_seconds: float = DEFAULT_AUDIO_WINDOW_SECONDS
     queue_limit: int = DEFAULT_AUDIO_WINDOW_QUEUE_LIMIT
     idle_sleep_seconds: float = DEFAULT_AUDIO_IDLE_SLEEP_SECONDS
@@ -111,7 +120,9 @@ def audio_capture_settings_from_config(
     """Build validated audio capture settings from application config."""
     settings = AudioCaptureSettings(
         input_device=config.input_device,
+        source=config.source,
         sample_rate=config.sample_rate,
+        wav_path=config.wav_path,
         window_seconds=window_seconds,
         queue_limit=queue_limit,
         idle_sleep_seconds=idle_sleep_seconds,
@@ -122,7 +133,7 @@ def audio_capture_settings_from_config(
 
 def build_audio_capture_pipeline(
     config: AudioConfig,
-    input_factory: AudioInputFactory,
+    input_factory: AudioInputFactory | None = None,
     *,
     window_seconds: float = DEFAULT_AUDIO_WINDOW_SECONDS,
     queue_limit: int = DEFAULT_AUDIO_WINDOW_QUEUE_LIMIT,
@@ -130,6 +141,7 @@ def build_audio_capture_pipeline(
     monotonic_now: Callable[[], float] | None = None,
 ) -> AudioCapturePipeline:
     """Create an audio capture pipeline from configured audio input settings."""
+    resolved_input_factory = input_factory or build_configured_audio_input
     settings = audio_capture_settings_from_config(
         config,
         window_seconds=window_seconds,
@@ -138,9 +150,150 @@ def build_audio_capture_pipeline(
     )
     return AudioCapturePipeline(
         settings=settings,
-        audio_input=input_factory(settings),
+        audio_input=resolved_input_factory(settings),
         monotonic_now=monotonic_now,
     )
+
+
+def build_configured_audio_input(settings: AudioCaptureSettings) -> AudioInput:
+    """Create the concrete configured audio input."""
+    _validate_settings(settings)
+    if settings.source == "microphone":
+        return MicrophoneAudioInput(settings)
+    if settings.source == "wav":
+        if settings.wav_path is None:
+            raise AudioCaptureError("audio.wav_path must be configured when audio.source is wav.")
+        return WavAudioInput(settings.wav_path, sample_rate=settings.sample_rate)
+    raise AudioCaptureError("audio.source must be one of: microphone, wav.")
+
+
+class WavAudioInput:
+    """Read mono float samples from a PCM WAV file."""
+
+    def __init__(self, path: str | Path, *, sample_rate: int) -> None:
+        """Open a PCM WAV file for detector replay.
+
+        Args:
+            path: Path to a WAV file.
+            sample_rate: Expected sample rate in Hz.
+        """
+        if sample_rate <= 0:
+            raise AudioCaptureError("audio.sample_rate must be > 0.")
+        self._path = Path(path)
+        try:
+            self._wav = wave.open(str(self._path), "rb")  # noqa: SIM115 - input owns the handle.
+        except (OSError, wave.Error) as exc:
+            raise AudioCaptureError(f"Could not open WAV audio source {self._path}: {exc}") from exc
+
+        self._channel_count = self._wav.getnchannels()
+        self._sample_width = self._wav.getsampwidth()
+        wav_sample_rate = self._wav.getframerate()
+        if self._channel_count < 1:
+            self.close()
+            raise AudioCaptureError("WAV audio source must have at least one channel.")
+        if self._sample_width not in {1, 2, 3, 4}:
+            self.close()
+            raise AudioCaptureError("WAV audio source must use 8, 16, 24, or 32-bit PCM samples.")
+        if wav_sample_rate != sample_rate:
+            self.close()
+            raise AudioCaptureError(
+                "WAV audio source sample rate "
+                f"{wav_sample_rate} does not match configured audio.sample_rate {sample_rate}."
+            )
+
+    def read_samples(self, sample_count: int) -> Sequence[float]:
+        """Read up to `sample_count` mono floating-point samples from the WAV file."""
+        if sample_count <= 0:
+            return ()
+        raw_frames = self._wav.readframes(sample_count)
+        if not raw_frames:
+            return ()
+        return _decode_pcm_frames(
+            raw_frames,
+            channel_count=self._channel_count,
+            sample_width=self._sample_width,
+        )
+
+    def close(self) -> None:
+        """Close the underlying WAV file."""
+        self._wav.close()
+
+    def __enter__(self) -> Self:
+        """Return this WAV input as a context manager."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close the WAV input when leaving a context manager."""
+        self.close()
+
+
+class MicrophoneAudioInput:
+    """Read mono float samples from the configured system microphone."""
+
+    def __init__(
+        self,
+        settings: AudioCaptureSettings,
+        *,
+        sounddevice_module: Any | None = None,
+    ) -> None:
+        """Open a PortAudio-backed microphone stream.
+
+        Args:
+            settings: Validated audio capture settings.
+            sounddevice_module: Optional injected sounddevice-compatible module for tests.
+        """
+        _validate_settings(settings)
+        self._settings = settings
+        sounddevice = sounddevice_module or _load_sounddevice()
+        try:
+            stream_factory = sounddevice.RawInputStream
+            self._stream = stream_factory(
+                samplerate=settings.sample_rate,
+                device=settings.input_device,
+                channels=1,
+                dtype="float32",
+                blocksize=0,
+            )
+            self._stream.start()
+        except Exception as exc:  # noqa: BLE001 - backend exceptions vary by platform.
+            raise AudioCaptureError(f"Could not open microphone audio source: {exc}") from exc
+
+    def read_samples(self, sample_count: int) -> Sequence[float]:
+        """Read up to `sample_count` mono floating-point samples from the microphone."""
+        if sample_count <= 0:
+            return ()
+        try:
+            raw_data, overflowed = self._stream.read(sample_count)
+        except Exception as exc:  # noqa: BLE001 - backend exceptions vary by platform.
+            raise AudioCaptureError(f"Could not read microphone audio source: {exc}") from exc
+        if overflowed:
+            raise AudioCaptureError("Microphone audio input overflowed.")
+        return tuple(float(sample[0]) for sample in struct.iter_unpack("f", bytes(raw_data)))
+
+    def close(self) -> None:
+        """Stop and close the microphone stream."""
+        try:
+            self._stream.stop()
+        finally:
+            self._stream.close()
+
+    def __enter__(self) -> Self:
+        """Return this microphone input as a context manager."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close the microphone input when leaving a context manager."""
+        self.close()
 
 
 class AudioCapturePipeline:
@@ -209,6 +362,11 @@ class AudioCapturePipeline:
         if thread is not None:
             thread.join(timeout=timeout_seconds)
         return self.snapshot()
+
+    def close(self) -> None:
+        """Stop capture and close the underlying audio input when supported."""
+        self.stop()
+        _close_audio_input_if_supported(self._audio_input)
 
     def get_window(
         self,
@@ -305,6 +463,8 @@ class AudioCapturePipeline:
 
 
 def _validate_settings(settings: AudioCaptureSettings) -> None:
+    if settings.source not in {"microphone", "wav"}:
+        raise AudioCaptureError("audio.source must be one of: microphone, wav.")
     if settings.sample_rate <= 0:
         raise AudioCaptureError("audio.sample_rate must be > 0.")
     if not math.isfinite(settings.window_seconds) or settings.window_seconds <= 0:
@@ -320,3 +480,63 @@ def _normalize_sample(sample: float) -> float:
     if not math.isfinite(normalized):
         raise AudioCaptureError("audio samples must be finite numbers.")
     return normalized
+
+
+def _load_sounddevice() -> Any:
+    try:
+        return importlib.import_module("sounddevice")
+    except ImportError as exc:
+        raise AudioCaptureError(
+            "Microphone audio input requires the sounddevice package and PortAudio runtime."
+        ) from exc
+
+
+def _decode_pcm_frames(
+    raw_frames: bytes,
+    *,
+    channel_count: int,
+    sample_width: int,
+) -> tuple[float, ...]:
+    sample_values = _decode_pcm_samples(raw_frames, sample_width=sample_width)
+    if channel_count == 1:
+        return sample_values
+
+    mono_samples: list[float] = []
+    frame_count = len(sample_values) // channel_count
+    for frame_index in range(frame_count):
+        frame_start = frame_index * channel_count
+        frame = sample_values[frame_start : frame_start + channel_count]
+        mono_samples.append(sum(frame) / channel_count)
+    return tuple(mono_samples)
+
+
+def _decode_pcm_samples(raw_frames: bytes, *, sample_width: int) -> tuple[float, ...]:
+    if sample_width == 1:
+        return tuple((sample - 128) / 128.0 for sample in raw_frames)
+    if sample_width == 2:
+        return tuple(sample[0] / 32768.0 for sample in struct.iter_unpack("<h", raw_frames))
+    if sample_width == 3:
+        return tuple(
+            _decode_signed_24bit(raw_frames[index : index + 3]) / 8388608.0
+            for index in range(0, len(raw_frames), 3)
+        )
+    if sample_width == 4:
+        return tuple(sample[0] / 2147483648.0 for sample in struct.iter_unpack("<i", raw_frames))
+    raise AudioCaptureError("WAV audio source must use 8, 16, 24, or 32-bit PCM samples.")
+
+
+def _decode_signed_24bit(raw_sample: bytes) -> int:
+    if len(raw_sample) != 3:
+        raise AudioCaptureError("WAV audio source contained a partial 24-bit sample.")
+    value = int.from_bytes(raw_sample, byteorder="little", signed=False)
+    if value & 0x800000:
+        value -= 0x1000000
+    return value
+
+
+def _close_audio_input_if_supported(audio_input: AudioInput) -> None:
+    close = getattr(audio_input, "close", None)
+    if close is None:
+        return
+    close_method = cast(Callable[[], None], close)
+    close_method()

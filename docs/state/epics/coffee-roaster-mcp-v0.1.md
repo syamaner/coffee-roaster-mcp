@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4-S8`
-- Current target: Add microphone and WAV audio input adapters
+- Active story: `E4-S9`
+- Current target: Integrate first crack with session timeline
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -69,6 +69,14 @@ The first implementation milestone is a mock vertical slice that requires no roa
   ONNX inference by itself, or write to the authoritative session timeline;
   E4-S9 owns timeline integration.
 - `E4-S8` is inserted after the detector adapter story to add concrete microphone and WAV audio input adapters behind the E4-S6 `AudioInput` boundary. This keeps Linux/Raspberry Pi microphone behavior and recorded-session replay explicit before first-crack events are wired into the session timeline in `E4-S9`.
+- `E4-S8` adds configured concrete audio sources behind the existing E4-S6
+  `AudioInput` boundary. `audio.source: microphone` opens a lazy
+  PortAudio-backed `sounddevice` raw input stream with configured device and
+  sample rate, keeping platform-specific macOS/Linux/Raspberry Pi behavior
+  behind the adapter. `audio.source: wav` reads PCM WAV files with stdlib
+  decoding, requires the WAV sample rate to match `audio.sample_rate`, converts
+  multi-channel files to mono, and returns the same mono float sample contract
+  as live microphone capture.
 - `E4-S10` closes Epic 4 with targeted test hardening before the next epic.
   It should reduce coverage gaps around the assembled first-crack path,
   MCP-facing behavior, current export surfaces, and mock-safe failure modes.
@@ -238,7 +246,7 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - [x] `E4-S7` Add detector adapter.
   - Done when detector output maps to a confirmed first-crack event with timestamp, precision, revision, and confidence when available.
 
-- [ ] `E4-S8` Add microphone and WAV audio input adapters.
+- [x] `E4-S8` Add microphone and WAV audio input adapters.
   - Done when configured microphone and recorded WAV inputs can feed the detector window pipeline through the same audio source boundary.
 
 - [ ] `E4-S9` Integrate first crack with session timeline.
@@ -751,6 +759,33 @@ After completing a story:
   - Kept ONNX runtime inference, model training, ONNX export, Hugging Face sync, concrete microphone/WAV adapters, local directory sync behavior, MCP tool behavior, and authoritative session timeline writes out of scope.
   - Ran `./.venv/bin/python -m pytest tests/test_detector.py`: 8 passed.
   - Ran `./.venv/bin/python -m pytest`: 218 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4-S8:
+  - Added explicit audio source selection with `audio.source: microphone|wav`,
+    `audio.wav_path`, and environment overrides for source, sample rate, and WAV
+    path while preserving `first_crack.mode: disabled` as the mock-safe default.
+  - Added `WavAudioInput` behind the E4-S6 `AudioInput` boundary. It reads PCM
+    WAV files with stdlib `wave`, supports 8/16/24/32-bit PCM sample widths,
+    converts multi-channel files to mono, emits normalized finite float samples,
+    and fails clearly when the WAV sample rate differs from configured
+    `audio.sample_rate`.
+  - Added `MicrophoneAudioInput` behind the same boundary. It opens a lazy
+    PortAudio-backed `sounddevice.RawInputStream` with configured device and
+    sample rate, reads mono float32 samples, and reports backend read/open errors
+    plus overflow as `AudioCaptureError`.
+  - Added `build_configured_audio_input(...)` as the source-selection factory
+    used by `build_audio_capture_pipeline(...)` when no test factory is injected.
+  - Tests cover config/source selection, generated WAV replay, stereo-to-mono WAV
+    conversion, WAV sample-rate mismatch, mocked microphone backend selection,
+    microphone overflow handling, and pipeline compatibility proving microphone
+    and WAV sources feed identical detector-window contracts.
+  - Kept detector inference, ONNX export, model training, Hugging Face sync,
+    local directory sync behavior, first-crack session timeline integration,
+    broad coverage hardening, and live Hottop control changes out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_audio.py tests/test_config.py`: 30 passed.
+  - Ran `./.venv/bin/python -m pytest`: 226 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

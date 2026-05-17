@@ -195,8 +195,10 @@ first_crack:
   allow_manual_override: true
 
 audio:
+  source: microphone
   input_device: null
   sample_rate: 16000
+  wav_path: null
 
 logging:
   log_dir: ./logs
@@ -224,9 +226,19 @@ Supported environment overrides:
 - `COFFEE_FIRST_CRACK_PRECISION`
 - `COFFEE_FIRST_CRACK_LOCAL_MODEL_DIR`
 - `COFFEE_FIRST_CRACK_ONNX_THREADS`
+- `COFFEE_AUDIO_SOURCE`
 - `COFFEE_AUDIO_INPUT_DEVICE`
+- `COFFEE_AUDIO_SAMPLE_RATE`
+- `COFFEE_AUDIO_WAV_PATH`
 - `COFFEE_ROAST_LOG_DIR`
 - `HF_HOME`
+
+`audio.source` can be `microphone` or `wav`. Microphone capture uses a
+PortAudio-backed `sounddevice` stream and keeps the configured device identifier
+behind the audio-input boundary for macOS, Linux, and Raspberry Pi hosts. WAV
+replay uses PCM `.wav` files, converts channels to the same mono float sample
+contract as microphone capture, and requires the file sample rate to match
+`audio.sample_rate`.
 
 `HF_HOME` is consumed by Hugging Face tooling directly rather than copied into the RoastPilot config object.
 

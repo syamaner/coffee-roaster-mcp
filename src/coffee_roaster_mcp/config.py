@@ -14,6 +14,7 @@ TransportType = Literal["stdio"]
 TemperatureUnit = Literal["celsius", "fahrenheit", "auto"]
 FirstCrackMode = Literal["disabled", "audio", "manual"]
 ModelPrecision = Literal["int8", "fp32"]
+AudioSource = Literal["microphone", "wav"]
 ExportFormat = Literal["jsonl", "csv", "summary"]
 
 
@@ -52,8 +53,10 @@ class FirstCrackConfig:
 class AudioConfig:
     """Audio capture configuration."""
 
+    source: AudioSource = "microphone"
     input_device: str | None = None
     sample_rate: int = 16_000
+    wav_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -227,8 +230,13 @@ def _first_crack_from_mapping(raw: Mapping[str, Any]) -> FirstCrackConfig:
 
 def _audio_from_mapping(raw: Mapping[str, Any]) -> AudioConfig:
     return AudioConfig(
+        source=_audio_source(
+            _string(raw, "source", "microphone", label="audio.source"),
+            label="audio.source",
+        ),
         input_device=_optional_string(raw, "input_device", label="audio.input_device"),
         sample_rate=_integer(raw, "sample_rate", 16_000, label="audio.sample_rate"),
+        wav_path=_optional_path(raw, "wav_path", label="audio.wav_path"),
     )
 
 
@@ -334,8 +342,24 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
             ),
         )
 
+    if "COFFEE_AUDIO_SOURCE" in environ:
+        audio = replace(
+            audio,
+            source=_audio_source(environ["COFFEE_AUDIO_SOURCE"], label="COFFEE_AUDIO_SOURCE"),
+        )
     if "COFFEE_AUDIO_INPUT_DEVICE" in environ:
         audio = replace(audio, input_device=_none_if_empty(environ["COFFEE_AUDIO_INPUT_DEVICE"]))
+    if "COFFEE_AUDIO_SAMPLE_RATE" in environ:
+        audio = replace(
+            audio,
+            sample_rate=_parse_integer(
+                environ["COFFEE_AUDIO_SAMPLE_RATE"],
+                "COFFEE_AUDIO_SAMPLE_RATE",
+            ),
+        )
+    if "COFFEE_AUDIO_WAV_PATH" in environ:
+        wav_path = _none_if_empty(environ["COFFEE_AUDIO_WAV_PATH"])
+        audio = replace(audio, wav_path=Path(wav_path) if wav_path is not None else None)
 
     if "COFFEE_ROAST_LOG_DIR" in environ:
         logging = replace(
@@ -462,6 +486,13 @@ def _model_precision(value: str, label: str = "first_crack.precision") -> ModelP
     if normalized not in {"int8", "fp32"}:
         raise ConfigError(f"{label} must be one of: int8, fp32.")
     return cast(ModelPrecision, normalized)
+
+
+def _audio_source(value: str, label: str = "audio.source") -> AudioSource:
+    normalized = _normalized_token(value)
+    if normalized not in {"microphone", "wav"}:
+        raise ConfigError(f"{label} must be one of: microphone, wav.")
+    return cast(AudioSource, normalized)
 
 
 def _export_formats(value: object) -> tuple[ExportFormat, ...]:

@@ -22,6 +22,8 @@ def test_default_config_allows_mock_run_without_file(
     assert config.first_crack.mode == "disabled"
     assert config.first_crack.repo_id == "syamaner/coffee-first-crack-detection"
     assert config.first_crack.precision == "int8"
+    assert config.audio.source == "microphone"
+    assert config.audio.wav_path is None
     assert config.logging.log_dir == Path("./logs")
     assert config.logging.export_formats == ("jsonl", "csv", "summary")
     assert config.session.auto_t0_detection_enabled is False
@@ -84,8 +86,10 @@ session:
     assert config.first_crack.local_model_dir == Path("./models/fp32")
     assert config.first_crack.onnx_threads == 4
     assert config.first_crack.allow_manual_override is False
+    assert config.audio.source == "microphone"
     assert config.audio.input_device == "roast-mic"
     assert config.audio.sample_rate == 48_000
+    assert config.audio.wav_path is None
     assert config.logging.log_dir == Path("./roast-logs")
     assert config.logging.sample_interval_seconds == 0.5
     assert config.logging.export_formats == ("jsonl", "summary")
@@ -104,7 +108,10 @@ first_crack:
   mode: disabled
   precision: int8
 audio:
+  source: wav
   input_device: file-mic
+  sample_rate: 8000
+  wav_path: ./fixture.wav
 logging:
   log_dir: ./file-logs
 """,
@@ -123,7 +130,10 @@ logging:
             "COFFEE_FIRST_CRACK_PRECISION": "fp32 ",
             "COFFEE_FIRST_CRACK_LOCAL_MODEL_DIR": "/models/env",
             "COFFEE_FIRST_CRACK_ONNX_THREADS": "8",
+            "COFFEE_AUDIO_SOURCE": "microphone",
             "COFFEE_AUDIO_INPUT_DEVICE": "env-mic",
+            "COFFEE_AUDIO_SAMPLE_RATE": "16000",
+            "COFFEE_AUDIO_WAV_PATH": "",
             "COFFEE_ROAST_LOG_DIR": "/tmp/roasts",
         },
     )
@@ -137,7 +147,10 @@ logging:
     assert config.first_crack.precision == "fp32"
     assert config.first_crack.local_model_dir == Path("/models/env")
     assert config.first_crack.onnx_threads == 8
+    assert config.audio.source == "microphone"
     assert config.audio.input_device == "env-mic"
+    assert config.audio.sample_rate == 16_000
+    assert config.audio.wav_path is None
     assert config.logging.log_dir == Path("/tmp/roasts")
 
 
@@ -156,6 +169,14 @@ def test_invalid_enum_value_fails(tmp_path: Path) -> None:
     config_path.write_text("first_crack:\n  precision: fp16\n", encoding="utf-8")
 
     with pytest.raises(ConfigError, match="first_crack.precision"):
+        load_config(config_path, environ={})
+
+
+def test_invalid_audio_source_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("audio:\n  source: bluetooth\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="audio.source"):
         load_config(config_path, environ={})
 
 

@@ -30,7 +30,7 @@ drop and emergency stop included. A follow-up 60-second stability test also held
 fan at `10%`, heat at `40%` for 30 seconds, then heat at `100%` for 30 seconds
 with continuous command streaming and no command-loop or status-read errors.
 
-E4-S7 is complete. The first-crack path now resolves the configured ONNX model
+E4-S8 is complete. The first-crack path now resolves the configured ONNX model
 artifact for both supported real-model precisions: `int8` selects
 `onnx/int8/model_quantized.onnx`, and `fp32` selects `onnx/fp32/model.onnx`
 through the artifact resolver. When `first_crack.local_model_dir` is configured,
@@ -46,17 +46,20 @@ bounded non-blocking queue for the detector adapter. The detector adapter now
 turns injected backend decisions into confirmed first-crack event candidates
 with monotonic timestamp, precision, revision, artifact, and optional confidence
 metadata for later session integration. This does not add model training,
-export, sync, concrete audio input adapters, local directory sync, ONNX runtime
-inference, or MCP session behavior.
+export, sync, local directory sync, ONNX runtime inference, or MCP session
+behavior. Configured microphone and recorded WAV sources now feed the same
+E4-S6 `AudioInput` boundary: microphone capture uses a lazy PortAudio-backed
+`sounddevice` stream with configured device and sample rate, while WAV replay
+uses stdlib PCM decoding, channel-to-mono conversion, and the same mono float
+sample contract as live capture. Real microphone validation remains optional
+and gated; normal CI uses mocked microphone backends and generated WAV fixtures.
 
-The next story is E4-S8: add microphone and WAV audio input adapters.
-Epic 4 now includes a new E4-S8 story for concrete microphone and WAV audio
-input adapters before session timeline integration. The previous timeline
-integration story is now E4-S9. Epic 4 also now includes E4-S10 as a closing
-test-hardening story before the next epic, focused on first-crack integration,
-MCP-facing behavior, export assertions, mock-safe failure modes, and coverage
-gaps. Real microphone validation is optional and must remain explicitly gated so
-normal CI does not require audio hardware.
+The next story is E4-S9: integrate first crack with the session timeline.
+Epic 4 includes E4-S10 as a closing test-hardening story before the next epic,
+focused on first-crack integration, MCP-facing behavior, export assertions,
+mock-safe failure modes, and coverage gaps. Real microphone validation is
+optional and must remain explicitly gated so normal CI does not require audio
+hardware.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
