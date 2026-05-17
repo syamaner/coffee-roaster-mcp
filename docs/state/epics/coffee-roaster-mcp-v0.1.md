@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E5-S1`
-- Current target: Implement rolling telemetry buffer
+- Active story: `E4.1-S1`
+- Current target: Wire MCP roast-control tools to configured driver
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -103,6 +103,16 @@ The first implementation milestone is a mock vertical slice that requires no roa
   Epic 5 finalizes schemas. Coverage now has a stable `90%` package floor, with
   local branch-aware coverage at `91.73%`. Normal CI remains mock-safe with no
   microphone, Hottop hardware, model download, or network requirement.
+- Epic 4.1 is inserted before Epic 5 because the installed Claude-local MCP
+  operational path is not complete yet. Current MCP heat/fan/drop/cooling tools
+  are covered at the existing mock/session boundary, but they are not yet wired
+  to the configured live driver. Current first-crack components resolve
+  artifacts, capture audio windows, adapt detector outputs, and write to the
+  session timeline, but there is not yet a released-artifact ONNX runtime
+  backend or session-owned detector loop. Epic 4.1 makes the operational MCP
+  flow explicit: Claude should be able to start a roast, adjust the configured
+  roaster, read current device/session state, and know whether first crack has
+  happened before Epic 5 adds richer telemetry metrics and final log schemas.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -110,7 +120,13 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Current Risks
 
-- Normal MCP heat, fan, drop, and cooling tools are not yet wired to live Hottop driver commands; current Hottop hardware readiness applies to the driver boundary validated by E3-S9.
+- Normal MCP heat, fan, drop, and cooling tools are not yet wired to live
+  Hottop driver commands; current Hottop hardware readiness applies to the
+  driver boundary validated by E3-S9, and Epic 4.1 now tracks the normal MCP
+  operational wiring.
+- The first-crack path does not yet include a released-artifact ONNX runtime
+  backend or session-owned detector loop; Epic 4.1 now tracks this before Epic
+  5 metrics/logging work.
 - MCP Registry publishing is preview and needs verification before release.
 - First-crack event integration must preserve one authoritative session timeline.
 - Log schema changes need compatibility discipline once users start collecting roast logs.
@@ -288,6 +304,59 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
   MCP-facing behavior, current export surfaces, and mock-safe failure modes.
 - Real microphone validation is optional, explicitly gated, and never required
   for normal CI.
+
+## Epic 4.1: Operational MCP Runtime
+
+Goal: make the locally installed MCP server operational for Claude before the
+metrics/logging epic. Claude should be able to start a roast, adjust the
+configured roaster, read current device and session state, and know whether
+first crack has happened through MCP tools.
+
+### Stories
+
+- [ ] `E4.1-S1` Wire MCP roast-control tools to configured driver.
+  - Done when `start_roast_session`, `set_heat`, `set_fan`, `drop_beans`,
+    `start_cooling`, `stop_cooling`, and `emergency_stop` call the configured
+    `RoasterDriver` boundary where appropriate while preserving the mock
+    default, one-session store semantics, fail-closed safety behavior, and
+    no-live-hardware CI.
+
+- [ ] `E4.1-S2` Expose current roaster device state through MCP.
+  - Done when MCP state output includes current driver state needed for
+    operational decisions: connected status, bean/environment temperatures when
+    available, heat/fan levels, cooling state, driver id, and safe raw
+    diagnostics, without implementing Epic 5 rolling metrics.
+
+- [ ] `E4.1-S3` Add released-artifact ONNX first-crack detector backend.
+  - Done when `first_crack.mode: audio` can construct a detector backend from
+    the resolved ONNX model and feature-extractor config using the existing
+    released-artifact resolver boundary, with mock-safe tests and no training,
+    export, or Hugging Face sync behavior.
+
+- [ ] `E4.1-S4` Start first-crack detection runtime with roast sessions.
+  - Done when audio mode starts/stops the configured audio pipeline and detector
+    runtime with the roast session, records confirmed first crack exactly once,
+    exposes disabled/manual/pending/detected/faulted/unavailable status through
+    MCP, and keeps detector/audio failures from crashing normal session control.
+
+- [ ] `E4.1-S5` Add MCP operational readiness tests and docs.
+  - Done when automated MCP tests cover the local Claude-installed operational
+    flow on the mock-safe path, MCP response schemas for device state and
+    first-crack status are asserted, and optional live Hottop/real microphone
+    validation docs remain explicitly gated.
+
+### Epic Acceptance Criteria
+
+- Claude can start a roast through MCP.
+- Claude can adjust configured roaster controls through MCP while the default
+  mock path remains hardware-free.
+- Claude can read current configured-device state and authoritative session
+  state through MCP.
+- Claude can determine whether first crack is disabled, manual, pending,
+  detected, faulted, or unavailable due to configuration/artifact/audio errors.
+- Normal CI requires no Hottop hardware, microphone, model download, or network.
+- Model training, ONNX export, Hugging Face sync, final telemetry metrics, and
+  final log schemas remain out of scope for this epic.
 
 ## Epic 5: Roast Metrics And Log Export
 

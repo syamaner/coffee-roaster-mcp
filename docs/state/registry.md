@@ -83,7 +83,16 @@ the existing one-session mock/session boundary rather than live Hottop command
 wiring, and automatic first-crack detector startup is not yet an MCP runtime
 loop.
 
-The next story after E4-S10 merges is E5-S1: implement rolling telemetry buffer.
+Epic 4.1 is now inserted before Epic 5 to close operational MCP runtime gaps.
+The target user flow is: install the MCP server locally in Claude, start a
+roast, adjust the configured roaster through MCP tools, read current device and
+session state, and know whether first crack has happened. E4.1 covers
+driver-backed MCP control tools, current roaster state exposure, released ONNX
+detector backend construction, session-owned first-crack detector lifecycle, and
+operational MCP readiness tests/docs. Epic 5 remains focused on telemetry
+buffering, derived metrics, and final log/export schemas.
+
+The next story after E4-S10 merges is E4.1-S1: wire MCP roast-control tools to the configured driver.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
