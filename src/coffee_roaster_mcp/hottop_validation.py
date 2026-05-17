@@ -157,6 +157,7 @@ def run_hottop_validation(
                 _control_step_status(
                     heat_state,
                     previous_command_write_count=previous_command_write_count,
+                    expected_heat_percent=heat_percent,
                 ),
                 f"Set heat to {heat_percent} percent.",
                 heat_state,
@@ -173,6 +174,7 @@ def run_hottop_validation(
                 _control_step_status(
                     heat_off_state,
                     previous_command_write_count=previous_command_write_count,
+                    expected_heat_percent=0,
                 ),
                 "Set heat back to zero.",
                 heat_off_state,
@@ -189,6 +191,7 @@ def run_hottop_validation(
                 _control_step_status(
                     fan_state,
                     previous_command_write_count=previous_command_write_count,
+                    expected_fan_percent=fan_percent,
                 ),
                 f"Set fan to {fan_percent} percent.",
                 fan_state,
@@ -379,10 +382,16 @@ def _control_step_status(
     state: RoasterState,
     *,
     previous_command_write_count: int,
+    expected_heat_percent: int | None = None,
+    expected_fan_percent: int | None = None,
 ) -> ValidationStatus:
     if _has_driver_errors(state):
         return "failed"
     if _command_write_count(state) <= previous_command_write_count:
+        return "failed"
+    if expected_heat_percent is not None and state.heat_level_percent != expected_heat_percent:
+        return "failed"
+    if expected_fan_percent is not None and state.fan_level_percent != expected_fan_percent:
         return "failed"
     return "passed"
 

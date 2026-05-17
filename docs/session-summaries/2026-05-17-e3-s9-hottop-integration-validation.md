@@ -183,6 +183,7 @@ Review quality comparison:
 - The overlap was strongest on evidence integrity: both reviews noticed that the validation record could become unreliable exactly when hardware validation most needs auditability.
 - Copilot's suppressed low-confidence notes about `/tmp` evidence were still useful after classification. Rather than committing raw hardware JSON, the durable docs now record SHA-256 checksums for the local evidence files.
 - Codex review `4305417406` on the first review-fix commit found two additional high-value issues: the skipped emergency-stop path still sent a hidden emergency-stop command, and command-step readiness accepted stale `command_write_count` values rather than proving fresh write progress per step.
+- Codex review `4305450927` on the second review-fix commit found one more hardware-readiness gap: heat and fan steps proved write progress but did not verify the driver state reached the requested control target.
 
 Review response:
 
@@ -195,6 +196,7 @@ Review response:
 - full validation now drops before cooling-stop validation so drop behavior is not masked by prior cooling
 - non-destructive validation now honors the skipped emergency-stop contract and does not send a hidden emergency-stop command
 - each control step now requires `command_write_count` to increase after that specific command before the step can pass
+- heat, heat-off, and fan steps now verify the resulting driver state matches the requested control target
 - hardware readiness now requires required steps to pass and no failed steps to appear
 - durable state and session summary now include SHA-256 checksums for the hardware evidence files
 - skill and registry stale-state wording was corrected

@@ -224,6 +224,24 @@ class StaleCommandWriteDriver(FakeValidationDriver):
         )
 
 
+class IgnoredHeatControlDriver(FakeValidationDriver):
+    """Driver double that writes heat commands without updating heat state."""
+
+    def set_heat(self, *, heat_level_percent: int) -> RoasterState:
+        """Record heat command but leave heat state unchanged."""
+        self.actions.append(f"heat:{heat_level_percent}")
+        return self.read_state()
+
+
+class IgnoredFanControlDriver(FakeValidationDriver):
+    """Driver double that writes fan commands without updating fan state."""
+
+    def set_fan(self, *, fan_level_percent: int) -> RoasterState:
+        """Record fan command but leave fan state unchanged."""
+        self.actions.append(f"fan:{fan_level_percent}")
+        return self.read_state()
+
+
 def test_hottop_validation_requires_hardware_acknowledgement(tmp_path: Path) -> None:
     config_path = _write_hottop_config(tmp_path)
 
@@ -417,6 +435,48 @@ def test_hottop_validation_readiness_requires_fresh_command_writes(
 
     statuses = {step.name: step.status for step in report.steps}
     assert statuses["heat"] == "failed"
+    assert report.hardware_ready_release_label_allowed is False
+
+
+def test_hottop_validation_readiness_requires_requested_heat_state(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_hottop_config(tmp_path)
+
+    report = run_hottop_validation(
+        HottopValidationOptions(
+            config_path=config_path,
+            hardware_acknowledged=True,
+            include_drop=True,
+            include_emergency_stop=True,
+        ),
+        driver_factory=_driver_factory(IgnoredHeatControlDriver()),
+        sleeper=_no_sleep,
+    )
+
+    statuses = {step.name: step.status for step in report.steps}
+    assert statuses["heat"] == "failed"
+    assert report.hardware_ready_release_label_allowed is False
+
+
+def test_hottop_validation_readiness_requires_requested_fan_state(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_hottop_config(tmp_path)
+
+    report = run_hottop_validation(
+        HottopValidationOptions(
+            config_path=config_path,
+            hardware_acknowledged=True,
+            include_drop=True,
+            include_emergency_stop=True,
+        ),
+        driver_factory=_driver_factory(IgnoredFanControlDriver()),
+        sleeper=_no_sleep,
+    )
+
+    statuses = {step.name: step.status for step in report.steps}
+    assert statuses["fan"] == "failed"
     assert report.hardware_ready_release_label_allowed is False
 
 
