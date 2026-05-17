@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from coffee_roaster_mcp.artifacts import ArtifactResolutionError, resolve_hugging_face_artifact
+from coffee_roaster_mcp.artifacts import (
+    INT8_ONNX_MODEL_FILENAME,
+    ArtifactResolutionError,
+    resolve_first_crack_onnx_model,
+    resolve_hugging_face_artifact,
+)
 from coffee_roaster_mcp.config import FirstCrackConfig
 
 
@@ -48,6 +53,53 @@ def test_resolves_first_crack_artifact_from_default_repo() -> None:
             "revision": None,
         }
     ]
+
+
+def test_resolves_int8_onnx_model_for_default_precision() -> None:
+    downloader = RecordingDownloader("/tmp/hf-cache/model_quantized.onnx")
+
+    artifact = resolve_first_crack_onnx_model(FirstCrackConfig(), downloader=downloader)
+
+    assert artifact.filename == INT8_ONNX_MODEL_FILENAME
+    assert artifact.local_path == Path("/tmp/hf-cache/model_quantized.onnx")
+    assert downloader.calls == [
+        {
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "filename": "onnx/int8/model_quantized.onnx",
+            "revision": None,
+        }
+    ]
+
+
+def test_resolves_int8_onnx_model_for_explicit_int8_precision() -> None:
+    downloader = RecordingDownloader("/tmp/hf-cache/explicit-int8.onnx")
+
+    artifact = resolve_first_crack_onnx_model(
+        FirstCrackConfig(precision="int8", revision="v0.1.0"),
+        downloader=downloader,
+    )
+
+    assert artifact.filename == "onnx/int8/model_quantized.onnx"
+    assert artifact.revision == "v0.1.0"
+    assert downloader.calls == [
+        {
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "filename": "onnx/int8/model_quantized.onnx",
+            "revision": "v0.1.0",
+        }
+    ]
+
+
+def test_fp32_onnx_model_resolution_is_deferred_to_e4_s3() -> None:
+    downloader = RecordingDownloader()
+
+    with pytest.raises(ArtifactResolutionError, match="E4-S3"):
+        resolve_first_crack_onnx_model(
+            FirstCrackConfig(precision="fp32"),
+            downloader=downloader,
+        )
+
+    assert downloader.calls == []
 
 
 def test_resolver_honors_configured_revision() -> None:

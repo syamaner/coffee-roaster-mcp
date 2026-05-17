@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4-S2`
-- Current target: Load INT8 ONNX by default
+- Active story: `E4-S3`
+- Current target: Load FP32 ONNX by config
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -56,6 +56,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - The `coffee-first-crack-detection` repo remains the source of truth for training, ONNX export, Hugging Face sync, model cards, and dataset cards.
 - This repo consumes released Hugging Face artifacts only.
 - `E4-S1` adds only a narrow Hugging Face Hub artifact resolver. It resolves repository-relative released files from the configured first-crack repo and revision, uses `huggingface_hub` as a declared runtime dependency, and leaves precision-specific ONNX selection, local offline directories, artifact validation, detector startup, and session-timeline integration to later Epic 4 stories.
+- `E4-S2` resolves the configured first-crack ONNX model for default `int8` precision by selecting `onnx/int8/model_quantized.onnx` through the E4-S1 Hugging Face artifact resolver. FP32 selection, local offline directories, artifact validation, detector startup, audio capture, and session-timeline integration remain later Epic 4 work.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -202,7 +203,7 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - [x] `E4-S1` Add Hugging Face artifact resolver.
   - Done when model files can be resolved from `syamaner/coffee-first-crack-detection` using configured revision.
 
-- [ ] `E4-S2` Load INT8 ONNX by default.
+- [x] `E4-S2` Load INT8 ONNX by default.
   - Done when `onnx/int8/model_quantized.onnx` is selected for `precision: int8`.
 
 - [ ] `E4-S3` Load FP32 ONNX by config.
@@ -655,6 +656,16 @@ After completing a story:
   - Added mocked resolver tests covering the default `syamaner/coffee-first-crack-detection` repository, configured revision handling, configured repository handling, invalid artifact names, and contextual failure messages.
   - Kept model training, ONNX export, Hugging Face sync, precision-specific model selection, local offline directory handling, artifact validation, detector startup, and MCP/session integration out of scope.
   - Ran `./.venv/bin/python -m pytest`: 184 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4-S2:
+  - Added `resolve_first_crack_onnx_model(...)` as the narrow ONNX model selection entry point on top of the E4-S1 Hugging Face artifact resolver.
+  - The selector resolves `onnx/int8/model_quantized.onnx` for configured `int8` precision, including the default `FirstCrackConfig()` precision.
+  - FP32 selection remains deferred to E4-S3, and model training, ONNX export, Hugging Face sync, detector startup, audio capture, local offline directories, artifact validation, and MCP/session integration remain out of scope.
+  - Added mocked resolver tests for default INT8 selection, explicit INT8 selection with revision propagation, and the deferred FP32 boundary.
+  - Ran `./.venv/bin/python -m pytest tests/test_artifacts.py`: 14 passed.
+  - Ran `./.venv/bin/python -m pytest`: 189 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
