@@ -195,8 +195,10 @@ first_crack:
   allow_manual_override: true
 
 audio:
+  source: microphone
   input_device: null
   sample_rate: 16000
+  wav_path: null
 
 logging:
   log_dir: ./logs
@@ -224,9 +226,29 @@ Supported environment overrides:
 - `COFFEE_FIRST_CRACK_PRECISION`
 - `COFFEE_FIRST_CRACK_LOCAL_MODEL_DIR`
 - `COFFEE_FIRST_CRACK_ONNX_THREADS`
+- `COFFEE_AUDIO_SOURCE`
 - `COFFEE_AUDIO_INPUT_DEVICE`
+- `COFFEE_AUDIO_SAMPLE_RATE`
+- `COFFEE_AUDIO_WAV_PATH`
 - `COFFEE_ROAST_LOG_DIR`
 - `HF_HOME`
+
+`audio.source` can be `microphone` or `wav`. Microphone capture uses a
+PortAudio-backed `sounddevice` stream and keeps the configured device identifier
+behind the audio-input boundary for macOS, Linux, and Raspberry Pi hosts. WAV
+replay uses PCM `.wav` files, converts channels to the same mono float sample
+contract as microphone capture, and requires the file sample rate to match
+`audio.sample_rate`.
+
+For microphone capture, `audio.input_device: null` uses the system default input
+device. To pin a specific microphone, set `audio.input_device` to a
+PortAudio-resolvable device name or platform device identifier. On Linux and
+Raspberry Pi, use `arecord -l` and `arecord -L` to inspect ALSA devices; values
+such as `plughw:1,0` are often more forgiving than raw `hw:1,0` because ALSA can
+perform format conversion. On macOS, use the system sound settings or a
+`sounddevice` device listing during manual validation. Real microphone checks
+are optional and should be run only when `first_crack.mode: audio` and
+`audio.source: microphone` are deliberately configured.
 
 `HF_HOME` is consumed by Hugging Face tooling directly rather than copied into the RoastPilot config object.
 

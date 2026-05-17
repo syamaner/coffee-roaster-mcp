@@ -31,7 +31,8 @@ dependencies = [
   "huggingface_hub>=0.23,<1",
   "mcp>=1.0.0,<2",
   "pyserial>=3.5",
-  "PyYAML>=6.0.2"
+  "PyYAML>=6.0.2",
+  "sounddevice>=0.5,<1"
 ]
 
 [project.urls]
