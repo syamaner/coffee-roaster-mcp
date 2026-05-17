@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4-S1`
-- Current target: Add the Hugging Face artifact resolver
+- Active story: `E4-S2`
+- Current target: Load INT8 ONNX by default
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -55,6 +55,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - ONNX FP32 is supported by config.
 - The `coffee-first-crack-detection` repo remains the source of truth for training, ONNX export, Hugging Face sync, model cards, and dataset cards.
 - This repo consumes released Hugging Face artifacts only.
+- `E4-S1` adds only a narrow Hugging Face Hub artifact resolver. It resolves repository-relative released files from the configured first-crack repo and revision, uses `huggingface_hub` as a declared runtime dependency, and leaves precision-specific ONNX selection, local offline directories, artifact validation, detector startup, and session-timeline integration to later Epic 4 stories.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -198,7 +199,7 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 
 ### Stories
 
-- [ ] `E4-S1` Add Hugging Face artifact resolver.
+- [x] `E4-S1` Add Hugging Face artifact resolver.
   - Done when model files can be resolved from `syamaner/coffee-first-crack-detection` using configured revision.
 
 - [ ] `E4-S2` Load INT8 ONNX by default.
@@ -644,6 +645,16 @@ After completing a story:
   - Added SHA-256 checksums for all three hardware evidence files instead of committing raw JSON evidence.
   - Updated the session summary with review quality, overlap, and response details.
   - Ran `./.venv/bin/python -m pytest`: 170 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4-S1:
+  - Added `src/coffee_roaster_mcp/artifacts.py` with a small Hugging Face Hub artifact resolver for released first-crack model files.
+  - The resolver accepts a repository-relative filename, uses `FirstCrackConfig.repo_id` and `FirstCrackConfig.revision`, returns the local Hub cache path, and wraps download failures with repository, revision, and artifact context.
+  - Added `huggingface_hub>=0.23,<1` as a declared runtime dependency while keeping the Hub import lazy so mocked resolver tests do not require network access or a real download.
+  - Added mocked resolver tests covering the default `syamaner/coffee-first-crack-detection` repository, configured revision handling, configured repository handling, invalid artifact names, and contextual failure messages.
+  - Kept model training, ONNX export, Hugging Face sync, precision-specific model selection, local offline directory handling, artifact validation, detector startup, and MCP/session integration out of scope.
+  - Ran `./.venv/bin/python -m pytest`: 184 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
