@@ -189,6 +189,37 @@ def test_automatic_detection_does_not_require_manual_override_permission() -> No
     assert session.phase == "development"
 
 
+def test_adapter_default_timestamp_records_when_window_end_is_slightly_ahead() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 501.25
+    config = FirstCrackConfig(mode="audio")
+    adapter = build_first_crack_detector_adapter(
+        config,
+        _resolved_detector_artifacts(),
+        MockDetectorBackend((FirstCrackDetectorOutput(confirmed=True),)),
+    )
+
+    result = integrate_first_crack_window_with_session(
+        config=config,
+        adapter=adapter,
+        session_store=store,
+        session=session,
+        window=_audio_window(
+            started_at_monotonic_seconds=501.0,
+            duration_seconds=1.0,
+        ),
+    )
+
+    assert result is not None
+    assert result.event.kind == "first_crack_detected"
+    assert result.event.monotonic_seconds == 1.25
+    assert result.event.payload["detected_at_monotonic_seconds"] == 502.0
+    assert session.first_crack_monotonic_seconds == 1.25
+
+
 def test_manual_first_crack_event_takes_precedence_over_later_detector_confirmation() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
@@ -231,13 +262,14 @@ def _audio_window(
     *,
     sequence_number: int = 3,
     started_at_monotonic_seconds: float = 500.5,
+    duration_seconds: float = 1.0,
 ) -> AudioWindow:
     return AudioWindow(
         sequence_number=sequence_number,
         input_device="mock-audio",
         sample_rate=4,
         started_at_monotonic_seconds=started_at_monotonic_seconds,
-        duration_seconds=1.0,
+        duration_seconds=duration_seconds,
         samples=(0.1, 0.2, 0.3, 0.4),
     )
 

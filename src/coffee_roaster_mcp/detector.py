@@ -184,6 +184,7 @@ def integrate_first_crack_window_with_session(
     event, snapshot = session_store.record_first_crack_detection_snapshot(
         session,
         detected_at_monotonic_seconds=detection_event.detected_at_monotonic_seconds,
+        max_future_seconds=window.duration_seconds,
         payload=detection_event.payload(),
     )
     return FirstCrackTimelineIntegrationResult(event=event, session=snapshot)

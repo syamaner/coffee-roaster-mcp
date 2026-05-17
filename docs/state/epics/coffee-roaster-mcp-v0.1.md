@@ -86,10 +86,12 @@ The first implementation milestone is a mock vertical slice that requires no roa
   timeline through an explicit helper that keeps mutation behind
   `RoastSessionStore`. The integration is gated to `first_crack.mode: audio`,
   writes the first-crack event at the detector-provided monotonic timestamp with
-  detector metadata payload, leaves disabled and manual modes disconnected from
-  detector writes, allows automatic detection even when manual override is
-  disabled, and relies on the store singleton event behavior so repeated
-  detector confirmations do not append duplicate `first_crack_detected` rows.
+  detector metadata payload, accepts adapter-inferred default timestamps that
+  land slightly ahead of the integration clock within the active detector-window
+  tolerance, leaves disabled and manual modes disconnected from detector writes,
+  allows automatic detection even when manual override is disabled, and relies
+  on the store singleton event behavior so repeated detector confirmations do
+  not append duplicate `first_crack_detected` rows.
 - `E4-S10` closes Epic 4 with targeted test hardening before the next epic.
   It should reduce coverage gaps around the assembled first-crack path,
   MCP-facing behavior, current export surfaces, and mock-safe failure modes.
@@ -820,6 +822,10 @@ After completing a story:
     `RoastSessionStore.record_first_crack_detection_snapshot(...)` path so the
     authoritative event timestamp and downstream development metrics use the
     detector-provided monotonic timestamp rather than the later integration time.
+  - A follow-up review fix allows adapter-inferred default window-end timestamps
+    that are slightly ahead of the integration clock, bounded by the detector
+    window duration, so backends without explicit timestamps do not fail the
+    automatic path.
   - Automatic detector integration remains independent of manual override
     permission, so `allow_manual_override: false` only disables the manual MCP
     override path.
