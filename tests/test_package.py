@@ -35,7 +35,7 @@ def test_main_without_subcommand_prints_help(capsys: pytest.CaptureFixture[str])
     assert main([]) == 0
     output = capsys.readouterr().out
     assert "usage: coffee-roaster-mcp" in output
-    assert "{serve}" in output
+    assert "{serve,hottop-validate}" in output
 
 
 def test_main_prints_version(capsys: pytest.CaptureFixture[str]) -> None:

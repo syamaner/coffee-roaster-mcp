@@ -133,11 +133,11 @@ mock disabled int8
 
 This confirms the bootstrap defaults are still aligned with the mock vertical-slice plan.
 
-## Hottop Configuration Placeholder
+## Hottop Configuration And Validation
 
-Hottop support is planned behind the `RoasterDriver` abstraction. It is not ready for hardware use yet.
+Hottop support lives behind the `RoasterDriver` abstraction. The current driver has lifecycle, command-loop, packet, control-state, and temperature-unit support, but it still requires guarded manual validation before any hardware-ready release label.
 
-When Hottop stories land, configuration will continue to live in `coffee-roaster-mcp.yaml`. The relevant roaster section already has the expected placeholder shape:
+Configuration lives in `coffee-roaster-mcp.yaml`. Keep local development on the mock driver unless you are intentionally validating connected Hottop hardware:
 
 ```yaml
 roaster:
@@ -148,9 +148,27 @@ roaster:
   command_interval_seconds: 0.3
 ```
 
-For future Hottop usage, the expected change is to switch `driver` away from `mock` and set the serial port explicitly. Until the Hottop driver and validation stories are complete, keep local development on the mock driver.
+For guarded hardware validation, switch `driver` to `hottop_kn8828b_2k_plus`, set the serial port explicitly, and run the validation harness with an evidence output path:
 
-Hardware safety matters here: Hottop command-loop behavior, packet handling, temperature units, drop behavior, cooling behavior, and emergency stop still require explicit implementation plus manual validation before hardware-ready use.
+```bash
+coffee-roaster-mcp hottop-validate \
+  --config coffee-roaster-mcp.yaml \
+  --output docs/validation/hottop-e3-s9-non-destructive.json \
+  --i-understand-this-controls-hardware
+```
+
+The irreversible and safety-action checks are opt-in:
+
+```bash
+coffee-roaster-mcp hottop-validate \
+  --config coffee-roaster-mcp.yaml \
+  --output docs/validation/hottop-e3-s9-full.json \
+  --i-understand-this-controls-hardware \
+  --include-drop \
+  --include-emergency-stop
+```
+
+Hardware safety matters here: command-loop cadence, packet handling, temperature units, drop behavior, cooling behavior, emergency stop, and cleanup must be validated on a supervised roaster before the Hottop path is treated as release-ready. The current MCP roast-session tools preserve their existing one-session store semantics; driver-level validation does not imply MCP heat, fan, drop, or cooling tools are live-hardware control surfaces yet.
 
 ## Configuration
 
