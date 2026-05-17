@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4-S3`
-- Current target: Load FP32 ONNX by config
+- Active story: `E4-S4`
+- Current target: Support local offline model directory
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -57,6 +57,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - This repo consumes released Hugging Face artifacts only.
 - `E4-S1` adds only a narrow Hugging Face Hub artifact resolver. It resolves repository-relative released files from the configured first-crack repo and revision, uses `huggingface_hub` as a declared runtime dependency, and leaves precision-specific ONNX selection, local offline directories, artifact validation, detector startup, and session-timeline integration to later Epic 4 stories.
 - `E4-S2` resolves the configured first-crack ONNX model for default `int8` precision by selecting `onnx/int8/model_quantized.onnx` through the E4-S1 Hugging Face artifact resolver. FP32 selection, local offline directories, artifact validation, detector startup, audio capture, and session-timeline integration remain later Epic 4 work.
+- `E4-S3` resolves the configured first-crack ONNX model for `fp32` precision by selecting `onnx/fp32/model.onnx` through the E4-S1/E4-S2 resolver boundary. Local offline directories, artifact validation, detector startup, audio capture, and session-timeline integration remain later Epic 4 work.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -206,7 +207,7 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - [x] `E4-S2` Load INT8 ONNX by default.
   - Done when `onnx/int8/model_quantized.onnx` is selected for `precision: int8`.
 
-- [ ] `E4-S3` Load FP32 ONNX by config.
+- [x] `E4-S3` Load FP32 ONNX by config.
   - Done when `onnx/fp32/model.onnx` is selected for `precision: fp32`.
 
 - [ ] `E4-S4` Support local offline model directory.
@@ -664,6 +665,16 @@ After completing a story:
   - The selector resolves `onnx/int8/model_quantized.onnx` for configured `int8` precision, including the default `FirstCrackConfig()` precision.
   - FP32 selection remains deferred to E4-S3, and model training, ONNX export, Hugging Face sync, detector startup, audio capture, local offline directories, artifact validation, and MCP/session integration remain out of scope.
   - Added mocked resolver tests for default INT8 selection, explicit INT8 selection with revision propagation, and the deferred FP32 boundary.
+  - Ran `./.venv/bin/python -m pytest tests/test_artifacts.py`: 14 passed.
+  - Ran `./.venv/bin/python -m pytest`: 189 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4-S3:
+  - Extended `resolve_first_crack_onnx_model(...)` to select `onnx/fp32/model.onnx` when `FirstCrackConfig.precision` is `fp32`.
+  - Preserved the default `int8` selection of `onnx/int8/model_quantized.onnx` and kept repository, revision, filename validation, and download behavior delegated to the E4-S1 Hugging Face artifact resolver.
+  - Kept model training, ONNX export, Hugging Face sync, detector startup, audio capture, local offline directories, artifact validation, and MCP/session integration out of scope.
+  - Added mocked resolver coverage for configured FP32 selection with revision propagation.
   - Ran `./.venv/bin/python -m pytest tests/test_artifacts.py`: 14 passed.
   - Ran `./.venv/bin/python -m pytest`: 189 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
