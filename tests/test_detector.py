@@ -92,6 +92,7 @@ def test_detector_adapter_maps_confirmed_output_to_first_crack_event() -> None:
     assert event.onnx_model_filename == "onnx/fp32/model.onnx"
     assert event.feature_extractor_filename == "onnx/fp32/preprocessor_config.json"
     assert event.window_sequence_number == 7
+    assert event.detected_at_inferred is False
     assert event.payload() == {
         "source": "first_crack_detector",
         "detected_at_monotonic_seconds": 120.42,
@@ -119,6 +120,7 @@ def test_detector_adapter_uses_window_end_timestamp_when_output_has_no_timestamp
     assert event is not None
     assert event.detected_at_monotonic_seconds == 56.25
     assert event.confidence is None
+    assert event.detected_at_inferred is True
     assert "confidence" not in event.payload()
 
 

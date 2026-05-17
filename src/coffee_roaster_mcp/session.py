@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from typing import Literal
@@ -590,6 +591,64 @@ class RoastSessionStore:
             event = self.record_event(session, kind, payload=payload)
             return event, _copy_session_for_read(session)
 
+    def record_first_crack_detection_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        detected_at_monotonic_seconds: float,
+        max_future_seconds: float = 0.0,
+        payload: dict[str, EventPayloadValue] | None = None,
+    ) -> tuple[RoastEvent, RoastSession]:
+        """Record automatic first crack at the detector-provided monotonic time.
+
+        Args:
+            session: Session to mutate.
+            detected_at_monotonic_seconds: Absolute monotonic timestamp reported
+                by the detector for the first-crack event.
+            max_future_seconds: Allowed future timestamp tolerance. This lets
+                adapter-inferred window-end defaults record when the capture
+                window has just been emitted but its inferred end timestamp is
+                slightly ahead of the integration clock.
+            payload: Optional structured event details.
+
+        Returns:
+            The event plus an atomic lightweight snapshot. Repeated calls return
+            the already-recorded first-crack singleton event.
+
+        Raises:
+            SessionLifecycleError: If the session transition is invalid or the
+                detector timestamp is outside the active roast interval.
+        """
+        with self._lock:
+            self._assert_latest_active_session(session)
+            if session.faulted_at_utc is not None:
+                raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
+
+            existing_event = self._get_existing_singleton_event(
+                session,
+                "first_crack_detected",
+            )
+            if existing_event is not None:
+                return existing_event, _copy_session_for_read(session)
+            _validate_event_transition(session, "first_crack_detected")
+
+            detected_elapsed_seconds = _detected_elapsed_seconds(
+                session,
+                detected_at_monotonic_seconds=detected_at_monotonic_seconds,
+                current_elapsed_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
+                max_future_seconds=max_future_seconds,
+            )
+            event = RoastEvent(
+                kind="first_crack_detected",
+                recorded_at_utc=session.created_at_utc
+                + timedelta(seconds=detected_elapsed_seconds),
+                monotonic_seconds=detected_elapsed_seconds,
+                payload={} if payload is None else dict(payload),
+            )
+            session.event_timeline.append(event)
+            _apply_event_timestamp(session, event)
+            return event, _copy_session_for_read(session)
+
     def emergency_stop(
         self,
         session: RoastSession,
@@ -782,6 +841,38 @@ def _apply_event_timestamp(session: RoastSession, event: RoastEvent) -> None:
         session.phase = "fault"
         session.faulted_at_utc = event.recorded_at_utc
         session.faulted_monotonic_seconds = event.monotonic_seconds
+
+
+def _detected_elapsed_seconds(
+    session: RoastSession,
+    *,
+    detected_at_monotonic_seconds: float,
+    current_elapsed_seconds: float,
+    max_future_seconds: float,
+) -> float:
+    if max_future_seconds < 0:
+        raise SessionLifecycleError("Detected first-crack future tolerance must be >= 0.")
+    detected_elapsed_seconds = round(
+        float(detected_at_monotonic_seconds) - session.monotonic_start,
+        6,
+    )
+    if not math.isfinite(detected_elapsed_seconds):
+        raise SessionLifecycleError("Detected first-crack timestamp must be finite.")
+    if detected_elapsed_seconds < 0:
+        raise SessionLifecycleError(
+            "Detected first-crack timestamp cannot be before session start."
+        )
+    if detected_elapsed_seconds > current_elapsed_seconds:
+        future_delta_seconds = detected_elapsed_seconds - current_elapsed_seconds
+        if future_delta_seconds > max_future_seconds:
+            raise SessionLifecycleError("Detected first-crack timestamp cannot be in the future.")
+        detected_elapsed_seconds = current_elapsed_seconds
+    if (
+        session.beans_added_monotonic_seconds is not None
+        and detected_elapsed_seconds < session.beans_added_monotonic_seconds
+    ):
+        raise SessionLifecycleError("Detected first crack cannot be before beans are added.")
+    return detected_elapsed_seconds
 
 
 def _validate_event_transition(session: RoastSession, kind: RoastEventKind) -> None:

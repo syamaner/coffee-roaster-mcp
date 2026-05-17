@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4-S9`
-- Current target: Integrate first crack with session timeline
+- Active story: `E4-S10`
+- Current target: Harden first-crack and MCP coverage before next epic
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -82,6 +82,17 @@ The first implementation milestone is a mock vertical slice that requires no roa
   sample rate to match `audio.sample_rate`, converts multi-channel files to
   mono, and returns the same mono float sample contract as live microphone
   capture.
+- `E4-S9` integrates confirmed detector output with the authoritative session
+  timeline through an explicit helper that keeps mutation behind
+  `RoastSessionStore`. The integration is gated to `first_crack.mode: audio`,
+  writes the first-crack event at the detector-provided monotonic timestamp with
+  detector metadata payload, accepts adapter-inferred default timestamps that
+  land slightly ahead of the integration clock within the active detector-window
+  tolerance while still rejecting explicit future detector timestamps, ignores
+  confirmed detector output before beans are added, ignores detector output once
+  the session leaves active `roasting`, leaves disabled and manual modes
+  disconnected from detector writes, and allows automatic detection even when
+  manual override is disabled.
 - `E4-S10` closes Epic 4 with targeted test hardening before the next epic.
   It should reduce coverage gaps around the assembled first-crack path,
   MCP-facing behavior, current export surfaces, and mock-safe failure modes.
@@ -254,7 +265,7 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - [x] `E4-S8` Add microphone and WAV audio input adapters.
   - Done when configured microphone and recorded WAV inputs can feed the detector window pipeline through the same audio source boundary.
 
-- [ ] `E4-S9` Integrate first crack with session timeline.
+- [x] `E4-S9` Integrate first crack with session timeline.
   - Done when mocked detector output creates exactly one `first_crack_detected` event.
 
 - [ ] `E4-S10` Harden first-crack and MCP coverage before next epic.
@@ -794,3 +805,54 @@ After completing a story:
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4-S9:
+  - Added an explicit detector-to-session integration helper in
+    `src/coffee_roaster_mcp/detector.py` that processes one `AudioWindow` with
+    the existing detector adapter and records confirmed output as an
+    authoritative `first_crack_detected` event through `RoastSessionStore`.
+  - The integration is gated to `first_crack.mode: audio`; disabled and manual
+    modes do not call the detector adapter or mutate the timeline.
+  - Confirmed detector payloads include detector source, detected monotonic
+    timestamp, precision, revision, repository id, resolved ONNX artifact,
+    feature-extractor artifact, source window sequence number, and optional
+    confidence.
+  - Repeated detector confirmations and detector confirmations after a manual
+    first-crack event are ignored after the session leaves active `roasting`, so
+    late detector output does not append duplicate timeline rows.
+  - PR review hardening moved automatic first-crack recording onto a dedicated
+    `RoastSessionStore.record_first_crack_detection_snapshot(...)` path so the
+    authoritative event timestamp and downstream development metrics use the
+    detector-provided monotonic timestamp rather than the later integration time.
+  - A follow-up review fix allows adapter-inferred default window-end timestamps
+    that are slightly ahead of the integration clock, bounded by the detector
+    window duration, so backends without explicit timestamps do not fail the
+    automatic path.
+  - Another review fix ignores confirmed detector output before beans are added
+    so early false positives cannot bubble a lifecycle exception and break the
+    detection loop before roasting starts.
+  - A final review fix restricts future-timestamp tolerance to adapter-inferred
+    window-end timestamps only; explicit future timestamps from detector
+    backends still fail fast so backend clock or timestamp bugs are not silently
+    clamped.
+  - The latest review fix also ignores detector output after the session leaves
+    active `roasting`, covering late confirmations after first crack, drop,
+    cooling, completion, fault, or stop without relying on store-level lifecycle
+    exceptions.
+  - Automatic detector integration remains independent of manual override
+    permission, so `allow_manual_override: false` only disables the manual MCP
+    override path.
+  - Kept model training, ONNX export, Hugging Face sync, local directory sync,
+    detector startup, audio capture startup, broad coverage hardening, and live
+    Hottop control changes out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_first_crack_integration.py tests/test_detector.py`: 13 passed.
+  - Ran `./.venv/bin/python -m pytest`: 234 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Final review-fix validation ran
+    `./.venv/bin/python -m pytest tests/test_first_crack_integration.py tests/test_detector.py tests/test_session.py`:
+    55 passed.
+  - Final full validation ran `./.venv/bin/python -m pytest`: 238 passed,
+    `./.venv/bin/python -m ruff check .`: passed,
+    `./.venv/bin/python -m ruff format --check .`: passed, and
+    `./.venv/bin/python -m pyright`: 0 errors.

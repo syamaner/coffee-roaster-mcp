@@ -9,6 +9,7 @@ from typing import Literal, Protocol
 from coffee_roaster_mcp.artifacts import ResolvedDetectorArtifacts
 from coffee_roaster_mcp.audio import AudioWindow
 from coffee_roaster_mcp.config import FirstCrackConfig, ModelPrecision
+from coffee_roaster_mcp.session import RoastEvent, RoastSession, RoastSessionStore
 
 FirstCrackDetectorEventKind = Literal["first_crack_detected"]
 
@@ -45,9 +46,9 @@ class FirstCrackDetectorOutput:
 class FirstCrackDetectionEvent:
     """Confirmed first-crack detector event candidate.
 
-    This is intentionally not written to the roast-session timeline here. E4-S9
-    owns session integration; this story only adapts detector output into the
-    event metadata needed by that later boundary.
+    The detector adapter returns this as metadata only. Session integration is
+    handled by the explicit E4-S9 integration helper so timeline writes stay
+    visible and preserve the `RoastSessionStore` mutation boundary.
 
     Attributes:
         kind: Event kind intended for the session timeline.
@@ -59,6 +60,8 @@ class FirstCrackDetectionEvent:
         onnx_model_filename: Repository-relative ONNX model artifact.
         feature_extractor_filename: Repository-relative feature extractor artifact.
         window_sequence_number: Source audio window sequence number.
+        detected_at_inferred: Whether the detection timestamp was inferred from
+            the source window end because the backend omitted an explicit timestamp.
     """
 
     kind: FirstCrackDetectorEventKind
@@ -70,6 +73,7 @@ class FirstCrackDetectionEvent:
     onnx_model_filename: str
     feature_extractor_filename: str
     window_sequence_number: int
+    detected_at_inferred: bool
 
     def payload(self) -> dict[str, str | int | float | None]:
         """Return session-event payload metadata for this confirmed detection."""
@@ -116,7 +120,22 @@ class FirstCrackDetectorAdapter:
             onnx_model_filename=self.artifacts.onnx_model.filename,
             feature_extractor_filename=self.artifacts.feature_extractor_config.filename,
             window_sequence_number=window.sequence_number,
+            detected_at_inferred=output.detected_at_monotonic_seconds is None,
         )
+
+
+@dataclass(frozen=True)
+class FirstCrackTimelineIntegrationResult:
+    """Result of applying one confirmed detector event to the session timeline.
+
+    Attributes:
+        event: Authoritative session event. Repeated confirmations return the
+            original first-crack event instead of adding another timeline row.
+        session: Snapshot of the authoritative session after integration.
+    """
+
+    event: RoastEvent
+    session: RoastSession
 
 
 def build_first_crack_detector_adapter(
@@ -130,6 +149,51 @@ def build_first_crack_detector_adapter(
         artifacts=artifacts,
         backend=backend,
     )
+
+
+def integrate_first_crack_window_with_session(
+    *,
+    config: FirstCrackConfig,
+    adapter: FirstCrackDetectorAdapter,
+    session_store: RoastSessionStore,
+    session: RoastSession,
+    window: AudioWindow,
+) -> FirstCrackTimelineIntegrationResult | None:
+    """Process one detector window and write one first-crack event if confirmed.
+
+    The integration is intentionally gated to `first_crack.mode: audio`; manual
+    and disabled modes leave detector output disconnected from the authoritative
+    timeline. Session mutation stays behind `RoastSessionStore`, so duplicate
+    detector confirmations return the original singleton `first_crack_detected`
+    event without appending another row.
+
+    Args:
+        config: First-crack runtime configuration.
+        adapter: Detector adapter that turns backend output into event metadata.
+        session_store: Authoritative one-session mutation boundary.
+        session: Active roast session to update.
+        window: Audio window to process.
+
+    Returns:
+        Timeline integration result for confirmed output, or `None` when the
+        mode is not audio or the detector did not confirm first crack.
+    """
+    if config.mode != "audio":
+        return None
+    if not session.active or session.phase != "roasting":
+        return None
+
+    detection_event = adapter.process_window(window)
+    if detection_event is None:
+        return None
+
+    event, snapshot = session_store.record_first_crack_detection_snapshot(
+        session,
+        detected_at_monotonic_seconds=detection_event.detected_at_monotonic_seconds,
+        max_future_seconds=window.duration_seconds if detection_event.detected_at_inferred else 0.0,
+        payload=detection_event.payload(),
+    )
+    return FirstCrackTimelineIntegrationResult(event=event, session=snapshot)
 
 
 def _detection_timestamp(
