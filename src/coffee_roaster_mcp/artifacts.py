@@ -93,6 +93,10 @@ def _validate_hub_filename(filename: str) -> str:
     normalized = filename.strip()
     if not normalized:
         raise ArtifactResolutionError("Hugging Face artifact filename must not be empty.")
+    if "\\" in normalized:
+        raise ArtifactResolutionError(
+            "Hugging Face artifact filename must use repository-relative POSIX separators."
+        )
 
     path = PurePosixPath(normalized)
     if path.is_absolute() or ".." in path.parts:

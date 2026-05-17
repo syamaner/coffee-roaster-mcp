@@ -80,7 +80,16 @@ def test_resolver_honors_configured_repo_id() -> None:
 
 
 @pytest.mark.parametrize(
-    "filename", ["", "  ", "/model.onnx", "../model.onnx", "onnx/../model.onnx"]
+    "filename",
+    [
+        "",
+        "  ",
+        "/model.onnx",
+        "../model.onnx",
+        "onnx/../model.onnx",
+        r"..\model.onnx",
+        r"onnx\..\model.onnx",
+    ],
 )
 def test_invalid_artifact_filename_fails_before_download(filename: str) -> None:
     downloader = RecordingDownloader()
