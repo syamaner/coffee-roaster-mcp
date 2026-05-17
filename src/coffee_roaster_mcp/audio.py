@@ -1,0 +1,310 @@
+"""Audio capture windowing for first-crack detection."""
+
+from __future__ import annotations
+
+import math
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from queue import Empty, Full, Queue
+from threading import Event, Lock, Thread
+from typing import Protocol
+
+from coffee_roaster_mcp.config import AudioConfig
+
+DEFAULT_AUDIO_WINDOW_SECONDS = 1.0
+DEFAULT_AUDIO_WINDOW_QUEUE_LIMIT = 8
+DEFAULT_AUDIO_IDLE_SLEEP_SECONDS = 0.01
+
+
+class AudioCaptureError(RuntimeError):
+    """Raised when audio capture cannot be configured or run."""
+
+
+class AudioInput(Protocol):
+    """Readable audio input for detector-window capture."""
+
+    def read_samples(self, sample_count: int) -> Sequence[float]:
+        """Read up to `sample_count` mono floating-point samples."""
+        ...
+
+
+class AudioInputFactory(Protocol):
+    """Factory for configured audio inputs."""
+
+    def __call__(self, settings: AudioCaptureSettings) -> AudioInput:
+        """Create an audio input for the supplied capture settings."""
+        ...
+
+
+@dataclass(frozen=True)
+class AudioCaptureSettings:
+    """Runtime audio capture settings.
+
+    Attributes:
+        input_device: Optional configured audio input identifier.
+        sample_rate: Audio sample rate in Hz.
+        window_seconds: Detector window duration in seconds.
+        queue_limit: Maximum detector windows retained for downstream consumers.
+        idle_sleep_seconds: Sleep duration when an input read returns no samples.
+    """
+
+    input_device: str | None
+    sample_rate: int
+    window_seconds: float = DEFAULT_AUDIO_WINDOW_SECONDS
+    queue_limit: int = DEFAULT_AUDIO_WINDOW_QUEUE_LIMIT
+    idle_sleep_seconds: float = DEFAULT_AUDIO_IDLE_SLEEP_SECONDS
+
+    @property
+    def window_sample_count(self) -> int:
+        """Return the exact number of samples required for one detector window."""
+        return max(1, round(self.sample_rate * self.window_seconds))
+
+
+@dataclass(frozen=True)
+class AudioWindow:
+    """Complete mono audio window ready for detector inference.
+
+    Attributes:
+        sequence_number: Monotonic window sequence number for one pipeline run.
+        input_device: Optional configured audio input identifier.
+        sample_rate: Audio sample rate in Hz.
+        started_at_monotonic_seconds: Monotonic timestamp when the window was emitted.
+        duration_seconds: Window duration derived from sample count and sample rate.
+        samples: Mono floating-point samples.
+    """
+
+    sequence_number: int
+    input_device: str | None
+    sample_rate: int
+    started_at_monotonic_seconds: float
+    duration_seconds: float
+    samples: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class AudioCaptureSnapshot:
+    """Current audio capture pipeline status.
+
+    Attributes:
+        running: Whether the capture worker is currently alive.
+        queued_window_count: Detector windows currently waiting for consumption.
+        emitted_window_count: Windows successfully queued for detector consumption.
+        dropped_window_count: Windows dropped because the detector queue was full.
+        latest_error: Last capture error message, if the worker stopped on error.
+    """
+
+    running: bool
+    queued_window_count: int
+    emitted_window_count: int
+    dropped_window_count: int
+    latest_error: str | None
+
+
+def audio_capture_settings_from_config(
+    config: AudioConfig,
+    *,
+    window_seconds: float = DEFAULT_AUDIO_WINDOW_SECONDS,
+    queue_limit: int = DEFAULT_AUDIO_WINDOW_QUEUE_LIMIT,
+    idle_sleep_seconds: float = DEFAULT_AUDIO_IDLE_SLEEP_SECONDS,
+) -> AudioCaptureSettings:
+    """Build validated audio capture settings from application config."""
+    settings = AudioCaptureSettings(
+        input_device=config.input_device,
+        sample_rate=config.sample_rate,
+        window_seconds=window_seconds,
+        queue_limit=queue_limit,
+        idle_sleep_seconds=idle_sleep_seconds,
+    )
+    _validate_settings(settings)
+    return settings
+
+
+def build_audio_capture_pipeline(
+    config: AudioConfig,
+    input_factory: AudioInputFactory,
+    *,
+    window_seconds: float = DEFAULT_AUDIO_WINDOW_SECONDS,
+    queue_limit: int = DEFAULT_AUDIO_WINDOW_QUEUE_LIMIT,
+    idle_sleep_seconds: float = DEFAULT_AUDIO_IDLE_SLEEP_SECONDS,
+    monotonic_now: Callable[[], float] | None = None,
+) -> AudioCapturePipeline:
+    """Create an audio capture pipeline from configured audio input settings."""
+    settings = audio_capture_settings_from_config(
+        config,
+        window_seconds=window_seconds,
+        queue_limit=queue_limit,
+        idle_sleep_seconds=idle_sleep_seconds,
+    )
+    return AudioCapturePipeline(
+        settings=settings,
+        audio_input=input_factory(settings),
+        monotonic_now=monotonic_now,
+    )
+
+
+class AudioCapturePipeline:
+    """Background audio capture pipeline that emits detector windows.
+
+    The worker thread owns potentially blocking audio reads. Complete windows
+    are offered to a bounded queue without waiting, so a slow detector consumer
+    cannot stall the capture worker or any roaster telemetry loop running
+    elsewhere in the process.
+    """
+
+    def __init__(
+        self,
+        *,
+        settings: AudioCaptureSettings,
+        audio_input: AudioInput,
+        monotonic_now: Callable[[], float] | None = None,
+    ) -> None:
+        """Initialize an audio capture pipeline.
+
+        Args:
+            settings: Validated audio capture settings.
+            audio_input: Configured readable audio source.
+            monotonic_now: Optional monotonic clock supplier for tests.
+        """
+        _validate_settings(settings)
+        self._settings = settings
+        self._audio_input = audio_input
+        self._monotonic_now = monotonic_now or time.monotonic
+        self._windows: Queue[AudioWindow] = Queue(maxsize=settings.queue_limit)
+        self._sample_buffer: list[float] = []
+        self._stop_requested = Event()
+        self._state_lock = Lock()
+        self._thread: Thread | None = None
+        self._next_sequence_number = 0
+        self._emitted_window_count = 0
+        self._dropped_window_count = 0
+        self._latest_error: str | None = None
+
+    @property
+    def settings(self) -> AudioCaptureSettings:
+        """Return the immutable capture settings."""
+        return self._settings
+
+    def start(self) -> AudioCaptureSnapshot:
+        """Start background audio capture and return the current status snapshot."""
+        with self._state_lock:
+            if self._thread is not None and self._thread.is_alive():
+                raise AudioCaptureError("Audio capture pipeline is already running.")
+            self._stop_requested.clear()
+            self._latest_error = None
+            self._thread = Thread(
+                target=self._run_capture_loop,
+                name="coffee-roaster-audio-capture",
+                daemon=True,
+            )
+            self._thread.start()
+        return self.snapshot()
+
+    def stop(self, *, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
+        """Request capture stop and wait briefly for the worker to finish."""
+        if timeout_seconds < 0:
+            raise AudioCaptureError("timeout_seconds must be >= 0.")
+        self._stop_requested.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout_seconds)
+        return self.snapshot()
+
+    def get_window(
+        self,
+        *,
+        block: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> AudioWindow | None:
+        """Return one queued detector window, if available."""
+        try:
+            return self._windows.get(block=block, timeout=timeout_seconds)
+        except Empty:
+            return None
+
+    def drain_windows(self, *, max_windows: int | None = None) -> tuple[AudioWindow, ...]:
+        """Return all currently queued detector windows without blocking."""
+        if max_windows is not None and max_windows < 0:
+            raise AudioCaptureError("max_windows must be >= 0.")
+        windows: list[AudioWindow] = []
+        while max_windows is None or len(windows) < max_windows:
+            window = self.get_window()
+            if window is None:
+                break
+            windows.append(window)
+        return tuple(windows)
+
+    def snapshot(self) -> AudioCaptureSnapshot:
+        """Return a thread-safe capture status snapshot."""
+        thread = self._thread
+        with self._state_lock:
+            return AudioCaptureSnapshot(
+                running=thread is not None and thread.is_alive(),
+                queued_window_count=self._windows.qsize(),
+                emitted_window_count=self._emitted_window_count,
+                dropped_window_count=self._dropped_window_count,
+                latest_error=self._latest_error,
+            )
+
+    def _run_capture_loop(self) -> None:
+        try:
+            while not self._stop_requested.is_set():
+                samples = self._read_next_samples()
+                if not samples:
+                    time.sleep(self._settings.idle_sleep_seconds)
+                    continue
+                self._sample_buffer.extend(samples)
+                self._emit_complete_windows()
+        except Exception as exc:  # noqa: BLE001 - worker stores error for caller inspection.
+            with self._state_lock:
+                self._latest_error = str(exc)
+            self._stop_requested.set()
+
+    def _read_next_samples(self) -> tuple[float, ...]:
+        needed_samples = self._settings.window_sample_count - len(self._sample_buffer)
+        raw_samples = self._audio_input.read_samples(max(1, needed_samples))
+        return tuple(_normalize_sample(sample) for sample in raw_samples)
+
+    def _emit_complete_windows(self) -> None:
+        window_sample_count = self._settings.window_sample_count
+        while len(self._sample_buffer) >= window_sample_count:
+            window_samples = tuple(self._sample_buffer[:window_sample_count])
+            del self._sample_buffer[:window_sample_count]
+            window = AudioWindow(
+                sequence_number=self._next_sequence_number,
+                input_device=self._settings.input_device,
+                sample_rate=self._settings.sample_rate,
+                started_at_monotonic_seconds=self._monotonic_now(),
+                duration_seconds=round(window_sample_count / self._settings.sample_rate, 6),
+                samples=window_samples,
+            )
+            self._next_sequence_number += 1
+            self._publish_window(window)
+
+    def _publish_window(self, window: AudioWindow) -> None:
+        try:
+            self._windows.put_nowait(window)
+        except Full:
+            with self._state_lock:
+                self._dropped_window_count += 1
+            return
+        with self._state_lock:
+            self._emitted_window_count += 1
+
+
+def _validate_settings(settings: AudioCaptureSettings) -> None:
+    if settings.sample_rate <= 0:
+        raise AudioCaptureError("audio.sample_rate must be > 0.")
+    if not math.isfinite(settings.window_seconds) or settings.window_seconds <= 0:
+        raise AudioCaptureError("audio window_seconds must be > 0.")
+    if settings.queue_limit < 1:
+        raise AudioCaptureError("audio queue_limit must be >= 1.")
+    if not math.isfinite(settings.idle_sleep_seconds) or settings.idle_sleep_seconds < 0:
+        raise AudioCaptureError("audio idle_sleep_seconds must be >= 0.")
+
+
+def _normalize_sample(sample: float) -> float:
+    normalized = float(sample)
+    if not math.isfinite(normalized):
+        raise AudioCaptureError("audio samples must be finite numbers.")
+    return normalized
