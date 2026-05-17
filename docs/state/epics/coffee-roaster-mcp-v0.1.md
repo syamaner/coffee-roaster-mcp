@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4-S6`
-- Current target: Add audio capture pipeline
+- Active story: `E4-S7`
+- Current target: Add detector adapter
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -60,6 +60,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E4-S3` resolves the configured first-crack ONNX model for `fp32` precision by selecting `onnx/fp32/model.onnx` through the E4-S1/E4-S2 resolver boundary. Local offline directories, artifact validation, detector startup, audio capture, and session-timeline integration remain later Epic 4 work.
 - `E4-S4` resolves configured first-crack artifacts from `first_crack.local_model_dir` before any Hugging Face Hub download. The local path uses the same repository-relative artifact names as the released Hub layout, fails clearly when the target local file is missing, and leaves broader detector artifact validation, detector startup, audio capture, and session-timeline integration to later Epic 4 work.
 - `E4-S5` validates the required first-crack detector artifact set through the existing resolver boundary before audio detection begins. The validation resolves the configured ONNX model plus `onnx/int8/preprocessor_config.json` or `onnx/fp32/preprocessor_config.json`, depending on precision, and keeps detector startup, audio capture, artifact content validation, and session-timeline integration out of scope.
+- `E4-S6` adds an injectable audio capture pipeline that builds its source from `AudioConfig`, reads on a background worker, frames complete one-second mono detector windows at the configured sample rate, and hands windows to a bounded non-blocking queue for the future detector adapter. Live audio backend selection, detector adapter behavior, model inference, and session-timeline integration remain later work.
+- `E4-S8` is inserted after the detector adapter story to add concrete microphone and WAV audio input adapters behind the E4-S6 `AudioInput` boundary. This keeps Linux/Raspberry Pi microphone behavior and recorded-session replay explicit before first-crack events are wired into the session timeline in `E4-S9`.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -218,13 +220,16 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - [x] `E4-S5` Validate required detector artifacts before detection starts.
   - Done when missing ONNX model or feature extractor files fail clearly before audio detection begins.
 
-- [ ] `E4-S6` Add audio capture pipeline.
+- [x] `E4-S6` Add audio capture pipeline.
   - Done when configured audio input can feed detector windows without blocking roaster telemetry.
 
 - [ ] `E4-S7` Add detector adapter.
   - Done when detector output maps to a confirmed first-crack event with timestamp, precision, revision, and confidence when available.
 
-- [ ] `E4-S8` Integrate first crack with session timeline.
+- [ ] `E4-S8` Add microphone and WAV audio input adapters.
+  - Done when configured microphone and recorded WAV inputs can feed the detector window pipeline through the same audio source boundary.
+
+- [ ] `E4-S9` Integrate first crack with session timeline.
   - Done when mocked detector output creates exactly one `first_crack_detected` event.
 
 ### Epic Acceptance Criteria
@@ -232,6 +237,7 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - INT8 resolver selects `onnx/int8/model_quantized.onnx`.
 - FP32 resolver selects `onnx/fp32/model.onnx`.
 - Offline local directory works without HF network access.
+- Configured microphone and WAV audio sources can feed the detector window pipeline.
 - Mocked detector output creates exactly one `first_crack_detected` event.
 
 ## Epic 5: Roast Metrics And Log Export
@@ -694,3 +700,27 @@ After completing a story:
   - Missing ONNX models fail before feature extractor resolution, and missing feature extractor configs fail with repository, revision, and filename context while preserving local offline directory behavior.
   - Kept model training, ONNX export, Hugging Face sync, detector startup beyond validation prerequisites, audio capture, local directory sync behavior, artifact content validation, and MCP/session integration out of scope.
   - Ran `./.venv/bin/python -m pytest tests/test_artifacts.py`: 24 passed.
+- Validation run for E4-S6:
+  - Added `src/coffee_roaster_mcp/audio.py` with an injectable audio capture pipeline for future first-crack detector use.
+  - The pipeline builds validated capture settings from `AudioConfig`, passes the configured input device and sample rate into an injected input factory, reads samples on a daemon worker thread, and emits complete one-second mono `AudioWindow` detector windows.
+  - Detector-window handoff uses a bounded queue and `put_nowait`; when the detector side is full, windows are dropped and counted instead of blocking capture or roaster telemetry work elsewhere in the process.
+  - Kept live microphone backend selection, detector adapter behavior, ONNX inference, first-crack session timeline integration, model training, ONNX export, and Hugging Face sync out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_audio.py`: 8 passed.
+  - Ran `./.venv/bin/python -m pytest`: 208 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- PR review fix for E4-S6:
+  - Reset audio capture run-scoped state on each `AudioCapturePipeline.start()` so partial samples, queued windows, sequence numbers, counters, and prior errors cannot leak across a stopped and restarted pipeline instance.
+  - Added a restart regression test proving leftover partial samples from the first run are not mixed into the first detector window of the next run, and sequence numbers restart from zero.
+  - Kept the detector window queue stable across restarts by draining and reusing the existing queue instead of replacing it, so blocking detector consumers are not stranded on an old queue object.
+  - Added a blocking-consumer restart regression test proving a consumer waiting before restart receives the next window after capture restarts.
+  - Ran `./.venv/bin/python -m pytest tests/test_audio.py`: 10 passed.
+  - Ran `./.venv/bin/python -m pytest`: 210 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Planning update after E4-S6:
+  - Inserted `E4-S8` / issue `#97` for concrete microphone and recorded WAV audio input adapters after the detector adapter story and before session timeline integration.
+  - Renamed the previous timeline integration issue `#39` to `E4-S9` so Raspberry Pi/Linux microphone behavior and recorded-session replay are captured explicitly before detector results are wired into the authoritative session timeline.
+  - Updated Epic 4 acceptance criteria to include configured microphone and WAV sources feeding the detector window pipeline.

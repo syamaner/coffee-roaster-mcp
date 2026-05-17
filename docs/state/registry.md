@@ -30,7 +30,7 @@ drop and emergency stop included. A follow-up 60-second stability test also held
 fan at `10%`, heat at `40%` for 30 seconds, then heat at `100%` for 30 seconds
 with continuous command streaming and no command-loop or status-read errors.
 
-E4-S5 is complete. The first-crack path now resolves the configured ONNX model
+E4-S6 is complete. The first-crack path now resolves the configured ONNX model
 artifact for both supported real-model precisions: `int8` selects
 `onnx/int8/model_quantized.onnx`, and `fp32` selects `onnx/fp32/model.onnx`
 through the artifact resolver. When `first_crack.local_model_dir` is configured,
@@ -39,11 +39,17 @@ without Hugging Face network access, and missing local files fail with a clear
 artifact resolution error. Detector artifact validation now resolves both the
 selected ONNX model and the precision-specific
 `onnx/{precision}/preprocessor_config.json` feature extractor config before
-audio detection begins. This does not add model training, export, sync, detector
-startup beyond validation prerequisites, audio capture, local directory sync, or
-MCP session behavior.
+audio detection begins. The audio capture path now has an injectable background
+pipeline that reads from the configured audio input, frames complete one-second
+mono detector windows at the configured sample rate, and hands windows to a
+bounded non-blocking queue for the future detector adapter. This does not add
+model training, export, sync, detector adapter behavior, local directory sync,
+or MCP session behavior.
 
-The next story is E4-S6: add audio capture pipeline.
+The next story is E4-S7: add detector adapter.
+Epic 4 now includes a new E4-S8 story for concrete microphone and WAV audio
+input adapters before session timeline integration. The previous timeline
+integration story is now E4-S9.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

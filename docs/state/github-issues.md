@@ -57,7 +57,8 @@ Milestone: `v0.1`
 - #36 E4-S5: Validate required detector artifacts before detection starts
 - #37 E4-S6: Add audio capture pipeline
 - #38 E4-S7: Add detector adapter
-- #39 E4-S8: Integrate first crack with session timeline
+- #97 E4-S8: Add microphone and WAV audio input adapters
+- #39 E4-S9: Integrate first crack with session timeline
 
 ## Epic 5 Stories
 
