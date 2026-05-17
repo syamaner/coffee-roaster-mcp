@@ -10,6 +10,7 @@ Milestone: `v0.1`
 - #2 Epic 2: MCP Runtime And Session Core
 - #3 Epic 3: Roaster Abstraction And Hottop Driver
 - #4 Epic 4: First-Crack Detection With HF Models
+- #103 Epic 4.1: Operational MCP runtime for device control and first-crack status
 - #5 Epic 5: Roast Metrics And Log Export
 - #6 Epic 6: Distribution And MCP Registry Publishing
 - #7 Epic 7: End-To-End Validation And Release Readiness
@@ -60,6 +61,14 @@ Milestone: `v0.1`
 - #97 E4-S8: Add microphone and WAV audio input adapters
 - #39 E4-S9: Integrate first crack with session timeline
 - #99 E4-S10: Harden first-crack and MCP coverage before next epic
+
+## Epic 4.1 Stories
+
+- #104 E4.1-S1: Wire MCP roast-control tools to configured driver
+- #105 E4.1-S2: Expose current roaster device state through MCP
+- #106 E4.1-S3: Add released-artifact ONNX first-crack detector backend
+- #107 E4.1-S4: Start first-crack detection runtime with roast sessions
+- #108 E4.1-S5: Add MCP operational readiness tests and docs
 
 ## Epic 5 Stories
 

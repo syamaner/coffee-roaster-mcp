@@ -30,7 +30,7 @@ drop and emergency stop included. A follow-up 60-second stability test also held
 fan at `10%`, heat at `40%` for 30 seconds, then heat at `100%` for 30 seconds
 with continuous command streaming and no command-loop or status-read errors.
 
-E4-S9 is complete. The first-crack path now resolves the configured ONNX model
+Epic 4 is complete pending merge of E4-S10. The first-crack path now resolves the configured ONNX model
 artifact for both supported real-model precisions: `int8` selects
 `onnx/int8/model_quantized.onnx`, and `fp32` selects `onnx/fp32/model.onnx`
 through the artifact resolver. When `first_crack.local_model_dir` is configured,
@@ -68,12 +68,36 @@ lifecycle errors. Disabled and manual modes do not let detector output mutate
 the session, and automatic detection does not require manual override
 permission.
 
-The next story is E4-S10: harden first-crack and MCP coverage before the next epic.
-Epic 4 includes E4-S10 as a closing test-hardening story before the next epic,
-focused on first-crack integration, MCP-facing behavior, export assertions,
-mock-safe failure modes, and coverage gaps. Real microphone validation is
-optional and must remain explicitly gated so normal CI does not require audio
-hardware.
+E4-S10 hardened the first-crack and MCP test surface before Epic 5. Direct
+in-process MCP tool tests now exercise the current mock-safe device/session
+tool surface, manual first-crack behavior, audio-mode bootstrap reporting,
+error propagation, and snapshot export through the registered FastMCP tool
+bodies. Export tests now prove automatic first-crack detector metadata is
+preserved in the current JSONL and CSV event export surfaces; `summary.json`
+continues to expose first-crack timestamp and metrics only until Epic 5 final
+schemas land. Coverage now has a stable `90%` package floor, with local
+branch-aware coverage at `91.73%`. Real microphone validation remains optional
+and gated; normal CI requires no audio hardware, model download, Hottop
+hardware, or network access. Normal MCP heat/fan/drop/cooling tools still use
+the existing one-session mock/session boundary rather than live Hottop command
+wiring, and automatic first-crack detector startup is not yet an MCP runtime
+loop.
+
+Epic 4.1 is now inserted before Epic 5 to close operational MCP runtime gaps.
+The target user flow is: install the MCP server locally in Claude, start a
+roast, adjust the configured roaster through MCP tools, read current device and
+session state, and know whether first crack has happened. E4.1 covers
+driver-backed MCP control tools, current roaster state exposure, released ONNX
+detector backend construction, session-owned first-crack detector lifecycle, and
+operational MCP readiness tests/docs. `mark_beans_added` and
+`mark_first_crack` remain explicit override tools, while automatic T0 and
+first-crack detection are internal runtime paths. `drop_beans` is the normal
+agent/operator command for drop and cooling transition; `start_cooling` is an
+advanced recovery/manual control rather than the normal roast flow. Epic 5
+remains focused on telemetry buffering, derived metrics, and final log/export
+schemas.
+
+The next story after E4-S10 merges is E4.1-S1: wire MCP roast-control tools to the configured driver.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

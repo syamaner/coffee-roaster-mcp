@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4-S10`
-- Current target: Harden first-crack and MCP coverage before next epic
+- Active story: `E4.1-S1`
+- Current target: Wire MCP roast-control tools to configured driver
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -94,10 +94,32 @@ The first implementation milestone is a mock vertical slice that requires no roa
   disconnected from detector writes, and allows automatic detection even when
   manual override is disabled.
 - `E4-S10` closes Epic 4 with targeted test hardening before the next epic.
-  It should reduce coverage gaps around the assembled first-crack path,
-  MCP-facing behavior, current export surfaces, and mock-safe failure modes.
-  Real microphone validation can be added only as an explicit opt-in manual path
-  that is skipped by default and never required for normal CI.
+  Direct in-process MCP tool tests now cover the registered FastMCP tool bodies
+  for the current mock-safe session/control surface, including manual
+  first-crack behavior, audio-mode bootstrap reporting, error propagation, and
+  export through the public tool. Export tests prove automatic first-crack
+  detector metadata is preserved in current JSONL and CSV event exports, while
+  `summary.json` remains limited to first-crack timestamps and metrics until
+  Epic 5 finalizes schemas. Coverage now has a stable `90%` package floor, with
+  local branch-aware coverage at `91.73%`. Normal CI remains mock-safe with no
+  microphone, Hottop hardware, model download, or network requirement.
+- Epic 4.1 is inserted before Epic 5 because the installed Claude-local MCP
+  operational path is not complete yet. Current MCP heat/fan/drop/cooling tools
+  are covered at the existing mock/session boundary, but they are not yet wired
+  to the configured live driver. Current first-crack components resolve
+  artifacts, capture audio windows, adapt detector outputs, and write to the
+  session timeline, but there is not yet a released-artifact ONNX runtime
+  backend or session-owned detector loop. Epic 4.1 makes the operational MCP
+  flow explicit: Claude should be able to start a roast, adjust the configured
+  roaster, read current device/session state, and know whether first crack has
+  happened before Epic 5 adds richer telemetry metrics and final log schemas.
+- `mark_beans_added` and `mark_first_crack` remain exposed as explicit
+  override tools. The primary runtime path should be internal auto-T0 detection
+  when enabled and internal first-crack detector confirmation in audio mode.
+  `drop_beans` is the normal agent/operator command that should trigger the
+  roaster drop/cooling behavior and record the relevant session events;
+  `start_cooling` remains an advanced recovery/manual tool, not the normal
+  Claude roast flow.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -105,7 +127,13 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Current Risks
 
-- Normal MCP heat, fan, drop, and cooling tools are not yet wired to live Hottop driver commands; current Hottop hardware readiness applies to the driver boundary validated by E3-S9.
+- Normal MCP heat, fan, drop, and cooling tools are not yet wired to live
+  Hottop driver commands; current Hottop hardware readiness applies to the
+  driver boundary validated by E3-S9, and Epic 4.1 now tracks the normal MCP
+  operational wiring.
+- The first-crack path does not yet include a released-artifact ONNX runtime
+  backend or session-owned detector loop; Epic 4.1 now tracks this before Epic
+  5 metrics/logging work.
 - MCP Registry publishing is preview and needs verification before release.
 - First-crack event integration must preserve one authoritative session timeline.
 - Log schema changes need compatibility discipline once users start collecting roast logs.
@@ -268,7 +296,7 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - [x] `E4-S9` Integrate first crack with session timeline.
   - Done when mocked detector output creates exactly one `first_crack_detected` event.
 
-- [ ] `E4-S10` Harden first-crack and MCP coverage before next epic.
+- [x] `E4-S10` Harden first-crack and MCP coverage before next epic.
   - Done when automated tests cover the assembled first-crack path, MCP-facing behavior, current export surfaces, duplicate/no-confirmation/error cases, disabled/manual modes, missing artifacts, and materially reduce `mcp_server.py`, `exports.py`, and Epic 4 coverage gaps.
   - Manual real-microphone validation may be added only behind an explicit opt-in gate and must be skipped by default unless a microphone is configured and ready.
 
@@ -283,6 +311,73 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
   MCP-facing behavior, current export surfaces, and mock-safe failure modes.
 - Real microphone validation is optional, explicitly gated, and never required
   for normal CI.
+
+## Epic 4.1: Operational MCP Runtime
+
+Goal: make the locally installed MCP server operational for Claude before the
+metrics/logging epic. Claude should be able to start a roast, adjust the
+configured roaster, read current device and session state, and know whether
+first crack has happened through MCP tools.
+
+### Stories
+
+- [ ] `E4.1-S1` Wire MCP roast-control tools to configured driver.
+  - Done when `start_roast_session`, `set_heat`, `set_fan`, `drop_beans`,
+    `start_cooling`, `stop_cooling`, and `emergency_stop` call the configured
+    `RoasterDriver` boundary where appropriate while preserving the mock
+    default, one-session store semantics, fail-closed safety behavior, and
+    no-live-hardware CI. `drop_beans` is the normal MCP path for drop and
+    cooling transition; `start_cooling` remains available only as an explicit
+    advanced/manual recovery control.
+
+- [ ] `E4.1-S2` Expose current roaster device state through MCP.
+  - Done when MCP state output includes current driver state needed for
+    operational decisions: connected status, bean/environment temperatures when
+    available, heat/fan levels, cooling state, driver id, and safe raw
+    diagnostics, plus authoritative event timestamps for beans added, first
+    crack, bean drop, cooling start, and cooling stop, without implementing Epic
+    5 rolling metrics.
+
+- [ ] `E4.1-S3` Add released-artifact ONNX first-crack detector backend.
+  - Done when `first_crack.mode: audio` can construct a detector backend from
+    the resolved ONNX model and feature-extractor config using the existing
+    released-artifact resolver boundary, with mock-safe tests and no training,
+    export, or Hugging Face sync behavior.
+
+- [ ] `E4.1-S4` Start first-crack detection runtime with roast sessions.
+  - Done when audio mode starts/stops the configured audio pipeline and detector
+    runtime with the roast session, records confirmed first crack exactly once,
+    exposes disabled/manual/pending/detected/faulted/unavailable status through
+    MCP, and keeps detector/audio failures from crashing normal session control.
+    `mark_first_crack` remains only the explicit manual override path when
+    configuration allows it.
+
+- [ ] `E4.1-S5` Add MCP operational readiness tests and docs.
+  - Done when automated MCP tests cover the local Claude-installed operational
+    flow on the mock-safe path, MCP response schemas for device state and
+    first-crack status are asserted, override-tool semantics for
+    `mark_beans_added` and `mark_first_crack` are documented, `drop_beans` is
+    documented as the normal drop/cooling command, and optional live
+    Hottop/real microphone validation docs remain explicitly gated.
+
+### Epic Acceptance Criteria
+
+- Claude can start a roast through MCP.
+- Claude can adjust configured roaster controls through MCP while the default
+  mock path remains hardware-free.
+- Claude can read current configured-device state and authoritative session
+  state through MCP.
+- Claude can determine whether first crack is disabled, manual, pending,
+  detected, faulted, or unavailable due to configuration/artifact/audio errors.
+- Claude can read event timestamps for beans added, first crack, bean drop,
+  cooling started, and cooling stopped from `get_roast_state`.
+- Automatic T0 and automatic first-crack detection are internal runtime paths;
+  exposed mark tools are explicit overrides.
+- `drop_beans` is the normal operational command for drop and cooling
+  transition; `start_cooling` is an advanced/manual recovery path.
+- Normal CI requires no Hottop hardware, microphone, model download, or network.
+- Model training, ONNX export, Hugging Face sync, final telemetry metrics, and
+  final log schemas remain out of scope for this epic.
 
 ## Epic 5: Roast Metrics And Log Export
 
@@ -856,3 +951,24 @@ After completing a story:
     `./.venv/bin/python -m ruff check .`: passed,
     `./.venv/bin/python -m ruff format --check .`: passed, and
     `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4-S10:
+  - Added direct in-process MCP tool coverage for the registered FastMCP tool
+    bodies so local coverage measures the same public tool logic already
+    exercised by stdio smoke tests.
+  - Covered current MCP-facing behavior for server info, runtime config,
+    session start/state, heat/fan controls, beans added, manual first crack,
+    drop, cooling, export, audio-mode bootstrap safety reporting, missing active
+    session errors, disabled manual override errors, and unknown session lookup.
+  - Added export coverage proving automatic first-crack detector metadata is
+    preserved in JSONL and CSV event exports while `summary.json` keeps the
+    current timestamp and metrics surface until Epic 5 finalizes log schemas.
+  - Reviewed the current MCP completion boundary: mock/session device control
+    and manual first-crack MCP behavior are covered, live Hottop command wiring
+    remains a deliberate future MCP integration story, and automatic
+    first-crack detector startup is not yet a runtime MCP loop.
+  - Added a stable `90%` package coverage floor in `pyproject.toml`; local
+    branch-aware coverage is `91.73%`.
+  - Ran `./.venv/bin/python -m pytest tests/test_exports.py tests/test_mcp_server.py tests/test_first_crack_integration.py tests/test_package.py`:
+    27 passed.
+  - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
+    241 passed, required coverage `90.0%` reached, total coverage `91.73%`.
