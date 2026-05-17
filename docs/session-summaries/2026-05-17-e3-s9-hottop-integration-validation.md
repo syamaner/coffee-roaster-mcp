@@ -182,6 +182,7 @@ Review quality comparison:
 - Copilot had broader coverage and found more hardware-safety edge cases. Several comments overlapped with Codex on evidence reliability, but Copilot added important independent issues around input validation, output preflight, readiness criteria, drop masking, and state-doc drift.
 - The overlap was strongest on evidence integrity: both reviews noticed that the validation record could become unreliable exactly when hardware validation most needs auditability.
 - Copilot's suppressed low-confidence notes about `/tmp` evidence were still useful after classification. Rather than committing raw hardware JSON, the durable docs now record SHA-256 checksums for the local evidence files.
+- Codex review `4305417406` on the first review-fix commit found two additional high-value issues: the skipped emergency-stop path still sent a hidden emergency-stop command, and command-step readiness accepted stale `command_write_count` values rather than proving fresh write progress per step.
 
 Review response:
 
@@ -192,7 +193,8 @@ Review response:
 - partial failure reports are written before re-raising validation errors
 - disconnect failures are recorded without silently losing the original failure context
 - full validation now drops before cooling-stop validation so drop behavior is not masked by prior cooling
-- non-destructive validation adds an explicit safe-cleanup step when emergency-stop validation is skipped
+- non-destructive validation now honors the skipped emergency-stop contract and does not send a hidden emergency-stop command
+- each control step now requires `command_write_count` to increase after that specific command before the step can pass
 - hardware readiness now requires required steps to pass and no failed steps to appear
 - durable state and session summary now include SHA-256 checksums for the hardware evidence files
 - skill and registry stale-state wording was corrected

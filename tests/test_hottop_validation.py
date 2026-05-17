@@ -203,6 +203,27 @@ class ErrorDiagnosticDriver(FakeValidationDriver):
         )
 
 
+class StaleCommandWriteDriver(FakeValidationDriver):
+    """Driver double that accepts commands but reports no fresh writes."""
+
+    def read_state(self) -> RoasterState:
+        """Return state with a stale command-write counter."""
+        state = super().read_state()
+        return RoasterState(
+            driver=state.driver,
+            connected=state.connected,
+            bean_temp_c=state.bean_temp_c,
+            env_temp_c=state.env_temp_c,
+            heat_level_percent=state.heat_level_percent,
+            fan_level_percent=state.fan_level_percent,
+            cooling_on=state.cooling_on,
+            raw_vendor_data={
+                **state.raw_vendor_data,
+                "command_write_count": 1,
+            },
+        )
+
+
 def test_hottop_validation_requires_hardware_acknowledgement(tmp_path: Path) -> None:
     config_path = _write_hottop_config(tmp_path)
 
@@ -270,6 +291,7 @@ def test_hottop_validation_writes_evidence_with_skipped_destructive_steps(
 ) -> None:
     config_path = _write_hottop_config(tmp_path)
     output_path = tmp_path / "evidence" / "hottop-validation.json"
+    driver = FakeValidationDriver()
 
     report = run_hottop_validation(
         HottopValidationOptions(
@@ -277,7 +299,7 @@ def test_hottop_validation_writes_evidence_with_skipped_destructive_steps(
             output_path=output_path,
             hardware_acknowledged=True,
         ),
-        driver_factory=_fake_driver_factory,
+        driver_factory=_driver_factory(driver),
         sleeper=_no_sleep,
     )
 
@@ -287,7 +309,7 @@ def test_hottop_validation_writes_evidence_with_skipped_destructive_steps(
     assert report.temperature_unit == "auto"
     assert {step.name: step.status for step in report.steps}["drop"] == "skipped"
     assert {step.name: step.status for step in report.steps}["emergency_stop"] == "skipped"
-    assert {step.name: step.status for step in report.steps}["safe_cleanup"] == "passed"
+    assert "emergency_stop" not in driver.actions
     assert "Do not apply a hardware-ready release label" in report.final_driver_decisions[-1]
 
 
@@ -375,6 +397,27 @@ def test_hottop_validation_readiness_fails_on_raw_driver_errors(tmp_path: Path) 
 
     assert report.hardware_ready_release_label_allowed is False
     assert any(step.status == "failed" for step in report.steps)
+
+
+def test_hottop_validation_readiness_requires_fresh_command_writes(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_hottop_config(tmp_path)
+
+    report = run_hottop_validation(
+        HottopValidationOptions(
+            config_path=config_path,
+            hardware_acknowledged=True,
+            include_drop=True,
+            include_emergency_stop=True,
+        ),
+        driver_factory=_driver_factory(StaleCommandWriteDriver()),
+        sleeper=_no_sleep,
+    )
+
+    statuses = {step.name: step.status for step in report.steps}
+    assert statuses["heat"] == "failed"
+    assert report.hardware_ready_release_label_allowed is False
 
 
 def _write_hottop_config(tmp_path: Path) -> Path:
