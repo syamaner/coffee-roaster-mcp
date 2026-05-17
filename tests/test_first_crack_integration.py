@@ -63,6 +63,28 @@ def test_integrator_ignores_detector_output_outside_audio_mode() -> None:
     assert session.phase == "roasting"
 
 
+def test_integrator_ignores_confirmed_detector_output_before_beans_are_added() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    backend = MockDetectorBackend((FirstCrackDetectorOutput(confirmed=True),))
+    config = FirstCrackConfig(mode="audio")
+    adapter = build_first_crack_detector_adapter(config, _resolved_detector_artifacts(), backend)
+
+    result = integrate_first_crack_window_with_session(
+        config=config,
+        adapter=adapter,
+        session_store=store,
+        session=session,
+        window=_audio_window(),
+    )
+
+    assert result is None
+    assert backend.windows == []
+    assert session.event_timeline == []
+    assert session.phase == "pre_roast"
+
+
 def test_integrator_ignores_unconfirmed_detector_output() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
