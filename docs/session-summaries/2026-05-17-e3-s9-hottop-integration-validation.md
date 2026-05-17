@@ -18,6 +18,16 @@ Session usage snapshot supplied by the operator near the end of the story:
 
 This was a high-context hardware validation story because it depended on the accumulated Epic 3 driver decisions from E3-S4 through E3-S8, prior Hottop review fixes, and live operator observations.
 
+Additional usage snapshot after the operator summarized the chat and the PR review loop continued:
+
+- Context window: `62% left (105K used / 258K)`
+- 5h limit: `96% left`, resets `17:12`
+- Weekly limit: `99% left`, resets `12:12 on 24 May`
+- GPT-5.3-Codex-Spark 5h limit: `100% left`, resets `18:43`
+- GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `13:43 on 24 May`
+
+The earlier context snapshot remains relevant because the hardware validation, first PR summary, and first review response consumed the previous long context. The later snapshot reflects the post-summary continuation where Copilot review attempts hit the free usage limit, while Codex reviews continued and drove additional PR hardening.
+
 ## Implementation
 
 Added a guarded validation harness:
@@ -184,6 +194,7 @@ Review quality comparison:
 - Copilot's suppressed low-confidence notes about `/tmp` evidence were still useful after classification. Rather than committing raw hardware JSON, the durable docs now record SHA-256 checksums for the local evidence files.
 - Codex review `4305417406` on the first review-fix commit found two additional high-value issues: the skipped emergency-stop path still sent a hidden emergency-stop command, and command-step readiness accepted stale `command_write_count` values rather than proving fresh write progress per step.
 - Codex review `4305450927` on the second review-fix commit found one more hardware-readiness gap: heat and fan steps proved write progress but did not verify the driver state reached the requested control target.
+- After the chat was summarized and resumed, Copilot review attempts returned usage-limit errors instead of actionable comments. Codex reviews continued to provide focused, actionable findings on the review-fix commits.
 
 Review response:
 
@@ -205,9 +216,16 @@ These were high-value fixes because this story is about reducing real hardware u
 
 ## Validation
 
-Local checks after implementation and state updates:
+Local checks after the initial implementation and first state updates:
 
 - `./.venv/bin/python -m pytest`: `170 passed`
+- `./.venv/bin/python -m ruff check .`: passed
+- `./.venv/bin/python -m ruff format --check .`: passed
+- `./.venv/bin/python -m pyright`: `0 errors`
+
+Local checks after the post-summary PR review responses:
+
+- `./.venv/bin/python -m pytest`: `173 passed`
 - `./.venv/bin/python -m ruff check .`: passed
 - `./.venv/bin/python -m ruff format --check .`: passed
 - `./.venv/bin/python -m pyright`: `0 errors`
