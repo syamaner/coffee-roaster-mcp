@@ -113,6 +113,13 @@ The first implementation milestone is a mock vertical slice that requires no roa
   flow explicit: Claude should be able to start a roast, adjust the configured
   roaster, read current device/session state, and know whether first crack has
   happened before Epic 5 adds richer telemetry metrics and final log schemas.
+- `mark_beans_added` and `mark_first_crack` remain exposed as explicit
+  override tools. The primary runtime path should be internal auto-T0 detection
+  when enabled and internal first-crack detector confirmation in audio mode.
+  `drop_beans` is the normal agent/operator command that should trigger the
+  roaster drop/cooling behavior and record the relevant session events;
+  `start_cooling` remains an advanced recovery/manual tool, not the normal
+  Claude roast flow.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -319,13 +326,17 @@ first crack has happened through MCP tools.
     `start_cooling`, `stop_cooling`, and `emergency_stop` call the configured
     `RoasterDriver` boundary where appropriate while preserving the mock
     default, one-session store semantics, fail-closed safety behavior, and
-    no-live-hardware CI.
+    no-live-hardware CI. `drop_beans` is the normal MCP path for drop and
+    cooling transition; `start_cooling` remains available only as an explicit
+    advanced/manual recovery control.
 
 - [ ] `E4.1-S2` Expose current roaster device state through MCP.
   - Done when MCP state output includes current driver state needed for
     operational decisions: connected status, bean/environment temperatures when
     available, heat/fan levels, cooling state, driver id, and safe raw
-    diagnostics, without implementing Epic 5 rolling metrics.
+    diagnostics, plus authoritative event timestamps for beans added, first
+    crack, bean drop, cooling start, and cooling stop, without implementing Epic
+    5 rolling metrics.
 
 - [ ] `E4.1-S3` Add released-artifact ONNX first-crack detector backend.
   - Done when `first_crack.mode: audio` can construct a detector backend from
@@ -338,12 +349,16 @@ first crack has happened through MCP tools.
     runtime with the roast session, records confirmed first crack exactly once,
     exposes disabled/manual/pending/detected/faulted/unavailable status through
     MCP, and keeps detector/audio failures from crashing normal session control.
+    `mark_first_crack` remains only the explicit manual override path when
+    configuration allows it.
 
 - [ ] `E4.1-S5` Add MCP operational readiness tests and docs.
   - Done when automated MCP tests cover the local Claude-installed operational
     flow on the mock-safe path, MCP response schemas for device state and
-    first-crack status are asserted, and optional live Hottop/real microphone
-    validation docs remain explicitly gated.
+    first-crack status are asserted, override-tool semantics for
+    `mark_beans_added` and `mark_first_crack` are documented, `drop_beans` is
+    documented as the normal drop/cooling command, and optional live
+    Hottop/real microphone validation docs remain explicitly gated.
 
 ### Epic Acceptance Criteria
 
@@ -354,6 +369,12 @@ first crack has happened through MCP tools.
   state through MCP.
 - Claude can determine whether first crack is disabled, manual, pending,
   detected, faulted, or unavailable due to configuration/artifact/audio errors.
+- Claude can read event timestamps for beans added, first crack, bean drop,
+  cooling started, and cooling stopped from `get_roast_state`.
+- Automatic T0 and automatic first-crack detection are internal runtime paths;
+  exposed mark tools are explicit overrides.
+- `drop_beans` is the normal operational command for drop and cooling
+  transition; `start_cooling` is an advanced/manual recovery path.
 - Normal CI requires no Hottop hardware, microphone, model download, or network.
 - Model training, ONNX export, Hugging Face sync, final telemetry metrics, and
   final log schemas remain out of scope for this epic.

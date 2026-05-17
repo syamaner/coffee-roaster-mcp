@@ -89,8 +89,13 @@ roast, adjust the configured roaster through MCP tools, read current device and
 session state, and know whether first crack has happened. E4.1 covers
 driver-backed MCP control tools, current roaster state exposure, released ONNX
 detector backend construction, session-owned first-crack detector lifecycle, and
-operational MCP readiness tests/docs. Epic 5 remains focused on telemetry
-buffering, derived metrics, and final log/export schemas.
+operational MCP readiness tests/docs. `mark_beans_added` and
+`mark_first_crack` remain explicit override tools, while automatic T0 and
+first-crack detection are internal runtime paths. `drop_beans` is the normal
+agent/operator command for drop and cooling transition; `start_cooling` is an
+advanced recovery/manual control rather than the normal roast flow. Epic 5
+remains focused on telemetry buffering, derived metrics, and final log/export
+schemas.
 
 The next story after E4-S10 merges is E4.1-S1: wire MCP roast-control tools to the configured driver.
 
