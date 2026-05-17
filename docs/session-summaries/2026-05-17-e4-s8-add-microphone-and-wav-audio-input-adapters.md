@@ -43,6 +43,15 @@ Quality versus context consumption note:
   stop. Both fixes improve Raspberry Pi/Linux and macOS operator behavior while
   staying within E4-S8 scope and preserving mock-safe CI.
 
+Final snapshot after the recent PR fixes:
+
+- Context window: `30% left (183K used / 258K)`
+- 5h limit: `93% left`, resets `22:35`
+- Weekly limit: `97% left`, resets `12:12 on 24 May`
+- GPT-5.3-Codex-Spark 5h limit: `100% left`, resets `00:46 on 18 May`
+- GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `19:46 on 24 May`
+- Warning: limits may be stale; run `/status` again shortly.
+
 ## Pre-Story Verification
 
 Before starting E4-S8:
@@ -143,6 +152,27 @@ Fixes applied:
 - Thread-aware review refresh after the fix showed all `PR #100` review threads
   resolved.
 
+Final Codex review on `PR #100` found two more actionable startup-failure
+normalization issues:
+
+- `_load_sounddevice()` only caught `ImportError`, but `sounddevice` can raise
+  `OSError` when the Python package is installed and the PortAudio runtime is
+  missing.
+- `_ensure_stream()` cached `self._stream` before `start()` succeeded and closed
+  it on failure without clearing the cached reference, so a transient startup
+  failure could leave the input unable to retry without rebuilding the object.
+
+Fixes applied:
+
+- `_load_sounddevice()` now normalizes both `ImportError` and `OSError` to
+  `AudioCaptureError`.
+- `_ensure_stream()` now clears `self._stream` when startup fails so a later
+  read can retry with a fresh stream.
+- Added mocked regression coverage for missing PortAudio runtime normalization
+  and retry after a transient microphone startup failure.
+- Thread-aware review refresh after the fix showed all `PR #100` review threads
+  resolved.
+
 ## Pull Request
 
 Opened `PR #100`: <https://github.com/syamaner/coffee-roaster-mcp/pull/100>
@@ -163,13 +193,17 @@ Commits on the branch before this summary:
   `docs: add e4 s8 session summary`
 - `64f6060e56d1b8f9c5b117d4ed78a8b42383c455` -
   `fix: align microphone stream lifecycle with capture`
+- `61bc7e5e13acfead84c3672dda77520443bca3c4` -
+  `docs: update e4 s8 review summary`
+- `847672ec43390e3fc8975e53d611e18e777597b2` -
+  `fix: normalize microphone startup failures`
 
 PR status when this summary was written:
 
 - state: open
 - draft: false
 - mergeable: true
-- head: `64f6060e56d1b8f9c5b117d4ed78a8b42383c455`
+- head: `847672ec43390e3fc8975e53d611e18e777597b2`
 - GitHub Actions `Build Package`: passed
 - GitHub Actions `Checks`: passed
 
@@ -209,6 +243,15 @@ After latest lifecycle review fix:
 - Ran `./.venv/bin/python -m ruff format --check .`: passed
 - Ran `./.venv/bin/python -m pyright`: `0 errors`
 - GitHub Actions on PR #100 passed after the latest review-fix commit.
+
+After final startup-failure review fix:
+
+- Ran `./.venv/bin/python -m pytest tests/test_audio.py`: `20 passed`
+- Ran `./.venv/bin/python -m pytest`: `229 passed`
+- Ran `./.venv/bin/python -m ruff check .`: passed
+- Ran `./.venv/bin/python -m ruff format --check .`: passed
+- Ran `./.venv/bin/python -m pyright`: `0 errors`
+- GitHub Actions on PR #100 passed after the final review-fix commit.
 
 ## Handoff Notes
 
