@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E3-S9`
-- Current target: Run the Hottop integration verification spike
+- Active story: `E4-S1`
+- Current target: Add the Hugging Face artifact resolver
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -47,6 +47,9 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E3-S6` implements deterministic Hottop packet build/parse primitives without turning on live Hottop hardware commands. The driver module can build 36-byte command packets with checksum bytes, validate packet checksums, parse exact 36-byte status packets, and scan serial buffers for the first valid status packet with raw Celsius bean and environment temperatures. The command loop still keeps the safe no-default-frame behavior until `E3-S7` wires these packet primitives to explicit control commands.
 - `E3-S7` wires Hottop control methods to driver-owned command state and the E3-S6 packet builder. Connected Hottop loops now stream verified safe-zero packets by default and then stream the latest explicit heat, main fan, drop, cooling, stop-cooling, or emergency-stop command state. Command methods remain safe to call before connection because no serial bytes are written until the driver lifecycle is opened.
 - `E3-S8` adds Hottop temperature unit handling at the driver boundary. Configured `celsius`, `fahrenheit`, and `auto` raw status-packet modes now normalize plausible bean and environment readings to Celsius before `RoasterState` exposure, and startup zero or implausible packet values are ignored until plausible telemetry arrives.
+- `E3-S9` is a guarded hardware verification spike, not a driver redesign. The validation path now uses a dedicated `coffee-roaster-mcp hottop-validate` command that records JSON evidence from the Hottop driver boundary, keeps irreversible drop and emergency-stop steps opt-in, and leaves the current MCP one-session store semantics unchanged until a later story wires normal MCP control tools to live driver commands deliberately.
+- `E3-S9` completed the guarded Hottop integration verification spike at the driver boundary. The non-destructive run passed first, then the full connected-Hottop run passed on `/dev/cu.usbserial-DN016OJ3` with `100%` heat and `100%` fan checks, drop, cooling stop, and emergency stop included. The validation evidence supports treating the Hottop driver boundary as hardware-ready while preserving the current MCP one-session store semantics until normal MCP control tools are deliberately wired to live driver commands.
+- A follow-up 60-second connected-Hottop stability test held fan at `10%`, heat at `40%` for 30 seconds, then heat at `100%` for 30 seconds. Command streaming stayed continuous with no command-loop or status-read errors. A plain heat/fan zero stop leaves the drum command state on after prior heat, so operational stop procedures should use the explicit emergency-stop or drop/cooling command path when drum-off is required.
 - The old `coffee-roasting` prototype was checked as a behavioral reference for E3-S1. It confirmed the need to model Hottop command streaming, temperature-unit normalization, compound drop/cooling behavior, and cleanup through driver lifecycle methods. Drum control remains an internal driver concern for now because E3-S1 and issue #23 do not require a public drum command.
 - ONNX INT8 is the default real model backend.
 - ONNX FP32 is supported by config.
@@ -59,7 +62,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Current Risks
 
-- Hottop command-loop behavior and temperature units need hardware verification.
+- Normal MCP heat, fan, drop, and cooling tools are not yet wired to live Hottop driver commands; current Hottop hardware readiness applies to the driver boundary validated by E3-S9.
 - MCP Registry publishing is preview and needs verification before release.
 - First-crack event integration must preserve one authoritative session timeline.
 - Log schema changes need compatibility discipline once users start collecting roast logs.
@@ -179,7 +182,7 @@ Goal: support multiple roasters behind one driver contract while preserving curr
 - [x] `E3-S8` Implement Hottop temperature unit handling.
   - Done when `celsius`, `fahrenheit`, and `auto` modes are supported and tested with plausible readings.
 
-- [ ] `E3-S9` Run Hottop integration verification spike.
+- [x] `E3-S9` Run Hottop integration verification spike.
   - Done when packet parsing, temp units, command cadence, drop, cooling, and cleanup have manual validation notes.
 
 ### Epic Acceptance Criteria
@@ -592,4 +595,55 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest`: 161 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed after applying `ruff format`.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation prep for E3-S9:
+  - Added `coffee-roaster-mcp hottop-validate` as a guarded hardware validation harness for the Hottop driver boundary.
+  - The command requires `--i-understand-this-controls-hardware`, validates that config uses `hottop_kn8828b_2k_plus` with an explicit serial port, writes optional JSON evidence, and keeps `--include-drop` plus `--include-emergency-stop` opt-in.
+  - Updated `.claude/skills/hottop-validation` and `README.md` with the non-destructive and full validation commands, safety gates, pass/fail criteria, hard abort conditions, troubleshooting paths, source artifact references, report template, and evidence expectations.
+  - Preserved the current MCP/session boundary: driver-level validation does not imply MCP heat, fan, drop, or cooling tools are live-hardware control surfaces yet.
+  - Added fake-driver tests for acknowledgement gating, Hottop config gating, skipped destructive steps, evidence output, and full validation report status.
+  - Manual Hottop hardware execution was still pending before E3-S9 could be marked complete.
+  - Ran `./.venv/bin/python -m pytest tests/test_hottop_validation.py tests/test_package.py`: 18 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Non-destructive connected-Hottop validation for E3-S9:
+  - Used config source `/tmp/coffee-roaster-mcp-hottop.yaml` with driver `hottop_kn8828b_2k_plus`, port `/dev/cu.usbserial-DN016OJ3`, baudrate `115200`, `temperature_unit: auto`, and command interval `0.3`.
+  - Ran `./.venv/bin/coffee-roaster-mcp hottop-validate --config /tmp/coffee-roaster-mcp-hottop.yaml --output /tmp/hottop-e3-s9-non-destructive.json --i-understand-this-controls-hardware`.
+  - Evidence file: `/tmp/hottop-e3-s9-non-destructive.json`; SHA-256 `eafc565eb11b8db4bc9b813894714f67732b4d57867a970fc2a7dd64a40571e0`.
+  - Connected successfully and streamed command frames at the configured cadence. By the final cooling-stop step the run recorded `49` command-loop iterations, `49` send attempts, `49` successful writes, last write size `36`, and `0` command-loop errors.
+  - Stable telemetry passed. The run recorded plausible room-temperature telemetry at `23.0 C` bean and `23.0 C` environment, `151` status packets by the final cooling-stop step, `0` ignored temperature packets, `0` status-read errors, and resolved `auto` mode to `celsius`.
+  - Heat validation passed at conservative `10%` heat, then heat-off returned heat to `0%`.
+  - Fan validation passed at `30%` main fan.
+  - Cooling validation passed: cooling start set cooling on and fan high; cooling stop cleared cooling and fan.
+  - Drop and emergency stop were intentionally skipped because the first hardware pass was non-destructive. This blocks any hardware-ready release label until a supervised full run validates those steps.
+- Full connected-Hottop validation for E3-S9:
+  - Used the same config source `/tmp/coffee-roaster-mcp-hottop.yaml` with driver `hottop_kn8828b_2k_plus`, port `/dev/cu.usbserial-DN016OJ3`, baudrate `115200`, `temperature_unit: auto`, and command interval `0.3`.
+  - Ran `./.venv/bin/coffee-roaster-mcp hottop-validate --config /tmp/coffee-roaster-mcp-hottop.yaml --output /tmp/hottop-e3-s9-full.json --i-understand-this-controls-hardware --heat-percent 100 --fan-percent 100 --include-drop --include-emergency-stop`.
+  - Evidence file: `/tmp/hottop-e3-s9-full.json`; SHA-256 `3756dc9a3481d3859f0767b10940ae481cbef5a4e3544357bd76121d5e0a22a1`.
+  - Connected successfully and streamed command frames at the configured cadence. By the emergency-stop step the run recorded `62` command-loop iterations, `62` send attempts, `62` successful writes, last write size `36`, and `0` command-loop errors.
+  - Stable telemetry passed. The run recorded plausible room-temperature telemetry at `23.0 C` bean and `23.0 C` environment, `191` status packets by the emergency-stop step, `0` ignored temperature packets, `0` status-read errors, and resolved `auto` mode to `celsius`.
+  - Heat validation passed at `100%` heat, then heat-off returned heat to `0%`.
+  - Fan validation passed at `100%` main fan.
+  - Drop validation passed: heat stayed `0%`, drum motor off, solenoid open, cooling on, and fan high.
+  - Cooling-stop validation passed: cooling off, solenoid closed, fan `0%`, heat `0%`, and drum motor off.
+  - Emergency-stop validation passed: heat `0%`, drum motor off, solenoid closed, cooling on, and fan high.
+  - The validation report set `hardware_ready_release_label_allowed` to `true` for the Hottop driver boundary.
+- 60-second connected-Hottop stability test for E3-S9:
+  - Ran a supervised live stability test on `/dev/cu.usbserial-DN016OJ3` with fan held at `10%`, heat at `40%` for 30 seconds, then heat at `100%` for 30 seconds.
+  - Evidence file: `/tmp/hottop-e3-s9-60s-stability.json`; SHA-256 `2887c42c301ce08f01b353b40c8ed8ab96137e21baef7f734708c10539e4a4cf`.
+  - Command streaming stayed continuous for the full run. At the 60-second sample the driver reported `197` command-loop iterations, `197` send attempts, `197` successful writes, last write size `36`, and `0` command-loop errors.
+  - Status reads stayed clean. At the 60-second sample the driver reported `607` status packets, `0` status-read errors, and resolved `auto` mode to `celsius`.
+  - Telemetry remained plausible during the short test: bean and environment readings stayed at `23.0 C` during the one-minute hold, then read `24.0 C` in the final safe-zero sample.
+  - After setting heat and fan to `0`, the command state still reported `drum_motor_on: true` because `set_heat(0)` does not clear a drum command that was enabled by prior nonzero heat. A follow-up safe-stop sequence used emergency stop, then cooling stop and zero heat/fan, and ended with heat `0%`, fan `0%`, cooling off, solenoid closed, drum motor off, and `0` command-loop/status-read errors.
+- PR review hardening for E3-S9:
+  - Codex review found that aborted validation runs could lose the most important partial evidence, and that stable-telemetry status and evidence could come from different concurrent state snapshots.
+  - Copilot review found additional hardware-safety and auditability gaps: telemetry `needs_review` did not abort before actuation, heat/fan CLI values were validated too late, disconnect failures could mask earlier failures, output paths were not preflighted before hardware commands, drop validation was partially masked by earlier cooling, readiness ignored raw diagnostics, non-destructive cleanup could leave the drum command on, reusable runbook text still assumed E3-S9 was active, registry status text conflicted, and `/tmp` evidence lacked durable checksums.
+  - Follow-up Codex review found that hidden safe cleanup violated the emergency-stop opt-in contract, that control-step readiness needed fresh command-write progress rather than stale write counters, that heat/fan steps also needed to verify the resulting driver state matched the requested target, and that CLI/evidence automation needed clearer failure behavior.
+  - Hardened the validation harness to validate heat/fan/durations before connecting, defer evidence output creation until config and required Hottop driver/port preflight passes, require finite durations, capture one stable-telemetry snapshot, abort before controls when telemetry does not pass, write partial failure reports before re-raising, record disconnect failures, drop before cooling-stop validation in full runs, honor the skipped emergency-stop contract without hidden emergency-stop commands, require per-step command-write progress plus requested heat/fan target state, return non-zero from the CLI when the report is not hardware-ready, and base readiness on required passed steps plus no failed steps.
+  - Added SHA-256 checksums for all three hardware evidence files instead of committing raw JSON evidence.
+  - Updated the session summary with review quality, overlap, and response details.
+  - Ran `./.venv/bin/python -m pytest`: 170 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
