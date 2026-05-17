@@ -112,6 +112,56 @@ def test_resolves_fp32_onnx_model_for_configured_precision() -> None:
     ]
 
 
+def test_resolves_onnx_model_from_local_model_dir_without_download(tmp_path: Path) -> None:
+    local_model_path = tmp_path / "onnx" / "int8" / "model_quantized.onnx"
+    local_model_path.parent.mkdir(parents=True)
+    local_model_path.write_bytes(b"onnx")
+    downloader = RecordingDownloader()
+
+    artifact = resolve_first_crack_onnx_model(
+        FirstCrackConfig(local_model_dir=tmp_path, revision="v0.1.0"),
+        downloader=downloader,
+    )
+
+    assert artifact.filename == INT8_ONNX_MODEL_FILENAME
+    assert artifact.local_path == local_model_path
+    assert artifact.repo_id == "syamaner/coffee-first-crack-detection"
+    assert artifact.revision == "v0.1.0"
+    assert downloader.calls == []
+
+
+def test_resolves_fp32_onnx_model_from_local_model_dir(tmp_path: Path) -> None:
+    local_model_path = tmp_path / "onnx" / "fp32" / "model.onnx"
+    local_model_path.parent.mkdir(parents=True)
+    local_model_path.write_bytes(b"onnx")
+    downloader = RecordingDownloader()
+
+    artifact = resolve_first_crack_onnx_model(
+        FirstCrackConfig(precision="fp32", local_model_dir=tmp_path),
+        downloader=downloader,
+    )
+
+    assert artifact.filename == FP32_ONNX_MODEL_FILENAME
+    assert artifact.local_path == local_model_path
+    assert downloader.calls == []
+
+
+def test_missing_local_onnx_model_fails_before_download(tmp_path: Path) -> None:
+    downloader = RecordingDownloader()
+
+    with pytest.raises(ArtifactResolutionError) as exc_info:
+        resolve_first_crack_onnx_model(
+            FirstCrackConfig(local_model_dir=tmp_path),
+            downloader=downloader,
+        )
+
+    message = str(exc_info.value)
+    assert "local first-crack artifact" in message
+    assert "onnx/int8/model_quantized.onnx" in message
+    assert str(tmp_path) in message
+    assert downloader.calls == []
+
+
 def test_unsupported_onnx_precision_fails_before_download() -> None:
     downloader = RecordingDownloader()
 
