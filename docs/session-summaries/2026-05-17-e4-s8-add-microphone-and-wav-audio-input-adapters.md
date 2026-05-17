@@ -19,13 +19,29 @@ integration, broad coverage hardening, or live Hottop control changes.
 
 ## Context Usage
 
-Session usage snapshot supplied by the operator after the E4-S8 review fix:
+Session usage snapshot supplied by the operator after the first E4-S8 review fix:
 
 - Context window: `51% left (133K used / 258K)`
 - 5h limit: `95% left`, resets `22:35`
 - Weekly limit: `97% left`, resets `12:12 on 24 May`
 - GPT-5.3-Codex-Spark 5h limit: `100% left`, resets `00:18 on 18 May`
 - GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `19:18 on 24 May`
+
+Updated snapshot after the latest Codex PR review fix:
+
+- Context window: `40% left (161K used / 258K)`
+- 5h limit: `94% left`, resets `22:35`
+- Weekly limit: `97% left`, resets `12:12 on 24 May`
+- GPT-5.3-Codex-Spark 5h limit: `100% left`, resets `00:28 on 18 May`
+- GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `19:28 on 24 May`
+
+Quality versus context consumption note:
+
+- The latest Codex PR review consumed meaningful context but caught two
+  lifecycle issues that matter for real microphone reliability: starting the
+  PortAudio stream too early and failing to release audio resources on pipeline
+  stop. Both fixes improve Raspberry Pi/Linux and macOS operator behavior while
+  staying within E4-S8 scope and preserving mock-safe CI.
 
 ## Pre-Story Verification
 
@@ -89,9 +105,9 @@ Tests added:
 - WAV and microphone sources feed detector windows through the same
   `AudioCapturePipeline` contract.
 
-## Review Fix
+## Review Fixes
 
-Codex review on `PR #100` found one actionable issue:
+First Codex review on `PR #100` found one actionable issue:
 
 - If `sounddevice.RawInputStream(...)` succeeded but `start()` failed, the
   partially initialized stream was not closed before raising `AudioCaptureError`.
@@ -101,6 +117,31 @@ Fix applied:
 - `MicrophoneAudioInput` now tracks the created stream during startup and closes
   it in the failure path before re-raising.
 - Added a mocked regression test proving a stream is closed when `start()` raises.
+
+Latest Codex review on `PR #100` found two additional actionable lifecycle
+issues:
+
+- `MicrophoneAudioInput` started the PortAudio stream in its constructor, before
+  `AudioCapturePipeline.start()` began reading. A delay between construction and
+  capture start could let the backend buffer overflow before the first detector
+  window was emitted.
+- `AudioCapturePipeline.stop()` signalled and joined the worker but did not
+  release the underlying audio input, leaving microphone streams running and
+  device handles reserved unless callers remembered to call `close()`.
+
+Fixes applied:
+
+- `MicrophoneAudioInput` now opens the PortAudio stream lazily on first
+  `read_samples()` instead of during construction.
+- `AudioCapturePipeline.stop()` now closes audio inputs that expose `close()`.
+- `MicrophoneAudioInput.close()` resets its stream reference so a later
+  `read_samples()` reopens a fresh stream.
+- `WavAudioInput` is reopen-safe after stop-time closure and preserves its WAV
+  frame position across close/reopen.
+- Added mocked regression coverage for lazy microphone startup, start-failure
+  cleanup, overflow behavior, and stop-time stream release.
+- Thread-aware review refresh after the fix showed all `PR #100` review threads
+  resolved.
 
 ## Pull Request
 
@@ -118,13 +159,17 @@ Commits on the branch before this summary:
   `docs: document microphone selection`
 - `8c8e0f9e84cbb2470414c536db6d7fe44d765f97` -
   `fix: close microphone stream on startup failure`
+- `2f47e8c63386c3ddc6992429ecd24938e3a63e1b` -
+  `docs: add e4 s8 session summary`
+- `64f6060e56d1b8f9c5b117d4ed78a8b42383c455` -
+  `fix: align microphone stream lifecycle with capture`
 
 PR status when this summary was written:
 
 - state: open
 - draft: false
 - mergeable: true
-- head: `8c8e0f9e84cbb2470414c536db6d7fe44d765f97`
+- head: `64f6060e56d1b8f9c5b117d4ed78a8b42383c455`
 - GitHub Actions `Build Package`: passed
 - GitHub Actions `Checks`: passed
 
@@ -155,6 +200,15 @@ After review fix:
 - Ran `./.venv/bin/python -m ruff format --check .`: passed
 - Ran `./.venv/bin/python -m pyright`: `0 errors`
 - GitHub Actions on PR #100 passed after the review-fix commit.
+
+After latest lifecycle review fix:
+
+- Ran `./.venv/bin/python -m pytest tests/test_audio.py`: `18 passed`
+- Ran `./.venv/bin/python -m pytest`: `227 passed`
+- Ran `./.venv/bin/python -m ruff check .`: passed
+- Ran `./.venv/bin/python -m ruff format --check .`: passed
+- Ran `./.venv/bin/python -m pyright`: `0 errors`
+- GitHub Actions on PR #100 passed after the latest review-fix commit.
 
 ## Handoff Notes
 
