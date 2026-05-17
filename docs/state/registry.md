@@ -55,10 +55,11 @@ sample contract as live capture. Real microphone validation remains optional
 and gated; normal CI uses mocked microphone backends and generated WAV fixtures.
 Confirmed detector output in `first_crack.mode: audio` now writes one
 `first_crack_detected` event into the authoritative `RoastSessionStore`
-timeline with detector metadata payload. Disabled and manual modes do not let
-detector output mutate the session, automatic detection does not require manual
-override permission, and repeated detector confirmations return the original
-first-crack singleton event instead of appending duplicates.
+timeline at the detector-provided monotonic timestamp with detector metadata
+payload. Disabled and manual modes do not let detector output mutate the
+session, automatic detection does not require manual override permission, and
+repeated detector confirmations return the original first-crack singleton event
+instead of appending duplicates.
 
 The next story is E4-S10: harden first-crack and MCP coverage before the next epic.
 Epic 4 includes E4-S10 as a closing test-hardening story before the next epic,

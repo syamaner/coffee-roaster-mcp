@@ -181,9 +181,9 @@ def integrate_first_crack_window_with_session(
     if detection_event is None:
         return None
 
-    event, snapshot = session_store.record_event_snapshot(
+    event, snapshot = session_store.record_first_crack_detection_snapshot(
         session,
-        detection_event.kind,
+        detected_at_monotonic_seconds=detection_event.detected_at_monotonic_seconds,
         payload=detection_event.payload(),
     )
     return FirstCrackTimelineIntegrationResult(event=event, session=snapshot)

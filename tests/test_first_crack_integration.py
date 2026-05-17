@@ -11,7 +11,7 @@ from coffee_roaster_mcp.detector import (
     build_first_crack_detector_adapter,
     integrate_first_crack_window_with_session,
 )
-from coffee_roaster_mcp.session import RoastSessionStore
+from coffee_roaster_mcp.session import RoastSessionStore, compute_roast_metrics
 
 
 class ClockHarness:
@@ -134,8 +134,18 @@ def test_confirmed_detector_output_records_first_crack_event_once() -> None:
         "first_crack_detected",
     ]
     assert session.phase == "development"
-    assert session.first_crack_at_utc == datetime(2026, 5, 17, 14, 6, tzinfo=UTC)
-    assert session.first_crack_monotonic_seconds == 40.0
+    assert session.first_crack_at_utc == datetime(
+        2026,
+        5,
+        17,
+        14,
+        0,
+        37,
+        250000,
+        tzinfo=UTC,
+    )
+    assert session.first_crack_monotonic_seconds == 37.25
+    assert first_result.event.monotonic_seconds == 37.25
     assert first_result.event.payload == {
         "source": "first_crack_detector",
         "detected_at_monotonic_seconds": 537.25,
@@ -149,6 +159,8 @@ def test_confirmed_detector_output_records_first_crack_event_once() -> None:
     }
     assert len(first_result.session.event_timeline) == 2
     assert len(second_result.session.event_timeline) == 2
+    metrics = compute_roast_metrics(session, monotonic_now=clock.monotonic_now)
+    assert metrics.development_time_seconds == 2.75
 
 
 def test_automatic_detection_does_not_require_manual_override_permission() -> None:
@@ -156,6 +168,7 @@ def test_automatic_detection_does_not_require_manual_override_permission() -> No
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
     session = store.start_session()
     store.record_event(session, "beans_added")
+    clock.monotonic_value = 502.0
     config = FirstCrackConfig(mode="audio", allow_manual_override=False)
     adapter = build_first_crack_detector_adapter(
         config,
@@ -217,7 +230,7 @@ def test_manual_first_crack_event_takes_precedence_over_later_detector_confirmat
 def _audio_window(
     *,
     sequence_number: int = 3,
-    started_at_monotonic_seconds: float = 10.0,
+    started_at_monotonic_seconds: float = 500.5,
 ) -> AudioWindow:
     return AudioWindow(
         sequence_number=sequence_number,
