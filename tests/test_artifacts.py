@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -9,7 +10,7 @@ from coffee_roaster_mcp.artifacts import (
     resolve_first_crack_onnx_model,
     resolve_hugging_face_artifact,
 )
-from coffee_roaster_mcp.config import FirstCrackConfig
+from coffee_roaster_mcp.config import FirstCrackConfig, ModelPrecision
 
 
 class RecordingDownloader:
@@ -109,6 +110,18 @@ def test_resolves_fp32_onnx_model_for_configured_precision() -> None:
             "revision": "v0.1.0",
         }
     ]
+
+
+def test_unsupported_onnx_precision_fails_before_download() -> None:
+    downloader = RecordingDownloader()
+
+    with pytest.raises(ArtifactResolutionError, match="Unsupported.*precision"):
+        resolve_first_crack_onnx_model(
+            FirstCrackConfig(precision=cast(ModelPrecision, "INT8")),
+            downloader=downloader,
+        )
+
+    assert downloader.calls == []
 
 
 def test_resolver_honors_configured_revision() -> None:

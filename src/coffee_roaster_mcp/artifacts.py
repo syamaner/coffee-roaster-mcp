@@ -110,11 +110,17 @@ def resolve_first_crack_onnx_model(
         ArtifactResolutionError: If the configured precision is unsupported or
             the artifact cannot be resolved.
     """
-    match config.precision:
+    precision = str(config.precision)
+    match precision:
         case "int8":
             filename = INT8_ONNX_MODEL_FILENAME
         case "fp32":
             filename = FP32_ONNX_MODEL_FILENAME
+        case unsupported_precision:
+            raise ArtifactResolutionError(
+                "Unsupported first-crack ONNX precision "
+                f"{unsupported_precision!r}; expected 'int8' or 'fp32'."
+            )
 
     return resolve_hugging_face_artifact(
         config,

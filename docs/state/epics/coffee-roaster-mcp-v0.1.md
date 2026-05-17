@@ -674,9 +674,9 @@ After completing a story:
   - Extended `resolve_first_crack_onnx_model(...)` to select `onnx/fp32/model.onnx` when `FirstCrackConfig.precision` is `fp32`.
   - Preserved the default `int8` selection of `onnx/int8/model_quantized.onnx` and kept repository, revision, filename validation, and download behavior delegated to the E4-S1 Hugging Face artifact resolver.
   - Kept model training, ONNX export, Hugging Face sync, detector startup, audio capture, local offline directories, artifact validation, and MCP/session integration out of scope.
-  - Added mocked resolver coverage for configured FP32 selection with revision propagation.
-  - Ran `./.venv/bin/python -m pytest tests/test_artifacts.py`: 14 passed.
-  - Ran `./.venv/bin/python -m pytest`: 189 passed.
+  - Added mocked resolver coverage for configured FP32 selection with revision propagation and unsupported precision domain-error handling.
+  - Ran `./.venv/bin/python -m pytest tests/test_artifacts.py`: 15 passed.
+  - Ran `./.venv/bin/python -m pytest`: 190 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
