@@ -47,6 +47,9 @@ model training, export, sync, detector adapter behavior, local directory sync,
 or MCP session behavior.
 
 The next story is E4-S7: add detector adapter.
+Epic 4 now includes a new E4-S8 story for concrete microphone and WAV audio
+input adapters before session timeline integration. The previous timeline
+integration story is now E4-S9.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

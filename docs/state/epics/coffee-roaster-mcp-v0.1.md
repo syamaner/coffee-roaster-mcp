@@ -61,6 +61,7 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E4-S4` resolves configured first-crack artifacts from `first_crack.local_model_dir` before any Hugging Face Hub download. The local path uses the same repository-relative artifact names as the released Hub layout, fails clearly when the target local file is missing, and leaves broader detector artifact validation, detector startup, audio capture, and session-timeline integration to later Epic 4 work.
 - `E4-S5` validates the required first-crack detector artifact set through the existing resolver boundary before audio detection begins. The validation resolves the configured ONNX model plus `onnx/int8/preprocessor_config.json` or `onnx/fp32/preprocessor_config.json`, depending on precision, and keeps detector startup, audio capture, artifact content validation, and session-timeline integration out of scope.
 - `E4-S6` adds an injectable audio capture pipeline that builds its source from `AudioConfig`, reads on a background worker, frames complete one-second mono detector windows at the configured sample rate, and hands windows to a bounded non-blocking queue for the future detector adapter. Live audio backend selection, detector adapter behavior, model inference, and session-timeline integration remain later work.
+- `E4-S8` is inserted after the detector adapter story to add concrete microphone and WAV audio input adapters behind the E4-S6 `AudioInput` boundary. This keeps Linux/Raspberry Pi microphone behavior and recorded-session replay explicit before first-crack events are wired into the session timeline in `E4-S9`.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -225,7 +226,10 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - [ ] `E4-S7` Add detector adapter.
   - Done when detector output maps to a confirmed first-crack event with timestamp, precision, revision, and confidence when available.
 
-- [ ] `E4-S8` Integrate first crack with session timeline.
+- [ ] `E4-S8` Add microphone and WAV audio input adapters.
+  - Done when configured microphone and recorded WAV inputs can feed the detector window pipeline through the same audio source boundary.
+
+- [ ] `E4-S9` Integrate first crack with session timeline.
   - Done when mocked detector output creates exactly one `first_crack_detected` event.
 
 ### Epic Acceptance Criteria
@@ -233,6 +237,7 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - INT8 resolver selects `onnx/int8/model_quantized.onnx`.
 - FP32 resolver selects `onnx/fp32/model.onnx`.
 - Offline local directory works without HF network access.
+- Configured microphone and WAV audio sources can feed the detector window pipeline.
 - Mocked detector output creates exactly one `first_crack_detected` event.
 
 ## Epic 5: Roast Metrics And Log Export
@@ -705,3 +710,7 @@ After completing a story:
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Planning update after E4-S6:
+  - Inserted `E4-S8` / issue `#97` for concrete microphone and recorded WAV audio input adapters after the detector adapter story and before session timeline integration.
+  - Renamed the previous timeline integration issue `#39` to `E4-S9` so Raspberry Pi/Linux microphone behavior and recorded-session replay are captured explicitly before detector results are wired into the authoritative session timeline.
+  - Updated Epic 4 acceptance criteria to include configured microphone and WAV sources feeding the detector window pipeline.
