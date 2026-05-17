@@ -180,7 +180,7 @@ def integrate_first_crack_window_with_session(
     """
     if config.mode != "audio":
         return None
-    if session.beans_added_at_utc is None:
+    if not session.active or session.phase != "roasting":
         return None
 
     detection_event = adapter.process_window(window)

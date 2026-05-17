@@ -91,6 +91,33 @@ def test_integrator_ignores_confirmed_detector_output_before_beans_are_added() -
     assert session.phase == "pre_roast"
 
 
+def test_integrator_ignores_confirmed_detector_output_after_roasting_phase() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    store.record_event(session, "beans_dropped")
+    backend = MockDetectorBackend((FirstCrackDetectorOutput(confirmed=True),))
+    config = FirstCrackConfig(mode="audio")
+    adapter = build_first_crack_detector_adapter(config, _resolved_detector_artifacts(), backend)
+
+    result = integrate_first_crack_window_with_session(
+        config=config,
+        adapter=adapter,
+        session_store=store,
+        session=session,
+        window=_audio_window(),
+    )
+
+    assert result is None
+    assert backend.windows == []
+    assert [event.kind for event in session.event_timeline] == [
+        "beans_added",
+        "beans_dropped",
+    ]
+    assert session.phase == "dropped"
+
+
 def test_integrator_ignores_unconfirmed_detector_output() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
@@ -155,8 +182,7 @@ def test_confirmed_detector_output_records_first_crack_event_once() -> None:
     )
 
     assert first_result is not None
-    assert second_result is not None
-    assert first_result.event == second_result.event
+    assert second_result is None
     assert [event.kind for event in session.event_timeline] == [
         "beans_added",
         "first_crack_detected",
@@ -186,7 +212,7 @@ def test_confirmed_detector_output_records_first_crack_event_once() -> None:
         "confidence": 0.91,
     }
     assert len(first_result.session.event_timeline) == 2
-    assert len(second_result.session.event_timeline) == 2
+    assert [window.sequence_number for window in backend.windows] == [11]
     metrics = compute_roast_metrics(session, monotonic_now=clock.monotonic_now)
     assert metrics.development_time_seconds == 2.75
 
@@ -289,21 +315,18 @@ def test_manual_first_crack_event_takes_precedence_over_later_detector_confirmat
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
     session = store.start_session()
     store.record_event(session, "beans_added")
-    manual_event = store.record_event(session, "first_crack_detected")
+    store.record_event(session, "first_crack_detected")
     config = FirstCrackConfig(mode="audio")
-    adapter = build_first_crack_detector_adapter(
-        config,
-        _resolved_detector_artifacts(),
-        MockDetectorBackend(
-            (
-                FirstCrackDetectorOutput(
-                    confirmed=True,
-                    confidence=0.7,
-                    detected_at_monotonic_seconds=502.0,
-                ),
-            )
-        ),
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(
+                confirmed=True,
+                confidence=0.7,
+                detected_at_monotonic_seconds=502.0,
+            ),
+        )
     )
+    adapter = build_first_crack_detector_adapter(config, _resolved_detector_artifacts(), backend)
 
     result = integrate_first_crack_window_with_session(
         config=config,
@@ -313,13 +336,13 @@ def test_manual_first_crack_event_takes_precedence_over_later_detector_confirmat
         window=_audio_window(),
     )
 
-    assert result is not None
-    assert result.event == manual_event
+    assert result is None
     assert [event.kind for event in session.event_timeline] == [
         "beans_added",
         "first_crack_detected",
     ]
     assert session.event_timeline[-1].payload == {}
+    assert backend.windows == []
 
 
 def _audio_window(

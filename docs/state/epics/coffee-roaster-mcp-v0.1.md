@@ -89,11 +89,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
   detector metadata payload, accepts adapter-inferred default timestamps that
   land slightly ahead of the integration clock within the active detector-window
   tolerance while still rejecting explicit future detector timestamps, ignores
-  confirmed detector output before beans are added, leaves disabled and manual
-  modes disconnected from detector writes, allows automatic detection even when
-  manual override is disabled, and relies on the store singleton event behavior
-  so repeated detector confirmations do not append duplicate
-  `first_crack_detected` rows.
+  confirmed detector output before beans are added, ignores detector output once
+  the session leaves active `roasting`, leaves disabled and manual modes
+  disconnected from detector writes, and allows automatic detection even when
+  manual override is disabled.
 - `E4-S10` closes Epic 4 with targeted test hardening before the next epic.
   It should reduce coverage gaps around the assembled first-crack path,
   MCP-facing behavior, current export surfaces, and mock-safe failure modes.
@@ -818,8 +817,8 @@ After completing a story:
     feature-extractor artifact, source window sequence number, and optional
     confidence.
   - Repeated detector confirmations and detector confirmations after a manual
-    first-crack event return the existing singleton first-crack event without
-    appending duplicate timeline rows.
+    first-crack event are ignored after the session leaves active `roasting`, so
+    late detector output does not append duplicate timeline rows.
   - PR review hardening moved automatic first-crack recording onto a dedicated
     `RoastSessionStore.record_first_crack_detection_snapshot(...)` path so the
     authoritative event timestamp and downstream development metrics use the
@@ -835,6 +834,10 @@ After completing a story:
     window-end timestamps only; explicit future timestamps from detector
     backends still fail fast so backend clock or timestamp bugs are not silently
     clamped.
+  - The latest review fix also ignores detector output after the session leaves
+    active `roasting`, covering late confirmations after first crack, drop,
+    cooling, completion, fault, or stop without relying on store-level lifecycle
+    exceptions.
   - Automatic detector integration remains independent of manual override
     permission, so `allow_manual_override: false` only disables the manual MCP
     override path.
@@ -846,3 +849,10 @@ After completing a story:
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Final review-fix validation ran
+    `./.venv/bin/python -m pytest tests/test_first_crack_integration.py tests/test_detector.py tests/test_session.py`:
+    55 passed.
+  - Final full validation ran `./.venv/bin/python -m pytest`: 238 passed,
+    `./.venv/bin/python -m ruff check .`: passed,
+    `./.venv/bin/python -m ruff format --check .`: passed, and
+    `./.venv/bin/python -m pyright`: 0 errors.

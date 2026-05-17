@@ -34,11 +34,12 @@ Quality versus context consumption note:
 - The PR review loop consumed substantial context, but the Codex review comments
   were high quality. Each comment identified a real integration edge case in the
   first-crack timeline boundary rather than style churn.
-- The comments improved correctness in four important places: preserving the
+- The comments improved correctness in five important places: preserving the
   detector timestamp as authoritative timing, accepting adapter-inferred default
   window-end timestamps without breaking the common backend path, ignoring
   pre-beans false positives, and restricting future-timestamp tolerance to
-  inferred timestamps only.
+  inferred timestamps only, and ignoring late detector confirmations after the
+  session leaves active `roasting`.
 - The fixes stayed inside E4-S9 scope. They did not expand into detector
   startup, audio capture startup, ONNX runtime inference, MCP tool wiring, or
   broad coverage hardening.
@@ -145,6 +146,25 @@ Fix applied:
 - Added regression coverage proving explicit future detector timestamps are
   rejected.
 
+Codex review `4306250152` found a late lifecycle issue:
+
+- The integration guard only checked `beans_added_at_utc`, so confirmed detector
+  output could still reach the session store after the session had moved to
+  `dropped`, `cooling`, `complete`, `fault`, or stopped states when first crack
+  had not been recorded.
+- In those states, `first_crack_detected` is not a valid transition and the
+  store would raise `SessionLifecycleError`, potentially crashing a long-running
+  detector loop on late confirmations.
+
+Fix applied:
+
+- `integrate_first_crack_window_with_session(...)` now processes detector output
+  only while the session is active and still in `roasting`.
+- Late confirmations after first crack, manual first crack, drop, cooling,
+  completion, fault, or stop are ignored before calling the backend or store.
+- Added regression coverage proving confirmed detector output after bean drop is
+  ignored without mutating the timeline or invoking the backend.
+
 ## Pull Request
 
 Opened `PR #101`: <https://github.com/syamaner/coffee-roaster-mcp/pull/101>
@@ -165,17 +185,23 @@ Commits on the branch before this summary:
   `fix: ignore detector confirmations before beans`
 - `afbd65ea67d4fbc7221441279751f4cfaff43da2` -
   `fix: restrict inferred timestamp tolerance`
+- `7a26c04816f0e655027abb686c95e80cb17b225a` -
+  `docs: add e4 s9 session summary`
+- latest local commit -
+  `fix: ignore detector output outside roasting`
 
 PR status when this summary was written:
 
 - state: open
 - draft: false
 - mergeable: true
-- head: `afbd65ea67d4fbc7221441279751f4cfaff43da2`
+- head: latest local commit after the post-roasting lifecycle fix
 - GitHub Actions `Build Package`: passed
 - GitHub Actions `Checks`: passed
 - Thread-aware refresh after the latest fix showed the newest review thread
   outdated; prior actionable threads were resolved.
+- A later Codex review on `afbd65ea67` found the post-roasting lifecycle gap;
+  the latest local commit addresses it and is ready for CI after push.
 
 Issue `#39` remains open and should close when PR #101 is merged through
 `Closes #39`.
@@ -231,6 +257,15 @@ After restricting tolerance to inferred timestamps:
 - Ran `./.venv/bin/python -m ruff format --check .`: passed
 - Ran `./.venv/bin/python -m pyright`: `0 errors`
 - GitHub Actions on PR #101 passed.
+
+After ignoring detector output outside active `roasting`:
+
+- Ran `./.venv/bin/python -m pytest tests/test_first_crack_integration.py tests/test_detector.py tests/test_session.py`:
+  `55 passed`
+- Ran `./.venv/bin/python -m pytest`: `238 passed`
+- Ran `./.venv/bin/python -m ruff check .`: passed
+- Ran `./.venv/bin/python -m ruff format --check .`: passed
+- Ran `./.venv/bin/python -m pyright`: `0 errors`
 
 ## Handoff Notes
 

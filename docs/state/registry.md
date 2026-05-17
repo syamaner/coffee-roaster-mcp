@@ -61,10 +61,12 @@ of the integration clock are accepted within the active detector-window
 tolerance and recorded at the current elapsed time instead of failing the
 automatic path, while explicit future detector timestamps still fail fast.
 Confirmed detector output before beans are added is ignored so early false
-positives cannot break the detection loop. Disabled and manual modes do not let
-detector output mutate the session, automatic detection does not require manual
-override permission, and repeated detector confirmations return the original
-first-crack singleton event instead of appending duplicates.
+positives cannot break the detection loop. Detector output is also ignored once
+the session leaves active `roasting`, including after first crack, drop,
+cooling, completion, fault, or stop, so late confirmations cannot raise session
+lifecycle errors. Disabled and manual modes do not let detector output mutate
+the session, and automatic detection does not require manual override
+permission.
 
 The next story is E4-S10: harden first-crack and MCP coverage before the next epic.
 Epic 4 includes E4-S10 as a closing test-hardening story before the next epic,
