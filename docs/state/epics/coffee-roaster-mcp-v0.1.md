@@ -69,6 +69,11 @@ The first implementation milestone is a mock vertical slice that requires no roa
   ONNX inference by itself, or write to the authoritative session timeline;
   E4-S9 owns timeline integration.
 - `E4-S8` is inserted after the detector adapter story to add concrete microphone and WAV audio input adapters behind the E4-S6 `AudioInput` boundary. This keeps Linux/Raspberry Pi microphone behavior and recorded-session replay explicit before first-crack events are wired into the session timeline in `E4-S9`.
+- `E4-S10` closes Epic 4 with targeted test hardening before the next epic.
+  It should reduce coverage gaps around the assembled first-crack path,
+  MCP-facing behavior, current export surfaces, and mock-safe failure modes.
+  Real microphone validation can be added only as an explicit opt-in manual path
+  that is skipped by default and never required for normal CI.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -239,6 +244,10 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - [ ] `E4-S9` Integrate first crack with session timeline.
   - Done when mocked detector output creates exactly one `first_crack_detected` event.
 
+- [ ] `E4-S10` Harden first-crack and MCP coverage before next epic.
+  - Done when automated tests cover the assembled first-crack path, MCP-facing behavior, current export surfaces, duplicate/no-confirmation/error cases, disabled/manual modes, missing artifacts, and materially reduce `mcp_server.py`, `exports.py`, and Epic 4 coverage gaps.
+  - Manual real-microphone validation may be added only behind an explicit opt-in gate and must be skipped by default unless a microphone is configured and ready.
+
 ### Epic Acceptance Criteria
 
 - INT8 resolver selects `onnx/int8/model_quantized.onnx`.
@@ -246,6 +255,10 @@ Goal: consume released Hugging Face model artifacts and feed first-crack events 
 - Offline local directory works without HF network access.
 - Configured microphone and WAV audio sources can feed the detector window pipeline.
 - Mocked detector output creates exactly one `first_crack_detected` event.
+- Epic 4 closes with targeted automated coverage for first-crack integration,
+  MCP-facing behavior, current export surfaces, and mock-safe failure modes.
+- Real microphone validation is optional, explicitly gated, and never required
+  for normal CI.
 
 ## Epic 5: Roast Metrics And Log Export
 
