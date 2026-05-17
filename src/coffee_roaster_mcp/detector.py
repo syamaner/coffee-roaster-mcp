@@ -60,6 +60,8 @@ class FirstCrackDetectionEvent:
         onnx_model_filename: Repository-relative ONNX model artifact.
         feature_extractor_filename: Repository-relative feature extractor artifact.
         window_sequence_number: Source audio window sequence number.
+        detected_at_inferred: Whether the detection timestamp was inferred from
+            the source window end because the backend omitted an explicit timestamp.
     """
 
     kind: FirstCrackDetectorEventKind
@@ -71,6 +73,7 @@ class FirstCrackDetectionEvent:
     onnx_model_filename: str
     feature_extractor_filename: str
     window_sequence_number: int
+    detected_at_inferred: bool
 
     def payload(self) -> dict[str, str | int | float | None]:
         """Return session-event payload metadata for this confirmed detection."""
@@ -117,6 +120,7 @@ class FirstCrackDetectorAdapter:
             onnx_model_filename=self.artifacts.onnx_model.filename,
             feature_extractor_filename=self.artifacts.feature_extractor_config.filename,
             window_sequence_number=window.sequence_number,
+            detected_at_inferred=output.detected_at_monotonic_seconds is None,
         )
 
 
@@ -186,7 +190,7 @@ def integrate_first_crack_window_with_session(
     event, snapshot = session_store.record_first_crack_detection_snapshot(
         session,
         detected_at_monotonic_seconds=detection_event.detected_at_monotonic_seconds,
-        max_future_seconds=window.duration_seconds,
+        max_future_seconds=window.duration_seconds if detection_event.detected_at_inferred else 0.0,
         payload=detection_event.payload(),
     )
     return FirstCrackTimelineIntegrationResult(event=event, session=snapshot)

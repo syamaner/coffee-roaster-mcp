@@ -88,11 +88,12 @@ The first implementation milestone is a mock vertical slice that requires no roa
   writes the first-crack event at the detector-provided monotonic timestamp with
   detector metadata payload, accepts adapter-inferred default timestamps that
   land slightly ahead of the integration clock within the active detector-window
-  tolerance, ignores confirmed detector output before beans are added, leaves
-  disabled and manual modes disconnected from detector writes, allows automatic
-  detection even when manual override is disabled, and relies on the store
-  singleton event behavior so repeated detector confirmations do not append
-  duplicate `first_crack_detected` rows.
+  tolerance while still rejecting explicit future detector timestamps, ignores
+  confirmed detector output before beans are added, leaves disabled and manual
+  modes disconnected from detector writes, allows automatic detection even when
+  manual override is disabled, and relies on the store singleton event behavior
+  so repeated detector confirmations do not append duplicate
+  `first_crack_detected` rows.
 - `E4-S10` closes Epic 4 with targeted test hardening before the next epic.
   It should reduce coverage gaps around the assembled first-crack path,
   MCP-facing behavior, current export surfaces, and mock-safe failure modes.
@@ -830,6 +831,10 @@ After completing a story:
   - Another review fix ignores confirmed detector output before beans are added
     so early false positives cannot bubble a lifecycle exception and break the
     detection loop before roasting starts.
+  - A final review fix restricts future-timestamp tolerance to adapter-inferred
+    window-end timestamps only; explicit future timestamps from detector
+    backends still fail fast so backend clock or timestamp bugs are not silently
+    clamped.
   - Automatic detector integration remains independent of manual override
     permission, so `allow_manual_override: false` only disables the manual MCP
     override path.

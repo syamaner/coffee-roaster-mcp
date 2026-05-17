@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from coffee_roaster_mcp.artifacts import ResolvedArtifact, ResolvedDetectorArtifacts
 from coffee_roaster_mcp.audio import AudioWindow
 from coffee_roaster_mcp.config import FirstCrackConfig
@@ -11,7 +13,11 @@ from coffee_roaster_mcp.detector import (
     build_first_crack_detector_adapter,
     integrate_first_crack_window_with_session,
 )
-from coffee_roaster_mcp.session import RoastSessionStore, compute_roast_metrics
+from coffee_roaster_mcp.session import (
+    RoastSessionStore,
+    SessionLifecycleError,
+    compute_roast_metrics,
+)
 
 
 class ClockHarness:
@@ -240,6 +246,42 @@ def test_adapter_default_timestamp_records_when_window_end_is_slightly_ahead() -
     assert result.event.monotonic_seconds == 1.25
     assert result.event.payload["detected_at_monotonic_seconds"] == 502.0
     assert session.first_crack_monotonic_seconds == 1.25
+
+
+def test_explicit_future_detector_timestamp_is_rejected() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 501.25
+    config = FirstCrackConfig(mode="audio")
+    adapter = build_first_crack_detector_adapter(
+        config,
+        _resolved_detector_artifacts(),
+        MockDetectorBackend(
+            (
+                FirstCrackDetectorOutput(
+                    confirmed=True,
+                    detected_at_monotonic_seconds=502.0,
+                ),
+            )
+        ),
+    )
+
+    with pytest.raises(SessionLifecycleError, match="cannot be in the future"):
+        integrate_first_crack_window_with_session(
+            config=config,
+            adapter=adapter,
+            session_store=store,
+            session=session,
+            window=_audio_window(
+                started_at_monotonic_seconds=501.0,
+                duration_seconds=1.0,
+            ),
+        )
+
+    assert [event.kind for event in session.event_timeline] == ["beans_added"]
+    assert session.phase == "roasting"
 
 
 def test_manual_first_crack_event_takes_precedence_over_later_detector_confirmation() -> None:
