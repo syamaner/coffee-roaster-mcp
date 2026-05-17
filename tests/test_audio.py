@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
+from threading import Lock
 
 import pytest
 
@@ -28,6 +29,26 @@ class FiniteAudioInput:
         samples = self._samples[:sample_count]
         del self._samples[:sample_count]
         return tuple(samples)
+
+
+class MutableAudioInput:
+    def __init__(self, samples: Sequence[float]) -> None:
+        self._samples = list(samples)
+        self._lock = Lock()
+        self.read_counts: list[int] = []
+
+    def add_samples(self, samples: Sequence[float]) -> None:
+        with self._lock:
+            self._samples.extend(samples)
+
+    def read_samples(self, sample_count: int) -> Sequence[float]:
+        with self._lock:
+            self.read_counts.append(sample_count)
+            if not self._samples:
+                return ()
+            samples = self._samples[:sample_count]
+            del self._samples[:sample_count]
+            return tuple(samples)
 
 
 class FailingAudioInput:
@@ -138,6 +159,34 @@ def test_audio_capture_pipeline_drops_windows_when_detector_queue_is_full() -> N
     assert snapshot.emitted_window_count == 1
     assert snapshot.dropped_window_count == 2
     assert pipeline.drain_windows()[0].samples == (0.0, 1.0, 2.0, 3.0)
+
+
+def test_audio_capture_pipeline_resets_run_state_on_restart() -> None:
+    audio_input = MutableAudioInput((10.0, 11.0, 12.0, 13.0, 1.0, 2.0))
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+    )
+
+    pipeline.start()
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count == 1)
+    pipeline.stop()
+    assert pipeline.drain_windows()[0].samples == (10.0, 11.0, 12.0, 13.0)
+
+    audio_input.add_samples((3.0, 4.0, 5.0, 6.0))
+
+    pipeline.start()
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count == 1)
+    pipeline.stop()
+
+    windows = pipeline.drain_windows()
+    assert [window.sequence_number for window in windows] == [0]
+    assert windows[0].samples == (3.0, 4.0, 5.0, 6.0)
 
 
 def test_audio_capture_pipeline_records_source_errors_without_raising_on_caller() -> None:

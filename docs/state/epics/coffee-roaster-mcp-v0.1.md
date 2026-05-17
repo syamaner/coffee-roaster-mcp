@@ -710,6 +710,14 @@ After completing a story:
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- PR review fix for E4-S6:
+  - Reset audio capture run-scoped state on each `AudioCapturePipeline.start()` so partial samples, queued windows, sequence numbers, counters, and prior errors cannot leak across a stopped and restarted pipeline instance.
+  - Added a restart regression test proving leftover partial samples from the first run are not mixed into the first detector window of the next run, and sequence numbers restart from zero.
+  - Ran `./.venv/bin/python -m pytest tests/test_audio.py`: 9 passed.
+  - Ran `./.venv/bin/python -m pytest`: 209 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
 - Planning update after E4-S6:
   - Inserted `E4-S8` / issue `#97` for concrete microphone and recorded WAV audio input adapters after the detector adapter story and before session timeline integration.
   - Renamed the previous timeline integration issue `#39` to `E4-S9` so Raspberry Pi/Linux microphone behavior and recorded-session replay are captured explicitly before detector results are wired into the authoritative session timeline.

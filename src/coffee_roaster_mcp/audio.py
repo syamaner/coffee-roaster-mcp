@@ -190,8 +190,8 @@ class AudioCapturePipeline:
         with self._state_lock:
             if self._thread is not None and self._thread.is_alive():
                 raise AudioCaptureError("Audio capture pipeline is already running.")
+            self._reset_run_state_locked()
             self._stop_requested.clear()
-            self._latest_error = None
             self._thread = Thread(
                 target=self._run_capture_loop,
                 name="coffee-roaster-audio-capture",
@@ -290,6 +290,14 @@ class AudioCapturePipeline:
             return
         with self._state_lock:
             self._emitted_window_count += 1
+
+    def _reset_run_state_locked(self) -> None:
+        self._windows = Queue(maxsize=self._settings.queue_limit)
+        self._sample_buffer.clear()
+        self._next_sequence_number = 0
+        self._emitted_window_count = 0
+        self._dropped_window_count = 0
+        self._latest_error = None
 
 
 def _validate_settings(settings: AudioCaptureSettings) -> None:
