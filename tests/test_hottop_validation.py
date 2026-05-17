@@ -264,6 +264,27 @@ def test_hottop_validation_requires_hottop_config(tmp_path: Path) -> None:
         )
 
 
+def test_hottop_validation_does_not_touch_output_before_config_preflight(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    output_path = tmp_path / "evidence" / "invalid-config.json"
+    config_path.write_text("roaster:\n  driver: mock\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="roaster.driver"):
+        run_hottop_validation(
+            HottopValidationOptions(
+                config_path=config_path,
+                output_path=output_path,
+                hardware_acknowledged=True,
+            ),
+            driver_factory=_fake_driver_factory,
+            sleeper=_no_sleep,
+        )
+
+    assert not output_path.exists()
+
+
 def test_hottop_validation_rejects_invalid_control_percent_before_connect(
     tmp_path: Path,
 ) -> None:

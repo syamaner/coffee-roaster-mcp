@@ -109,13 +109,12 @@ def run_hottop_validation(
     _validate_duration(options.telemetry_wait_seconds, label="telemetry_wait_seconds")
     heat_percent = validate_control_percent(options.heat_percent, label="heat_percent")
     fan_percent = validate_control_percent(options.fan_percent, label="fan_percent")
-    _preflight_output_path(options.output_path)
-
     config = load_config(path=options.config_path)
     if config.roaster.driver != HOTTOP_DRIVER_NAME:
         raise ValueError(f"roaster.driver must be {HOTTOP_DRIVER_NAME!r}.")
     if config.roaster.port is None:
         raise ValueError("roaster.port is required for Hottop validation.")
+    _preflight_output_path(options.output_path)
 
     driver = driver_factory(
         config.roaster.driver,

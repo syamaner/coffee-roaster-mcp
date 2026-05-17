@@ -122,6 +122,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         print(report_to_json(report), end="")
+        if not report.hardware_ready_release_label_allowed:
+            return 1
     return 0
 
 

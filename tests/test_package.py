@@ -6,13 +6,14 @@ import os
 import sys
 from collections.abc import Awaitable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, TypeVar, cast
 
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from coffee_roaster_mcp import __version__
+from coffee_roaster_mcp import __version__, cli
 from coffee_roaster_mcp.cli import build_parser, main
 from coffee_roaster_mcp.config import ConfigError
 from coffee_roaster_mcp.mcp_server import build_server_context, run_driver_emergency_stop
@@ -54,6 +55,27 @@ def test_main_prints_help(capsys: pytest.CaptureFixture[str]) -> None:
     output = capsys.readouterr().out
     assert "usage: coffee-roaster-mcp" in output
     assert "RoastPilot" in output
+
+
+def test_hottop_validate_returns_nonzero_for_unsuccessful_report(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    report = SimpleNamespace(hardware_ready_release_label_allowed=False)
+
+    def fake_run_hottop_validation(options: Any) -> Any:
+        _ = options
+        return report
+
+    def fake_report_to_json(validation_report: Any) -> str:
+        _ = validation_report
+        return "{}\n"
+
+    monkeypatch.setattr(cli, "run_hottop_validation", fake_run_hottop_validation)
+    monkeypatch.setattr(cli, "report_to_json", fake_report_to_json)
+
+    assert main(["hottop-validate", "--i-understand-this-controls-hardware"]) == 1
+    assert capsys.readouterr().out == "{}\n"
 
 
 def test_stdio_server_starts_and_exposes_bootstrap_tools(tmp_path: Path) -> None:

@@ -194,6 +194,7 @@ Review quality comparison:
 - Copilot's suppressed low-confidence notes about `/tmp` evidence were still useful after classification. Rather than committing raw hardware JSON, the durable docs now record SHA-256 checksums for the local evidence files.
 - Codex review `4305417406` on the first review-fix commit found two additional high-value issues: the skipped emergency-stop path still sent a hidden emergency-stop command, and command-step readiness accepted stale `command_write_count` values rather than proving fresh write progress per step.
 - Codex review `4305450927` on the second review-fix commit found one more hardware-readiness gap: heat and fan steps proved write progress but did not verify the driver state reached the requested control target.
+- Codex review `4305459682` on the third review-fix commit found two automation-quality issues: evidence output was touched before config preflight could reject invalid runs, and the CLI returned success even when the validation report was unsuccessful.
 - After the chat was summarized and resumed, Copilot review attempts returned usage-limit errors instead of actionable comments. Codex reviews continued to provide focused, actionable findings on the review-fix commits.
 
 Review response:
@@ -208,6 +209,8 @@ Review response:
 - non-destructive validation now honors the skipped emergency-stop contract and does not send a hidden emergency-stop command
 - each control step now requires `command_write_count` to increase after that specific command before the step can pass
 - heat, heat-off, and fan steps now verify the resulting driver state matches the requested control target
+- output evidence files are not created until config and required Hottop driver/port preflight checks pass
+- the `hottop-validate` CLI now returns non-zero when the report is not hardware-ready
 - hardware readiness now requires required steps to pass and no failed steps to appear
 - durable state and session summary now include SHA-256 checksums for the hardware evidence files
 - skill and registry stale-state wording was corrected
