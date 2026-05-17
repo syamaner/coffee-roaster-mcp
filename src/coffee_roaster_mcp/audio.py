@@ -292,7 +292,11 @@ class AudioCapturePipeline:
             self._emitted_window_count += 1
 
     def _reset_run_state_locked(self) -> None:
-        self._windows = Queue(maxsize=self._settings.queue_limit)
+        while True:
+            try:
+                self._windows.get_nowait()
+            except Empty:
+                break
         self._sample_buffer.clear()
         self._next_sequence_number = 0
         self._emitted_window_count = 0

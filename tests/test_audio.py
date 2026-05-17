@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
-from threading import Lock
+from queue import Queue
+from threading import Lock, Thread
 
 import pytest
 
@@ -187,6 +188,50 @@ def test_audio_capture_pipeline_resets_run_state_on_restart() -> None:
     windows = pipeline.drain_windows()
     assert [window.sequence_number for window in windows] == [0]
     assert windows[0].samples == (3.0, 4.0, 5.0, 6.0)
+
+
+def test_audio_capture_pipeline_keeps_blocking_consumer_across_restart() -> None:
+    audio_input = MutableAudioInput((10.0, 11.0, 12.0, 13.0))
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+    )
+
+    pipeline.start()
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count == 1)
+    pipeline.stop()
+    assert pipeline.drain_windows()[0].samples == (10.0, 11.0, 12.0, 13.0)
+
+    received_windows: Queue[tuple[float, ...] | None] = Queue()
+    consumer = Thread(
+        target=lambda: received_windows.put(
+            None
+            if (
+                window := pipeline.get_window(
+                    block=True,
+                    timeout_seconds=1.0,
+                )
+            )
+            is None
+            else window.samples
+        )
+    )
+    consumer.start()
+    _wait_for(lambda: consumer.is_alive())
+    audio_input.add_samples((1.0, 2.0, 3.0, 4.0))
+
+    pipeline.start()
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count == 1)
+    pipeline.stop()
+    consumer.join(timeout=1.0)
+
+    assert not consumer.is_alive()
+    assert received_windows.get_nowait() == (1.0, 2.0, 3.0, 4.0)
 
 
 def test_audio_capture_pipeline_records_source_errors_without_raising_on_caller() -> None:
