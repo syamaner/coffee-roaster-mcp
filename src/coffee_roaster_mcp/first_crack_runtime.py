@@ -220,6 +220,22 @@ class FirstCrackSessionRuntime:
             self._stop_locked(reason=reason)
             return self.snapshot()
 
+    def discard_queued_windows_for_session(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+    ) -> FirstCrackRuntimeSnapshot:
+        """Drop queued detector windows that were captured before a runtime boundary."""
+        with self._lock:
+            if self._active_session_id != session_id:
+                return self.snapshot()
+            if self._pipeline is not None:
+                self._pipeline.drain_windows()
+            if self._status == "pending":
+                self._reason = reason
+            return self.snapshot()
+
     def shutdown(self) -> FirstCrackRuntimeSnapshot:
         """Stop any active detector runtime for process shutdown."""
         with self._lock:

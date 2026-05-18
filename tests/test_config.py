@@ -193,6 +193,26 @@ def test_invalid_auto_t0_threshold_fails(tmp_path: Path) -> None:
         load_config(config_path, environ={})
 
 
+@pytest.mark.parametrize("threshold", ["nan", "inf", "-inf"])
+def test_non_finite_auto_t0_threshold_fails(tmp_path: Path, threshold: str) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        f"session:\n  auto_t0_drop_threshold_c: {threshold}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="session.auto_t0_drop_threshold_c"):
+        load_config(config_path, environ={})
+
+
+def test_non_finite_auto_t0_threshold_environment_override_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("roaster:\n  driver: mock\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="COFFEE_AUTO_T0_DROP_THRESHOLD_C"):
+        load_config(config_path, environ={"COFFEE_AUTO_T0_DROP_THRESHOLD_C": "nan"})
+
+
 def test_error_messages_include_section_context(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text("roaster:\n  baudrate: invalid\n", encoding="utf-8")

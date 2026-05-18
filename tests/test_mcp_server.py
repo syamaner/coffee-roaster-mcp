@@ -312,6 +312,45 @@ def test_get_roast_state_records_automatic_t0_after_configured_drop(
     }
 
 
+def test_get_roast_state_discards_queued_first_crack_windows_after_auto_t0(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "first_crack:",
+                "  mode: audio",
+                "session:",
+                "  auto_t0_detection_enabled: true",
+                "  auto_t0_drop_threshold_c: 25",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(bean_temp_c=170.0)
+    runtime = FakeFirstCrackRuntime(record_first_crack_on_process=True)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    _set_first_crack_runtime(server_context, runtime)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "get_roast_state", ctx)
+    driver.bean_temp_c = 145.0
+    state = _call_tool(server, "get_roast_state", ctx)
+
+    assert state.phase == "development"
+    assert [event.kind for event in state.events] == [
+        "beans_added",
+        "first_crack_detected",
+    ]
+    assert runtime.discarded_sessions == [state.session_id]
+    assert runtime.processed_sessions == [state.session_id, state.session_id]
+
+
 def test_get_roast_state_auto_t0_uses_max_preheat_and_ignores_small_drops(
     tmp_path: Path,
 ) -> None:
@@ -1081,6 +1120,7 @@ class FakeFirstCrackRuntime:
         self.started_sessions: list[str] = []
         self.processed_sessions: list[str] = []
         self.stopped_sessions: list[str] = []
+        self.discarded_sessions: list[str] = []
 
     def start_for_session(self, session: RoastSession) -> FirstCrackRuntimeSnapshot:
         self.active_session_id = session.id
@@ -1094,13 +1134,27 @@ class FakeFirstCrackRuntime:
         session: RoastSession,
     ) -> FirstCrackRuntimeSnapshot:
         self.processed_sessions.append(session.id)
-        if self.record_first_crack_on_process and session.first_crack_at_utc is None:
+        if (
+            self.record_first_crack_on_process
+            and session.phase == "roasting"
+            and session.first_crack_at_utc is None
+        ):
             session_store.record_event_snapshot(session, "first_crack_detected")
             self.status = "detected"
         return self.snapshot()
 
     def stop_for_session(self, session_id: str, *, reason: str) -> FirstCrackRuntimeSnapshot:
         self.stopped_sessions.append(session_id)
+        self.reason = reason
+        return self.snapshot()
+
+    def discard_queued_windows_for_session(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+    ) -> FirstCrackRuntimeSnapshot:
+        self.discarded_sessions.append(session_id)
         self.reason = reason
         return self.snapshot()
 

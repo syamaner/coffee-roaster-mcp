@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -497,7 +498,7 @@ def _positive_float(
 
 def _parse_positive_float(value: object, key: str) -> float:
     parsed = _parse_float(value, key)
-    if parsed <= 0:
+    if not math.isfinite(parsed) or parsed <= 0:
         raise ConfigError(f"{key} must be greater than 0.")
     return parsed
 

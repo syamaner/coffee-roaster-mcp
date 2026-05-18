@@ -449,11 +449,16 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
         device_state = _read_current_device_state(server_context)
-        _process_auto_t0_for_active_session(
+        auto_t0_recorded = _process_auto_t0_for_active_session(
             server_context,
             session_id=session_id,
             device_state=device_state,
         )
+        if auto_t0_recorded:
+            server_context.first_crack_runtime.discard_queued_windows_for_session(
+                session.id,
+                reason="Dropped queued pre-T0 detector windows after automatic T0.",
+            )
         _process_first_crack_runtime_for_active_session(server_context, session_id=session_id)
         session = _resolve_session(server_context, session_id=session_id)
         return _serialize_session_state(
@@ -695,24 +700,25 @@ def _process_auto_t0_for_active_session(
     *,
     session_id: str | None,
     device_state: RoasterDeviceState,
-) -> None:
+) -> bool:
     """Process automatic T0 after a successful configured-driver state read."""
     if not server_context.config.session.auto_t0_detection_enabled:
-        return
+        return False
     active_session = server_context.session_store.get_active_session()
     if active_session is None:
-        return
+        return False
     if session_id is not None and session_id != active_session.id:
-        return
+        return False
     if active_session.phase != "pre_roast" or active_session.beans_added_at_utc is not None:
-        return
+        return False
     if not device_state.connected or device_state.bean_temp_c is None:
-        return
-    server_context.session_store.process_auto_t0_reading_snapshot(
+        return False
+    event, _ = server_context.session_store.process_auto_t0_reading_snapshot(
         active_session,
         bean_temp_c=device_state.bean_temp_c,
         drop_threshold_c=server_context.config.session.auto_t0_drop_threshold_c,
     )
+    return event is not None
 
 
 def _run_reserved_driver_control(
