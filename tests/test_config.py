@@ -27,6 +27,7 @@ def test_default_config_allows_mock_run_without_file(
     assert config.logging.log_dir == Path("./logs")
     assert config.logging.export_formats == ("jsonl", "csv", "summary")
     assert config.session.auto_t0_detection_enabled is False
+    assert config.session.auto_t0_drop_threshold_c == 25.0
 
 
 def test_missing_explicit_config_file_fails(tmp_path: Path) -> None:
@@ -65,6 +66,7 @@ logging:
     - summary
 session:
   auto_t0_detection_enabled: true
+  auto_t0_drop_threshold_c: 20.5
   ror_window_seconds: 45
   ror_min_sample_seconds: 12
 """,
@@ -94,6 +96,7 @@ session:
     assert config.logging.sample_interval_seconds == 0.5
     assert config.logging.export_formats == ("jsonl", "summary")
     assert config.session.auto_t0_detection_enabled is True
+    assert config.session.auto_t0_drop_threshold_c == 20.5
     assert config.session.ror_window_seconds == 45
     assert config.session.ror_min_sample_seconds == 12
 
@@ -135,6 +138,7 @@ logging:
             "COFFEE_AUDIO_SAMPLE_RATE": "16000",
             "COFFEE_AUDIO_WAV_PATH": "",
             "COFFEE_ROAST_LOG_DIR": "/tmp/roasts",
+            "COFFEE_AUTO_T0_DROP_THRESHOLD_C": "30",
         },
     )
 
@@ -152,6 +156,7 @@ logging:
     assert config.audio.sample_rate == 16_000
     assert config.audio.wav_path is None
     assert config.logging.log_dir == Path("/tmp/roasts")
+    assert config.session.auto_t0_drop_threshold_c == 30.0
 
 
 def test_environment_config_path_is_supported(tmp_path: Path) -> None:
@@ -178,6 +183,34 @@ def test_invalid_audio_source_fails(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="audio.source"):
         load_config(config_path, environ={})
+
+
+def test_invalid_auto_t0_threshold_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("session:\n  auto_t0_drop_threshold_c: 0\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="session.auto_t0_drop_threshold_c"):
+        load_config(config_path, environ={})
+
+
+@pytest.mark.parametrize("threshold", ["nan", "inf", "-inf"])
+def test_non_finite_auto_t0_threshold_fails(tmp_path: Path, threshold: str) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        f"session:\n  auto_t0_drop_threshold_c: {threshold}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="session.auto_t0_drop_threshold_c"):
+        load_config(config_path, environ={})
+
+
+def test_non_finite_auto_t0_threshold_environment_override_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("roaster:\n  driver: mock\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="COFFEE_AUTO_T0_DROP_THRESHOLD_C"):
+        load_config(config_path, environ={"COFFEE_AUTO_T0_DROP_THRESHOLD_C": "nan"})
 
 
 def test_error_messages_include_section_context(tmp_path: Path) -> None:

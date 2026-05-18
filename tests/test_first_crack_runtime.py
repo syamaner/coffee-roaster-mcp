@@ -73,6 +73,9 @@ class FakeAudioPipeline:
         del self._windows[:max_windows]
         return drained
 
+    def add_window(self, window: AudioWindow) -> None:
+        self._windows.append(window)
+
     def snapshot(self) -> AudioCaptureSnapshot:
         return AudioCaptureSnapshot(
             running=self.started and not self.stopped,
@@ -169,6 +172,56 @@ def test_audio_runtime_processes_after_beans_added_and_records_once() -> None:
         "first_crack_detected",
     ]
     assert session.first_crack_monotonic_seconds == 6.0
+
+
+def test_audio_runtime_can_discard_queued_pre_t0_windows() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(
+                confirmed=True,
+                confidence=0.94,
+                detected_at_monotonic_seconds=506.0,
+            ),
+        )
+    )
+    pipeline = FakeAudioPipeline(
+        (
+            _audio_window(sequence_number=1, started_at_monotonic_seconds=501.0),
+            _audio_window(sequence_number=2, started_at_monotonic_seconds=502.0),
+        )
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+    )
+
+    runtime.start_for_session(session)
+    discarded = runtime.discard_queued_windows_for_session(
+        session.id,
+        reason="automatic T0 boundary",
+    )
+    pipeline.add_window(_audio_window(sequence_number=3, started_at_monotonic_seconds=506.0))
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 510.0
+    detected = runtime.process_available_windows(session_store=store, session=session)
+
+    assert discarded.queued_window_count == 0
+    assert discarded.reason == "automatic T0 boundary"
+    assert detected.status == "detected"
+    assert [window.sequence_number for window in backend.windows] == [3]
+    assert [event.kind for event in session.event_timeline] == [
+        "beans_added",
+        "first_crack_detected",
+    ]
 
 
 def test_audio_runtime_keeps_pending_status_when_detector_does_not_confirm() -> None:

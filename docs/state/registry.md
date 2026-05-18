@@ -82,8 +82,8 @@ hardware, or network access. E4-S10 did not wire live Hottop command behavior
 or automatic first-crack detector startup into the MCP runtime; those gaps moved
 into Epic 4.1.
 
-Epic 4.1 is now active before Epic 5 to close operational MCP runtime gaps.
-The target user flow is: install the MCP server locally in Claude, start a
+Epic 4.1 is now complete and closed the operational MCP runtime gaps before
+Epic 5. The target user flow is: install the MCP server locally in Claude, start a
 roast, adjust the configured roaster through MCP tools, read current device and
 session state, and know whether first crack has happened. E4.1 covers
 driver-backed MCP control tools, current roaster state exposure, released ONNX
@@ -148,13 +148,25 @@ explicit override semantics for `mark_beans_added` and `mark_first_crack`,
 `drop_beans` as the normal cooling transition, and gated optional live
 Hottop/real microphone validation evidence. Normal CI remains mock-safe.
 
+E4.1-S6 added the automatic T0 runtime path. Automatic T0 remains disabled by
+default, but when `session.auto_t0_detection_enabled` is configured, successful
+`get_roast_state` driver reads process the current bean temperature before
+first-crack runtime windows. The session store tracks the max preheat/charge
+bean temperature before T0, records the authoritative `beans_added` event when
+the current bean temperature drops from that max by
+`session.auto_t0_drop_threshold_c`, and preserves charge temperature,
+detected bean temperature, drop, and threshold diagnostics in the event payload
+and `get_roast_state.t0_status`. The explicit `mark_beans_added` override
+remains available and idempotent. Driver read failures still surface without
+session mutation, and normal CI remains mock-safe.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E4.1-S6: add automatic T0 runtime path.
+The next story is E5-S1: implement rolling telemetry buffer.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
