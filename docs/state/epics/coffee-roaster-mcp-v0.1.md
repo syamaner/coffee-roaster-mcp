@@ -121,6 +121,13 @@ The first implementation milestone is a mock vertical slice that requires no roa
   driver safety call fails. `drop_beans` records both `beans_dropped` and
   `cooling_started` when the driver reports cooling active, which is the normal
   Hottop compound drop/cooling path and the mock-safe default path.
+- `E4.1-S1` review hardening reserves session startup before driver `connect()`
+  so concurrent starts cannot both reach the configured driver. Reserved
+  `stop_cooling` completion trusts the driver's returned cooling state and does
+  not mark the session complete if cooling remains active. Stale non-emergency
+  command fail-closed handling is scoped to the reservation's session id so a
+  previous session's late command cannot emergency-stop a newer active session
+  without that session owning the fault.
 - `mark_beans_added` and `mark_first_crack` remain exposed as explicit
   override tools. The primary runtime path should be internal auto-T0 detection
   when enabled and internal first-crack detector confirmation in audio mode.
@@ -1004,14 +1011,25 @@ After completing a story:
   - Repeated `drop_beans` and `start_cooling` calls return the existing
     singleton event without resending driver commands. Emergency stop cancels
     pending non-emergency reservations before running the fail-closed driver
-    safety call, and stale completed commands reapply driver emergency stop
-    before surfacing a lifecycle error.
+    safety call, and stale completed commands surface a lifecycle error instead
+    of mutating the session. Stale-command emergency stop is reapplied only when
+    no newer active session has replaced the command's owning session.
+  - Added review hardening for remaining race and state-reporting edges:
+    session startup is reserved before driver `connect()`, reserved
+    `stop_cooling` uses the driver's returned cooling state before completing
+    the session, and stale command fail-closed handling skips global emergency
+    stop when a newer active session has replaced the reservation's session.
+  - Added MCP regression coverage for concurrent start reservation,
+    cooling-stop driver-state mismatch, and stale previous-session command
+    completion after a newer session starts.
   - Kept automatic first-crack detector startup, ONNX detector runtime,
     auto-T0 detection, rolling telemetry metrics, final log schemas, model
     training, ONNX export, Hugging Face sync, real microphone validation, and
     broad release validation out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_mcp_server.py`: 11 passed.
+  - Ran `./.venv/bin/python -m pytest tests/test_session.py`: 38 passed.
   - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
-    247 passed, required coverage `90.0%` reached, total coverage `90.28%`.
+    250 passed, required coverage `90.0%` reached, total coverage `90.39%`.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

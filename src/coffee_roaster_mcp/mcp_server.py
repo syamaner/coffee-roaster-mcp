@@ -318,10 +318,13 @@ def create_mcp_server(
     ) -> StartRoastSessionResult:
         """Start one new authoritative roast session and prepare the driver."""
         server_context = ctx.request_context.lifespan_context
-        if server_context.session_store.get_active_session() is not None:
-            raise ValueError("An active roast session already exists.")
-        server_context.roaster_driver.connect()
-        session = server_context.session_store.start_session_snapshot()
+        reservation = server_context.session_store.reserve_session_start()
+        try:
+            server_context.roaster_driver.connect()
+            session = server_context.session_store.complete_session_start_snapshot(reservation)
+        except Exception:
+            server_context.session_store.clear_session_start_reservation(reservation)
+            raise
         return StartRoastSessionResult(session=_serialize_session_state(session))
 
     @mcp.tool()
@@ -525,7 +528,7 @@ def _run_reserved_driver_control(
                 driver_state=driver_state,
             )
         except SessionLifecycleError:
-            _fail_closed_after_stale_driver_command(server_context)
+            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
             raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
@@ -555,7 +558,7 @@ def _run_reserved_driver_drop(
                 cooling_on=driver_state.cooling_on,
             )
         except SessionLifecycleError:
-            _fail_closed_after_stale_driver_command(server_context)
+            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
             raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
@@ -587,7 +590,7 @@ def _run_reserved_driver_start_cooling(
                 cooling_on=driver_state.cooling_on,
             )
         except SessionLifecycleError:
-            _fail_closed_after_stale_driver_command(server_context)
+            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
             raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
@@ -608,10 +611,10 @@ def _run_reserved_driver_stop_cooling(
                 reservation=reservation,
                 heat_level_percent=driver_state.heat_level_percent,
                 fan_level_percent=driver_state.fan_level_percent,
-                cooling_on=session.cooling_on,
+                cooling_on=driver_state.cooling_on,
             )
         except SessionLifecycleError:
-            _fail_closed_after_stale_driver_command(server_context)
+            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
             raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
@@ -636,8 +639,15 @@ def _complete_driver_control(
     )
 
 
-def _fail_closed_after_stale_driver_command(server_context: ServerContext) -> None:
+def _fail_closed_after_stale_driver_command(
+    server_context: ServerContext,
+    *,
+    reservation: DriverCommandReservation,
+) -> None:
     """Reapply driver safety when a completed command no longer owns the session."""
+    active_session = server_context.session_store.get_active_session()
+    if active_session is not None and active_session.id != reservation.session_id:
+        return
     run_driver_emergency_stop(
         server_context,
         reason="stale driver command after session state changed",

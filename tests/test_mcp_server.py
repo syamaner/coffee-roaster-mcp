@@ -209,6 +209,38 @@ def test_driver_connect_failure_prevents_session_creation(tmp_path: Path) -> Non
         _call_tool(server, "get_roast_state", ctx)
 
 
+def test_concurrent_session_start_reserves_before_driver_connect(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    connect_started = Event()
+    release_connect = Event()
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(block_connect=(connect_started, release_connect))
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    start_thread = Thread(
+        target=_record_tool_result,
+        args=(results, errors, server, "start_roast_session", ctx),
+    )
+    start_thread.start()
+    assert connect_started.wait(timeout=1.0)
+
+    with pytest.raises(SessionLifecycleError, match="start is already in progress"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    release_connect.set()
+    start_thread.join(timeout=1.0)
+
+    assert not start_thread.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert driver.actions == ["connect"]
+
+
 def test_stale_heat_command_fails_closed_after_emergency_stop(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
@@ -248,6 +280,51 @@ def test_stale_heat_command_fails_closed_after_emergency_stop(tmp_path: Path) ->
     ]
 
 
+def test_stale_command_does_not_emergency_stop_newer_active_session(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    command_started = Event()
+    release_command = Event()
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(block_heat=(command_started, release_command))
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    errors: list[BaseException] = []
+
+    first_start = _call_tool(server, "start_roast_session", ctx)
+    heat_thread = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "set_heat", ctx),
+        kwargs={"heat_level_percent": 65},
+    )
+    heat_thread.start()
+    assert command_started.wait(timeout=1.0)
+
+    _call_tool(server, "emergency_stop", ctx, reason="unit-test")
+    second_start = _call_tool(server, "start_roast_session", ctx)
+    release_command.set()
+    heat_thread.join(timeout=1.0)
+
+    assert not heat_thread.is_alive()
+    assert isinstance(errors[0], SessionLifecycleError)
+    assert second_start.session.session_id != first_start.session.session_id
+    second_state = _call_tool(
+        server,
+        "get_roast_state",
+        ctx,
+        session_id=second_start.session.session_id,
+    )
+    assert second_state.active is True
+    assert second_state.phase == "pre_roast"
+    assert driver.actions == [
+        "connect",
+        "set_heat:65",
+        "emergency_stop:unit-test",
+        "connect",
+    ]
+
+
 def test_blocked_drop_command_does_not_block_emergency_stop(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
@@ -284,6 +361,39 @@ def test_blocked_drop_command_does_not_block_emergency_stop(tmp_path: Path) -> N
     ]
 
 
+def test_stop_cooling_uses_driver_cooling_state_before_completing(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(stop_cooling_stays_on=True)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    _call_tool(server, "drop_beans", ctx)
+
+    with pytest.raises(SessionLifecycleError, match="still reports cooling active"):
+        _call_tool(server, "stop_cooling", ctx)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+    assert state.active is True
+    assert state.phase == "cooling"
+    assert state.cooling_on is True
+    assert [event.kind for event in state.events] == [
+        "beans_added",
+        "beans_dropped",
+        "cooling_started",
+    ]
+    assert driver.actions == [
+        "connect",
+        "drop_beans",
+        "stop_cooling",
+        "emergency_stop:stale driver command after session state changed",
+    ]
+
+
 class RecordingRoasterDriver:
     """Driver double that records MCP boundary calls."""
 
@@ -294,15 +404,19 @@ class RecordingRoasterDriver:
         *,
         fail_connect: bool = False,
         fail_heat: bool = False,
+        block_connect: tuple[Event, Event] | None = None,
         block_heat: tuple[Event, Event] | None = None,
         block_drop: tuple[Event, Event] | None = None,
+        stop_cooling_stays_on: bool = False,
     ) -> None:
         """Initialize a deterministic recording driver."""
         self.actions: list[str] = []
         self.fail_connect = fail_connect
         self.fail_heat = fail_heat
+        self.block_connect = block_connect
         self.block_heat = block_heat
         self.block_drop = block_drop
+        self.stop_cooling_stays_on = stop_cooling_stays_on
         self.connected = False
         self.heat_level_percent = 0
         self.fan_level_percent = 0
@@ -316,6 +430,10 @@ class RecordingRoasterDriver:
     def connect(self) -> None:
         """Record connect calls."""
         self.actions.append("connect")
+        if self.block_connect is not None:
+            started, release = self.block_connect
+            started.set()
+            assert release.wait(timeout=1.0)
         if self.fail_connect:
             raise RuntimeError("connect failed")
         self.connected = True
@@ -368,7 +486,7 @@ class RecordingRoasterDriver:
     def stop_cooling(self) -> RoasterState:
         """Record cooling-stop commands."""
         self.actions.append("stop_cooling")
-        self.cooling_on = False
+        self.cooling_on = self.stop_cooling_stays_on
         return self._state()
 
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
@@ -412,6 +530,21 @@ def _record_tool_error(
     """Run one tool in a background thread and record any exception."""
     try:
         _call_tool(server, tool_name, ctx, **kwargs)
+    except BaseException as exc:
+        errors.append(exc)
+
+
+def _record_tool_result(
+    results: list[object],
+    errors: list[BaseException],
+    server: FastMCP,
+    tool_name: str,
+    ctx: Any,
+    **kwargs: object,
+) -> None:
+    """Run one tool in a background thread and record its result or exception."""
+    try:
+        results.append(_call_tool(server, tool_name, ctx, **kwargs))
     except BaseException as exc:
         errors.append(exc)
 

@@ -159,6 +159,13 @@ class TelemetrySample:
 
 
 @dataclass(frozen=True)
+class SessionStartReservation:
+    """Reservation for preparing a driver before creating a session."""
+
+    token: str
+
+
+@dataclass(frozen=True)
 class DriverCommandReservation:
     """Reservation for one non-emergency driver command.
 
@@ -409,6 +416,7 @@ class RoastSessionStore:
         self._latest_session: RoastSession | None = None
         self._sessions_by_id: dict[str, RoastSession] = {}
         self._session_id_order: deque[str] = deque()
+        self._pending_session_start_token: str | None = None
 
     def start_session(self) -> RoastSession:
         """Start one new active session.
@@ -420,30 +428,48 @@ class RoastSessionStore:
             SessionLifecycleError: If an active session already exists.
         """
         with self._lock:
-            if self._latest_session is not None and self._latest_session.active:
-                raise SessionLifecycleError("An active roast session already exists.")
-
-            session_id = self._session_id_factory()
-            session = RoastSession(
-                id=session_id,
-                created_at_utc=self._utc_now(),
-                monotonic_start=self._monotonic_now(),
-                log_writer=LogWriterReference(
-                    session_id=session_id,
-                    log_dir=self._default_log_dir / session_id,
-                ),
-            )
-            self._latest_session = session
-            self._sessions_by_id[session_id] = session
-            self._session_id_order.append(session_id)
-            self._prune_session_history_locked()
-            return session
+            if self._pending_session_start_token is not None:
+                raise SessionLifecycleError("A roast session start is already in progress.")
+            return self._start_session_locked()
 
     def start_session_snapshot(self) -> RoastSession:
         """Start one new session and return an atomic lightweight snapshot."""
         with self._lock:
             session = self.start_session()
             return _copy_session_for_read(session)
+
+    def reserve_session_start(self) -> SessionStartReservation:
+        """Reserve session startup before preparing the configured driver."""
+        with self._lock:
+            if self._latest_session is not None and self._latest_session.active:
+                raise SessionLifecycleError("An active roast session already exists.")
+            if self._pending_session_start_token is not None:
+                raise SessionLifecycleError("A roast session start is already in progress.")
+            reservation = SessionStartReservation(token=_generate_session_id())
+            self._pending_session_start_token = reservation.token
+            return reservation
+
+    def complete_session_start_snapshot(
+        self,
+        reservation: SessionStartReservation,
+    ) -> RoastSession:
+        """Create the reserved session and return an atomic lightweight snapshot."""
+        with self._lock:
+            self._assert_session_start_reservation(reservation)
+            try:
+                session = self._start_session_locked()
+            finally:
+                self._pending_session_start_token = None
+            return _copy_session_for_read(session)
+
+    def clear_session_start_reservation(
+        self,
+        reservation: SessionStartReservation,
+    ) -> None:
+        """Clear a pending session-start reservation if it is still current."""
+        with self._lock:
+            if self._pending_session_start_token == reservation.token:
+                self._pending_session_start_token = None
 
     def stop_session(self, *, phase: RoastPhase = "complete") -> RoastSession | None:
         """Stop the active session if one exists.
@@ -729,13 +755,27 @@ class RoastSessionStore:
         """Complete a reserved cooling-stop command and record the event."""
         with self._lock:
             self._assert_driver_command_reservation(session, reservation)
-            self.apply_driver_control_state(
-                session,
-                heat_level_percent=heat_level_percent,
-                fan_level_percent=fan_level_percent,
-                cooling_on=cooling_on,
+            if cooling_on:
+                raise SessionLifecycleError(
+                    "Driver still reports cooling active after stop_cooling."
+                )
+            validated_heat = validate_control_percent(
+                heat_level_percent,
+                label="heat_level_percent",
             )
-            event = self.stop_cooling(session)
+            validated_fan = validate_control_percent(
+                fan_level_percent,
+                label="fan_level_percent",
+            )
+            event = self.record_event(session, "cooling_stopped")
+            session.heat_level_percent = validated_heat
+            session.fan_level_percent = validated_fan
+            session.cooling_on = False
+            session.stop(
+                utc_now=self._utc_now,
+                monotonic_now=self._monotonic_now,
+                phase="complete",
+            )
             self._clear_driver_command_reservation_locked(session, reservation)
             return event, _copy_session_for_read(session)
 
@@ -1014,6 +1054,35 @@ class RoastSessionStore:
         """Validate that one session is the latest known session."""
         if self._latest_session is not session:
             raise SessionLifecycleError("Only the latest session can be mutated.")
+
+    def _start_session_locked(self) -> RoastSession:
+        """Start one new active session while the store lock is already held."""
+        if self._latest_session is not None and self._latest_session.active:
+            raise SessionLifecycleError("An active roast session already exists.")
+
+        session_id = self._session_id_factory()
+        session = RoastSession(
+            id=session_id,
+            created_at_utc=self._utc_now(),
+            monotonic_start=self._monotonic_now(),
+            log_writer=LogWriterReference(
+                session_id=session_id,
+                log_dir=self._default_log_dir / session_id,
+            ),
+        )
+        self._latest_session = session
+        self._sessions_by_id[session_id] = session
+        self._session_id_order.append(session_id)
+        self._prune_session_history_locked()
+        return session
+
+    def _assert_session_start_reservation(
+        self,
+        reservation: SessionStartReservation,
+    ) -> None:
+        """Validate a session-start reservation before creating the session."""
+        if self._pending_session_start_token != reservation.token:
+            raise SessionLifecycleError("Session start reservation is no longer active.")
 
     def _get_existing_singleton_event(
         self,

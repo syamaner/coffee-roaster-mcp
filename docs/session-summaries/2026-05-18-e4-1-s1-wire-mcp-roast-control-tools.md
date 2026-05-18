@@ -161,8 +161,9 @@ Review fixes added:
 - `emergency_stop` cancels pending non-emergency driver command reservations
   before running the fail-closed driver safety call.
 - If a non-emergency driver command finishes after its reservation was canceled,
-  the code reapplies driver emergency stop and surfaces a lifecycle error
-  instead of updating the authoritative session state.
+  the code surfaces a lifecycle error instead of updating the authoritative
+  session state. It reapplies driver emergency stop only when no newer active
+  session has replaced the command's owning session.
 
 Validation after these review fixes:
 
@@ -198,18 +199,48 @@ Third Codex review on PR #109:
     is stopped/faulted, session B starts, and A's stale command completes, this
     can interfere with B without recording a B fault.
 
-These latest three review items have not been fixed yet. They are the next
-work items before PR #109 should merge.
+These latest three review items were fixed after the context snapshot above:
+
+- `start_roast_session` now reserves session startup in `RoastSessionStore`
+  before calling driver `connect()`. A concurrent start attempt fails before
+  invoking the configured driver, and failed `connect()` clears the reservation
+  without creating a session.
+- Reserved `stop_cooling` completion now uses `driver_state.cooling_on`. If the
+  driver still reports cooling active after `stop_cooling`, the session remains
+  active in `cooling` and does not record `cooling_stopped` or complete.
+- Stale non-emergency command fail-closed handling is now scoped to the
+  reservation's session id. If a newer session has already become active, the
+  stale command surfaces a lifecycle error without sending an untracked
+  emergency stop to the newer session's hardware boundary.
+
+Regression coverage added:
+
+- Concurrent session starts call driver `connect()` only once.
+- A driver that still reports cooling active after `stop_cooling` does not mark
+  the authoritative MCP session complete.
+- A stale command from a previous session does not emergency-stop a newer active
+  session.
+
+Focused validation after these latest fixes:
+
+- Ran `./.venv/bin/python -m pytest tests/test_mcp_server.py`: `11 passed`.
+- Ran `./.venv/bin/python -m pytest tests/test_session.py`: `38 passed`.
+- Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
+  `250 passed`, required coverage `90.0%` reached, total coverage `90.39%`.
+- Ran `./.venv/bin/python -m ruff check .`: passed.
+- Ran `./.venv/bin/python -m ruff format --check .`: passed.
+- Ran `./.venv/bin/python -m pyright`: `0 errors`.
 
 ## Handoff Notes
 
 Continue on branch
 `feature/104-wire-mcp-roast-control-tools-to-configured-driver`.
 
-Before making more code changes:
+Before making more code changes or merging:
 
 1. Re-read the latest thread-aware review state for PR #109.
-2. Focus on the three unresolved review threads from review `4312706674`.
+2. Confirm the three review threads from review `4312706674` are outdated or
+   resolved after the latest push.
 3. Keep any follow-up scoped to E4.1-S1: configured-driver MCP control wiring and
    safety/idempotency around those controls.
 4. Do not add automatic first-crack detector startup, released-artifact ONNX
