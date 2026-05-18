@@ -17,6 +17,11 @@ from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.config import AppConfig, ConfigError, FirstCrackMode, load_config
 from coffee_roaster_mcp.drivers import RoasterDriver, RoasterState, create_roaster_driver
 from coffee_roaster_mcp.exports import export_roast_snapshot
+from coffee_roaster_mcp.first_crack_runtime import (
+    FirstCrackRuntimeSnapshot,
+    FirstCrackSessionRuntime,
+    build_first_crack_session_runtime,
+)
 from coffee_roaster_mcp.session import (
     DriverCommandReservation,
     EventPayloadValue,
@@ -39,6 +44,7 @@ class ServerContext:
         transport: Actual MCP transport used by this server process.
         session_store: Authoritative in-process roast session owner.
         roaster_driver: Configured driver boundary.
+        first_crack_runtime: Session-owned first-crack detector runtime.
         started_at_utc: UTC time when the MCP process initialized.
     """
 
@@ -46,6 +52,7 @@ class ServerContext:
     transport: str
     session_store: RoastSessionStore
     roaster_driver: RoasterDriver
+    first_crack_runtime: FirstCrackSessionRuntime
     started_at_utc: datetime
 
 
@@ -285,6 +292,7 @@ def build_server_context(
         transport=transport,
         session_store=RoastSessionStore(default_log_dir=config.logging.log_dir / "roasts"),
         roaster_driver=roaster_driver,
+        first_crack_runtime=build_first_crack_session_runtime(config),
         started_at_utc=datetime.now(UTC),
     )
 
@@ -307,7 +315,11 @@ def create_mcp_server(
     @asynccontextmanager
     async def server_lifespan(_: FastMCP) -> AsyncGenerator[ServerContext, None]:
         """Load typed config once for the MCP process lifetime."""
-        yield build_server_context(config_path=config_path, transport=transport)
+        server_context = build_server_context(config_path=config_path, transport=transport)
+        try:
+            yield server_context
+        finally:
+            server_context.first_crack_runtime.shutdown()
 
     mcp = FastMCP(
         name="RoastPilot",
@@ -389,8 +401,13 @@ def create_mcp_server(
         except Exception:
             server_context.session_store.clear_session_start_reservation(reservation)
             raise
+        _start_first_crack_runtime(server_context, session=session)
         return StartRoastSessionResult(
-            session=_serialize_session_state(session, config=server_context.config)
+            session=_serialize_session_state(
+                session,
+                config=server_context.config,
+                first_crack_runtime=server_context.first_crack_runtime.snapshot(),
+            )
         )
 
     @mcp.tool()
@@ -402,10 +419,13 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
         device_state = _read_current_device_state(server_context)
+        _process_first_crack_runtime_for_active_session(server_context, session_id=session_id)
+        session = _resolve_session(server_context, session_id=session_id)
         return _serialize_session_state(
             session,
             config=server_context.config,
             device_state=device_state,
+            first_crack_runtime=server_context.first_crack_runtime.snapshot(),
         )
 
     @mcp.tool()
@@ -447,7 +467,21 @@ def create_mcp_server(
         ctx: Context[ServerSession, ServerContext],
     ) -> EventCommandResult:
         """Record the authoritative beans-added event."""
-        return _record_session_event(ctx, "beans_added")
+        result = _record_session_event(ctx, "beans_added")
+        _process_first_crack_runtime_for_active_session(
+            ctx.request_context.lifespan_context,
+            session_id=result.session_id,
+        )
+        snapshot = _snapshot_session(
+            ctx.request_context.lifespan_context,
+            session_id=result.session_id,
+        )
+        return EventCommandResult(
+            session_id=snapshot.id,
+            phase=snapshot.phase,
+            event=result.event,
+            event_count=len(snapshot.event_timeline),
+        )
 
     @mcp.tool()
     def mark_first_crack(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -457,7 +491,12 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         if not server_context.config.first_crack.allow_manual_override:
             raise ValueError("Manual first-crack override is disabled by configuration.")
-        return _record_session_event(ctx, "first_crack_detected")
+        result = _record_session_event(ctx, "first_crack_detected")
+        server_context.first_crack_runtime.stop_for_session(
+            result.session_id,
+            reason="manual first-crack override",
+        )
+        return result
 
     @mcp.tool()
     def drop_beans(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -467,6 +506,10 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
         event, snapshot = _run_reserved_driver_drop(server_context, session)
+        server_context.first_crack_runtime.stop_for_session(
+            snapshot.id,
+            reason="beans dropped",
+        )
         return _serialize_event_result(snapshot=snapshot, event=event)
 
     @mcp.tool()
@@ -487,6 +530,10 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
         event, snapshot = _run_reserved_driver_stop_cooling(server_context, session)
+        server_context.first_crack_runtime.stop_for_session(
+            snapshot.id,
+            reason="cooling stopped",
+        )
         return _serialize_event_result(snapshot=snapshot, event=event)
 
     @mcp.tool()
@@ -523,6 +570,10 @@ def create_mcp_server(
             reason=reason,
             safety_payload=safety_payload,
             allow_stopped_latest=True,
+        )
+        server_context.first_crack_runtime.stop_for_session(
+            snapshot.id,
+            reason="emergency stop",
         )
         return _serialize_event_result(snapshot=snapshot, event=event)
 
@@ -576,6 +627,32 @@ def _record_session_event(
     session = _require_active_session(server_context)
     event, snapshot = server_context.session_store.record_event_snapshot(session, kind)
     return _serialize_event_result(snapshot=snapshot, event=event)
+
+
+def _start_first_crack_runtime(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+) -> None:
+    """Start first-crack runtime preparation for a newly created session."""
+    server_context.first_crack_runtime.start_for_session(session)
+
+
+def _process_first_crack_runtime_for_active_session(
+    server_context: ServerContext,
+    *,
+    session_id: str | None,
+) -> None:
+    """Process queued detector windows when the requested session is active."""
+    active_session = server_context.session_store.get_active_session()
+    if active_session is None:
+        return
+    if session_id is not None and session_id != active_session.id:
+        return
+    server_context.first_crack_runtime.process_available_windows(
+        session_store=server_context.session_store,
+        session=active_session,
+    )
 
 
 def _run_reserved_driver_control(
@@ -770,6 +847,7 @@ def _serialize_session_state(
     *,
     config: AppConfig,
     device_state: RoasterDeviceState | None = None,
+    first_crack_runtime: FirstCrackRuntimeSnapshot | None = None,
 ) -> RoastSessionState:
     """Convert one in-memory session into an MCP-safe snapshot."""
     metrics = compute_roast_metrics(session)
@@ -799,7 +877,11 @@ def _serialize_session_state(
         development_time_seconds=metrics.development_time_seconds,
         development_percent=metrics.development_percent,
         device_state=device_state,
-        first_crack_status=_serialize_first_crack_status(session, config=config),
+        first_crack_status=_serialize_first_crack_status(
+            session,
+            config=config,
+            first_crack_runtime=first_crack_runtime,
+        ),
         events=tuple(_serialize_event(event) for event in session.event_timeline),
         log_dir=str(session.log_writer.log_dir.resolve())
         if session.log_writer is not None
@@ -825,6 +907,7 @@ def _serialize_first_crack_status(
     session: RoastSession,
     *,
     config: AppConfig,
+    first_crack_runtime: FirstCrackRuntimeSnapshot | None = None,
 ) -> FirstCrackStatus:
     """Derive first-crack status from config and the session timeline."""
     if session.first_crack_at_utc is not None:
@@ -871,13 +954,35 @@ def _serialize_first_crack_status(
             allow_manual_override=config.first_crack.allow_manual_override,
             reason="Waiting for explicit mark_first_crack override.",
         )
+    if (
+        config.first_crack.mode == "audio"
+        and first_crack_runtime is not None
+        and first_crack_runtime.active_session_id == session.id
+        and first_crack_runtime.status in {"faulted", "unavailable"}
+    ):
+        return FirstCrackStatus(
+            mode=config.first_crack.mode,
+            status=first_crack_runtime.status,
+            detected_at_utc=None,
+            detected_monotonic_seconds=None,
+            allow_manual_override=config.first_crack.allow_manual_override,
+            reason=first_crack_runtime.reason,
+        )
+    reason = "Audio first-crack detection has not recorded first crack for this session."
+    if (
+        config.first_crack.mode == "audio"
+        and first_crack_runtime is not None
+        and first_crack_runtime.active_session_id == session.id
+        and first_crack_runtime.reason is not None
+    ):
+        reason = first_crack_runtime.reason
     return FirstCrackStatus(
         mode=config.first_crack.mode,
         status="pending",
         detected_at_utc=None,
         detected_monotonic_seconds=None,
         allow_manual_override=config.first_crack.allow_manual_override,
-        reason="Audio first-crack detection has not recorded first crack for this session.",
+        reason=reason,
     )
 
 

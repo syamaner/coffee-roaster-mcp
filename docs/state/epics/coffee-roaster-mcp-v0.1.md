@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4.1-S4`
-- Current target: Start first-crack detection runtime with roast sessions
+- Active story: `E4.1-S5`
+- Current target: Add MCP operational readiness tests and docs
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -108,9 +108,9 @@ The first implementation milestone is a mock vertical slice that requires no roa
   tools to the configured `RoasterDriver` boundary while preserving the default
   mock path, one-session store semantics, fail-closed emergency behavior, and
   no-live-hardware CI. Current first-crack components resolve
-  artifacts, capture audio windows, adapt detector outputs, and write to the
-  session timeline, but there is not yet a released-artifact ONNX runtime
-  backend, session-owned detector loop, or automatic T0 runtime path. Epic 4.1
+  released artifacts, capture audio windows, run the released ONNX detector
+  adapter, and write confirmed first crack to the session timeline through a
+  session-owned runtime. Automatic T0 remains a later Epic 4.1 story. Epic 4.1
   makes the operational MCP flow explicit: Claude should be able to start a
   roast, adjust the configured roaster, read current device/session state, and
   know whether first crack has happened before Epic 5 adds richer telemetry
@@ -163,6 +163,19 @@ The first implementation milestone is a mock vertical slice that requires no roa
   artifact paths, fake feature extraction, and fake ONNX sessions so normal CI
   remains mock-safe and requires no model download, microphone, Hottop hardware,
   or network.
+- `E4.1-S4` adds the session-owned first-crack runtime. In
+  `first_crack.mode: audio`, `start_roast_session` prepares the configured
+  audio capture pipeline and released-artifact ONNX detector adapter without
+  requiring CI to use real microphone input, real model files, Hottop hardware,
+  or network. Detector processing is activated only after authoritative T0 puts
+  the active session into `roasting`; queued windows are processed through the
+  existing detector adapter and `RoastSessionStore` integration path, confirmed
+  output records first crack exactly once, and capture/detector/artifact
+  failures are reflected through MCP first-crack status as `faulted` or
+  `unavailable` without crashing normal session control. The runtime stops on
+  confirmed first crack, explicit manual first-crack override, drop, cooling
+  completion, emergency stop, and process shutdown. Disabled and manual modes do
+  not start audio or detector runtime.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -170,9 +183,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Current Risks
 
-- The first-crack path does not yet include a released-artifact ONNX runtime
-  backend or session-owned detector loop; Epic 4.1 now tracks this before Epic
-  5 metrics/logging work.
+- Automatic T0 detection remains to be wired in E4.1-S6 before the fully
+  agent-driven roast path can avoid `mark_beans_added` as its primary T0 path.
 - MCP Registry publishing is preview and needs verification before release.
 - First-crack event integration must preserve one authoritative session timeline.
 - Log schema changes need compatibility discipline once users start collecting roast logs.
@@ -383,7 +395,7 @@ first crack has happened through MCP tools.
     existing released-artifact resolver boundary, with mock-safe tests and no
     training, export, or Hugging Face sync behavior.
 
-- [ ] `E4.1-S4` Start first-crack detection runtime with roast sessions.
+- [x] `E4.1-S4` Start first-crack detection runtime with roast sessions.
   - Done when audio mode starts/stops the configured audio pipeline and detector
     runtime with the roast session, records confirmed first crack exactly once,
     exposes disabled/manual/pending/detected/faulted/unavailable status through
@@ -1142,6 +1154,36 @@ After completing a story:
     43 passed.
   - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
     272 passed, required coverage `90.0%` reached, total coverage `90.45%`.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4.1-S4:
+  - Added `FirstCrackSessionRuntime` as the session-owned coordinator for audio
+    capture and detector processing. `start_roast_session` now prepares the
+    runtime in `first_crack.mode: audio`, while disabled and manual modes do not
+    start audio or detector runtime.
+  - Runtime processing drains queued audio windows only for the owning active
+    session after authoritative T0 moves the session into `roasting`, then uses
+    the existing detector adapter plus `RoastSessionStore` integration helper to
+    record confirmed first crack exactly once.
+  - `get_roast_state.first_crack_status` now reflects runtime-level
+    `pending`, `detected`, `faulted`, and `unavailable` audio-mode status,
+    including artifact, audio-capture, and detector failures, without crashing
+    normal session control.
+  - Runtime stop is wired to confirmed first crack, explicit
+    `mark_first_crack` override, `drop_beans`, `stop_cooling`,
+    `emergency_stop`, and MCP process shutdown. No automatic T0 implementation,
+    rolling telemetry metrics, final log schemas, model training/export/sync,
+    real microphone validation, live Hottop validation, or broad release
+    validation was added.
+  - Added fake-backed tests for disabled/manual no-start behavior, audio-mode
+    preparation, activation after beans-added, no-confirmation pending status,
+    duplicate confirmation handling, artifact unavailability, capture faults,
+    detector faults, and terminal runtime stop behavior.
+  - Ran `./.venv/bin/python -m pytest tests/test_first_crack_runtime.py tests/test_mcp_server.py tests/test_first_crack_integration.py`:
+    29 passed.
+  - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
+    280 passed, required coverage `90.0%` reached, total coverage `90.15%`.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

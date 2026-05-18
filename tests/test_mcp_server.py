@@ -6,14 +6,18 @@ import json
 from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from mcp.server.fastmcp import FastMCP
 
 from coffee_roaster_mcp.drivers import EmergencyStopResult, MockRoasterDriver, RoasterState
+from coffee_roaster_mcp.first_crack_runtime import (
+    FirstCrackRuntimeSnapshot,
+    FirstCrackRuntimeState,
+)
 from coffee_roaster_mcp.mcp_server import ServerContext, build_server_context, create_mcp_server
-from coffee_roaster_mcp.session import SessionLifecycleError
+from coffee_roaster_mcp.session import RoastSession, RoastSessionStore, SessionLifecycleError
 
 
 def test_in_process_mcp_tools_cover_mock_roast_and_export(tmp_path: Path) -> None:
@@ -96,6 +100,7 @@ def test_in_process_mcp_tools_surface_errors_and_audio_bootstrap_state(tmp_path:
         encoding="utf-8",
     )
     server_context = build_server_context(config_path=config_path)
+    _set_first_crack_runtime(server_context, FakeFirstCrackRuntime())
     server = create_mcp_server(config_path=config_path)
     ctx = _ctx(server_context)
 
@@ -217,6 +222,82 @@ def test_get_roast_state_driver_read_failure_does_not_mutate_session(
     assert state.phase == "roasting"
 
 
+def test_get_roast_state_reads_driver_before_detector_side_effects(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "first_crack:",
+                "  mode: audio",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(fail_read=True)
+    runtime = FakeFirstCrackRuntime(record_first_crack_on_process=False)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    _set_first_crack_runtime(server_context, runtime)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    runtime.record_first_crack_on_process = True
+
+    with pytest.raises(RuntimeError, match="Could not read current roaster state"):
+        _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+
+    failed_read_snapshot = server_context.session_store.get_session_snapshot(
+        session_id=start_result.session.session_id
+    )
+    assert failed_read_snapshot.first_crack_at_utc is None
+    assert runtime.processed_sessions == [start_result.session.session_id]
+
+    driver.fail_read = False
+    state = _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+
+    assert state.phase == "development"
+    assert state.first_crack_at_utc is not None
+    assert [event.kind for event in state.events] == [
+        "beans_added",
+        "first_crack_detected",
+    ]
+
+
+def test_mark_beans_added_returns_snapshot_after_immediate_detector_confirmation(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "first_crack:",
+                "  mode: audio",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    _set_first_crack_runtime(
+        server_context,
+        FakeFirstCrackRuntime(record_first_crack_on_process=True),
+    )
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    beans_added = _call_tool(server, "mark_beans_added", ctx)
+
+    assert beans_added.event.kind == "beans_added"
+    assert beans_added.phase == "development"
+    assert beans_added.event_count == 2
+
+
 def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
     manual_config_path = tmp_path / "manual.yaml"
     manual_config_path.write_text(
@@ -287,6 +368,8 @@ def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     audio_context = build_server_context(config_path=audio_config_path)
+    audio_runtime = FakeFirstCrackRuntime()
+    _set_first_crack_runtime(audio_context, audio_runtime)
     audio_server = create_mcp_server(config_path=audio_config_path)
     audio_ctx = _ctx(audio_context)
     audio_start = _call_tool(audio_server, "start_roast_session", audio_ctx)
@@ -312,6 +395,39 @@ def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
         detected_state.first_crack_status.detected_monotonic_seconds
         == detected.event.monotonic_seconds
     )
+    assert audio_runtime.stopped_sessions == [audio_start.session.session_id]
+
+    audio_unavailable_config_path = tmp_path / "audio-unavailable.yaml"
+    audio_unavailable_config_path.write_text(
+        "\n".join(
+            [
+                "first_crack:",
+                "  mode: audio",
+                f"logging:\n  log_dir: {tmp_path / 'audio-unavailable-logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    audio_unavailable_context = build_server_context(config_path=audio_unavailable_config_path)
+    _set_first_crack_runtime(
+        audio_unavailable_context,
+        FakeFirstCrackRuntime(status="unavailable", reason="missing detector artifacts"),
+    )
+    audio_unavailable_server = create_mcp_server(config_path=audio_unavailable_config_path)
+    audio_unavailable_ctx = _ctx(audio_unavailable_context)
+    audio_unavailable_start = _call_tool(
+        audio_unavailable_server,
+        "start_roast_session",
+        audio_unavailable_ctx,
+    )
+    audio_unavailable_state = _call_tool(
+        audio_unavailable_server,
+        "get_roast_state",
+        audio_unavailable_ctx,
+        session_id=audio_unavailable_start.session.session_id,
+    )
+    assert audio_unavailable_state.first_crack_status.status == "unavailable"
+    assert audio_unavailable_state.first_crack_status.reason == "missing detector artifacts"
 
     fault_config_path = tmp_path / "fault.yaml"
     fault_config_path.write_text(
@@ -325,6 +441,7 @@ def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     fault_context = build_server_context(config_path=fault_config_path)
+    _set_first_crack_runtime(fault_context, FakeFirstCrackRuntime())
     fault_server = create_mcp_server(config_path=fault_config_path)
     fault_ctx = _ctx(fault_context)
     fault_start = _call_tool(fault_server, "start_roast_session", fault_ctx)
@@ -712,9 +829,68 @@ class RecordingRoasterDriver:
         )
 
 
+class FakeFirstCrackRuntime:
+    """Runtime double that keeps audio-mode MCP tests network-free."""
+
+    def __init__(
+        self,
+        *,
+        status: str = "pending",
+        reason: str | None = None,
+        record_first_crack_on_process: bool = False,
+    ) -> None:
+        self.status = status
+        self.reason = reason
+        self.record_first_crack_on_process = record_first_crack_on_process
+        self.active_session_id: str | None = None
+        self.started_sessions: list[str] = []
+        self.processed_sessions: list[str] = []
+        self.stopped_sessions: list[str] = []
+
+    def start_for_session(self, session: RoastSession) -> FirstCrackRuntimeSnapshot:
+        self.active_session_id = session.id
+        self.started_sessions.append(session.id)
+        return self.snapshot()
+
+    def process_available_windows(
+        self,
+        *,
+        session_store: RoastSessionStore,
+        session: RoastSession,
+    ) -> FirstCrackRuntimeSnapshot:
+        self.processed_sessions.append(session.id)
+        if self.record_first_crack_on_process and session.first_crack_at_utc is None:
+            session_store.record_event_snapshot(session, "first_crack_detected")
+            self.status = "detected"
+        return self.snapshot()
+
+    def stop_for_session(self, session_id: str, *, reason: str) -> FirstCrackRuntimeSnapshot:
+        self.stopped_sessions.append(session_id)
+        self.reason = reason
+        return self.snapshot()
+
+    def shutdown(self) -> FirstCrackRuntimeSnapshot:
+        return self.snapshot()
+
+    def snapshot(self) -> FirstCrackRuntimeSnapshot:
+        return FirstCrackRuntimeSnapshot(
+            status=cast(FirstCrackRuntimeState, self.status),
+            active_session_id=self.active_session_id,
+            active=self.active_session_id is not None,
+            reason=self.reason,
+        )
+
+
 def _ctx(server_context: ServerContext) -> Any:
     """Build the minimal context shape used by FastMCP tool functions."""
     return SimpleNamespace(request_context=SimpleNamespace(lifespan_context=server_context))
+
+
+def _set_first_crack_runtime(
+    server_context: ServerContext,
+    runtime: FakeFirstCrackRuntime,
+) -> None:
+    object.__setattr__(server_context, "first_crack_runtime", runtime)
 
 
 def _record_tool_error(

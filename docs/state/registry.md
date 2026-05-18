@@ -122,14 +122,27 @@ Backend output is adapted into the existing detector confidence metadata path.
 Normal CI remains mock-safe through fake artifact paths, fake feature
 extraction, and fake ONNX sessions.
 
+E4.1-S4 starts and stops a session-owned first-crack runtime when
+`first_crack.mode: audio` is configured. Starting a roast session now prepares
+the configured audio capture pipeline and released-artifact ONNX detector
+adapter; preparation failures such as missing artifacts, unavailable audio
+capture, or detector dependency failures are reflected through
+`get_roast_state.first_crack_status` as `unavailable` instead of crashing normal
+session control. During active `roasting` after T0, queued detector windows are
+processed through the existing detector/session integration helper and confirmed
+output records exactly one authoritative `first_crack_detected` event. Runtime
+capture or detector errors surface as `faulted` first-crack status. The runtime
+stops on first-crack confirmation, explicit manual first-crack override, drop,
+cooling completion, emergency stop, and process shutdown. Disabled and manual
+modes still do not start audio or detector runtime.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E4.1-S4: start first-crack detection runtime with roast
-sessions.
+The next story is E4.1-S5: add MCP operational readiness tests and docs.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
