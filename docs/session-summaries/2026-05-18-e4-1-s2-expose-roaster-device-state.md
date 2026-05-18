@@ -55,6 +55,21 @@ Behavior implemented:
   or faulted. The status enum also reserves `unavailable` for later detector
   runtime failures when E4.1-S4 owns detector startup.
 
+## PR Review Fixes
+
+Review `4312989085` on `PR #110` found one relevant issue:
+
+- Manual first-crack mode with `allow_manual_override: false` returned
+  `status="manual"` and a reason telling clients to wait for
+  `mark_first_crack`, even though that tool is rejected by configuration.
+
+Fix:
+
+- `get_roast_state` now reports first-crack `status="unavailable"` for
+  `first_crack.mode: manual` plus `allow_manual_override: false`, with a reason
+  that explicitly says manual override is disabled.
+- Added MCP regression coverage for that configuration.
+
 Out of scope kept out:
 
 - Rolling telemetry retention, 60-second deltas, RoR, and final log schemas.
@@ -70,6 +85,13 @@ Out of scope kept out:
 - Ran `./.venv/bin/python -m pytest tests/test_package.py`: `15 passed`.
 - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
   `253 passed`, required coverage `90.0%` reached, total coverage `90.56%`.
+- Ran `./.venv/bin/python -m ruff check .`: passed.
+- Ran `./.venv/bin/python -m ruff format --check .`: passed.
+- Ran `./.venv/bin/python -m pyright`: `0 errors`.
+
+Review-fix validation:
+
+- Ran `./.venv/bin/python -m pytest tests/test_mcp_server.py`: `14 passed`.
 - Ran `./.venv/bin/python -m ruff check .`: passed.
 - Ran `./.venv/bin/python -m ruff format --check .`: passed.
 - Ran `./.venv/bin/python -m pyright`: `0 errors`.

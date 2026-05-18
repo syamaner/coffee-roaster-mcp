@@ -242,6 +242,39 @@ def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
     assert manual_state.first_crack_status.status == "manual"
     assert manual_state.first_crack_status.allow_manual_override is True
 
+    manual_unavailable_config_path = tmp_path / "manual-unavailable.yaml"
+    manual_unavailable_config_path.write_text(
+        "\n".join(
+            [
+                "first_crack:",
+                "  mode: manual",
+                "  allow_manual_override: false",
+                f"logging:\n  log_dir: {tmp_path / 'manual-unavailable-logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manual_unavailable_context = build_server_context(config_path=manual_unavailable_config_path)
+    manual_unavailable_server = create_mcp_server(config_path=manual_unavailable_config_path)
+    manual_unavailable_ctx = _ctx(manual_unavailable_context)
+    manual_unavailable_start = _call_tool(
+        manual_unavailable_server,
+        "start_roast_session",
+        manual_unavailable_ctx,
+    )
+    manual_unavailable_state = _call_tool(
+        manual_unavailable_server,
+        "get_roast_state",
+        manual_unavailable_ctx,
+        session_id=manual_unavailable_start.session.session_id,
+    )
+    assert manual_unavailable_state.first_crack_status.status == "unavailable"
+    assert manual_unavailable_state.first_crack_status.allow_manual_override is False
+    assert (
+        manual_unavailable_state.first_crack_status.reason
+        == "Manual first-crack mode is configured, but manual override is disabled."
+    )
+
     audio_config_path = tmp_path / "audio.yaml"
     audio_config_path.write_text(
         "\n".join(

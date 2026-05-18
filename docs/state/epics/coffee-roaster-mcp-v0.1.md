@@ -1052,6 +1052,9 @@ After completing a story:
     MCP output reports disabled, manual, pending, detected, or faulted from
     configuration and the authoritative session timeline; the status enum leaves
     room for unavailable runtime failures when E4.1-S4 owns detector startup.
+  - PR review hardening changed manual first-crack mode with
+    `allow_manual_override: false` to report `status="unavailable"` instead of
+    telling clients to wait for a rejected `mark_first_crack` override.
   - Driver state-read failures now surface as clear `get_roast_state` tool
     errors and do not mutate session history.
   - Kept rolling telemetry retention, RoR/60-second deltas, final log schemas,

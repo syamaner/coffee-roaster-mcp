@@ -854,6 +854,15 @@ def _serialize_first_crack_status(
             reason="Automatic first-crack detection is disabled by configuration.",
         )
     if config.first_crack.mode == "manual":
+        if not config.first_crack.allow_manual_override:
+            return FirstCrackStatus(
+                mode=config.first_crack.mode,
+                status="unavailable",
+                detected_at_utc=None,
+                detected_monotonic_seconds=None,
+                allow_manual_override=config.first_crack.allow_manual_override,
+                reason=("Manual first-crack mode is configured, but manual override is disabled."),
+            )
         return FirstCrackStatus(
             mode=config.first_crack.mode,
             status="manual",
