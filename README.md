@@ -91,7 +91,11 @@ The default local path is intentionally mock-safe:
 - no microphone required
 - no model download required
 
-RoastPilot now provides a real local stdio MCP server entrypoint plus the first mock-safe roast-session tool surface. Later Epic 2 stories still need to refine phase transitions, emergency-stop semantics, and the real log writers.
+RoastPilot now provides a local stdio MCP server entrypoint with a mock-safe
+roast-session tool surface. The default configuration lets an MCP client start
+a roast, adjust controls, read current device and session state, record explicit
+override events, drop beans into cooling, and export snapshot logs without
+roaster hardware, microphone input, model files, or network access.
 
 ### Start The Local MCP Server
 
@@ -116,6 +120,46 @@ The current MCP tool surface includes:
 - `emergency_stop`
 
 `export_roast_log` writes snapshot `roast.jsonl`, `roast.csv`, and `summary.json` files for the current in-process session. Append-only telemetry writers and final log schemas land in Epic 5.
+
+### Operational MCP Flow
+
+The mock-safe Claude/operator flow is:
+
+1. Call `start_roast_session` to create the one active roast session and connect
+   the configured driver.
+2. Call `set_heat` and `set_fan` as operational decisions require. These tools
+   go through the configured `RoasterDriver` boundary; the default mock driver
+   stays local and deterministic.
+3. Call `get_roast_state` to read both the authoritative session state and the
+   current configured-device state. The response includes driver id, connected
+   status, bean/environment temperatures when available, heat/fan levels,
+   cooling state, safe raw diagnostics, first-crack status, and lifecycle
+   timestamps for beans added, first crack, bean drop, cooling started, and
+   cooling stopped.
+4. Use `drop_beans` as the normal drop command. For the mock path and the
+   Hottop compound drop path, this records `beans_dropped`, records
+   `cooling_started` when the driver reports cooling active, turns heat off,
+   sets fan to `100%`, and enters the cooling phase.
+5. Use `stop_cooling` when cooling is complete. `start_cooling` remains
+   available as an explicit advanced/manual recovery tool, not as the normal
+   roast flow after `drop_beans`.
+
+`mark_beans_added` and `mark_first_crack` are explicit override tools. They are
+kept available for operator recovery and controlled manual runs. The primary
+automatic runtime paths are internal: automatic T0 detection is owned by
+E4.1-S6, and audio-mode first-crack confirmation is owned by the session-owned
+first-crack runtime when `first_crack.mode: audio` is deliberately configured.
+
+`get_roast_state.first_crack_status.status` is one of:
+
+- `disabled`: first-crack detection is disabled and no first-crack event exists.
+- `manual`: manual first-crack mode is configured and the override tool is
+  available.
+- `pending`: audio detection is configured and waiting for a confirmed event.
+- `detected`: the authoritative session timeline has a first-crack event.
+- `faulted`: the detector runtime or session has faulted.
+- `unavailable`: configuration, artifacts, audio capture, or manual-override
+  settings make first-crack detection unavailable.
 
 ### Mock-Safe Bootstrap Smoke
 
@@ -174,6 +218,16 @@ must be validated on a supervised roaster before the Hottop path is treated as
 release-ready. The current MCP roast-session tools call the configured driver
 boundary, so keep normal development on the mock driver unless a guarded Hottop
 validation run is explicitly intended.
+
+Optional live Hottop MCP validation is gated manual work. Run it only with a
+supervised roaster, an explicit `hottop_kn8828b_2k_plus` config, a known serial
+port, and a clear stop plan. Expected evidence for a pass is: the MCP client can
+start one session, set heat and fan, read connected device state with plausible
+temperatures, call `drop_beans` to trigger drop plus cooling, read
+`beans_dropped` and `cooling_started` timestamps from `get_roast_state`, stop
+cooling when the roaster reports cooling off, and preserve any failure as a
+fault event. Any serial, telemetry, command-loop, or safety uncertainty should
+be treated as a failed validation and should not be required by normal CI.
 
 ## Configuration
 
@@ -255,6 +309,17 @@ perform format conversion. On macOS, use the system sound settings or a
 are optional and should be run only when `first_crack.mode: audio` and
 `audio.source: microphone` are deliberately configured.
 
+Optional real microphone validation is gated manual work. Before running it,
+configure released Hugging Face ONNX artifacts or a validated
+`first_crack.local_model_dir`, select the intended microphone, and confirm the
+MCP process can start without artifact or audio-capture errors. Expected
+evidence for a pass is: `get_roast_state.first_crack_status` moves from
+`pending` to `detected` during a supervised roast or controlled replay, the
+recorded `first_crack_detected` event includes detector metadata, and normal
+roast controls continue to work. Missing artifacts, unavailable audio devices,
+and detector failures should surface as `unavailable` or `faulted` status and
+remain outside normal CI.
+
 `HF_HOME` is consumed by Hugging Face tooling directly rather than copied into the RoastPilot config object.
 
 ## Hugging Face Model Boundary
@@ -298,13 +363,16 @@ start audio capture or detector runtime.
 
 ## Log Export
 
-Roast log export is a planned v0.1 capability, not a completed runtime feature yet.
+RoastPilot currently supports snapshot export through `export_roast_log` for
+the active in-process session.
 
-The intended direction is:
+Current export files:
 
-- append-only JSONL during roast
-- CSV export for analysis
-- `summary.json` for session-level metadata
+- `roast.jsonl` with the current event timeline snapshot
+- `roast.csv` with the current event timeline snapshot
+- `summary.json` with current session-level metadata and timestamp-derived
+  metrics
 - output under `logs/roasts/{session_id}/`
 
-Those exports will be produced by the future MCP runtime once roast sessions, telemetry, and export flows are implemented in later epics. They are not available from the current bootstrap CLI yet.
+Append-only telemetry logging, rolling RoR metrics, development percentage
+hardening, and final log schemas land in Epic 5.
