@@ -21,6 +21,55 @@ from coffee_roaster_mcp.mcp_server import build_server_context, run_driver_emerg
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _T = TypeVar("_T")
 
+_EXPECTED_ROAST_STATE_KEYS = {
+    "active",
+    "beans_added_at_utc",
+    "beans_added_monotonic_seconds",
+    "beans_dropped_at_utc",
+    "beans_dropped_monotonic_seconds",
+    "cooling_on",
+    "cooling_started_at_utc",
+    "cooling_started_monotonic_seconds",
+    "cooling_stopped_at_utc",
+    "cooling_stopped_monotonic_seconds",
+    "created_at_utc",
+    "development_percent",
+    "development_time_seconds",
+    "device_state",
+    "elapsed_monotonic_seconds",
+    "events",
+    "fan_level_percent",
+    "faulted_at_utc",
+    "faulted_monotonic_seconds",
+    "first_crack_at_utc",
+    "first_crack_monotonic_seconds",
+    "first_crack_status",
+    "heat_level_percent",
+    "log_dir",
+    "phase",
+    "roast_elapsed_seconds",
+    "session_id",
+    "stopped_at_utc",
+}
+_EXPECTED_DEVICE_STATE_KEYS = {
+    "bean_temp_c",
+    "connected",
+    "cooling_on",
+    "driver",
+    "env_temp_c",
+    "fan_level_percent",
+    "heat_level_percent",
+    "raw_vendor_data",
+}
+_EXPECTED_FIRST_CRACK_STATUS_KEYS = {
+    "allow_manual_override",
+    "detected_at_utc",
+    "detected_monotonic_seconds",
+    "mode",
+    "reason",
+    "status",
+}
+
 
 def test_version_is_defined() -> None:
     assert __version__ == "0.1.0"
@@ -216,22 +265,62 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
                 session.call_tool("get_roast_state", {"session_id": session_id})
             ),
         )
-        assert state_result.structuredContent["session_id"] == session_id
-        assert state_result.structuredContent["active"] is False
-        assert state_result.structuredContent["heat_level_percent"] == 0
-        assert state_result.structuredContent["fan_level_percent"] == 100
-        assert state_result.structuredContent["cooling_on"] is False
-        assert state_result.structuredContent["roast_elapsed_seconds"] is not None
-        assert state_result.structuredContent["development_time_seconds"] is not None
-        assert state_result.structuredContent["development_percent"] is not None
-        assert [event["kind"] for event in state_result.structuredContent["events"]] == [
+        state_content = state_result.structuredContent
+        assert state_content is not None
+        assert set(state_content) == _EXPECTED_ROAST_STATE_KEYS
+        assert state_content["session_id"] == session_id
+        assert state_content["active"] is False
+        assert state_content["phase"] == "complete"
+        assert state_content["heat_level_percent"] == 0
+        assert state_content["fan_level_percent"] == 100
+        assert state_content["cooling_on"] is False
+        assert state_content["roast_elapsed_seconds"] is not None
+        assert state_content["development_time_seconds"] is not None
+        assert state_content["development_percent"] is not None
+
+        device_state = state_content["device_state"]
+        assert set(device_state) == _EXPECTED_DEVICE_STATE_KEYS
+        assert device_state["driver"] == "mock"
+        assert device_state["connected"] is True
+        assert device_state["bean_temp_c"] is not None
+        assert device_state["env_temp_c"] is not None
+        assert device_state["heat_level_percent"] == 0
+        assert device_state["fan_level_percent"] == 100
+        assert device_state["cooling_on"] is False
+        assert isinstance(device_state["raw_vendor_data"], dict)
+
+        first_crack_status = state_content["first_crack_status"]
+        assert set(first_crack_status) == _EXPECTED_FIRST_CRACK_STATUS_KEYS
+        assert first_crack_status["mode"] == "disabled"
+        assert first_crack_status["status"] == "detected"
+        assert first_crack_status["detected_at_utc"] == state_content["first_crack_at_utc"]
+        assert (
+            first_crack_status["detected_monotonic_seconds"]
+            == state_content["first_crack_monotonic_seconds"]
+        )
+        assert first_crack_status["allow_manual_override"] is True
+        assert first_crack_status["reason"] is None
+
+        assert state_content["beans_added_at_utc"] is not None
+        assert state_content["beans_added_monotonic_seconds"] is not None
+        assert state_content["first_crack_at_utc"] is not None
+        assert state_content["first_crack_monotonic_seconds"] is not None
+        assert state_content["beans_dropped_at_utc"] is not None
+        assert state_content["beans_dropped_monotonic_seconds"] is not None
+        assert state_content["cooling_started_at_utc"] is not None
+        assert state_content["cooling_started_monotonic_seconds"] is not None
+        assert state_content["cooling_stopped_at_utc"] is not None
+        assert state_content["cooling_stopped_monotonic_seconds"] is not None
+        assert state_content["faulted_at_utc"] is None
+        assert state_content["faulted_monotonic_seconds"] is None
+        assert [event["kind"] for event in state_content["events"]] == [
             "beans_added",
             "first_crack_detected",
             "beans_dropped",
             "cooling_started",
             "cooling_stopped",
         ]
-        assert state_result.structuredContent["events"][2]["payload"] == {}
+        assert state_content["events"][2]["payload"] == {}
 
         export_result = cast(
             Any,

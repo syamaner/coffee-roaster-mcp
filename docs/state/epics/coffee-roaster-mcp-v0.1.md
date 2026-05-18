@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4.1-S5`
-- Current target: Add MCP operational readiness tests and docs
+- Active story: `E4.1-S6`
+- Current target: Add automatic T0 runtime path
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -176,6 +176,16 @@ The first implementation milestone is a mock vertical slice that requires no roa
   confirmed first crack, explicit manual first-crack override, drop, cooling
   completion, emergency stop, and process shutdown. Disabled and manual modes do
   not start audio or detector runtime.
+- `E4.1-S5` adds operational MCP readiness coverage and docs before Epic 5.
+  The public stdio MCP test path now covers the mock-safe Claude/operator flow:
+  start a roast, set heat and fan, use explicit override tools when needed,
+  drop beans through the normal drop/cooling command, stop cooling, read current
+  device/session state, understand first-crack status, and export snapshot logs.
+  The same coverage asserts `get_roast_state` schemas for lifecycle timestamps,
+  configured-device state, and first-crack status to prevent accidental tool
+  shape drift. README docs now explain the operational flow, first-crack status
+  meanings, explicit override semantics, and gated optional live Hottop/real
+  microphone validation evidence.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -403,7 +413,7 @@ first crack has happened through MCP tools.
     `mark_first_crack` remains only the explicit manual override path when
     configuration allows it.
 
-- [ ] `E4.1-S5` Add MCP operational readiness tests and docs.
+- [x] `E4.1-S5` Add MCP operational readiness tests and docs.
   - Done when automated MCP tests cover the local Claude-installed operational
     flow on the mock-safe path, MCP response schemas for device state and
     first-crack status are asserted, override-tool semantics for
@@ -1182,6 +1192,29 @@ After completing a story:
     detector faults, and terminal runtime stop behavior.
   - Ran `./.venv/bin/python -m pytest tests/test_first_crack_runtime.py tests/test_mcp_server.py tests/test_first_crack_integration.py`:
     29 passed.
+  - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
+    280 passed, required coverage `90.0%` reached, total coverage `90.15%`.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4.1-S5:
+  - Strengthened the public stdio MCP mock-roast test to assert the operational
+    Claude/operator flow through public tools: start session, set heat and fan,
+    record explicit beans-added and first-crack overrides, use `drop_beans` as
+    the normal drop/cooling command, stop cooling, read state, export snapshot
+    logs, and start a later session after completion or fault.
+  - Added schema assertions for `get_roast_state`, nested `device_state`, and
+    nested `first_crack_status`, including lifecycle timestamp fields for beans
+    added, first crack, bean drop, cooling started, and cooling stopped.
+  - Updated README operator docs for the current MCP flow, first-crack status
+    values, override tool semantics, `drop_beans` as the normal cooling
+    transition, and gated optional live Hottop/real microphone validation
+    evidence.
+  - Kept automatic T0 implementation, rolling telemetry metrics, final log
+    schemas, model training/export/sync, real microphone validation, live
+    Hottop validation, and broad release validation out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_package.py tests/test_mcp_server.py`:
+    31 passed.
   - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
     280 passed, required coverage `90.0%` reached, total coverage `90.15%`.
   - Ran `./.venv/bin/python -m ruff check .`: passed.

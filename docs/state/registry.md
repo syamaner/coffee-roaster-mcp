@@ -136,13 +136,25 @@ stops on first-crack confirmation, explicit manual first-crack override, drop,
 cooling completion, emergency stop, and process shutdown. Disabled and manual
 modes still do not start audio or detector runtime.
 
+E4.1-S5 added operational MCP readiness coverage and docs before Epic 5. The
+stdio MCP test path now asserts the public mock-safe Claude/operator flow:
+start a roast, set heat and fan, use explicit override tools when needed, drop
+beans through the normal drop/cooling command, stop cooling, read device/session
+state, and export current snapshot logs. The same test now pins
+`get_roast_state` response schemas for lifecycle timestamps, configured-device
+state, and first-crack status so accidental tool-shape drift is caught. README
+docs now explain the normal operational MCP flow, first-crack status meanings,
+explicit override semantics for `mark_beans_added` and `mark_first_crack`,
+`drop_beans` as the normal cooling transition, and gated optional live
+Hottop/real microphone validation evidence. Normal CI remains mock-safe.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E4.1-S5: add MCP operational readiness tests and docs.
+The next story is E4.1-S6: add automatic T0 runtime path.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
