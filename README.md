@@ -272,7 +272,12 @@ Current first-crack defaults are kept safe for local development:
 - `precision: int8`
 - `repo_id: syamaner/coffee-first-crack-detection`
 
-That default keeps local setup free from Hugging Face network access until first-crack runtime stories are implemented.
+That default keeps local setup free from Hugging Face network access until
+audio mode is deliberately configured.
+When `first_crack.mode: audio` is deliberately configured, RoastPilot consumes
+the released ONNX artifacts with ONNX Runtime and the released AST preprocessor
+config with `transformers.ASTFeatureExtractor`; model training, export, and Hub
+publishing remain outside this repository.
 
 ## Log Export
 

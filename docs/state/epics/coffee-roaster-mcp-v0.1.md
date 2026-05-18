@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4.1-S3`
-- Current target: Add released-artifact ONNX first-crack detector backend
+- Active story: `E4.1-S4`
+- Current target: Start first-crack detection runtime with roast sessions
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -153,6 +153,16 @@ The first implementation milestone is a mock vertical slice that requires no roa
   the runtime should track the max preheat/charge bean temperature before T0,
   then record `beans_added` when current bean temperature drops from that max by
   the configured threshold. The pre-drop max is the charge temperature.
+- `E4.1-S3` adds the released-artifact ONNX first-crack detector backend
+  without starting any session-owned detector loop. `first_crack.mode: audio`
+  can now resolve the configured precision-specific Hugging Face artifacts,
+  load `onnx/{precision}/preprocessor_config.json` through
+  `transformers.ASTFeatureExtractor`, create an ONNX Runtime CPU session for the
+  resolved ONNX model using configured thread limits, and adapt model logits
+  into existing detector outputs with first-crack confidence. Tests use fake
+  artifact paths, fake feature extraction, and fake ONNX sessions so normal CI
+  remains mock-safe and requires no model download, microphone, Hottop hardware,
+  or network.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -367,7 +377,7 @@ first crack has happened through MCP tools.
     crack, bean drop, cooling start, and cooling stop, without implementing Epic
     5 rolling metrics.
 
-- [ ] `E4.1-S3` Add released-artifact ONNX first-crack detector backend.
+- [x] `E4.1-S3` Add released-artifact ONNX first-crack detector backend.
   - Done when `first_crack.mode: audio` can construct a detector backend from
     the resolved Hugging Face ONNX model and feature-extractor config using the
     existing released-artifact resolver boundary, with mock-safe tests and no
@@ -1105,6 +1115,33 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest tests/test_package.py`: 15 passed.
   - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
     253 passed, required coverage `90.0%` reached, total coverage `90.56%`.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4.1-S3:
+  - Added `OnnxFirstCrackDetectorBackend` and
+    `build_released_onnx_first_crack_detector_adapter(...)` so
+    `first_crack.mode: audio` can resolve the configured released Hugging Face
+    detector artifacts, load the precision-specific
+    `preprocessor_config.json`, construct an ONNX Runtime CPU session for the
+    resolved ONNX model, and feed output through the existing detector adapter
+    metadata path.
+  - Added lazy, clearly failing runtime dependency boundaries for
+    `onnxruntime` and `transformers.ASTFeatureExtractor`; default mock
+    configuration still does not import or start either dependency.
+  - Added fake-backed tests for INT8/FP32 artifact resolution, ONNX session
+    construction, AST feature-extractor construction, confidence parsing,
+    sample-rate validation, missing/invalid preprocessor config, missing model
+    inputs, empty outputs, and dependency failures without requiring model
+    downloads, real ONNX files, microphone input, Hottop hardware, or network.
+  - Kept session-owned detector startup, audio capture lifecycle wiring,
+    automatic T0, rolling metrics, final log schemas, model training, ONNX
+    export, Hugging Face sync, real microphone validation, live Hottop
+    validation, and broad release validation out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_detector.py tests/test_artifacts.py`:
+    43 passed.
+  - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
+    272 passed, required coverage `90.0%` reached, total coverage `90.45%`.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

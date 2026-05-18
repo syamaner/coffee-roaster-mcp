@@ -111,14 +111,25 @@ state-read failures surface clearly and do not mutate session history. Epic 5
 remains focused on telemetry buffering, derived metrics, and final log/export
 schemas.
 
+E4.1-S3 added the released-artifact ONNX first-crack detector backend without
+starting any session-owned detector lifecycle. `first_crack.mode: audio` can
+now construct an ONNX detector adapter from the existing released-artifact
+resolver boundary: configured INT8/FP32 artifacts resolve from Hugging Face or
+`local_model_dir`, the precision-specific `preprocessor_config.json` is loaded
+through `transformers.ASTFeatureExtractor`, and the resolved ONNX model is
+opened through an ONNX Runtime CPU session using configured thread limits.
+Backend output is adapted into the existing detector confidence metadata path.
+Normal CI remains mock-safe through fake artifact paths, fake feature
+extraction, and fake ONNX sessions.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E4.1-S3: add the released-artifact ONNX first-crack detector
-backend.
+The next story is E4.1-S4: start first-crack detection runtime with roast
+sessions.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
