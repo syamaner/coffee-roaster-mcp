@@ -104,6 +104,7 @@ class RuntimeConfigSnapshot:
         log_dir: Configured log directory.
         sample_interval_seconds: Telemetry sample interval in seconds.
         auto_t0_detection_enabled: Whether automatic T0 detection is enabled.
+        auto_t0_drop_threshold_c: Bean-temperature drop threshold for automatic T0.
     """
 
     config_source: str | None
@@ -119,6 +120,7 @@ class RuntimeConfigSnapshot:
     log_dir: str
     sample_interval_seconds: float
     auto_t0_detection_enabled: bool
+    auto_t0_drop_threshold_c: float
 
 
 @dataclass(frozen=True)
@@ -187,6 +189,32 @@ class FirstCrackStatus:
     reason: str | None = None
 
 
+T0RuntimeStatus = Literal["disabled", "pending", "detected", "unavailable"]
+
+
+@dataclass(frozen=True)
+class T0Status:
+    """Serializable automatic T0 status for operator decisions.
+
+    Attributes:
+        auto_detection_enabled: Whether automatic T0 detection is enabled.
+        status: Current automatic T0 detection status.
+        charge_temperature_c: Max preheat/charge bean temperature seen before T0.
+        current_drop_c: Current drop from charge temperature when available.
+        drop_threshold_c: Configured bean-temperature drop threshold.
+        detected_bean_temperature_c: Bean temperature at the detected T0 reading.
+        reason: Human-readable reason when status needs extra context.
+    """
+
+    auto_detection_enabled: bool
+    status: T0RuntimeStatus
+    charge_temperature_c: float | None
+    current_drop_c: float | None
+    drop_threshold_c: float
+    detected_bean_temperature_c: float | None
+    reason: str | None = None
+
+
 @dataclass(frozen=True)
 class RoastSessionState:
     """Serializable roast session state returned by MCP tools."""
@@ -216,6 +244,7 @@ class RoastSessionState:
     development_time_seconds: float | None
     development_percent: float | None
     device_state: RoasterDeviceState | None
+    t0_status: T0Status
     first_crack_status: FirstCrackStatus
     events: tuple[EventSnapshot, ...]
     log_dir: str | None
@@ -386,6 +415,7 @@ def create_mcp_server(
             log_dir=str(config.logging.log_dir),
             sample_interval_seconds=config.logging.sample_interval_seconds,
             auto_t0_detection_enabled=config.session.auto_t0_detection_enabled,
+            auto_t0_drop_threshold_c=config.session.auto_t0_drop_threshold_c,
         )
 
     @mcp.tool()
@@ -419,6 +449,11 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
         device_state = _read_current_device_state(server_context)
+        _process_auto_t0_for_active_session(
+            server_context,
+            session_id=session_id,
+            device_state=device_state,
+        )
         _process_first_crack_runtime_for_active_session(server_context, session_id=session_id)
         session = _resolve_session(server_context, session_id=session_id)
         return _serialize_session_state(
@@ -655,6 +690,31 @@ def _process_first_crack_runtime_for_active_session(
     )
 
 
+def _process_auto_t0_for_active_session(
+    server_context: ServerContext,
+    *,
+    session_id: str | None,
+    device_state: RoasterDeviceState,
+) -> None:
+    """Process automatic T0 after a successful configured-driver state read."""
+    if not server_context.config.session.auto_t0_detection_enabled:
+        return
+    active_session = server_context.session_store.get_active_session()
+    if active_session is None:
+        return
+    if session_id is not None and session_id != active_session.id:
+        return
+    if active_session.phase != "pre_roast" or active_session.beans_added_at_utc is not None:
+        return
+    if device_state.bean_temp_c is None:
+        return
+    server_context.session_store.process_auto_t0_reading_snapshot(
+        active_session,
+        bean_temp_c=device_state.bean_temp_c,
+        drop_threshold_c=server_context.config.session.auto_t0_drop_threshold_c,
+    )
+
+
 def _run_reserved_driver_control(
     server_context: ServerContext,
     session: RoastSession,
@@ -877,6 +937,7 @@ def _serialize_session_state(
         development_time_seconds=metrics.development_time_seconds,
         development_percent=metrics.development_percent,
         device_state=device_state,
+        t0_status=_serialize_t0_status(session, config=config),
         first_crack_status=_serialize_first_crack_status(
             session,
             config=config,
@@ -984,6 +1045,76 @@ def _serialize_first_crack_status(
         allow_manual_override=config.first_crack.allow_manual_override,
         reason=reason,
     )
+
+
+def _serialize_t0_status(session: RoastSession, *, config: AppConfig) -> T0Status:
+    """Derive automatic T0 status from config and the session timeline."""
+    beans_added_event = next(
+        (event for event in session.event_timeline if event.kind == "beans_added"),
+        None,
+    )
+    detected_temp = None
+    if beans_added_event is not None:
+        payload_value = beans_added_event.payload.get("detected_bean_temperature_c")
+        if isinstance(payload_value, (int, float)) and not isinstance(payload_value, bool):
+            detected_temp = float(payload_value)
+    if session.beans_added_at_utc is not None:
+        return T0Status(
+            auto_detection_enabled=config.session.auto_t0_detection_enabled,
+            status="detected",
+            charge_temperature_c=_event_or_session_charge_temperature(
+                beans_added_event,
+                session,
+            ),
+            current_drop_c=session.auto_t0_current_drop_c,
+            drop_threshold_c=config.session.auto_t0_drop_threshold_c,
+            detected_bean_temperature_c=detected_temp,
+        )
+    if not config.session.auto_t0_detection_enabled:
+        return T0Status(
+            auto_detection_enabled=False,
+            status="disabled",
+            charge_temperature_c=session.auto_t0_charge_temperature_c,
+            current_drop_c=session.auto_t0_current_drop_c,
+            drop_threshold_c=config.session.auto_t0_drop_threshold_c,
+            detected_bean_temperature_c=None,
+            reason="Automatic T0 detection is disabled by configuration.",
+        )
+    if session.phase != "pre_roast":
+        return T0Status(
+            auto_detection_enabled=True,
+            status="unavailable",
+            charge_temperature_c=session.auto_t0_charge_temperature_c,
+            current_drop_c=session.auto_t0_current_drop_c,
+            drop_threshold_c=config.session.auto_t0_drop_threshold_c,
+            detected_bean_temperature_c=None,
+            reason=f"Automatic T0 is unavailable while phase is {session.phase}.",
+        )
+    reason = "Waiting for bean temperature to drop from tracked charge temperature."
+    if session.auto_t0_preheat_sample_count == 0:
+        reason = "Waiting for a valid preheat bean-temperature reading."
+    elif session.auto_t0_preheat_sample_count == 1:
+        reason = "Waiting for a second valid bean-temperature reading before detecting T0."
+    return T0Status(
+        auto_detection_enabled=True,
+        status="pending",
+        charge_temperature_c=session.auto_t0_charge_temperature_c,
+        current_drop_c=session.auto_t0_current_drop_c,
+        drop_threshold_c=config.session.auto_t0_drop_threshold_c,
+        detected_bean_temperature_c=None,
+        reason=reason,
+    )
+
+
+def _event_or_session_charge_temperature(
+    event: RoastEvent | None,
+    session: RoastSession,
+) -> float | None:
+    if event is not None:
+        value = event.payload.get("charge_temperature_c")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return session.auto_t0_charge_temperature_c
 
 
 def _serialize_control_result(session: RoastSession) -> ControlCommandResult:

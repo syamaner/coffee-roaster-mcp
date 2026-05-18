@@ -283,6 +283,120 @@ def test_record_event_allows_drop_directly_from_roasting_phase() -> None:
     assert session.first_crack_at_utc is None
 
 
+def test_auto_t0_records_beans_added_from_drop_against_preheat_max() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    event, first_snapshot = store.process_auto_t0_reading_snapshot(
+        session,
+        bean_temp_c=170.0,
+        drop_threshold_c=25.0,
+    )
+    assert event is None
+    assert first_snapshot.phase == "pre_roast"
+    assert first_snapshot.auto_t0_charge_temperature_c == 170.0
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    event, snapshot = store.process_auto_t0_reading_snapshot(
+        session,
+        bean_temp_c=143.5,
+        drop_threshold_c=25.0,
+    )
+
+    assert event is not None
+    assert event.kind == "beans_added"
+    assert event.recorded_at_utc == clock.utc_value
+    assert event.monotonic_seconds == 5.0
+    assert event.payload == {
+        "source": "auto_t0",
+        "charge_temperature_c": 170.0,
+        "detected_bean_temperature_c": 143.5,
+        "drop_c": 26.5,
+        "drop_threshold_c": 25.0,
+    }
+    assert snapshot.phase == "roasting"
+    assert snapshot.beans_added_at_utc == clock.utc_value
+    assert snapshot.auto_t0_charge_temperature_c == 170.0
+    assert snapshot.auto_t0_current_drop_c == 26.5
+
+
+def test_auto_t0_uses_max_preheat_for_gradual_drop() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    for bean_temp_c in (160.0, 170.0, 162.0, 151.0):
+        event, _ = store.process_auto_t0_reading_snapshot(
+            session,
+            bean_temp_c=bean_temp_c,
+            drop_threshold_c=25.0,
+        )
+        assert event is None
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
+    clock.monotonic_value = 112.0
+    event, snapshot = store.process_auto_t0_reading_snapshot(
+        session,
+        bean_temp_c=144.9,
+        drop_threshold_c=25.0,
+    )
+
+    assert event is not None
+    assert event.kind == "beans_added"
+    assert event.payload["charge_temperature_c"] == 170.0
+    assert event.payload["drop_c"] == 25.1
+    assert snapshot.phase == "roasting"
+
+
+def test_auto_t0_does_not_guess_without_preheat_baseline() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    event, snapshot = store.process_auto_t0_reading_snapshot(
+        session,
+        bean_temp_c=120.0,
+        drop_threshold_c=25.0,
+    )
+
+    assert event is None
+    assert snapshot.phase == "pre_roast"
+    assert snapshot.beans_added_at_utc is None
+    assert snapshot.auto_t0_charge_temperature_c == 120.0
+    assert snapshot.auto_t0_current_drop_c == 0.0
+
+
+def test_auto_t0_rejects_invalid_phase_after_manual_override() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+    manual_event = store.record_event(session, "beans_added")
+
+    event, snapshot = store.process_auto_t0_reading_snapshot(
+        session,
+        bean_temp_c=140.0,
+        drop_threshold_c=25.0,
+    )
+
+    assert event == manual_event
+    assert snapshot.phase == "roasting"
+    assert len(snapshot.event_timeline) == 1
+
+
 def test_record_event_keeps_later_phase_when_singleton_event_is_repeated() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(

@@ -73,6 +73,7 @@ class SessionConfig:
     """Roast session metric configuration."""
 
     auto_t0_detection_enabled: bool = False
+    auto_t0_drop_threshold_c: float = 25.0
     ror_window_seconds: int = 60
     ror_min_sample_seconds: int = 10
 
@@ -261,6 +262,12 @@ def _session_from_mapping(raw: Mapping[str, Any]) -> SessionConfig:
             False,
             label="session.auto_t0_detection_enabled",
         ),
+        auto_t0_drop_threshold_c=_positive_float(
+            raw,
+            "auto_t0_drop_threshold_c",
+            25.0,
+            label="session.auto_t0_drop_threshold_c",
+        ),
         ror_window_seconds=_integer(
             raw,
             "ror_window_seconds",
@@ -366,6 +373,16 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
             logging,
             log_dir=Path(_required_string(environ["COFFEE_ROAST_LOG_DIR"], "COFFEE_ROAST_LOG_DIR")),
         )
+    if "COFFEE_AUTO_T0_DROP_THRESHOLD_C" in environ:
+        session = replace(
+            config.session,
+            auto_t0_drop_threshold_c=_parse_positive_float(
+                environ["COFFEE_AUTO_T0_DROP_THRESHOLD_C"],
+                "COFFEE_AUTO_T0_DROP_THRESHOLD_C",
+            ),
+        )
+    else:
+        session = config.session
 
     return replace(
         config,
@@ -373,6 +390,7 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
         first_crack=first_crack,
         audio=audio,
         logging=logging,
+        session=session,
     )
 
 
@@ -465,6 +483,36 @@ def _float(raw: Mapping[str, Any], key: str, default: float, label: str | None =
         except ValueError as exc:
             raise ConfigError(f"{error_key} must be a number.") from exc
     raise ConfigError(f"{error_key} must be a number.")
+
+
+def _positive_float(
+    raw: Mapping[str, Any],
+    key: str,
+    default: float,
+    label: str | None = None,
+) -> float:
+    error_key = label or key
+    return _parse_positive_float(raw.get(key, default), error_key)
+
+
+def _parse_positive_float(value: object, key: str) -> float:
+    parsed = _parse_float(value, key)
+    if parsed <= 0:
+        raise ConfigError(f"{key} must be greater than 0.")
+    return parsed
+
+
+def _parse_float(value: object, key: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{key} must be a number.")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise ConfigError(f"{key} must be a number.") from exc
+    raise ConfigError(f"{key} must be a number.")
 
 
 def _temperature_unit(value: str, label: str = "temperature_unit") -> TemperatureUnit:

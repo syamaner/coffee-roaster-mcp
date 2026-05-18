@@ -50,6 +50,7 @@ _EXPECTED_ROAST_STATE_KEYS = {
     "roast_elapsed_seconds",
     "session_id",
     "stopped_at_utc",
+    "t0_status",
 }
 _EXPECTED_DEVICE_STATE_KEYS = {
     "bean_temp_c",
@@ -66,6 +67,15 @@ _EXPECTED_FIRST_CRACK_STATUS_KEYS = {
     "detected_at_utc",
     "detected_monotonic_seconds",
     "mode",
+    "reason",
+    "status",
+}
+_EXPECTED_T0_STATUS_KEYS = {
+    "auto_detection_enabled",
+    "charge_temperature_c",
+    "current_drop_c",
+    "detected_bean_temperature_c",
+    "drop_threshold_c",
     "reason",
     "status",
 }
@@ -300,6 +310,15 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         )
         assert first_crack_status["allow_manual_override"] is True
         assert first_crack_status["reason"] is None
+
+        t0_status = state_content["t0_status"]
+        assert set(t0_status) == _EXPECTED_T0_STATUS_KEYS
+        assert t0_status["auto_detection_enabled"] is False
+        assert t0_status["status"] == "detected"
+        assert t0_status["drop_threshold_c"] == 25.0
+        assert t0_status["charge_temperature_c"] is None
+        assert t0_status["detected_bean_temperature_c"] is None
+        assert t0_status["reason"] is None
 
         assert state_content["beans_added_at_utc"] is not None
         assert state_content["beans_added_monotonic_seconds"] is not None

@@ -197,6 +197,8 @@ def test_get_roast_state_exposes_current_driver_state_and_event_timestamps(
     assert state.first_crack_status.mode == "disabled"
     assert state.first_crack_status.detected_at_utc is None
     assert state.first_crack_status.detected_monotonic_seconds is None
+    assert state.t0_status.status == "detected"
+    assert state.t0_status.auto_detection_enabled is False
 
 
 def test_get_roast_state_driver_read_failure_does_not_mutate_session(
@@ -220,6 +222,168 @@ def test_get_roast_state_driver_read_failure_does_not_mutate_session(
     state = _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
     assert [event.kind for event in state.events] == ["beans_added"]
     assert state.phase == "roasting"
+
+
+def test_get_roast_state_auto_t0_driver_read_failure_does_not_mutate_session(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "session:",
+                "  auto_t0_detection_enabled: true",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(fail_read=True, bean_temp_c=170.0)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    with pytest.raises(RuntimeError, match="Could not read current roaster state"):
+        _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+
+    driver.fail_read = False
+    driver.bean_temp_c = 145.0
+    state = _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+    assert state.phase == "pre_roast"
+    assert state.events == ()
+    assert state.t0_status.status == "pending"
+    assert state.t0_status.charge_temperature_c == 145.0
+    assert state.t0_status.current_drop_c == 0.0
+
+
+def test_get_roast_state_records_automatic_t0_after_configured_drop(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "session:",
+                "  auto_t0_detection_enabled: true",
+                "  auto_t0_drop_threshold_c: 25",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(bean_temp_c=170.0)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    first_state = _call_tool(server, "get_roast_state", ctx)
+    assert first_state.phase == "pre_roast"
+    assert first_state.beans_added_at_utc is None
+    assert first_state.t0_status.status == "pending"
+    assert first_state.t0_status.charge_temperature_c == 170.0
+    assert first_state.t0_status.current_drop_c == 0.0
+
+    driver.bean_temp_c = 145.0
+    threshold_state = _call_tool(
+        server,
+        "get_roast_state",
+        ctx,
+        session_id=start_result.session.session_id,
+    )
+    assert threshold_state.phase == "roasting"
+    assert threshold_state.beans_added_at_utc is not None
+    assert threshold_state.t0_status.status == "detected"
+    assert threshold_state.t0_status.auto_detection_enabled is True
+    assert threshold_state.t0_status.charge_temperature_c == 170.0
+    assert threshold_state.t0_status.current_drop_c == 25.0
+    assert threshold_state.t0_status.drop_threshold_c == 25.0
+    assert threshold_state.t0_status.detected_bean_temperature_c == 145.0
+    assert [event.kind for event in threshold_state.events] == ["beans_added"]
+    assert threshold_state.events[0].payload == {
+        "source": "auto_t0",
+        "charge_temperature_c": 170.0,
+        "detected_bean_temperature_c": 145.0,
+        "drop_c": 25.0,
+        "drop_threshold_c": 25.0,
+    }
+
+
+def test_get_roast_state_auto_t0_uses_max_preheat_and_ignores_small_drops(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "session:",
+                "  auto_t0_detection_enabled: true",
+                "  auto_t0_drop_threshold_c: 30",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(bean_temp_c=160.0)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "get_roast_state", ctx)
+    driver.bean_temp_c = 175.0
+    _call_tool(server, "get_roast_state", ctx)
+    driver.bean_temp_c = 150.1
+    small_drop_state = _call_tool(server, "get_roast_state", ctx)
+    assert small_drop_state.phase == "pre_roast"
+    assert small_drop_state.t0_status.status == "pending"
+    assert small_drop_state.t0_status.charge_temperature_c == 175.0
+    assert small_drop_state.t0_status.current_drop_c == 24.9
+
+    driver.bean_temp_c = 144.9
+    detected_state = _call_tool(server, "get_roast_state", ctx)
+    assert detected_state.phase == "roasting"
+    assert detected_state.t0_status.status == "detected"
+    assert detected_state.t0_status.charge_temperature_c == 175.0
+    assert detected_state.t0_status.current_drop_c == 30.1
+
+
+def test_get_roast_state_auto_t0_waits_for_valid_baseline(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "session:",
+                "  auto_t0_detection_enabled: true",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(bean_temp_c=None)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    no_temp_state = _call_tool(server, "get_roast_state", ctx)
+    assert no_temp_state.phase == "pre_roast"
+    assert no_temp_state.t0_status.status == "pending"
+    assert no_temp_state.t0_status.charge_temperature_c is None
+
+    driver.bean_temp_c = 125.0
+    first_temp_state = _call_tool(server, "get_roast_state", ctx)
+    assert first_temp_state.phase == "pre_roast"
+    assert first_temp_state.t0_status.status == "pending"
+    assert first_temp_state.t0_status.charge_temperature_c == 125.0
+    assert first_temp_state.t0_status.current_drop_c == 0.0
 
 
 def test_get_roast_state_reads_driver_before_detector_side_effects(

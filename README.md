@@ -133,9 +133,9 @@ The mock-safe Claude/operator flow is:
 3. Call `get_roast_state` to read both the authoritative session state and the
    current configured-device state. The response includes driver id, connected
    status, bean/environment temperatures when available, heat/fan levels,
-   cooling state, safe raw diagnostics, first-crack status, and lifecycle
-   timestamps for beans added, first crack, bean drop, cooling started, and
-   cooling stopped.
+   cooling state, safe raw diagnostics, T0 status, first-crack status, and
+   lifecycle timestamps for beans added, first crack, bean drop, cooling
+   started, and cooling stopped.
 4. Use `drop_beans` as the normal drop command. For the mock path and the
    Hottop compound drop path, this records `beans_dropped`, records
    `cooling_started` when the driver reports cooling active, turns heat off,
@@ -146,9 +146,17 @@ The mock-safe Claude/operator flow is:
 
 `mark_beans_added` and `mark_first_crack` are explicit override tools. They are
 kept available for operator recovery and controlled manual runs. The primary
-automatic runtime paths are internal: automatic T0 detection is owned by
-E4.1-S6, and audio-mode first-crack confirmation is owned by the session-owned
-first-crack runtime when `first_crack.mode: audio` is deliberately configured.
+automatic runtime paths are internal: automatic T0 detection can record
+`beans_added` when `session.auto_t0_detection_enabled` is enabled, and
+audio-mode first-crack confirmation is owned by the session-owned first-crack
+runtime when `first_crack.mode: audio` is deliberately configured.
+
+Automatic T0 is disabled by default. When enabled, `get_roast_state` reads the
+configured driver, tracks the max preheat bean temperature before T0, and
+records `beans_added` when the current bean temperature drops from that max by
+`session.auto_t0_drop_threshold_c`. `get_roast_state.t0_status` exposes the
+configured threshold, tracked charge temperature, current drop, and detected
+bean temperature when automatic T0 records the event.
 
 `get_roast_state.first_crack_status.status` is one of:
 
@@ -269,6 +277,7 @@ logging:
 
 session:
   auto_t0_detection_enabled: false
+  auto_t0_drop_threshold_c: 25.0
   ror_window_seconds: 60
   ror_min_sample_seconds: 10
 ```
@@ -290,6 +299,7 @@ Supported environment overrides:
 - `COFFEE_AUDIO_SAMPLE_RATE`
 - `COFFEE_AUDIO_WAV_PATH`
 - `COFFEE_ROAST_LOG_DIR`
+- `COFFEE_AUTO_T0_DROP_THRESHOLD_C`
 - `HF_HOME`
 
 `audio.source` can be `microphone` or `wav`. Microphone capture uses a

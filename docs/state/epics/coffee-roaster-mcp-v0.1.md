@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4.1-S6`
-- Current target: Add automatic T0 runtime path
+- Active story: `E5-S1`
+- Current target: Implement rolling telemetry buffer
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -186,15 +186,22 @@ The first implementation milestone is a mock vertical slice that requires no roa
   shape drift. README docs now explain the operational flow, first-crack status
   meanings, explicit override semantics, and gated optional live Hottop/real
   microphone validation evidence.
-- Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
+- `E4.1-S6` adds the automatic T0 runtime path. Auto-T0 detection is disabled by
+  default, but when `session.auto_t0_detection_enabled` is configured,
+  successful `get_roast_state` driver reads process the current bean
+  temperature before first-crack runtime windows. The session store tracks max
+  preheat/charge bean temperature before T0, records the authoritative
+  `beans_added` event when current bean temperature drops from that max by
+  `session.auto_t0_drop_threshold_c`, and preserves charge temperature,
+  detected bean temperature, drop, and threshold diagnostics in the event
+  payload and `get_roast_state.t0_status`. `mark_beans_added` remains an
+  explicit idempotent override.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
 
 ## Current Risks
 
-- Automatic T0 detection remains to be wired in E4.1-S6 before the fully
-  agent-driven roast path can avoid `mark_beans_added` as its primary T0 path.
 - MCP Registry publishing is preview and needs verification before release.
 - First-crack event integration must preserve one authoritative session timeline.
 - Log schema changes need compatibility discipline once users start collecting roast logs.
@@ -421,7 +428,7 @@ first crack has happened through MCP tools.
     documented as the normal drop/cooling command, and optional live
     Hottop/real microphone validation docs remain explicitly gated.
 
-- [ ] `E4.1-S6` Add automatic T0 runtime path.
+- [x] `E4.1-S6` Add automatic T0 runtime path.
   - Done when `session.auto_t0_detection_enabled` can record the authoritative
     `beans_added` event internally through `RoastSessionStore` without using
     `mark_beans_added` as the primary path, tracks max preheat/charge bean
@@ -1217,6 +1224,33 @@ After completing a story:
     31 passed.
   - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
     280 passed, required coverage `90.0%` reached, total coverage `90.15%`.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4.1-S6:
+  - Added `session.auto_t0_drop_threshold_c`, defaulting to `25.0`, while
+    keeping `session.auto_t0_detection_enabled` disabled by default.
+  - Added session-store automatic T0 processing that tracks max preheat/charge
+    bean temperature before T0, requires at least one prior valid baseline
+    reading, records `beans_added` when the current bean temperature drops from
+    that max by the configured threshold, and stores charge temperature,
+    detected bean temperature, drop, threshold, and `auto_t0` source in the
+    event payload.
+  - Wired `get_roast_state` to process automatic T0 only after a successful
+    configured-driver `read_state()` call and before first-crack runtime window
+    processing, preserving driver-read failure no-mutation behavior.
+  - Added `get_roast_state.t0_status` with enabled/disabled status, pending or
+    detected state, charge temperature, current drop, threshold, and detected
+    bean-temperature diagnostics.
+  - Preserved `mark_beans_added` as an explicit idempotent override and kept
+    rolling telemetry metrics, final log schemas, model training/export/sync,
+    real microphone validation, live Hottop validation, end-to-end agent roast
+    validation, and broad release validation out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_config.py tests/test_session.py tests/test_mcp_server.py`:
+    76 passed.
+  - Ran `./.venv/bin/python -m pytest tests/test_package.py`: 15 passed.
+  - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
+    289 passed, required coverage `90.0%` reached, total coverage `90.06%`.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

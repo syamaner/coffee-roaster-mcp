@@ -247,6 +247,9 @@ class RoastSession:
         heat_level_percent: Latest in-memory heat setting for the active mock path.
         fan_level_percent: Latest in-memory fan setting for the active mock path.
         cooling_on: Whether cooling is currently active in the session state.
+        auto_t0_charge_temperature_c: Max preheat/charge bean temperature before T0.
+        auto_t0_current_drop_c: Current drop from the tracked charge temperature.
+        auto_t0_preheat_sample_count: Number of valid pre-T0 bean-temperature samples.
         event_timeline: Shared ordered event timeline for future runtime stories.
         telemetry_buffer: Rolling telemetry sample buffer.
         log_writer: Append-only log writer reference when available.
@@ -273,6 +276,9 @@ class RoastSession:
     heat_level_percent: int = 0
     fan_level_percent: int = 0
     cooling_on: bool = False
+    auto_t0_charge_temperature_c: float | None = None
+    auto_t0_current_drop_c: float | None = None
+    auto_t0_preheat_sample_count: int = 0
     event_timeline: list[RoastEvent] = field(default_factory=_event_timeline_default)
     telemetry_buffer: deque[TelemetrySample] = field(default_factory=_telemetry_buffer_default)
     log_writer: LogWriterReference | None = None
@@ -888,6 +894,66 @@ class RoastSessionStore:
             event = self.record_event(session, kind, payload=payload)
             return event, _copy_session_for_read(session)
 
+    def process_auto_t0_reading_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        bean_temp_c: float,
+        drop_threshold_c: float,
+    ) -> tuple[RoastEvent | None, RoastSession]:
+        """Process one bean-temperature reading for automatic T0 detection.
+
+        Args:
+            session: Session to mutate.
+            bean_temp_c: Current bean temperature from the configured driver.
+            drop_threshold_c: Required drop from max preheat temperature.
+
+        Returns:
+            The recorded beans-added event when this reading crosses the
+            threshold, otherwise `None`, plus an atomic session snapshot.
+
+        Raises:
+            SessionLifecycleError: If called outside the pre-T0 active phase or
+                with non-finite inputs.
+        """
+        with self._lock:
+            self._assert_latest_active_session(session)
+            if session.beans_added_at_utc is not None:
+                return self._get_existing_singleton_event(session, "beans_added"), (
+                    _copy_session_for_read(session)
+                )
+            _validate_event_transition(session, "beans_added")
+            current_temp = float(bean_temp_c)
+            threshold = float(drop_threshold_c)
+            if not math.isfinite(current_temp):
+                raise SessionLifecycleError("Automatic T0 bean temperature must be finite.")
+            if not math.isfinite(threshold) or threshold <= 0:
+                raise SessionLifecycleError("Automatic T0 threshold must be greater than 0.")
+
+            previous_max = session.auto_t0_charge_temperature_c
+            if previous_max is None or current_temp > previous_max:
+                session.auto_t0_charge_temperature_c = current_temp
+                previous_max = current_temp
+
+            session.auto_t0_preheat_sample_count += 1
+            drop_c = previous_max - current_temp
+            session.auto_t0_current_drop_c = round(max(0.0, drop_c), 3)
+            if session.auto_t0_preheat_sample_count < 2 or drop_c < threshold:
+                return None, _copy_session_for_read(session)
+
+            event = self.record_event(
+                session,
+                "beans_added",
+                payload={
+                    "source": "auto_t0",
+                    "charge_temperature_c": round(previous_max, 3),
+                    "detected_bean_temperature_c": round(current_temp, 3),
+                    "drop_c": round(drop_c, 3),
+                    "drop_threshold_c": round(threshold, 3),
+                },
+            )
+            return event, _copy_session_for_read(session)
+
     def record_first_crack_detection_snapshot(
         self,
         session: RoastSession,
@@ -1381,6 +1447,9 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         heat_level_percent=session.heat_level_percent,
         fan_level_percent=session.fan_level_percent,
         cooling_on=session.cooling_on,
+        auto_t0_charge_temperature_c=session.auto_t0_charge_temperature_c,
+        auto_t0_current_drop_c=session.auto_t0_current_drop_c,
+        auto_t0_preheat_sample_count=session.auto_t0_preheat_sample_count,
         event_timeline=deepcopy(session.event_timeline),
         telemetry_buffer=deque(),
         log_writer=session.log_writer,
