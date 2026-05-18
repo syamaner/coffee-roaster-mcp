@@ -34,6 +34,15 @@ batch was fixed and before fixing the third review batch:
 - GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `19:21 on 25 May`
 - Warning from status output: limits may be stale; run `/status` again shortly.
 
+Latest context-reset usage snapshot supplied by the operator after all known PR
+review issues were fixed:
+
+- Context window: `66% left (95.6K used / 258K)`
+- 5h limit: `95% left`, resets `20:10`
+- Weekly limit: `94% left`, resets `12:12 on 24 May`
+- GPT-5.3-Codex-Spark 5h limit: `100% left`, resets `00:37 on 19 May`
+- GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `19:37 on 25 May`
+
 ## Pre-Story Verification
 
 Before starting E4.1-S1:
@@ -236,11 +245,15 @@ Focused validation after these latest fixes:
 Continue on branch
 `feature/104-wire-mcp-roast-control-tools-to-configured-driver`.
 
+All known review issues from PR #109 have been fixed and pushed. The latest
+thread-aware GitHub check after commit `162e3cf` showed the three review
+threads from review `4312706674` as outdated. GitHub reported the PR as
+mergeable and clean, with no status checks currently reported on the branch.
+
 Before making more code changes or merging:
 
 1. Re-read the latest thread-aware review state for PR #109.
-2. Confirm the three review threads from review `4312706674` are outdated or
-   resolved after the latest push.
+2. Confirm no new review comments were added after commit `162e3cf`.
 3. Keep any follow-up scoped to E4.1-S1: configured-driver MCP control wiring and
    safety/idempotency around those controls.
 4. Do not add automatic first-crack detector startup, released-artifact ONNX
