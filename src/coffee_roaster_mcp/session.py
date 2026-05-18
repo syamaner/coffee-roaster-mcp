@@ -937,7 +937,7 @@ class RoastSessionStore:
 
             session.auto_t0_preheat_sample_count += 1
             drop_c = previous_max - current_temp
-            session.auto_t0_current_drop_c = round(max(0.0, drop_c), 3)
+            session.auto_t0_current_drop_c = max(0.0, drop_c)
             if session.auto_t0_preheat_sample_count < 2 or drop_c < threshold:
                 return None, _copy_session_for_read(session)
 

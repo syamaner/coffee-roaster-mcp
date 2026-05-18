@@ -342,14 +342,49 @@ def test_get_roast_state_auto_t0_uses_max_preheat_and_ignores_small_drops(
     assert small_drop_state.phase == "pre_roast"
     assert small_drop_state.t0_status.status == "pending"
     assert small_drop_state.t0_status.charge_temperature_c == 175.0
-    assert small_drop_state.t0_status.current_drop_c == 24.9
+    assert small_drop_state.t0_status.current_drop_c is not None
+    assert abs(small_drop_state.t0_status.current_drop_c - 24.9) < 0.000001
 
     driver.bean_temp_c = 144.9
     detected_state = _call_tool(server, "get_roast_state", ctx)
     assert detected_state.phase == "roasting"
     assert detected_state.t0_status.status == "detected"
     assert detected_state.t0_status.charge_temperature_c == 175.0
-    assert detected_state.t0_status.current_drop_c == 30.1
+    assert detected_state.t0_status.current_drop_c is not None
+    assert abs(detected_state.t0_status.current_drop_c - 30.1) < 0.000001
+
+
+def test_get_roast_state_auto_t0_pending_drop_does_not_round_to_threshold(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "session:",
+                "  auto_t0_detection_enabled: true",
+                "  auto_t0_drop_threshold_c: 25",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(bean_temp_c=170.0)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "get_roast_state", ctx)
+    driver.bean_temp_c = 145.0004
+    state = _call_tool(server, "get_roast_state", ctx)
+
+    assert state.phase == "pre_roast"
+    assert state.t0_status.status == "pending"
+    assert state.t0_status.current_drop_c is not None
+    assert abs(state.t0_status.current_drop_c - 24.9996) < 0.000001
+    assert state.t0_status.current_drop_c < state.t0_status.drop_threshold_c
 
 
 def test_get_roast_state_auto_t0_waits_for_valid_baseline(

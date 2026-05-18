@@ -356,6 +356,32 @@ def test_auto_t0_uses_max_preheat_for_gradual_drop() -> None:
     assert snapshot.phase == "roasting"
 
 
+def test_auto_t0_pending_status_does_not_round_drop_to_threshold() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    store.process_auto_t0_reading_snapshot(
+        session,
+        bean_temp_c=170.0,
+        drop_threshold_c=25.0,
+    )
+    event, snapshot = store.process_auto_t0_reading_snapshot(
+        session,
+        bean_temp_c=145.0004,
+        drop_threshold_c=25.0,
+    )
+
+    assert event is None
+    assert snapshot.phase == "pre_roast"
+    assert snapshot.auto_t0_current_drop_c is not None
+    assert abs(snapshot.auto_t0_current_drop_c - 24.9996) < 0.000001
+    assert snapshot.auto_t0_current_drop_c < 25.0
+
+
 def test_auto_t0_does_not_guess_without_preheat_baseline() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
