@@ -168,7 +168,12 @@ coffee-roaster-mcp hottop-validate \
   --include-emergency-stop
 ```
 
-Hardware safety matters here: command-loop cadence, packet handling, temperature units, drop behavior, cooling behavior, emergency stop, and cleanup must be validated on a supervised roaster before the Hottop path is treated as release-ready. The current MCP roast-session tools preserve their existing one-session store semantics; driver-level validation does not imply MCP heat, fan, drop, or cooling tools are live-hardware control surfaces yet.
+Hardware safety matters here: command-loop cadence, packet handling,
+temperature units, drop behavior, cooling behavior, emergency stop, and cleanup
+must be validated on a supervised roaster before the Hottop path is treated as
+release-ready. The current MCP roast-session tools call the configured driver
+boundary, so keep normal development on the mock driver unless a guarded Hottop
+validation run is explicitly intended.
 
 ## Configuration
 
@@ -278,6 +283,18 @@ When `first_crack.mode: audio` is deliberately configured, RoastPilot consumes
 the released ONNX artifacts with ONNX Runtime and the released AST preprocessor
 config with `transformers.ASTFeatureExtractor`; model training, export, and Hub
 publishing remain outside this repository.
+
+In audio mode, starting a roast session prepares the configured audio capture
+pipeline and released-artifact detector runtime. Detector windows are processed
+only after T0 is recorded and the active session is in `roasting`. Confirmed
+detector output records `first_crack_detected` once through the authoritative
+session timeline. The runtime stops when first crack is recorded automatically
+or through the explicit manual override, and also stops on drop, cooling
+completion, emergency stop, and process shutdown. Missing artifacts,
+unavailable audio capture, and detector errors are surfaced through
+`get_roast_state.first_crack_status` as `unavailable` or `faulted` rather than
+crashing normal roast controls. Disabled and manual first-crack modes do not
+start audio capture or detector runtime.
 
 ## Log Export
 
