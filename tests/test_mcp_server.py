@@ -354,6 +354,42 @@ def test_get_roast_state_auto_t0_uses_max_preheat_and_ignores_small_drops(
     assert abs(detected_state.t0_status.current_drop_c - 30.1) < 0.000001
 
 
+def test_get_roast_state_auto_t0_ignores_disconnected_driver_readings(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "session:",
+                "  auto_t0_detection_enabled: true",
+                "  auto_t0_drop_threshold_c: 25",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(bean_temp_c=170.0)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "get_roast_state", ctx)
+    driver.connected = False
+    driver.bean_temp_c = 140.0
+    disconnected_state = _call_tool(server, "get_roast_state", ctx)
+
+    assert disconnected_state.phase == "pre_roast"
+    assert disconnected_state.events == ()
+    assert disconnected_state.device_state is not None
+    assert disconnected_state.device_state.connected is False
+    assert disconnected_state.t0_status.status == "pending"
+    assert disconnected_state.t0_status.charge_temperature_c == 170.0
+    assert disconnected_state.t0_status.current_drop_c == 0.0
+
+
 def test_get_roast_state_auto_t0_pending_drop_does_not_round_to_threshold(
     tmp_path: Path,
 ) -> None:

@@ -706,7 +706,7 @@ def _process_auto_t0_for_active_session(
         return
     if active_session.phase != "pre_roast" or active_session.beans_added_at_utc is not None:
         return
-    if device_state.bean_temp_c is None:
+    if not device_state.connected or device_state.bean_temp_c is None:
         return
     server_context.session_store.process_auto_t0_reading_snapshot(
         active_session,
