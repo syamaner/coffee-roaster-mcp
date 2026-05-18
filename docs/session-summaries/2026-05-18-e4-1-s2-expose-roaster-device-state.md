@@ -14,7 +14,13 @@ Hottop validation boundary, and E4.1-S1 configured-driver control wiring.
 
 ## Context Usage
 
-No new context-usage snapshot was supplied during this session.
+Final context snapshot supplied by the operator after PR feedback was addressed:
+
+- Context window: `48% left (139K used / 258K)`
+- 5h limit: `100% left`, resets `01:10 on 19 May`
+- Weekly limit: `94% left`, resets `12:12 on 24 May`
+- GPT-5.3-Codex-Spark 5h limit: `100% left`, resets `01:10 on 19 May`
+- GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `20:10 on 25 May`
 
 ## Pre-Story Verification
 
@@ -92,9 +98,18 @@ Out of scope kept out:
 Review-fix validation:
 
 - Ran `./.venv/bin/python -m pytest tests/test_mcp_server.py`: `14 passed`.
+- Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
+  `253 passed`, required coverage `90.0%` reached, total coverage `90.57%`.
 - Ran `./.venv/bin/python -m ruff check .`: passed.
 - Ran `./.venv/bin/python -m ruff format --check .`: passed.
 - Ran `./.venv/bin/python -m pyright`: `0 errors`.
+
+## Pull Request Status
+
+`PR #110` is open at
+<https://github.com/syamaner/coffee-roaster-mcp/pull/110>. After the review fix
+commit `06fa8bf`, GitHub CI reported both `Checks` and `Build Package` passed.
+The operator confirmed there is no remaining PR feedback.
 
 ## Handoff
 
