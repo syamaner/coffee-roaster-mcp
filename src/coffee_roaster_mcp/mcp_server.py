@@ -14,7 +14,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
 from coffee_roaster_mcp import __version__
-from coffee_roaster_mcp.config import AppConfig, ConfigError, load_config
+from coffee_roaster_mcp.config import AppConfig, ConfigError, FirstCrackMode, load_config
 from coffee_roaster_mcp.drivers import RoasterDriver, RoasterState, create_roaster_driver
 from coffee_roaster_mcp.exports import export_roast_snapshot
 from coffee_roaster_mcp.session import (
@@ -124,6 +124,62 @@ class EventSnapshot:
     payload: dict[str, EventPayloadValue]
 
 
+FirstCrackRuntimeStatus = Literal[
+    "disabled",
+    "manual",
+    "pending",
+    "detected",
+    "faulted",
+    "unavailable",
+]
+
+
+@dataclass(frozen=True)
+class RoasterDeviceState:
+    """Serializable configured-device state returned by MCP tools.
+
+    Attributes:
+        driver: Stable driver identifier returned by the configured driver.
+        connected: Whether the driver reports an open roaster connection.
+        bean_temp_c: Current bean temperature in Celsius when available.
+        env_temp_c: Current environment temperature in Celsius when available.
+        heat_level_percent: Current heat control level.
+        fan_level_percent: Current fan control level.
+        cooling_on: Whether cooling is currently active.
+        raw_vendor_data: Flat safe diagnostic fields from the driver boundary.
+    """
+
+    driver: str
+    connected: bool
+    bean_temp_c: float | None
+    env_temp_c: float | None
+    heat_level_percent: int
+    fan_level_percent: int
+    cooling_on: bool
+    raw_vendor_data: dict[str, EventPayloadValue]
+
+
+@dataclass(frozen=True)
+class FirstCrackStatus:
+    """Serializable first-crack status for operator decisions.
+
+    Attributes:
+        mode: Configured first-crack mode.
+        status: Current first-crack runtime status.
+        detected_at_utc: Authoritative detection timestamp when first crack exists.
+        detected_monotonic_seconds: Authoritative monotonic detection timestamp.
+        allow_manual_override: Whether the explicit override tool is enabled.
+        reason: Human-readable reason when status needs extra context.
+    """
+
+    mode: FirstCrackMode
+    status: FirstCrackRuntimeStatus
+    detected_at_utc: str | None
+    detected_monotonic_seconds: float | None
+    allow_manual_override: bool
+    reason: str | None = None
+
+
 @dataclass(frozen=True)
 class RoastSessionState:
     """Serializable roast session state returned by MCP tools."""
@@ -143,9 +199,17 @@ class RoastSessionState:
     cooling_started_at_utc: str | None
     cooling_stopped_at_utc: str | None
     faulted_at_utc: str | None
+    beans_added_monotonic_seconds: float | None
+    first_crack_monotonic_seconds: float | None
+    beans_dropped_monotonic_seconds: float | None
+    cooling_started_monotonic_seconds: float | None
+    cooling_stopped_monotonic_seconds: float | None
+    faulted_monotonic_seconds: float | None
     roast_elapsed_seconds: float | None
     development_time_seconds: float | None
     development_percent: float | None
+    device_state: RoasterDeviceState | None
+    first_crack_status: FirstCrackStatus
     events: tuple[EventSnapshot, ...]
     log_dir: str | None
 
@@ -325,7 +389,9 @@ def create_mcp_server(
         except Exception:
             server_context.session_store.clear_session_start_reservation(reservation)
             raise
-        return StartRoastSessionResult(session=_serialize_session_state(session))
+        return StartRoastSessionResult(
+            session=_serialize_session_state(session, config=server_context.config)
+        )
 
     @mcp.tool()
     def get_roast_state(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -335,7 +401,12 @@ def create_mcp_server(
         """Return the current authoritative roast session state."""
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
-        return _serialize_session_state(session)
+        device_state = _read_current_device_state(server_context)
+        return _serialize_session_state(
+            session,
+            config=server_context.config,
+            device_state=device_state,
+        )
 
     @mcp.tool()
     def set_heat(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -681,8 +752,24 @@ def _snapshot_session(
         raise ValueError(str(exc)) from exc
 
 
+def _read_current_device_state(server_context: ServerContext) -> RoasterDeviceState:
+    """Read and serialize the configured driver state for MCP output."""
+    try:
+        driver_state = server_context.roaster_driver.read_state()
+    except Exception as exc:
+        driver_name = server_context.config.roaster.driver
+        raise RuntimeError(
+            f"Could not read current roaster state from driver {driver_name}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    return _serialize_device_state(driver_state)
+
+
 def _serialize_session_state(
     session: RoastSession,
+    *,
+    config: AppConfig,
+    device_state: RoasterDeviceState | None = None,
 ) -> RoastSessionState:
     """Convert one in-memory session into an MCP-safe snapshot."""
     metrics = compute_roast_metrics(session)
@@ -702,13 +789,95 @@ def _serialize_session_state(
         cooling_started_at_utc=_iso_or_none(session.cooling_started_at_utc),
         cooling_stopped_at_utc=_iso_or_none(session.cooling_stopped_at_utc),
         faulted_at_utc=_iso_or_none(session.faulted_at_utc),
+        beans_added_monotonic_seconds=session.beans_added_monotonic_seconds,
+        first_crack_monotonic_seconds=session.first_crack_monotonic_seconds,
+        beans_dropped_monotonic_seconds=session.beans_dropped_monotonic_seconds,
+        cooling_started_monotonic_seconds=session.cooling_started_monotonic_seconds,
+        cooling_stopped_monotonic_seconds=session.cooling_stopped_monotonic_seconds,
+        faulted_monotonic_seconds=session.faulted_monotonic_seconds,
         roast_elapsed_seconds=metrics.roast_elapsed_seconds,
         development_time_seconds=metrics.development_time_seconds,
         development_percent=metrics.development_percent,
+        device_state=device_state,
+        first_crack_status=_serialize_first_crack_status(session, config=config),
         events=tuple(_serialize_event(event) for event in session.event_timeline),
         log_dir=str(session.log_writer.log_dir.resolve())
         if session.log_writer is not None
         else None,
+    )
+
+
+def _serialize_device_state(driver_state: RoasterState) -> RoasterDeviceState:
+    """Convert normalized driver state into an MCP-safe device snapshot."""
+    return RoasterDeviceState(
+        driver=driver_state.driver,
+        connected=driver_state.connected,
+        bean_temp_c=driver_state.bean_temp_c,
+        env_temp_c=driver_state.env_temp_c,
+        heat_level_percent=driver_state.heat_level_percent,
+        fan_level_percent=driver_state.fan_level_percent,
+        cooling_on=driver_state.cooling_on,
+        raw_vendor_data=dict(driver_state.raw_vendor_data),
+    )
+
+
+def _serialize_first_crack_status(
+    session: RoastSession,
+    *,
+    config: AppConfig,
+) -> FirstCrackStatus:
+    """Derive first-crack status from config and the session timeline."""
+    if session.first_crack_at_utc is not None:
+        return FirstCrackStatus(
+            mode=config.first_crack.mode,
+            status="detected",
+            detected_at_utc=session.first_crack_at_utc.isoformat(),
+            detected_monotonic_seconds=session.first_crack_monotonic_seconds,
+            allow_manual_override=config.first_crack.allow_manual_override,
+        )
+    if session.faulted_at_utc is not None:
+        return FirstCrackStatus(
+            mode=config.first_crack.mode,
+            status="faulted",
+            detected_at_utc=None,
+            detected_monotonic_seconds=None,
+            allow_manual_override=config.first_crack.allow_manual_override,
+            reason="Session faulted before first crack was recorded.",
+        )
+    if config.first_crack.mode == "disabled":
+        return FirstCrackStatus(
+            mode=config.first_crack.mode,
+            status="disabled",
+            detected_at_utc=None,
+            detected_monotonic_seconds=None,
+            allow_manual_override=config.first_crack.allow_manual_override,
+            reason="Automatic first-crack detection is disabled by configuration.",
+        )
+    if config.first_crack.mode == "manual":
+        if not config.first_crack.allow_manual_override:
+            return FirstCrackStatus(
+                mode=config.first_crack.mode,
+                status="unavailable",
+                detected_at_utc=None,
+                detected_monotonic_seconds=None,
+                allow_manual_override=config.first_crack.allow_manual_override,
+                reason=("Manual first-crack mode is configured, but manual override is disabled."),
+            )
+        return FirstCrackStatus(
+            mode=config.first_crack.mode,
+            status="manual",
+            detected_at_utc=None,
+            detected_monotonic_seconds=None,
+            allow_manual_override=config.first_crack.allow_manual_override,
+            reason="Waiting for explicit mark_first_crack override.",
+        )
+    return FirstCrackStatus(
+        mode=config.first_crack.mode,
+        status="pending",
+        detected_at_utc=None,
+        detected_monotonic_seconds=None,
+        allow_manual_override=config.first_crack.allow_manual_override,
+        reason="Audio first-crack detection has not recorded first crack for this session.",
     )
 
 

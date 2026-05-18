@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4.1-S2`
-- Current target: Expose current roaster device state through MCP
+- Active story: `E4.1-S3`
+- Current target: Add released-artifact ONNX first-crack detector backend
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -128,6 +128,16 @@ The first implementation milestone is a mock vertical slice that requires no roa
   command fail-closed handling is scoped to the reservation's session id so a
   previous session's late command cannot emergency-stop a newer active session
   without that session owning the fault.
+- `E4.1-S2` expands `get_roast_state` into the operational MCP state read for
+  Claude/operator decisions. The tool now reads the configured driver through
+  the existing `RoasterDriver.read_state()` boundary and returns connected
+  status, driver id, bean/environment temperatures when available, heat/fan
+  levels, cooling state, and flat safe raw diagnostics. The same response now
+  includes authoritative UTC and monotonic event timestamps for beans added,
+  first crack, bean drop, cooling start, cooling stop, and faults, plus a
+  structured first-crack status derived from current config and the session
+  timeline. Driver state-read failures surface as clear MCP tool errors and do
+  not mutate session history.
 - `mark_beans_added` and `mark_first_crack` remain exposed as explicit
   override tools. The primary runtime path should be internal auto-T0 detection
   when enabled and internal first-crack detector confirmation in audio mode.
@@ -142,9 +152,6 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Current Risks
 
-- Current MCP state output does not yet expose the full normalized device state
-  required for operator decisions; E4.1-S2 owns that schema and tool response
-  work.
 - The first-crack path does not yet include a released-artifact ONNX runtime
   backend or session-owned detector loop; Epic 4.1 now tracks this before Epic
   5 metrics/logging work.
@@ -344,7 +351,7 @@ first crack has happened through MCP tools.
     cooling transition; `start_cooling` remains available only as an explicit
     advanced/manual recovery control.
 
-- [ ] `E4.1-S2` Expose current roaster device state through MCP.
+- [x] `E4.1-S2` Expose current roaster device state through MCP.
   - Done when MCP state output includes current driver state needed for
     operational decisions: connected status, bean/environment temperatures when
     available, heat/fan levels, cooling state, driver id, and safe raw
@@ -1030,6 +1037,34 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest tests/test_session.py`: 38 passed.
   - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
     250 passed, required coverage `90.0%` reached, total coverage `90.39%`.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E4.1-S2:
+  - Expanded `get_roast_state` with a current `device_state` snapshot from the
+    configured `RoasterDriver.read_state()` boundary: driver id, connected
+    status, bean/environment temperatures when available, heat/fan levels,
+    cooling state, and flat safe raw diagnostics.
+  - Added authoritative monotonic event timestamp fields alongside existing UTC
+    fields for beans added, first crack, bean drop, cooling start, cooling stop,
+    and faults.
+  - Added structured first-crack status fields for operator decisions. Current
+    MCP output reports disabled, manual, pending, detected, or faulted from
+    configuration and the authoritative session timeline; the status enum leaves
+    room for unavailable runtime failures when E4.1-S4 owns detector startup.
+  - PR review hardening changed manual first-crack mode with
+    `allow_manual_override: false` to report `status="unavailable"` instead of
+    telling clients to wait for a rejected `mark_first_crack` override.
+  - Driver state-read failures now surface as clear `get_roast_state` tool
+    errors and do not mutate session history.
+  - Kept rolling telemetry retention, RoR/60-second deltas, final log schemas,
+    released-artifact ONNX runtime construction, detector startup, auto-T0
+    detection, training/export/sync behavior, real microphone validation, and
+    live Hottop validation out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_mcp_server.py`: 14 passed.
+  - Ran `./.venv/bin/python -m pytest tests/test_package.py`: 15 passed.
+  - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
+    253 passed, required coverage `90.0%` reached, total coverage `90.56%`.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

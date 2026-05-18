@@ -152,6 +152,192 @@ def test_mcp_roast_controls_call_configured_driver_boundary(tmp_path: Path) -> N
     assert complete.phase == "complete"
 
 
+def test_get_roast_state_exposes_current_driver_state_and_event_timestamps(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(
+        bean_temp_c=151.25,
+        env_temp_c=204.5,
+        raw_vendor_data={"status_packet_count": 7, "vendor_note": "ready"},
+    )
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "set_heat", ctx, heat_level_percent=55)
+    _call_tool(server, "set_fan", ctx, fan_level_percent=35)
+    beans_added = _call_tool(server, "mark_beans_added", ctx)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+
+    assert state.device_state is not None
+    assert state.device_state.driver == "recording"
+    assert state.device_state.connected is True
+    assert state.device_state.bean_temp_c == 151.25
+    assert state.device_state.env_temp_c == 204.5
+    assert state.device_state.heat_level_percent == 55
+    assert state.device_state.fan_level_percent == 35
+    assert state.device_state.cooling_on is False
+    assert state.device_state.raw_vendor_data == {
+        "status_packet_count": 7,
+        "vendor_note": "ready",
+    }
+    assert state.beans_added_at_utc == beans_added.event.recorded_at_utc
+    assert state.beans_added_monotonic_seconds == beans_added.event.monotonic_seconds
+    assert state.first_crack_status.status == "disabled"
+    assert state.first_crack_status.mode == "disabled"
+    assert state.first_crack_status.detected_at_utc is None
+    assert state.first_crack_status.detected_monotonic_seconds is None
+
+
+def test_get_roast_state_driver_read_failure_does_not_mutate_session(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(fail_read=True)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+
+    with pytest.raises(RuntimeError, match="Could not read current roaster state"):
+        _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+
+    driver.fail_read = False
+    state = _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+    assert [event.kind for event in state.events] == ["beans_added"]
+    assert state.phase == "roasting"
+
+
+def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
+    manual_config_path = tmp_path / "manual.yaml"
+    manual_config_path.write_text(
+        "\n".join(
+            [
+                "first_crack:",
+                "  mode: manual",
+                f"logging:\n  log_dir: {tmp_path / 'manual-logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manual_context = build_server_context(config_path=manual_config_path)
+    manual_server = create_mcp_server(config_path=manual_config_path)
+    manual_ctx = _ctx(manual_context)
+    manual_start = _call_tool(manual_server, "start_roast_session", manual_ctx)
+    manual_state = _call_tool(
+        manual_server,
+        "get_roast_state",
+        manual_ctx,
+        session_id=manual_start.session.session_id,
+    )
+    assert manual_state.first_crack_status.status == "manual"
+    assert manual_state.first_crack_status.allow_manual_override is True
+
+    manual_unavailable_config_path = tmp_path / "manual-unavailable.yaml"
+    manual_unavailable_config_path.write_text(
+        "\n".join(
+            [
+                "first_crack:",
+                "  mode: manual",
+                "  allow_manual_override: false",
+                f"logging:\n  log_dir: {tmp_path / 'manual-unavailable-logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manual_unavailable_context = build_server_context(config_path=manual_unavailable_config_path)
+    manual_unavailable_server = create_mcp_server(config_path=manual_unavailable_config_path)
+    manual_unavailable_ctx = _ctx(manual_unavailable_context)
+    manual_unavailable_start = _call_tool(
+        manual_unavailable_server,
+        "start_roast_session",
+        manual_unavailable_ctx,
+    )
+    manual_unavailable_state = _call_tool(
+        manual_unavailable_server,
+        "get_roast_state",
+        manual_unavailable_ctx,
+        session_id=manual_unavailable_start.session.session_id,
+    )
+    assert manual_unavailable_state.first_crack_status.status == "unavailable"
+    assert manual_unavailable_state.first_crack_status.allow_manual_override is False
+    assert (
+        manual_unavailable_state.first_crack_status.reason
+        == "Manual first-crack mode is configured, but manual override is disabled."
+    )
+
+    audio_config_path = tmp_path / "audio.yaml"
+    audio_config_path.write_text(
+        "\n".join(
+            [
+                "first_crack:",
+                "  mode: audio",
+                f"logging:\n  log_dir: {tmp_path / 'audio-logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    audio_context = build_server_context(config_path=audio_config_path)
+    audio_server = create_mcp_server(config_path=audio_config_path)
+    audio_ctx = _ctx(audio_context)
+    audio_start = _call_tool(audio_server, "start_roast_session", audio_ctx)
+    audio_state = _call_tool(
+        audio_server,
+        "get_roast_state",
+        audio_ctx,
+        session_id=audio_start.session.session_id,
+    )
+    assert audio_state.first_crack_status.status == "pending"
+
+    _call_tool(audio_server, "mark_beans_added", audio_ctx)
+    detected = _call_tool(audio_server, "mark_first_crack", audio_ctx)
+    detected_state = _call_tool(
+        audio_server,
+        "get_roast_state",
+        audio_ctx,
+        session_id=audio_start.session.session_id,
+    )
+    assert detected_state.first_crack_status.status == "detected"
+    assert detected_state.first_crack_status.detected_at_utc == detected.event.recorded_at_utc
+    assert (
+        detected_state.first_crack_status.detected_monotonic_seconds
+        == detected.event.monotonic_seconds
+    )
+
+    fault_config_path = tmp_path / "fault.yaml"
+    fault_config_path.write_text(
+        "\n".join(
+            [
+                "first_crack:",
+                "  mode: audio",
+                f"logging:\n  log_dir: {tmp_path / 'fault-logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fault_context = build_server_context(config_path=fault_config_path)
+    fault_server = create_mcp_server(config_path=fault_config_path)
+    fault_ctx = _ctx(fault_context)
+    fault_start = _call_tool(fault_server, "start_roast_session", fault_ctx)
+    _call_tool(fault_server, "emergency_stop", fault_ctx, reason="unit-test")
+    fault_state = _call_tool(
+        fault_server,
+        "get_roast_state",
+        fault_ctx,
+        session_id=fault_start.session.session_id,
+    )
+    assert fault_state.first_crack_status.status == "faulted"
+
+
 def test_driver_command_failure_does_not_mutate_session_state(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
@@ -404,15 +590,20 @@ class RecordingRoasterDriver:
         *,
         fail_connect: bool = False,
         fail_heat: bool = False,
+        fail_read: bool = False,
         block_connect: tuple[Event, Event] | None = None,
         block_heat: tuple[Event, Event] | None = None,
         block_drop: tuple[Event, Event] | None = None,
         stop_cooling_stays_on: bool = False,
+        bean_temp_c: float | None = None,
+        env_temp_c: float | None = None,
+        raw_vendor_data: dict[str, str | int | float | bool | None] | None = None,
     ) -> None:
         """Initialize a deterministic recording driver."""
         self.actions: list[str] = []
         self.fail_connect = fail_connect
         self.fail_heat = fail_heat
+        self.fail_read = fail_read
         self.block_connect = block_connect
         self.block_heat = block_heat
         self.block_drop = block_drop
@@ -421,6 +612,9 @@ class RecordingRoasterDriver:
         self.heat_level_percent = 0
         self.fan_level_percent = 0
         self.cooling_on = False
+        self.bean_temp_c = bean_temp_c
+        self.env_temp_c = env_temp_c
+        self.raw_vendor_data = {} if raw_vendor_data is None else dict(raw_vendor_data)
 
     @property
     def capabilities(self) -> object:
@@ -445,6 +639,8 @@ class RecordingRoasterDriver:
 
     def read_state(self) -> RoasterState:
         """Return the current test state."""
+        if self.fail_read:
+            raise RuntimeError("read failed")
         return self._state()
 
     def set_heat(self, *, heat_level_percent: int) -> RoasterState:
@@ -507,11 +703,12 @@ class RecordingRoasterDriver:
         return RoasterState(
             driver=self.name,
             connected=self.connected,
-            bean_temp_c=None,
-            env_temp_c=None,
+            bean_temp_c=self.bean_temp_c,
+            env_temp_c=self.env_temp_c,
             heat_level_percent=self.heat_level_percent,
             fan_level_percent=self.fan_level_percent,
             cooling_on=self.cooling_on,
+            raw_vendor_data=self.raw_vendor_data,
         )
 
 
