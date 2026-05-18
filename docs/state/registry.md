@@ -97,11 +97,16 @@ commands are sent. `mark_beans_added` and
 `mark_first_crack` remain explicit override tools, while automatic T0 and
 first-crack detection are internal runtime paths. `drop_beans` is the normal
 agent/operator command for drop and cooling transition; `start_cooling` is an
-advanced recovery/manual control rather than the normal roast flow. Epic 5
+advanced recovery/manual control rather than the normal roast flow. E4.1-S2
+expands `get_roast_state` with the current configured-device state from
+`RoasterDriver.read_state()`, authoritative UTC and monotonic lifecycle event
+timestamps, and a structured first-crack status for operator decisions. Driver
+state-read failures surface clearly and do not mutate session history. Epic 5
 remains focused on telemetry buffering, derived metrics, and final log/export
 schemas.
 
-The next story is E4.1-S2: expose current roaster device state through MCP.
+The next story is E4.1-S3: add the released-artifact ONNX first-crack detector
+backend.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
