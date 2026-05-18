@@ -222,6 +222,82 @@ def test_get_roast_state_driver_read_failure_does_not_mutate_session(
     assert state.phase == "roasting"
 
 
+def test_get_roast_state_reads_driver_before_detector_side_effects(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "first_crack:",
+                "  mode: audio",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(fail_read=True)
+    runtime = FakeFirstCrackRuntime(record_first_crack_on_process=False)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    _set_first_crack_runtime(server_context, runtime)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    runtime.record_first_crack_on_process = True
+
+    with pytest.raises(RuntimeError, match="Could not read current roaster state"):
+        _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+
+    failed_read_snapshot = server_context.session_store.get_session_snapshot(
+        session_id=start_result.session.session_id
+    )
+    assert failed_read_snapshot.first_crack_at_utc is None
+    assert runtime.processed_sessions == [start_result.session.session_id]
+
+    driver.fail_read = False
+    state = _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+
+    assert state.phase == "development"
+    assert state.first_crack_at_utc is not None
+    assert [event.kind for event in state.events] == [
+        "beans_added",
+        "first_crack_detected",
+    ]
+
+
+def test_mark_beans_added_returns_snapshot_after_immediate_detector_confirmation(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "first_crack:",
+                "  mode: audio",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    _set_first_crack_runtime(
+        server_context,
+        FakeFirstCrackRuntime(record_first_crack_on_process=True),
+    )
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    beans_added = _call_tool(server, "mark_beans_added", ctx)
+
+    assert beans_added.event.kind == "beans_added"
+    assert beans_added.phase == "development"
+    assert beans_added.event_count == 2
+
+
 def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
     manual_config_path = tmp_path / "manual.yaml"
     manual_config_path.write_text(
@@ -756,9 +832,16 @@ class RecordingRoasterDriver:
 class FakeFirstCrackRuntime:
     """Runtime double that keeps audio-mode MCP tests network-free."""
 
-    def __init__(self, *, status: str = "pending", reason: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        status: str = "pending",
+        reason: str | None = None,
+        record_first_crack_on_process: bool = False,
+    ) -> None:
         self.status = status
         self.reason = reason
+        self.record_first_crack_on_process = record_first_crack_on_process
         self.active_session_id: str | None = None
         self.started_sessions: list[str] = []
         self.processed_sessions: list[str] = []
@@ -776,6 +859,9 @@ class FakeFirstCrackRuntime:
         session: RoastSession,
     ) -> FirstCrackRuntimeSnapshot:
         self.processed_sessions.append(session.id)
+        if self.record_first_crack_on_process and session.first_crack_at_utc is None:
+            session_store.record_event_snapshot(session, "first_crack_detected")
+            self.status = "detected"
         return self.snapshot()
 
     def stop_for_session(self, session_id: str, *, reason: str) -> FirstCrackRuntimeSnapshot:

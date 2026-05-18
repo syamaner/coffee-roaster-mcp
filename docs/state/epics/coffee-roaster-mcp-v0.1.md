@@ -1183,7 +1183,7 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest tests/test_first_crack_runtime.py tests/test_mcp_server.py tests/test_first_crack_integration.py`:
     29 passed.
   - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
-    278 passed, required coverage `90.0%` reached, total coverage `90.20%`.
+    280 passed, required coverage `90.0%` reached, total coverage `90.15%`.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

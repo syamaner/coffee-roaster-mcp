@@ -417,9 +417,10 @@ def create_mcp_server(
     ) -> RoastSessionState:
         """Return the current authoritative roast session state."""
         server_context = ctx.request_context.lifespan_context
-        _process_first_crack_runtime_for_active_session(server_context, session_id=session_id)
         session = _resolve_session(server_context, session_id=session_id)
         device_state = _read_current_device_state(server_context)
+        _process_first_crack_runtime_for_active_session(server_context, session_id=session_id)
+        session = _resolve_session(server_context, session_id=session_id)
         return _serialize_session_state(
             session,
             config=server_context.config,
@@ -471,7 +472,16 @@ def create_mcp_server(
             ctx.request_context.lifespan_context,
             session_id=result.session_id,
         )
-        return result
+        snapshot = _snapshot_session(
+            ctx.request_context.lifespan_context,
+            session_id=result.session_id,
+        )
+        return EventCommandResult(
+            session_id=snapshot.id,
+            phase=snapshot.phase,
+            event=result.event,
+            event_count=len(snapshot.event_timeline),
+        )
 
     @mcp.tool()
     def mark_first_crack(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
