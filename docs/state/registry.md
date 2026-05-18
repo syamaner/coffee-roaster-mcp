@@ -88,22 +88,34 @@ roast, adjust the configured roaster through MCP tools, read current device and
 session state, and know whether first crack has happened. E4.1 covers
 driver-backed MCP control tools, current roaster state exposure, released ONNX
 detector backend construction, session-owned first-crack detector lifecycle, and
-operational MCP readiness tests/docs. E4.1-S1 wires `start_roast_session`,
-`set_heat`, `set_fan`, `drop_beans`, `start_cooling`, and `stop_cooling` to the
-configured `RoasterDriver` boundary while preserving the default mock path and
-one-session store semantics. `drop_beans` is now the normal MCP path for drop
-and cooling transition, and invalid phase calls are rejected before driver
-commands are sent. `mark_beans_added` and
-`mark_first_crack` remain explicit override tools, while automatic T0 and
-first-crack detection are internal runtime paths. `drop_beans` is the normal
-agent/operator command for drop and cooling transition; `start_cooling` is an
-advanced recovery/manual control rather than the normal roast flow. E4.1-S2
+operational MCP readiness tests/docs. E4.1 now also explicitly owns the
+automatic T0 runtime path so a fully agent-driven roast does not depend on
+`mark_beans_added` as the primary T0 path when auto-T0 is enabled. T0 is beans
+added: the automatic path should track the max preheat/charge bean temperature
+and record `beans_added` when current bean temperature drops from that max by
+the configured threshold; the pre-drop max is the charge temperature. E4.1-S1
+wires `start_roast_session`, `set_heat`, `set_fan`, `drop_beans`,
+`start_cooling`, and `stop_cooling` to the configured `RoasterDriver` boundary
+while preserving the default mock path and one-session store semantics.
+`drop_beans` is now the normal MCP path for drop and cooling transition, and
+invalid phase calls are rejected before driver commands are sent.
+`mark_beans_added` and `mark_first_crack` remain explicit override tools, while
+automatic T0 and first-crack detection are internal runtime paths. `drop_beans`
+is the normal agent/operator command for drop and cooling transition;
+`start_cooling` is an advanced recovery/manual control rather than the normal
+roast flow. E4.1-S2
 expands `get_roast_state` with the current configured-device state from
 `RoasterDriver.read_state()`, authoritative UTC and monotonic lifecycle event
 timestamps, and a structured first-crack status for operator decisions. Driver
 state-read failures surface clearly and do not mutate session history. Epic 5
 remains focused on telemetry buffering, derived metrics, and final log/export
 schemas.
+
+Epic 7 now includes a final end-to-end agent roast validation story that uses a
+real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
+first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
+surface to prove the release candidate can support full roasts with recorded
+evidence.
 
 The next story is E4.1-S3: add the released-artifact ONNX first-crack detector
 backend.
