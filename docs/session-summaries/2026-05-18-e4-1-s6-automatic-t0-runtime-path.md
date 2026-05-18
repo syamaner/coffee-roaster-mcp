@@ -15,14 +15,14 @@ mock-safe CI, and MCP state diagnostics.
 
 ## Context Usage
 
-Final context snapshot supplied by the operator after implementation and PR
+Latest context snapshot supplied by the operator after implementation and PR
 review fixes:
 
-- Context window: `33% left (177K used / 258K)`
-- 5h limit: `92% left`, resets `01:10 on 19 May`
+- Context window: `20% left (209K used / 258K)`
+- 5h limit: `90% left`, resets `01:10 on 19 May`
 - Weekly limit: `92% left`, resets `12:12 on 24 May`
-- GPT-5.3-Codex-Spark 5h limit: `100% left`, resets `03:17 on 19 May`
-- GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `22:17 on 25 May`
+- GPT-5.3-Codex-Spark 5h limit: `100% left`, resets `03:33 on 19 May`
+- GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `22:33 on 25 May`
 
 ## Pre-Story Verification
 
@@ -41,7 +41,7 @@ Before starting E4.1-S6:
 
 ## Implementation
 
-Updated:
+Initial implementation updated:
 
 - `src/coffee_roaster_mcp/config.py`
 - `src/coffee_roaster_mcp/session.py`
@@ -80,7 +80,7 @@ Out of scope kept out:
 
 ## Review Fixes
 
-Two actionable PR review comments were addressed:
+Four actionable PR review comments were addressed:
 
 - `7876ae2` - `fix: align auto t0 drop diagnostics with threshold`
   - Removed rounding from the stored `auto_t0_current_drop_c` diagnostic so a
@@ -93,6 +93,16 @@ Two actionable PR review comments were addressed:
     or stale driver readings cannot record `beans_added`.
   - Added an MCP regression proving a disconnected driver with a large stale
     temperature drop leaves the session in `pre_roast` with no events.
+- `b181710` - `fix: harden auto t0 audio and threshold handling`
+  - Rejected non-finite automatic T0 thresholds (`nan`, `inf`, `-inf`) during
+    config load, including YAML and `COFFEE_AUTO_T0_DROP_THRESHOLD_C`.
+  - Added first-crack runtime support for discarding queued audio windows at a
+    runtime boundary.
+  - Wired `get_roast_state` to discard queued pre-T0 detector windows when
+    automatic T0 records `beans_added`, before normal first-crack detector
+    processing resumes.
+  - Added config, runtime, and MCP regressions for the non-finite threshold and
+    queued pre-T0 audio-window cases.
 
 ## Validation
 
@@ -126,8 +136,18 @@ After the disconnected-driver review fix:
 - Ran `./.venv/bin/python -m ruff format --check .`: passed.
 - Ran `./.venv/bin/python -m pyright`: `0 errors`.
 
+After the non-finite threshold and queued pre-T0 audio-window review fixes:
+
+- Ran `./.venv/bin/python -m pytest tests/test_config.py tests/test_first_crack_runtime.py tests/test_mcp_server.py`:
+  `48 passed`.
+- Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
+  `298 passed`, required coverage `90.0%` reached, total coverage `90.06%`.
+- Ran `./.venv/bin/python -m ruff check .`: passed.
+- Ran `./.venv/bin/python -m ruff format --check .`: passed.
+- Ran `./.venv/bin/python -m pyright`: `0 errors`.
+
 GitHub CI for `PR #117` on head
-`261916d78ba8ca4234312bbc1302bc9710a56f5d` passed:
+`b18171099e7171bb32fdea290af06f1d05e3024c` passed:
 
 - `Build Package`: passed.
 - `Checks`: passed.
@@ -141,7 +161,7 @@ GitHub CI for `PR #117` on head
 - Merge state: mergeable.
 - Branch: `feature/111-add-automatic-t0-runtime-path`.
 - Latest commit:
-  - `261916d` - `fix: skip auto t0 on disconnected driver state`
+  - `b181710` - `fix: harden auto t0 audio and threshold handling`
 
 ## Handoff
 
