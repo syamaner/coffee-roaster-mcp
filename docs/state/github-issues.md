@@ -69,6 +69,7 @@ Milestone: `v0.1`
 - #106 E4.1-S3: Add released-artifact ONNX first-crack detector backend
 - #107 E4.1-S4: Start first-crack detection runtime with roast sessions
 - #108 E4.1-S5: Add MCP operational readiness tests and docs
+- #111 E4.1-S6: Add automatic T0 runtime path
 
 ## Epic 5 Stories
 
@@ -99,6 +100,7 @@ Milestone: `v0.1`
 - #58 E7-S3: Test MCP client connection
 - #59 E7-S4: Run Hottop manual hardware validation
 - #60 E7-S5: Produce v0.1 release checklist
+- #112 E7-S6: Run end-to-end agent roast validation with HF ONNX audio path
 
 ## Standalone Spikes
 

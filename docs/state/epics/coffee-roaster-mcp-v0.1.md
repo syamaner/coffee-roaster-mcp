@@ -110,10 +110,11 @@ The first implementation milestone is a mock vertical slice that requires no roa
   no-live-hardware CI. Current first-crack components resolve
   artifacts, capture audio windows, adapt detector outputs, and write to the
   session timeline, but there is not yet a released-artifact ONNX runtime
-  backend or session-owned detector loop. Epic 4.1 makes the operational MCP
-  flow explicit: Claude should be able to start a roast, adjust the configured
-  roaster, read current device/session state, and know whether first crack has
-  happened before Epic 5 adds richer telemetry metrics and final log schemas.
+  backend, session-owned detector loop, or automatic T0 runtime path. Epic 4.1
+  makes the operational MCP flow explicit: Claude should be able to start a
+  roast, adjust the configured roaster, read current device/session state, and
+  know whether first crack has happened before Epic 5 adds richer telemetry
+  metrics and final log schemas.
 - `E4.1-S1` keeps driver commands outside the store lock while ensuring invalid
   drop/cooling phase calls fail before the driver boundary is touched. Driver
   command failures surface as MCP tool errors before session mutation, while
@@ -145,6 +146,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
   roaster drop/cooling behavior and record the relevant session events;
   `start_cooling` remains an advanced recovery/manual tool, not the normal
   Claude roast flow.
+- `E4.1-S6` is added so the automatic T0 runtime path is explicitly owned
+  before the operational epic closes. The explicit `mark_beans_added` override
+  remains available, but a fully agent-driven roast should not depend on that
+  override as the primary T0 path when auto-T0 is enabled.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -361,9 +366,9 @@ first crack has happened through MCP tools.
 
 - [ ] `E4.1-S3` Add released-artifact ONNX first-crack detector backend.
   - Done when `first_crack.mode: audio` can construct a detector backend from
-    the resolved ONNX model and feature-extractor config using the existing
-    released-artifact resolver boundary, with mock-safe tests and no training,
-    export, or Hugging Face sync behavior.
+    the resolved Hugging Face ONNX model and feature-extractor config using the
+    existing released-artifact resolver boundary, with mock-safe tests and no
+    training, export, or Hugging Face sync behavior.
 
 - [ ] `E4.1-S4` Start first-crack detection runtime with roast sessions.
   - Done when audio mode starts/stops the configured audio pipeline and detector
@@ -381,6 +386,14 @@ first crack has happened through MCP tools.
     documented as the normal drop/cooling command, and optional live
     Hottop/real microphone validation docs remain explicitly gated.
 
+- [ ] `E4.1-S6` Add automatic T0 runtime path.
+  - Done when `session.auto_t0_detection_enabled` can record the authoritative
+    `beans_added` event internally through `RoastSessionStore` without using
+    `mark_beans_added` as the primary path, remains disabled by default,
+    preserves `mark_beans_added` as an explicit idempotent override, rejects
+    invalid phases and duplicates, exposes the resulting T0 timestamps through
+    `get_roast_state`, and keeps normal CI mock-safe.
+
 ### Epic Acceptance Criteria
 
 - Claude can start a roast through MCP.
@@ -394,6 +407,9 @@ first crack has happened through MCP tools.
   cooling started, and cooling stopped from `get_roast_state`.
 - Automatic T0 and automatic first-crack detection are internal runtime paths;
   exposed mark tools are explicit overrides.
+- In audio mode, first-crack runtime uses released Hugging Face ONNX artifacts
+  consumed by this repo; model training, ONNX export, and Hugging Face sync stay
+  in `coffee-first-crack-detection`.
 - `drop_beans` is the normal operational command for drop and cooling
   transition; `start_cooling` is an advanced/manual recovery path.
 - Normal CI requires no Hottop hardware, microphone, model download, or network.
@@ -495,11 +511,23 @@ Goal: prove the package works from install through mock roast, MCP client calls,
 - [ ] `E7-S5` Produce v0.1 release checklist.
   - Done when release steps cover tests, package build, version alignment, HF revision pin, PyPI publish, registry publish, GitHub release, and hardware-ready labeling.
 
+- [ ] `E7-S6` Run end-to-end agent roast validation with HF ONNX audio path.
+  - Done when a real MCP client or agent can install/connect to the package and
+    run a full roast flow using public MCP tools, configured Hottop hardware,
+    released Hugging Face ONNX first-crack artifacts, and real microphone/audio
+    input; validation evidence records lifecycle timestamps, first-crack
+    status/metadata, roaster device state, Epic 5 metrics/stat fields,
+    exported logs, configuration, artifact revision, hardware/audio setup, and
+    operator interventions.
+
 ### Epic Acceptance Criteria
 
 - Full mock roast works from install to exported logs.
 - MCP client can discover and call tools.
 - Manual hardware results are recorded.
+- A real MCP client or agent can complete an end-to-end roast validation using
+  configured hardware, real audio, and released Hugging Face ONNX first-crack
+  artifacts, with correct state, stats, and exported logs recorded as evidence.
 - Release is tagged only after package, registry, and smoke tests pass.
 
 ## Spikes
