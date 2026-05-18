@@ -187,14 +187,14 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
             await _call_with_timeout(session.call_tool("drop_beans", {})),
         )
         assert drop_result.structuredContent["event"]["kind"] == "beans_dropped"
-        assert drop_result.structuredContent["phase"] == "dropped"
+        assert drop_result.structuredContent["phase"] == "cooling"
 
         repeated_drop_result = cast(
             Any,
             await _call_with_timeout(session.call_tool("drop_beans", {})),
         )
         assert repeated_drop_result.structuredContent["event"]["kind"] == "beans_dropped"
-        assert repeated_drop_result.structuredContent["event_count"] == 3
+        assert repeated_drop_result.structuredContent["event_count"] == 4
 
         cooling_result = cast(
             Any,
@@ -219,7 +219,7 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert state_result.structuredContent["session_id"] == session_id
         assert state_result.structuredContent["active"] is False
         assert state_result.structuredContent["heat_level_percent"] == 0
-        assert state_result.structuredContent["fan_level_percent"] == 35
+        assert state_result.structuredContent["fan_level_percent"] == 100
         assert state_result.structuredContent["cooling_on"] is False
         assert state_result.structuredContent["roast_elapsed_seconds"] is not None
         assert state_result.structuredContent["development_time_seconds"] is not None

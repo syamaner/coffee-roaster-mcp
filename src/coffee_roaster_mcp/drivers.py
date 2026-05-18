@@ -614,9 +614,11 @@ class MockRoasterDriver:
         return self._state_snapshot()
 
     def drop_beans(self) -> RoasterState:
-        """Record a mock bean drop and force heat off."""
+        """Record a mock bean drop and enter cooling."""
         self._beans_dropped = True
         self._heat_level_percent = 0
+        self._fan_level_percent = 100
+        self._cooling_on = True
         return self._state_snapshot()
 
     def start_cooling(self) -> RoasterState:

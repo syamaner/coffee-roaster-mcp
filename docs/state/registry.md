@@ -30,7 +30,7 @@ drop and emergency stop included. A follow-up 60-second stability test also held
 fan at `10%`, heat at `40%` for 30 seconds, then heat at `100%` for 30 seconds
 with continuous command streaming and no command-loop or status-read errors.
 
-Epic 4 is complete pending merge of E4-S10. The first-crack path now resolves the configured ONNX model
+Epic 4 is complete. The first-crack path now resolves the configured ONNX model
 artifact for both supported real-model precisions: `int8` selects
 `onnx/int8/model_quantized.onnx`, and `fp32` selects `onnx/fp32/model.onnx`
 through the artifact resolver. When `first_crack.local_model_dir` is configured,
@@ -78,18 +78,22 @@ continues to expose first-crack timestamp and metrics only until Epic 5 final
 schemas land. Coverage now has a stable `90%` package floor, with local
 branch-aware coverage at `91.73%`. Real microphone validation remains optional
 and gated; normal CI requires no audio hardware, model download, Hottop
-hardware, or network access. Normal MCP heat/fan/drop/cooling tools still use
-the existing one-session mock/session boundary rather than live Hottop command
-wiring, and automatic first-crack detector startup is not yet an MCP runtime
-loop.
+hardware, or network access. E4-S10 did not wire live Hottop command behavior
+or automatic first-crack detector startup into the MCP runtime; those gaps moved
+into Epic 4.1.
 
-Epic 4.1 is now inserted before Epic 5 to close operational MCP runtime gaps.
+Epic 4.1 is now active before Epic 5 to close operational MCP runtime gaps.
 The target user flow is: install the MCP server locally in Claude, start a
 roast, adjust the configured roaster through MCP tools, read current device and
 session state, and know whether first crack has happened. E4.1 covers
 driver-backed MCP control tools, current roaster state exposure, released ONNX
 detector backend construction, session-owned first-crack detector lifecycle, and
-operational MCP readiness tests/docs. `mark_beans_added` and
+operational MCP readiness tests/docs. E4.1-S1 wires `start_roast_session`,
+`set_heat`, `set_fan`, `drop_beans`, `start_cooling`, and `stop_cooling` to the
+configured `RoasterDriver` boundary while preserving the default mock path and
+one-session store semantics. `drop_beans` is now the normal MCP path for drop
+and cooling transition, and invalid phase calls are rejected before driver
+commands are sent. `mark_beans_added` and
 `mark_first_crack` remain explicit override tools, while automatic T0 and
 first-crack detection are internal runtime paths. `drop_beans` is the normal
 agent/operator command for drop and cooling transition; `start_cooling` is an
@@ -97,7 +101,7 @@ advanced recovery/manual control rather than the normal roast flow. Epic 5
 remains focused on telemetry buffering, derived metrics, and final log/export
 schemas.
 
-The next story after E4-S10 merges is E4.1-S1: wire MCP roast-control tools to the configured driver.
+The next story is E4.1-S2: expose current roaster device state through MCP.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

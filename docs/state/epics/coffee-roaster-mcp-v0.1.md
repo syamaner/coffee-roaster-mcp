@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E4.1-S1`
-- Current target: Wire MCP roast-control tools to configured driver
+- Active story: `E4.1-S2`
+- Current target: Expose current roaster device state through MCP
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -104,15 +104,30 @@ The first implementation milestone is a mock vertical slice that requires no roa
   local branch-aware coverage at `91.73%`. Normal CI remains mock-safe with no
   microphone, Hottop hardware, model download, or network requirement.
 - Epic 4.1 is inserted before Epic 5 because the installed Claude-local MCP
-  operational path is not complete yet. Current MCP heat/fan/drop/cooling tools
-  are covered at the existing mock/session boundary, but they are not yet wired
-  to the configured live driver. Current first-crack components resolve
+  operational path is not complete yet. E4.1-S1 wires MCP heat/fan/drop/cooling
+  tools to the configured `RoasterDriver` boundary while preserving the default
+  mock path, one-session store semantics, fail-closed emergency behavior, and
+  no-live-hardware CI. Current first-crack components resolve
   artifacts, capture audio windows, adapt detector outputs, and write to the
   session timeline, but there is not yet a released-artifact ONNX runtime
   backend or session-owned detector loop. Epic 4.1 makes the operational MCP
   flow explicit: Claude should be able to start a roast, adjust the configured
   roaster, read current device/session state, and know whether first crack has
   happened before Epic 5 adds richer telemetry metrics and final log schemas.
+- `E4.1-S1` keeps driver commands outside the store lock while ensuring invalid
+  drop/cooling phase calls fail before the driver boundary is touched. Driver
+  command failures surface as MCP tool errors before session mutation, while
+  emergency stop continues to record a fail-closed fault event even if the
+  driver safety call fails. `drop_beans` records both `beans_dropped` and
+  `cooling_started` when the driver reports cooling active, which is the normal
+  Hottop compound drop/cooling path and the mock-safe default path.
+- `E4.1-S1` review hardening reserves session startup before driver `connect()`
+  so concurrent starts cannot both reach the configured driver. Reserved
+  `stop_cooling` completion trusts the driver's returned cooling state and does
+  not mark the session complete if cooling remains active. Stale non-emergency
+  command fail-closed handling is scoped to the reservation's session id so a
+  previous session's late command cannot emergency-stop a newer active session
+  without that session owning the fault.
 - `mark_beans_added` and `mark_first_crack` remain exposed as explicit
   override tools. The primary runtime path should be internal auto-T0 detection
   when enabled and internal first-crack detector confirmation in audio mode.
@@ -127,10 +142,9 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Current Risks
 
-- Normal MCP heat, fan, drop, and cooling tools are not yet wired to live
-  Hottop driver commands; current Hottop hardware readiness applies to the
-  driver boundary validated by E3-S9, and Epic 4.1 now tracks the normal MCP
-  operational wiring.
+- Current MCP state output does not yet expose the full normalized device state
+  required for operator decisions; E4.1-S2 owns that schema and tool response
+  work.
 - The first-crack path does not yet include a released-artifact ONNX runtime
   backend or session-owned detector loop; Epic 4.1 now tracks this before Epic
   5 metrics/logging work.
@@ -321,7 +335,7 @@ first crack has happened through MCP tools.
 
 ### Stories
 
-- [ ] `E4.1-S1` Wire MCP roast-control tools to configured driver.
+- [x] `E4.1-S1` Wire MCP roast-control tools to configured driver.
   - Done when `start_roast_session`, `set_heat`, `set_fan`, `drop_beans`,
     `start_cooling`, `stop_cooling`, and `emergency_stop` call the configured
     `RoasterDriver` boundary where appropriate while preserving the mock
@@ -972,3 +986,50 @@ After completing a story:
     27 passed.
   - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
     241 passed, required coverage `90.0%` reached, total coverage `91.73%`.
+- Validation run for E4.1-S1:
+  - Wired `start_roast_session` to call the configured driver `connect()`
+    before creating a session, preserving the default mock path and requiring
+    explicit Hottop configuration for live hardware.
+  - Wired MCP `set_heat`, `set_fan`, `drop_beans`, `start_cooling`, and
+    `stop_cooling` to the configured `RoasterDriver` methods and mirrored the
+    returned normalized heat, fan, and cooling state into the authoritative
+    session snapshot.
+  - Updated the mock driver drop path to match the normal operational
+    drop/cooling transition: heat off, fan `100%`, cooling on.
+  - Kept `drop_beans` as the normal agent/operator path for drop plus cooling
+    transition; `start_cooling` remains available as an explicit advanced or
+    recovery command and is idempotent after drop-triggered cooling has already
+    been recorded.
+  - Added pre-driver phase guards so invalid drop, cooling-start, and
+    cooling-stop calls fail before any driver command is sent.
+  - Added driver-double MCP coverage proving configured-driver calls happen,
+    driver command failures do not mutate session state, and connect failures
+    do not create a roast session.
+  - PR review hardening added store-owned non-emergency driver command
+    reservations. Driver I/O now runs outside the store lock, but completion
+    must still own the active reservation before session state is updated.
+  - Repeated `drop_beans` and `start_cooling` calls return the existing
+    singleton event without resending driver commands. Emergency stop cancels
+    pending non-emergency reservations before running the fail-closed driver
+    safety call, and stale completed commands surface a lifecycle error instead
+    of mutating the session. Stale-command emergency stop is reapplied only when
+    no newer active session has replaced the command's owning session.
+  - Added review hardening for remaining race and state-reporting edges:
+    session startup is reserved before driver `connect()`, reserved
+    `stop_cooling` uses the driver's returned cooling state before completing
+    the session, and stale command fail-closed handling skips global emergency
+    stop when a newer active session has replaced the reservation's session.
+  - Added MCP regression coverage for concurrent start reservation,
+    cooling-stop driver-state mismatch, and stale previous-session command
+    completion after a newer session starts.
+  - Kept automatic first-crack detector startup, ONNX detector runtime,
+    auto-T0 detection, rolling telemetry metrics, final log schemas, model
+    training, ONNX export, Hugging Face sync, real microphone validation, and
+    broad release validation out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_mcp_server.py`: 11 passed.
+  - Ran `./.venv/bin/python -m pytest tests/test_session.py`: 38 passed.
+  - Ran `./.venv/bin/python -m pytest --cov=coffee_roaster_mcp --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html:htmlcov`:
+    250 passed, required coverage `90.0%` reached, total coverage `90.39%`.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
