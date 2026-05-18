@@ -34,6 +34,7 @@ RoastEventKind = Literal[
     "fault",
 ]
 EventPayloadValue = str | int | float | bool | None
+DriverCommandKind = Literal["control", "drop", "start_cooling", "stop_cooling"]
 
 _SINGLETON_EVENT_KINDS: frozenset[RoastEventKind] = frozenset(
     {
@@ -158,6 +159,45 @@ class TelemetrySample:
 
 
 @dataclass(frozen=True)
+class DriverCommandReservation:
+    """Reservation for one non-emergency driver command.
+
+    Attributes:
+        session_id: Session that owns the reservation.
+        token: Opaque reservation token.
+        kind: Reserved command kind.
+    """
+
+    session_id: str
+    token: str
+    kind: DriverCommandKind
+
+
+@dataclass(frozen=True)
+class DriverDropReservation:
+    """Result of reserving the driver drop command.
+
+    Attributes:
+        reservation: Reservation to complete when a new drop command is needed.
+        existing_event: Existing singleton drop event for idempotent retries.
+        snapshot: Session snapshot returned for idempotent retries.
+    """
+
+    reservation: DriverCommandReservation | None
+    existing_event: RoastEvent | None = None
+    snapshot: RoastSession | None = None
+
+
+@dataclass(frozen=True)
+class DriverEventReservation:
+    """Result of reserving a driver command that records a singleton event."""
+
+    reservation: DriverCommandReservation | None
+    existing_event: RoastEvent | None = None
+    snapshot: RoastSession | None = None
+
+
+@dataclass(frozen=True)
 class RoastMetrics:
     """Timestamp-derived roast metrics for the current session snapshot.
 
@@ -231,6 +271,8 @@ class RoastSession:
     log_writer: LogWriterReference | None = None
     stopped_at_utc: datetime | None = None
     monotonic_stop: float | None = None
+    pending_driver_command_token: str | None = None
+    pending_driver_command_kind: DriverCommandKind | None = None
 
     @property
     def active(self) -> bool:
@@ -498,6 +540,221 @@ class RoastSessionStore:
         with self._lock:
             self.set_fan(session, fan_level_percent=fan_level_percent)
             return _copy_session_for_read(session)
+
+    def apply_driver_control_state(
+        self,
+        session: RoastSession,
+        *,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> RoastSession:
+        """Apply the normalized control state returned by the configured driver."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            validated_heat = validate_control_percent(
+                heat_level_percent,
+                label="heat_level_percent",
+            )
+            if session.faulted_at_utc is not None and validated_heat > 0:
+                raise SessionLifecycleError("Heat cannot be increased after a fault.")
+            session.heat_level_percent = validated_heat
+            session.fan_level_percent = validate_control_percent(
+                fan_level_percent,
+                label="fan_level_percent",
+            )
+            session.cooling_on = cooling_on
+            return session
+
+    def apply_driver_control_state_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> RoastSession:
+        """Apply driver controls and return an atomic lightweight snapshot."""
+        with self._lock:
+            self.apply_driver_control_state(
+                session,
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=fan_level_percent,
+                cooling_on=cooling_on,
+            )
+            return _copy_session_for_read(session)
+
+    def reserve_driver_command(
+        self,
+        session: RoastSession,
+        *,
+        kind: DriverCommandKind,
+    ) -> DriverCommandReservation:
+        """Reserve one non-emergency driver command for an active session."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            return self._reserve_driver_command_locked(session, kind=kind)
+
+    def reserve_driver_drop(self, session: RoastSession) -> DriverDropReservation:
+        """Reserve a driver drop command or return the existing drop event."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            existing_event = self._get_existing_singleton_event(session, "beans_dropped")
+            if existing_event is not None:
+                return DriverDropReservation(
+                    reservation=None,
+                    existing_event=existing_event,
+                    snapshot=_copy_session_for_read(session),
+                )
+            _validate_event_transition(session, "beans_dropped")
+            return DriverDropReservation(
+                reservation=self._reserve_driver_command_locked(session, kind="drop")
+            )
+
+    def reserve_driver_start_cooling(self, session: RoastSession) -> DriverEventReservation:
+        """Reserve a cooling-start command or return the existing event."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            existing_event = self._get_existing_singleton_event(session, "cooling_started")
+            if existing_event is not None:
+                return DriverEventReservation(
+                    reservation=None,
+                    existing_event=existing_event,
+                    snapshot=_copy_session_for_read(session),
+                )
+            if session.beans_dropped_at_utc is None:
+                raise SessionLifecycleError("Cooling can only start after beans are dropped.")
+            _validate_event_transition(session, "cooling_started")
+            return DriverEventReservation(
+                reservation=self._reserve_driver_command_locked(session, kind="start_cooling")
+            )
+
+    def reserve_driver_stop_cooling(self, session: RoastSession) -> DriverCommandReservation:
+        """Reserve a cooling-stop command for an active cooling session."""
+        with self._lock:
+            self._assert_latest_active_session(session)
+            if session.beans_dropped_at_utc is None:
+                raise SessionLifecycleError("Cooling cannot stop before beans are dropped.")
+            if session.cooling_started_at_utc is None or not session.cooling_on:
+                raise SessionLifecycleError("Cooling must be started before it can be stopped.")
+            return self._reserve_driver_command_locked(session, kind="stop_cooling")
+
+    def complete_reserved_driver_control_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> RoastSession:
+        """Complete a reserved control command and return a session snapshot."""
+        with self._lock:
+            self._assert_driver_command_reservation(session, reservation)
+            self.apply_driver_control_state(
+                session,
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=fan_level_percent,
+                cooling_on=cooling_on,
+            )
+            self._clear_driver_command_reservation_locked(session, reservation)
+            return _copy_session_for_read(session)
+
+    def complete_reserved_driver_drop_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> tuple[RoastEvent, RoastSession]:
+        """Complete a reserved drop command and record resulting events.
+
+        Args:
+            session: Session to mutate.
+            reservation: Active drop command reservation.
+            heat_level_percent: Driver heat level after the drop command.
+            fan_level_percent: Driver fan level after the drop command.
+            cooling_on: Driver cooling state after the drop command.
+
+        Returns:
+            The bean-drop event plus an atomic lightweight session snapshot.
+        """
+        with self._lock:
+            self._assert_driver_command_reservation(session, reservation)
+            self.apply_driver_control_state(
+                session,
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=fan_level_percent,
+                cooling_on=cooling_on,
+            )
+            event = self.record_event(session, "beans_dropped")
+            if cooling_on:
+                self.record_event(session, "cooling_started")
+            self._clear_driver_command_reservation_locked(session, reservation)
+            return event, _copy_session_for_read(session)
+
+    def complete_reserved_driver_start_cooling_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> tuple[RoastEvent, RoastSession]:
+        """Complete a reserved cooling-start command and record the event."""
+        with self._lock:
+            self._assert_driver_command_reservation(session, reservation)
+            self.apply_driver_control_state(
+                session,
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=fan_level_percent,
+                cooling_on=cooling_on,
+            )
+            event = self.record_event(session, "cooling_started")
+            self._clear_driver_command_reservation_locked(session, reservation)
+            return event, _copy_session_for_read(session)
+
+    def complete_reserved_driver_stop_cooling_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> tuple[RoastEvent, RoastSession]:
+        """Complete a reserved cooling-stop command and record the event."""
+        with self._lock:
+            self._assert_driver_command_reservation(session, reservation)
+            self.apply_driver_control_state(
+                session,
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=fan_level_percent,
+                cooling_on=cooling_on,
+            )
+            event = self.stop_cooling(session)
+            self._clear_driver_command_reservation_locked(session, reservation)
+            return event, _copy_session_for_read(session)
+
+    def clear_driver_command_reservation(
+        self,
+        session: RoastSession,
+        reservation: DriverCommandReservation,
+    ) -> None:
+        """Clear a pending driver command reservation if it is still current."""
+        with self._lock:
+            if session.pending_driver_command_token == reservation.token:
+                self._clear_driver_command_reservation_locked(session, reservation)
+
+    def cancel_pending_driver_command(self, session: RoastSession) -> None:
+        """Cancel any pending non-emergency driver command for one session."""
+        with self._lock:
+            self._assert_latest_session(session)
+            session.pending_driver_command_token = None
+            session.pending_driver_command_kind = None
 
     def start_cooling(self, session: RoastSession) -> RoastEvent:
         """Start cooling for one active session."""
@@ -771,6 +1028,50 @@ class RoastSessionStore:
                 return event
         return None
 
+    def _reserve_driver_command_locked(
+        self,
+        session: RoastSession,
+        *,
+        kind: DriverCommandKind,
+    ) -> DriverCommandReservation:
+        """Reserve a driver command while the store lock is already held."""
+        if session.pending_driver_command_token is not None:
+            raise SessionLifecycleError("Another driver command is already in progress.")
+        reservation = DriverCommandReservation(
+            session_id=session.id,
+            token=_generate_session_id(),
+            kind=kind,
+        )
+        session.pending_driver_command_token = reservation.token
+        session.pending_driver_command_kind = reservation.kind
+        return reservation
+
+    def _assert_driver_command_reservation(
+        self,
+        session: RoastSession,
+        reservation: DriverCommandReservation,
+    ) -> None:
+        """Validate a reservation before applying one driver command result."""
+        self._assert_latest_active_session(session)
+        if reservation.session_id != session.id:
+            raise SessionLifecycleError("Driver command reservation belongs to another session.")
+        if (
+            session.pending_driver_command_token != reservation.token
+            or session.pending_driver_command_kind != reservation.kind
+        ):
+            raise SessionLifecycleError("Driver command reservation is no longer active.")
+
+    def _clear_driver_command_reservation_locked(
+        self,
+        session: RoastSession,
+        reservation: DriverCommandReservation,
+    ) -> None:
+        """Clear a driver command reservation while the store lock is held."""
+        if session.pending_driver_command_token != reservation.token:
+            return
+        session.pending_driver_command_token = None
+        session.pending_driver_command_kind = None
+
     def _prune_session_history_locked(self) -> None:
         """Evict oldest completed sessions once retained history exceeds the limit."""
         while len(self._session_id_order) > self._session_history_limit:
@@ -1016,4 +1317,6 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         log_writer=session.log_writer,
         stopped_at_utc=session.stopped_at_utc,
         monotonic_stop=session.monotonic_stop,
+        pending_driver_command_token=session.pending_driver_command_token,
+        pending_driver_command_kind=session.pending_driver_command_kind,
     )
