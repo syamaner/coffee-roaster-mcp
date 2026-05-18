@@ -90,7 +90,10 @@ driver-backed MCP control tools, current roaster state exposure, released ONNX
 detector backend construction, session-owned first-crack detector lifecycle, and
 operational MCP readiness tests/docs. E4.1 now also explicitly owns the
 automatic T0 runtime path so a fully agent-driven roast does not depend on
-`mark_beans_added` as the primary T0 path when auto-T0 is enabled. E4.1-S1
+`mark_beans_added` as the primary T0 path when auto-T0 is enabled. T0 is beans
+added: the automatic path should track the max preheat/charge bean temperature
+and record `beans_added` when current bean temperature drops from that max by
+the configured threshold; the pre-drop max is the charge temperature. E4.1-S1
 wires `start_roast_session`, `set_heat`, `set_fan`, `drop_beans`,
 `start_cooling`, and `stop_cooling` to the configured `RoasterDriver` boundary
 while preserving the default mock path and one-session store semantics.

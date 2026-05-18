@@ -149,7 +149,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E4.1-S6` is added so the automatic T0 runtime path is explicitly owned
   before the operational epic closes. The explicit `mark_beans_added` override
   remains available, but a fully agent-driven roast should not depend on that
-  override as the primary T0 path when auto-T0 is enabled.
+  override as the primary T0 path when auto-T0 is enabled. T0 is beans added:
+  the runtime should track the max preheat/charge bean temperature before T0,
+  then record `beans_added` when current bean temperature drops from that max by
+  the configured threshold. The pre-drop max is the charge temperature.
 - Auto-T0 detection is disabled by default. `mark_beans_added` is authoritative.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
@@ -389,10 +392,16 @@ first crack has happened through MCP tools.
 - [ ] `E4.1-S6` Add automatic T0 runtime path.
   - Done when `session.auto_t0_detection_enabled` can record the authoritative
     `beans_added` event internally through `RoastSessionStore` without using
-    `mark_beans_added` as the primary path, remains disabled by default,
+    `mark_beans_added` as the primary path, tracks max preheat/charge bean
+    temperature from `RoasterDriver.read_state()` before T0, records T0 at the
+    first reading where current bean temperature drops from that max by the
+    configured threshold, preserves the pre-drop max as charge temperature in
+    diagnostics, handles gradual drops by comparing against the tracked max
+    rather than only the previous reading, remains disabled by default,
     preserves `mark_beans_added` as an explicit idempotent override, rejects
-    invalid phases and duplicates, exposes the resulting T0 timestamps through
-    `get_roast_state`, and keeps normal CI mock-safe.
+    invalid phases and duplicates, exposes the resulting T0 timestamps and
+    charge-temperature diagnostics through `get_roast_state`, and keeps normal
+    CI mock-safe.
 
 ### Epic Acceptance Criteria
 
@@ -407,6 +416,9 @@ first crack has happened through MCP tools.
   cooling started, and cooling stopped from `get_roast_state`.
 - Automatic T0 and automatic first-crack detection are internal runtime paths;
   exposed mark tools are explicit overrides.
+- Automatic T0 means bean-charge detection from a configured bean-temperature
+  drop threshold against max preheat/charge temperature, not temperature
+  recovery after the drop.
 - In audio mode, first-crack runtime uses released Hugging Face ONNX artifacts
   consumed by this repo; model training, ONNX export, and Hugging Face sync stay
   in `coffee-first-crack-detection`.

@@ -119,8 +119,12 @@ agent-run roasts, two explicit stories were added:
 - GitHub issue `#111`, `E4.1-S6: Add automatic T0 runtime path`. This owns the
   internal automatic beans-added/T0 path so a fully agent-driven roast does not
   depend on `mark_beans_added` as the primary runtime path when auto-T0 is
-  enabled. `mark_beans_added` remains an explicit override and auto-T0 remains
-  disabled by default.
+  enabled. After checking the old `coffee-roasting` prototype
+  `RoastTracker`, the story was tightened so T0 is beans added, detected when
+  current bean temperature drops from the tracked max preheat/charge
+  temperature by the configured threshold; the pre-drop max is preserved as the
+  charge temperature. `mark_beans_added` remains an explicit override and
+  auto-T0 remains disabled by default.
 - GitHub issue `#112`, `E7-S6: Run end-to-end agent roast validation with HF
   ONNX audio path`. This owns final validation that a real MCP client or agent
   can run a full roast with configured Hottop hardware, real microphone/audio
