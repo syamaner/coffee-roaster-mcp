@@ -78,3 +78,5 @@ def test_snapshot_export_preserves_first_crack_detector_metadata(tmp_path: Path)
     assert summary["first_crack_at_utc"] == "2026-05-17T14:00:37.250000+00:00"
     assert summary["metrics"]["development_time_seconds"] == 32.75
     assert summary["metrics"]["development_percent"] == 50.385
+    assert summary["metrics"]["bean_ror_c_per_min"] is None
+    assert summary["metrics"]["env_ror_c_per_min"] is None

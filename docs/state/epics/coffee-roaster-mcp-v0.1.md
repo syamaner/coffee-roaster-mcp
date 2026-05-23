@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E5-S5`
-- Current target: Compute bean/env RoR
+- Active story: `E5-S6`
+- Current target: Write append-only JSONL roast log
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -233,6 +233,16 @@ The first implementation milestone is a mock vertical slice that requires no roa
   `get_roast_state` and snapshot summary metric surfaces use these helpers
   through `compute_roast_metrics(...)`. RoR, append-only telemetry writers, and
   final log schemas remain later Epic 5 work.
+- `E5-S5` makes bean and environment rate-of-rise metrics explicit through
+  `compute_bean_ror_c_per_min(...)` and `compute_env_ror_c_per_min(...)`. The
+  helpers use the E5-S1 rolling telemetry buffer, anchor the rolling RoR window
+  at the latest retained telemetry sample, skip missing sensor values per
+  sensor, normalize the latest-minus-oldest retained temperature slope to
+  Celsius per minute using the actual valid sample span, and return `None`
+  until the relevant sensor has at least the configured minimum sample span,
+  defaulting to 10 seconds. Existing `get_roast_state` and snapshot summary
+  metric surfaces use these helpers through `compute_roast_metrics(...)`.
+  Append-only telemetry writers and final log schemas remain later Epic 5 work.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -522,7 +532,7 @@ Goal: compute roast metrics from one session clock and export durable logs.
 - [x] `E5-S4` Compute 60s bean/env deltas.
   - Done when latest minus oldest sample in rolling 60s window is returned for bean and environment temps.
 
-- [ ] `E5-S5` Compute bean/env RoR.
+- [x] `E5-S5` Compute bean/env RoR.
   - Done when RoR is normalized to C/min and returns null before 10 seconds of samples.
 
 - [ ] `E5-S6` Write append-only JSONL roast log.
@@ -1380,6 +1390,27 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest tests/test_session.py tests/test_package.py tests/test_exports.py`:
     72 passed.
   - Ran `./.venv/bin/python -m pytest`: 312 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+- Validation run for E5-S5:
+  - Added `compute_bean_ror_c_per_min(...)` and
+    `compute_env_ror_c_per_min(...)` as explicit helpers for bean and
+    environment rate of rise from the E5-S1 rolling telemetry buffer.
+  - Wired `compute_roast_metrics(...)` to expose `bean_ror_c_per_min` and
+    `env_ror_c_per_min` through the existing `get_roast_state` and snapshot
+    summary metric surfaces.
+  - Added RoR tests for regular 60-second sample intervals, irregular sample
+    spans normalized to C/min, per-sensor missing temperature values, the
+    minimum 10-second sample-span guard, and configured window/minimum span
+    values.
+  - Kept append-only telemetry log files, final JSONL/CSV/summary schemas,
+    model training/export/sync, real microphone validation, live Hottop
+    validation, end-to-end agent roast validation, and broad release validation
+    out of scope.
+  - Ran `./.venv/bin/python -m pytest`: 318 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

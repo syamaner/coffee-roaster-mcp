@@ -199,13 +199,24 @@ through `compute_roast_metrics(...)`. RoR, append-only telemetry writers, final
 JSONL/CSV/summary schemas, and broad release validation remain later Epic 5/E7
 work.
 
+E5-S5 added explicit bean and environment rate-of-rise metrics from the E5-S1
+rolling telemetry buffer. `bean_ror_c_per_min` and `env_ror_c_per_min` compute
+latest minus oldest retained temperature sample in the rolling RoR window,
+normalized by the actual valid sample span to Celsius per minute. The helpers
+skip missing sensor values per sensor and return `None` until the relevant
+sensor has at least the configured minimum sample span, defaulting to 10
+seconds. Existing MCP state and snapshot summary metric surfaces use these
+helpers through `compute_roast_metrics(...)`. Append-only telemetry writers,
+final JSONL/CSV/summary schemas, and broad release validation remain later Epic
+5/E7 work.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E5-S5: compute bean/env RoR.
+The next story is E5-S6: write append-only JSONL roast log.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
