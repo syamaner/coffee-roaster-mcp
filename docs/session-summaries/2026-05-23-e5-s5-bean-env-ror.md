@@ -56,6 +56,47 @@ Durable state updates:
 - `docs/state/registry.md` says the next story is `E5-S6: write append-only
   JSONL roast log`.
 
+## Usage Snapshot
+
+Operator-provided context snapshot after PR #122 review and fix turn:
+
+- Context window: `41% left (158K used / 258K)`
+- 5h limit: `94% left`, resets `02:17 on 24 May`
+- Weekly limit: `99% left`, resets `21:17 on 30 May`
+- GPT-5.3-Codex-Spark 5h limit: `100% left`, resets `04:20 on 24 May`
+- GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `23:20 on 30 May`
+
+## Review And Fix Turns
+
+Review state checked on PR #122:
+
+- PR #122 is open and mergeable.
+- Issue #44 remains open and will close through the PR `Closes #44` footer when
+  the PR merges.
+- Codex review `4351492259` posted one actionable inline comment on
+  `src/coffee_roaster_mcp/exports.py`.
+- CodeRabbit review `4351493716` posted one outside-diff finding on the same
+  behavior.
+- CodeRabbit's follow-up review on commit `220f5ee` reported no actionable
+  comments.
+
+Actionable review finding:
+
+- The initial summary export path computed RoR through `compute_roast_metrics`
+  with default RoR parameters, while MCP `get_roast_state` used the configured
+  `session.ror_window_seconds` and `session.ror_min_sample_seconds` values.
+- The accepted fix passes runtime RoR config through
+  `export_roast_log -> export_roast_snapshot(...) -> _write_summary_json(...)`,
+  so `summary.json` and `get_roast_state` use the same RoR settings.
+- Regression coverage was added with
+  `test_snapshot_export_uses_configured_ror_parameters`.
+
+Non-blocking review notes:
+
+- CodeRabbit continued to show a docstring coverage warning from its own
+  pre-merge checks. The repo's required `ruff`, `pyright`, `pytest`, and CLI
+  gates passed, so no broad docstring-only cleanup was taken in this story.
+
 ## Validation
 
 Local validation:
