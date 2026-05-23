@@ -12,6 +12,29 @@ import pytest
 from coffee_roaster_mcp.exports import export_roast_snapshot
 from coffee_roaster_mcp.session import EventPayloadValue, RoastSessionStore, TelemetrySample
 
+EXPECTED_CSV_FIELDNAMES = [
+    "timestamp_utc",
+    "elapsed_seconds",
+    "phase",
+    "bean_temp_c",
+    "env_temp_c",
+    "heat_level_percent",
+    "fan_level_percent",
+    "cooling_on",
+    "event",
+    "beans_added",
+    "first_crack_detected",
+    "beans_dropped",
+    "development_time_percent",
+    "bean_ror_c_per_min",
+    "env_ror_c_per_min",
+    "bean_delta_60s_c",
+    "env_delta_60s_c",
+    "fc_model_repo",
+    "fc_model_revision",
+    "fc_model_precision",
+]
+
 
 class ClockHarness:
     """Deterministic clock supplier for export tests."""
@@ -70,11 +93,17 @@ def test_snapshot_export_preserves_first_crack_detector_metadata(tmp_path: Path)
     assert first_crack_jsonl["payload"] == metadata
 
     with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
-        csv_rows = list(csv.DictReader(csv_file))
-    first_crack_csv_payload = json.loads(csv_rows[1]["payload_json"])
-    assert csv_rows[1]["kind"] == "first_crack_detected"
-    assert float(csv_rows[1]["monotonic_seconds"]) == 37.25
-    assert first_crack_csv_payload == metadata
+        reader = csv.DictReader(csv_file)
+        csv_rows = list(reader)
+    assert reader.fieldnames == EXPECTED_CSV_FIELDNAMES
+    first_crack_csv_row = csv_rows[1]
+    assert first_crack_csv_row["event"] == "first_crack_detected"
+    assert first_crack_csv_row["elapsed_seconds"] == "32.25"
+    assert first_crack_csv_row["phase"] == "development"
+    assert first_crack_csv_row["first_crack_detected"] == "True"
+    assert first_crack_csv_row["fc_model_repo"] == "syamaner/coffee-first-crack-detection"
+    assert first_crack_csv_row["fc_model_revision"] == "v0.1.0"
+    assert first_crack_csv_row["fc_model_precision"] == "int8"
 
     summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
     assert summary["first_crack_at_utc"] == "2026-05-17T14:00:37.250000+00:00"
@@ -115,6 +144,106 @@ def test_snapshot_export_uses_configured_ror_parameters(tmp_path: Path) -> None:
     summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
     assert summary["metrics"]["bean_ror_c_per_min"] is None
     assert summary["metrics"]["env_ror_c_per_min"] is None
+
+
+def test_snapshot_export_csv_includes_plan_columns_for_telemetry_and_events(
+    tmp_path: Path,
+) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+
+    store.append_telemetry(
+        session,
+        TelemetrySample(
+            recorded_at_utc=datetime(2026, 5, 17, 14, 0, 1, tzinfo=UTC),
+            monotonic_seconds=1.0,
+            bean_temp_c=150.0,
+            env_temp_c=180.0,
+            heat_level_percent=50,
+            fan_level_percent=20,
+            cooling_on=False,
+        ),
+    )
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    store.append_telemetry(
+        session,
+        TelemetrySample(
+            recorded_at_utc=datetime(2026, 5, 17, 14, 0, 15, tzinfo=UTC),
+            monotonic_seconds=15.0,
+            bean_temp_c=160.0,
+            env_temp_c=192.0,
+            heat_level_percent=60,
+            fan_level_percent=25,
+            cooling_on=False,
+        ),
+    )
+    metadata: dict[str, EventPayloadValue] = {
+        "repo_id": "syamaner/coffee-first-crack-detection",
+        "revision": "v0.1.0",
+        "precision": "int8",
+    }
+    clock.monotonic_value = 135.0
+    store.record_event(session, "first_crack_detected", payload=metadata)
+    store.append_telemetry(
+        session,
+        TelemetrySample(
+            recorded_at_utc=datetime(2026, 5, 17, 14, 1, 15, tzinfo=UTC),
+            monotonic_seconds=75.0,
+            bean_temp_c=170.0,
+            env_temp_c=204.0,
+            heat_level_percent=45,
+            fan_level_percent=40,
+            cooling_on=False,
+        ),
+    )
+    clock.monotonic_value = 180.0
+    store.record_event(session, "beans_dropped")
+
+    export = export_roast_snapshot(session)
+
+    with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
+        rows = list(reader)
+    assert reader.fieldnames == EXPECTED_CSV_FIELDNAMES
+    assert [row["event"] for row in rows] == [
+        "",
+        "beans_added",
+        "",
+        "first_crack_detected",
+        "",
+        "beans_dropped",
+    ]
+    first_telemetry = rows[0]
+    assert first_telemetry["phase"] == "pre_roast"
+    assert first_telemetry["elapsed_seconds"] == ""
+    assert first_telemetry["bean_temp_c"] == "150.0"
+    assert first_telemetry["event"] == ""
+
+    post_fc_telemetry = rows[4]
+    assert post_fc_telemetry["phase"] == "development"
+    assert post_fc_telemetry["elapsed_seconds"] == "70.0"
+    assert post_fc_telemetry["beans_added"] == "True"
+    assert post_fc_telemetry["first_crack_detected"] == "True"
+    assert post_fc_telemetry["beans_dropped"] == "False"
+    assert post_fc_telemetry["development_time_percent"] == "57.143"
+    assert post_fc_telemetry["bean_ror_c_per_min"] == "10.0"
+    assert post_fc_telemetry["env_ror_c_per_min"] == "12.0"
+    assert post_fc_telemetry["bean_delta_60s_c"] == "10.0"
+    assert post_fc_telemetry["env_delta_60s_c"] == "12.0"
+    assert post_fc_telemetry["fc_model_repo"] == "syamaner/coffee-first-crack-detection"
+    assert post_fc_telemetry["fc_model_revision"] == "v0.1.0"
+    assert post_fc_telemetry["fc_model_precision"] == "int8"
+
+    drop_event = rows[5]
+    assert drop_event["phase"] == "dropped"
+    assert drop_event["elapsed_seconds"] == "75.0"
+    assert drop_event["beans_dropped"] == "True"
 
 
 def test_snapshot_export_rejects_existing_jsonl_directory(tmp_path: Path) -> None:

@@ -4,12 +4,43 @@ from __future__ import annotations
 
 import csv
 import json
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from coffee_roaster_mcp.session import RoastEvent, RoastSession, compute_roast_metrics
+from coffee_roaster_mcp.session import (
+    EventPayloadValue,
+    RoastEvent,
+    RoastPhase,
+    RoastSession,
+    TelemetrySample,
+    compute_roast_metrics,
+)
+
+_CSV_FIELDNAMES: tuple[str, ...] = (
+    "timestamp_utc",
+    "elapsed_seconds",
+    "phase",
+    "bean_temp_c",
+    "env_temp_c",
+    "heat_level_percent",
+    "fan_level_percent",
+    "cooling_on",
+    "event",
+    "beans_added",
+    "first_crack_detected",
+    "beans_dropped",
+    "development_time_percent",
+    "bean_ror_c_per_min",
+    "env_ror_c_per_min",
+    "bean_delta_60s_c",
+    "env_delta_60s_c",
+    "fc_model_repo",
+    "fc_model_revision",
+    "fc_model_precision",
+)
 
 
 @dataclass(frozen=True)
@@ -103,29 +134,12 @@ def _write_event_jsonl(path: Path, *, session: RoastSession) -> None:
 
 
 def _write_event_csv(path: Path, *, session: RoastSession) -> None:
-    """Write one CSV row per recorded event."""
+    """Write CSV rows with the planned roast log schema."""
     with path.open("w", encoding="utf-8", newline="") as output:
-        writer = csv.DictWriter(
-            output,
-            fieldnames=[
-                "session_id",
-                "kind",
-                "recorded_at_utc",
-                "monotonic_seconds",
-                "payload_json",
-            ],
-        )
+        writer = csv.DictWriter(output, fieldnames=_CSV_FIELDNAMES)
         writer.writeheader()
-        for event in session.event_timeline:
-            writer.writerow(
-                {
-                    "session_id": session.id,
-                    "kind": event.kind,
-                    "recorded_at_utc": event.recorded_at_utc.isoformat(),
-                    "monotonic_seconds": event.monotonic_seconds,
-                    "payload_json": json.dumps(event.payload, sort_keys=True),
-                }
-            )
+        for row in _csv_rows(session):
+            writer.writerow(row)
 
 
 def _write_summary_json(
@@ -180,6 +194,270 @@ def _event_row(*, session: RoastSession, event: RoastEvent) -> dict[str, Any]:
         "monotonic_seconds": event.monotonic_seconds,
         "payload": dict(event.payload),
     }
+
+
+def _csv_rows(session: RoastSession) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    sorted_events = sorted(session.event_timeline, key=_event_sort_key)
+    telemetry_by_monotonic = list(session.telemetry_buffer)
+    combined: list[tuple[float, int, RoastEvent | TelemetrySample]] = [
+        (sample.monotonic_seconds, 0, sample) for sample in telemetry_by_monotonic
+    ]
+    combined.extend((event.monotonic_seconds, 1, event) for event in sorted_events)
+    last_sample: TelemetrySample | None = None
+    for _, _, item in sorted(combined, key=lambda row: (row[0], row[1])):
+        if isinstance(item, TelemetrySample):
+            last_sample = item
+            rows.append(_csv_telemetry_row(session, item))
+            continue
+        event_sample = _latest_sample_at_or_before(
+            session.telemetry_buffer,
+            monotonic_seconds=item.monotonic_seconds,
+        )
+        rows.append(_csv_event_row(session, item, telemetry=event_sample or last_sample))
+    return rows
+
+
+def _csv_telemetry_row(session: RoastSession, sample: TelemetrySample) -> dict[str, object]:
+    metrics = compute_roast_metrics(
+        _session_view_at(session, monotonic_seconds=sample.monotonic_seconds),
+        monotonic_now=lambda: session.monotonic_start + sample.monotonic_seconds,
+    )
+    fc_payload = _first_crack_payload_at(
+        session,
+        monotonic_seconds=sample.monotonic_seconds,
+    )
+    return {
+        "timestamp_utc": sample.recorded_at_utc.isoformat(),
+        "elapsed_seconds": _roast_elapsed_at(session, sample.monotonic_seconds),
+        "phase": _phase_at(session, sample.monotonic_seconds),
+        "bean_temp_c": sample.bean_temp_c,
+        "env_temp_c": sample.env_temp_c,
+        "heat_level_percent": sample.heat_level_percent,
+        "fan_level_percent": sample.fan_level_percent,
+        "cooling_on": sample.cooling_on,
+        "event": None,
+        "beans_added": _event_seen_at(session, "beans_added", sample.monotonic_seconds),
+        "first_crack_detected": _event_seen_at(
+            session,
+            "first_crack_detected",
+            sample.monotonic_seconds,
+        ),
+        "beans_dropped": _event_seen_at(session, "beans_dropped", sample.monotonic_seconds),
+        "development_time_percent": metrics.development_percent,
+        "bean_ror_c_per_min": metrics.bean_ror_c_per_min,
+        "env_ror_c_per_min": metrics.env_ror_c_per_min,
+        "bean_delta_60s_c": metrics.bean_temp_delta_60s_c,
+        "env_delta_60s_c": metrics.env_temp_delta_60s_c,
+        "fc_model_repo": fc_payload.get("repo_id"),
+        "fc_model_revision": fc_payload.get("revision"),
+        "fc_model_precision": fc_payload.get("precision"),
+    }
+
+
+def _csv_event_row(
+    session: RoastSession,
+    event: RoastEvent,
+    *,
+    telemetry: TelemetrySample | None,
+) -> dict[str, object]:
+    metrics = compute_roast_metrics(
+        _session_view_at(session, monotonic_seconds=event.monotonic_seconds),
+        monotonic_now=lambda: session.monotonic_start + event.monotonic_seconds,
+    )
+    fc_payload = _first_crack_payload_at(
+        session,
+        monotonic_seconds=event.monotonic_seconds,
+    )
+    return {
+        "timestamp_utc": event.recorded_at_utc.isoformat(),
+        "elapsed_seconds": _roast_elapsed_at(session, event.monotonic_seconds),
+        "phase": _phase_at(session, event.monotonic_seconds),
+        "bean_temp_c": None if telemetry is None else telemetry.bean_temp_c,
+        "env_temp_c": None if telemetry is None else telemetry.env_temp_c,
+        "heat_level_percent": _event_control_value(
+            event,
+            telemetry=telemetry,
+            key="heat_level_percent",
+        ),
+        "fan_level_percent": _event_control_value(
+            event,
+            telemetry=telemetry,
+            key="fan_level_percent",
+        ),
+        "cooling_on": _event_cooling_value(event, telemetry=telemetry),
+        "event": event.kind,
+        "beans_added": _event_seen_at(session, "beans_added", event.monotonic_seconds),
+        "first_crack_detected": _event_seen_at(
+            session,
+            "first_crack_detected",
+            event.monotonic_seconds,
+        ),
+        "beans_dropped": _event_seen_at(session, "beans_dropped", event.monotonic_seconds),
+        "development_time_percent": metrics.development_percent,
+        "bean_ror_c_per_min": metrics.bean_ror_c_per_min,
+        "env_ror_c_per_min": metrics.env_ror_c_per_min,
+        "bean_delta_60s_c": metrics.bean_temp_delta_60s_c,
+        "env_delta_60s_c": metrics.env_temp_delta_60s_c,
+        "fc_model_repo": fc_payload.get("repo_id"),
+        "fc_model_revision": fc_payload.get("revision"),
+        "fc_model_precision": fc_payload.get("precision"),
+    }
+
+
+def _session_view_at(session: RoastSession, *, monotonic_seconds: float) -> RoastSession:
+    events = [
+        event
+        for event in sorted(session.event_timeline, key=_event_sort_key)
+        if event.monotonic_seconds <= monotonic_seconds
+    ]
+    view = RoastSession(
+        id=session.id,
+        created_at_utc=session.created_at_utc,
+        monotonic_start=session.monotonic_start,
+        event_timeline=list(events),
+        telemetry_buffer=deque(
+            sample
+            for sample in session.telemetry_buffer
+            if sample.monotonic_seconds <= monotonic_seconds
+        ),
+        log_writer=session.log_writer,
+        stopped_at_utc=session.created_at_utc,
+        monotonic_stop=session.monotonic_start + monotonic_seconds,
+    )
+    for event in events:
+        _apply_view_event(view, event)
+    view.phase = _phase_at(session, monotonic_seconds)
+    return view
+
+
+def _apply_view_event(session: RoastSession, event: RoastEvent) -> None:
+    if event.kind == "beans_added":
+        session.beans_added_at_utc = event.recorded_at_utc
+        session.beans_added_monotonic_seconds = event.monotonic_seconds
+    elif event.kind == "first_crack_detected":
+        session.first_crack_at_utc = event.recorded_at_utc
+        session.first_crack_monotonic_seconds = event.monotonic_seconds
+    elif event.kind == "beans_dropped":
+        session.beans_dropped_at_utc = event.recorded_at_utc
+        session.beans_dropped_monotonic_seconds = event.monotonic_seconds
+    elif event.kind == "cooling_started":
+        session.cooling_started_at_utc = event.recorded_at_utc
+        session.cooling_started_monotonic_seconds = event.monotonic_seconds
+    elif event.kind == "cooling_stopped":
+        session.cooling_stopped_at_utc = event.recorded_at_utc
+        session.cooling_stopped_monotonic_seconds = event.monotonic_seconds
+    elif event.kind == "fault":
+        session.faulted_at_utc = event.recorded_at_utc
+        session.faulted_monotonic_seconds = event.monotonic_seconds
+
+
+def _phase_at(session: RoastSession, monotonic_seconds: float) -> RoastPhase:
+    phase: RoastPhase = "pre_roast"
+    for event in sorted(session.event_timeline, key=_event_sort_key):
+        if event.monotonic_seconds > monotonic_seconds:
+            break
+        if event.kind == "beans_added":
+            phase = "roasting"
+        elif event.kind == "first_crack_detected":
+            phase = "development"
+        elif event.kind == "beans_dropped":
+            phase = "dropped"
+        elif event.kind == "cooling_started":
+            phase = "cooling"
+        elif event.kind == "cooling_stopped":
+            phase = "complete"
+        elif event.kind == "fault":
+            phase = "fault"
+    return phase
+
+
+def _roast_elapsed_at(session: RoastSession, monotonic_seconds: float) -> float | None:
+    if session.beans_added_monotonic_seconds is None:
+        return None
+    if monotonic_seconds < session.beans_added_monotonic_seconds:
+        return None
+    end_seconds = monotonic_seconds
+    if (
+        session.beans_dropped_monotonic_seconds is not None
+        and monotonic_seconds >= session.beans_dropped_monotonic_seconds
+    ):
+        end_seconds = session.beans_dropped_monotonic_seconds
+    return round(max(0.0, end_seconds - session.beans_added_monotonic_seconds), 3)
+
+
+def _event_seen_at(session: RoastSession, kind: str, monotonic_seconds: float) -> bool:
+    return any(
+        event.kind == kind and event.monotonic_seconds <= monotonic_seconds
+        for event in session.event_timeline
+    )
+
+
+def _first_crack_payload_at(
+    session: RoastSession,
+    *,
+    monotonic_seconds: float,
+) -> dict[str, EventPayloadValue]:
+    for event in sorted(session.event_timeline, key=_event_sort_key):
+        if event.monotonic_seconds > monotonic_seconds:
+            break
+        if event.kind == "first_crack_detected":
+            return dict(event.payload)
+    return {}
+
+
+def _latest_sample_at_or_before(
+    samples: deque[TelemetrySample],
+    *,
+    monotonic_seconds: float,
+) -> TelemetrySample | None:
+    latest: TelemetrySample | None = None
+    for sample in samples:
+        if sample.monotonic_seconds > monotonic_seconds:
+            break
+        latest = sample
+    return latest
+
+
+def _event_control_value(
+    event: RoastEvent,
+    *,
+    telemetry: TelemetrySample | None,
+    key: str,
+) -> int | None:
+    value = event.payload.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if telemetry is None:
+        return None
+    if key == "heat_level_percent":
+        return telemetry.heat_level_percent
+    return telemetry.fan_level_percent
+
+
+def _event_cooling_value(event: RoastEvent, *, telemetry: TelemetrySample | None) -> bool | None:
+    value = event.payload.get("cooling_on")
+    if isinstance(value, bool):
+        return value
+    return None if telemetry is None else telemetry.cooling_on
+
+
+def _event_sort_key(event: RoastEvent) -> tuple[float, int]:
+    return (event.monotonic_seconds, _event_order(event.kind))
+
+
+def _event_order(kind: str) -> int:
+    order_by_kind = {
+        "beans_added": 0,
+        "first_crack_detected": 1,
+        "beans_dropped": 2,
+        "cooling_started": 3,
+        "cooling_stopped": 4,
+        "fault": 5,
+    }
+    return order_by_kind.get(kind, 99)
 
 
 def _iso_or_none(value: datetime | None) -> str | None:

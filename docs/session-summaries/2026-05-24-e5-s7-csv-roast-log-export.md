@@ -1,0 +1,76 @@
+# E5-S7 CSV Roast Log Export
+
+This summary captures the E5-S7 implementation, validation state, and restart
+context.
+
+## Scope
+
+Story: `E5-S7` / issue `#46`, export CSV roast log.
+
+Branch: `feature/46-export-csv-roast-log`
+
+The implementation stayed inside the E5-S7 boundary:
+
+- update snapshot `roast.csv` export to include all plan-required CSV columns
+- write retained telemetry samples and recorded session events in monotonic
+  order
+- infer phase, event flags, elapsed roast seconds, development percent,
+  60-second temperature deltas, RoR metrics, and first-crack model metadata for
+  CSV rows
+- preserve append-only runtime `roast.jsonl` writes from `RoastSessionStore`
+- preserve existing `summary.json`, metric helper, session lifecycle, MCP, and
+  configured-driver behavior
+
+No final `summary.json` schema work, model training, ONNX export, Hugging Face
+sync, real microphone validation, live Hottop validation, end-to-end agent roast
+validation, or broad release validation was added.
+
+## Implementation Summary
+
+`export_roast_snapshot(...)` still writes `roast.csv` as a snapshot export, but
+the CSV schema now matches the required columns in the v0.1 plan:
+
+- timestamp, elapsed seconds, inferred phase, temperatures, heat/fan controls,
+  cooling state, event marker, and event flags
+- development percent, bean/environment RoR, and bean/environment 60-second
+  deltas computed from the retained telemetry available at each row
+- first-crack model repository, revision, and precision from the authoritative
+  first-crack event payload once first crack has been recorded
+
+The exporter builds rows from the existing in-memory session snapshot. It does
+not change the append-only JSONL runtime writer, the one-session
+`RoastSessionStore` mutation boundary, or the configured MCP control/runtime
+behavior.
+
+Durable state updates:
+
+- `docs/state/epics/coffee-roaster-mcp-v0.1.md` marks `E5-S7` complete and sets
+  the active story to `E5-S8`.
+- `docs/state/registry.md` says the next story is `E5-S8: export summary.json`.
+- `README.md` describes the current JSONL/CSV/summary export behavior.
+
+## Validation
+
+Focused validation:
+
+- `./.venv/bin/python -m pytest tests/test_exports.py`: 4 passed
+
+Full validation:
+
+- `./.venv/bin/python -m pytest`: 328 passed
+- `./.venv/bin/python -m ruff check .`: passed
+- `./.venv/bin/python -m ruff format --check .`: passed
+- `./.venv/bin/python -m pyright`: 0 errors
+- `./.venv/bin/coffee-roaster-mcp --help`: passed
+- `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
+
+## Restart Prompt
+
+Resume in the local clone of `syamaner/coffee-roaster-mcp`. PR for E5-S7 should
+be checked first. If it has merged, verify issue #46 is closed, check out
+`main`, run `git pull --ff-only origin main`, then begin E5-S8 from updated main
+on the appropriate `feature/47-...` branch after reading the registry, active
+epic, this summary, and the GitHub issue for E5-S8. Keep E5-S8 scoped to
+`summary.json` export unless its issue explicitly requires more, and preserve
+the append-only JSONL runtime writer, CSV schema, and existing
+metrics/session/runtime boundaries.

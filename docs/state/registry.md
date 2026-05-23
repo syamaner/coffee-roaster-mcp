@@ -216,9 +216,17 @@ authoritative timeline events are recorded, and writes telemetry rows from the
 existing E5-S1 driver polling path no more often than
 `logging.sample_interval_seconds`, defaulting to 1 Hz. The existing rolling
 telemetry buffer, metric helpers, one-session store boundary, mock-safe MCP
-flow, and final CSV/summary schema boundaries remain unchanged. Snapshot export
+flow, and final CSV/summary schema boundaries remained unchanged. Snapshot export
 continues to write CSV and `summary.json`, but no longer overwrites an existing
 append-only `roast.jsonl` file.
+
+E5-S7 added the planned CSV roast log export schema to snapshot
+`export_roast_log` output. `roast.csv` now includes telemetry and event rows
+using the plan-required columns for timestamps, elapsed seconds, inferred phase,
+temperatures, controls, cooling state, event markers, event flags, development
+percent, RoR/delta metrics, and first-crack model metadata. Append-only JSONL
+runtime logging, the one-session `RoastSessionStore` mutation boundary, existing
+metric helpers, and `summary.json` behavior remain unchanged.
 
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
@@ -226,7 +234,7 @@ first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E5-S7: export CSV roast log.
+The next story is E5-S8: export `summary.json`.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
