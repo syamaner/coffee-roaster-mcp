@@ -219,6 +219,8 @@ class RoastMetrics:
         development_percent: Development time as a percentage of roast elapsed time.
         bean_temp_delta_60s_c: Bean-temperature delta across the rolling 60s window.
         env_temp_delta_60s_c: Environment-temperature delta across the rolling 60s window.
+        bean_ror_c_per_min: Bean-temperature rate of rise in Celsius per minute.
+        env_ror_c_per_min: Environment-temperature rate of rise in Celsius per minute.
     """
 
     roast_elapsed_seconds: float | None
@@ -226,6 +228,8 @@ class RoastMetrics:
     development_percent: float | None
     bean_temp_delta_60s_c: float | None
     env_temp_delta_60s_c: float | None
+    bean_ror_c_per_min: float | None
+    env_ror_c_per_min: float | None
 
 
 @dataclass
@@ -341,12 +345,16 @@ def compute_roast_metrics(
     session: RoastSession,
     *,
     monotonic_now: Callable[[], float] | None = None,
+    ror_window_seconds: float = 60.0,
+    ror_min_sample_seconds: float = 10.0,
 ) -> RoastMetrics:
     """Compute timestamp-derived metrics for one session snapshot.
 
     Args:
         session: Session snapshot to inspect.
         monotonic_now: Optional monotonic clock supplier for active sessions.
+        ror_window_seconds: Rolling telemetry window for RoR calculations.
+        ror_min_sample_seconds: Minimum valid sensor sample span required for RoR.
 
     Returns:
         Minimal roast metrics available from the current event timestamps.
@@ -371,6 +379,16 @@ def compute_roast_metrics(
         ),
         bean_temp_delta_60s_c=compute_bean_temp_delta_60s_c(session),
         env_temp_delta_60s_c=compute_env_temp_delta_60s_c(session),
+        bean_ror_c_per_min=compute_bean_ror_c_per_min(
+            session,
+            window_seconds=ror_window_seconds,
+            min_sample_seconds=ror_min_sample_seconds,
+        ),
+        env_ror_c_per_min=compute_env_ror_c_per_min(
+            session,
+            window_seconds=ror_window_seconds,
+            min_sample_seconds=ror_min_sample_seconds,
+        ),
     )
 
 
@@ -494,6 +512,56 @@ def compute_env_temp_delta_60s_c(session: RoastSession) -> float | None:
     )
 
 
+def compute_bean_ror_c_per_min(
+    session: RoastSession,
+    *,
+    window_seconds: float = 60.0,
+    min_sample_seconds: float = 10.0,
+) -> float | None:
+    """Compute bean-temperature rate of rise in Celsius per minute.
+
+    Args:
+        session: Session snapshot with retained telemetry samples.
+        window_seconds: Rolling telemetry window ending at the latest sample.
+        min_sample_seconds: Minimum valid bean sample span required for a value.
+
+    Returns:
+        Bean-temperature slope over the latest valid rolling sample span,
+        normalized to Celsius per minute, or `None` before enough samples exist.
+    """
+    return _compute_temperature_ror_c_per_min(
+        session,
+        temperature_field="bean_temp_c",
+        window_seconds=window_seconds,
+        min_sample_seconds=min_sample_seconds,
+    )
+
+
+def compute_env_ror_c_per_min(
+    session: RoastSession,
+    *,
+    window_seconds: float = 60.0,
+    min_sample_seconds: float = 10.0,
+) -> float | None:
+    """Compute environment-temperature rate of rise in Celsius per minute.
+
+    Args:
+        session: Session snapshot with retained telemetry samples.
+        window_seconds: Rolling telemetry window ending at the latest sample.
+        min_sample_seconds: Minimum valid environment sample span required for a value.
+
+    Returns:
+        Environment-temperature slope over the latest valid rolling sample span,
+        normalized to Celsius per minute, or `None` before enough samples exist.
+    """
+    return _compute_temperature_ror_c_per_min(
+        session,
+        temperature_field="env_temp_c",
+        window_seconds=window_seconds,
+        min_sample_seconds=min_sample_seconds,
+    )
+
+
 def _compute_development_percent_from_values(
     *,
     roast_elapsed_seconds: float | None,
@@ -535,6 +603,46 @@ def _compute_temperature_delta_60s_c(
     if oldest_temp_c is None or latest_temp_c is None or valid_sample_count < 2:
         return None
     return round(latest_temp_c - oldest_temp_c, 3)
+
+
+def _compute_temperature_ror_c_per_min(
+    session: RoastSession,
+    *,
+    temperature_field: Literal["bean_temp_c", "env_temp_c"],
+    window_seconds: float,
+    min_sample_seconds: float,
+) -> float | None:
+    """Return temperature slope over the latest rolling window as C/min."""
+    if not session.telemetry_buffer:
+        return None
+    latest_sample_seconds = session.telemetry_buffer[-1].monotonic_seconds
+    window_start_seconds = latest_sample_seconds - window_seconds
+    oldest_temp_c: float | None = None
+    oldest_sample_seconds: float | None = None
+    latest_temp_c: float | None = None
+    latest_temp_seconds: float | None = None
+    for sample in session.telemetry_buffer:
+        if sample.monotonic_seconds < window_start_seconds:
+            continue
+        temp_c = getattr(sample, temperature_field)
+        if temp_c is None:
+            continue
+        if oldest_temp_c is None:
+            oldest_temp_c = temp_c
+            oldest_sample_seconds = sample.monotonic_seconds
+        latest_temp_c = temp_c
+        latest_temp_seconds = sample.monotonic_seconds
+    if (
+        oldest_temp_c is None
+        or oldest_sample_seconds is None
+        or latest_temp_c is None
+        or latest_temp_seconds is None
+    ):
+        return None
+    sample_span_seconds = latest_temp_seconds - oldest_sample_seconds
+    if sample_span_seconds < min_sample_seconds or sample_span_seconds <= 0:
+        return None
+    return round(((latest_temp_c - oldest_temp_c) / sample_span_seconds) * 60.0, 3)
 
 
 class SessionLifecycleError(RuntimeError):

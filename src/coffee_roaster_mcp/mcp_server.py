@@ -245,6 +245,8 @@ class RoastSessionState:
     development_percent: float | None
     bean_temp_delta_60s_c: float | None
     env_temp_delta_60s_c: float | None
+    bean_ror_c_per_min: float | None
+    env_ror_c_per_min: float | None
     device_state: RoasterDeviceState | None
     t0_status: T0Status
     first_crack_status: FirstCrackStatus
@@ -593,7 +595,11 @@ def create_mcp_server(
         """Write a snapshot export for one roast session."""
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
-        export = export_roast_snapshot(session)
+        export = export_roast_snapshot(
+            session,
+            ror_window_seconds=server_context.config.session.ror_window_seconds,
+            ror_min_sample_seconds=server_context.config.session.ror_min_sample_seconds,
+        )
         return ExportRoastLogResult(
             session_id=export.session_id,
             log_dir=str(export.log_dir),
@@ -943,7 +949,11 @@ def _serialize_session_state(
     first_crack_runtime: FirstCrackRuntimeSnapshot | None = None,
 ) -> RoastSessionState:
     """Convert one in-memory session into an MCP-safe snapshot."""
-    metrics = compute_roast_metrics(session)
+    metrics = compute_roast_metrics(
+        session,
+        ror_window_seconds=config.session.ror_window_seconds,
+        ror_min_sample_seconds=config.session.ror_min_sample_seconds,
+    )
     return RoastSessionState(
         session_id=session.id,
         active=session.active,
@@ -971,6 +981,8 @@ def _serialize_session_state(
         development_percent=metrics.development_percent,
         bean_temp_delta_60s_c=metrics.bean_temp_delta_60s_c,
         env_temp_delta_60s_c=metrics.env_temp_delta_60s_c,
+        bean_ror_c_per_min=metrics.bean_ror_c_per_min,
+        env_ror_c_per_min=metrics.env_ror_c_per_min,
         device_state=device_state,
         t0_status=_serialize_t0_status(session, config=config),
         first_crack_status=_serialize_first_crack_status(

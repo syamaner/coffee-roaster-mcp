@@ -35,7 +35,12 @@ class RoastLogExport:
     note: str
 
 
-def export_roast_snapshot(session: RoastSession) -> RoastLogExport:
+def export_roast_snapshot(
+    session: RoastSession,
+    *,
+    ror_window_seconds: float = 60.0,
+    ror_min_sample_seconds: float = 10.0,
+) -> RoastLogExport:
     """Write a deterministic snapshot export for one roast session.
 
     Epic 2 exports the current session snapshot so the one-process mock flow can
@@ -44,6 +49,8 @@ def export_roast_snapshot(session: RoastSession) -> RoastLogExport:
 
     Args:
         session: Copied session snapshot to export.
+        ror_window_seconds: Rolling telemetry window for RoR calculations.
+        ror_min_sample_seconds: Minimum valid sensor sample span required for RoR.
 
     Returns:
         Export file paths and readiness metadata.
@@ -62,7 +69,12 @@ def export_roast_snapshot(session: RoastSession) -> RoastLogExport:
     log_dir.mkdir(parents=True, exist_ok=True)
     _write_event_jsonl(jsonl_path, session=session)
     _write_event_csv(csv_path, session=session)
-    _write_summary_json(summary_path, session=session)
+    _write_summary_json(
+        summary_path,
+        session=session,
+        ror_window_seconds=ror_window_seconds,
+        ror_min_sample_seconds=ror_min_sample_seconds,
+    )
 
     return RoastLogExport(
         session_id=session.id,
@@ -112,9 +124,19 @@ def _write_event_csv(path: Path, *, session: RoastSession) -> None:
             )
 
 
-def _write_summary_json(path: Path, *, session: RoastSession) -> None:
+def _write_summary_json(
+    path: Path,
+    *,
+    session: RoastSession,
+    ror_window_seconds: float = 60.0,
+    ror_min_sample_seconds: float = 10.0,
+) -> None:
     """Write a compact summary for the exported session snapshot."""
-    metrics = compute_roast_metrics(session)
+    metrics = compute_roast_metrics(
+        session,
+        ror_window_seconds=ror_window_seconds,
+        ror_min_sample_seconds=ror_min_sample_seconds,
+    )
     payload: dict[str, Any] = {
         "session_id": session.id,
         "active": session.active,
@@ -137,6 +159,8 @@ def _write_summary_json(path: Path, *, session: RoastSession) -> None:
             "development_percent": metrics.development_percent,
             "bean_temp_delta_60s_c": metrics.bean_temp_delta_60s_c,
             "env_temp_delta_60s_c": metrics.env_temp_delta_60s_c,
+            "bean_ror_c_per_min": metrics.bean_ror_c_per_min,
+            "env_ror_c_per_min": metrics.env_ror_c_per_min,
         },
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
