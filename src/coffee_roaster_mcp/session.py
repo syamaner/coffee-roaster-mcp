@@ -521,16 +521,18 @@ def _compute_temperature_delta_60s_c(
     window_start_seconds = latest_sample_seconds - 60.0
     oldest_temp_c: float | None = None
     latest_temp_c: float | None = None
+    valid_sample_count = 0
     for sample in session.telemetry_buffer:
         if sample.monotonic_seconds < window_start_seconds:
             continue
         temp_c = getattr(sample, temperature_field)
         if temp_c is None:
             continue
+        valid_sample_count += 1
         if oldest_temp_c is None:
             oldest_temp_c = temp_c
         latest_temp_c = temp_c
-    if oldest_temp_c is None or latest_temp_c is None:
+    if oldest_temp_c is None or latest_temp_c is None or valid_sample_count < 2:
         return None
     return round(latest_temp_c - oldest_temp_c, 3)
 

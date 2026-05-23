@@ -1075,6 +1075,37 @@ def test_compute_temperature_deltas_60s_skip_missing_sensor_values() -> None:
     assert compute_env_temp_delta_60s_c(session) == 15.0
 
 
+def test_compute_temperature_deltas_60s_return_none_for_single_valid_sample() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    store.append_telemetry(
+        session,
+        TelemetrySample(
+            recorded_at_utc=clock.utc_now(),
+            monotonic_seconds=1.0,
+            bean_temp_c=150.0,
+            env_temp_c=None,
+        ),
+    )
+    store.append_telemetry(
+        session,
+        TelemetrySample(
+            recorded_at_utc=clock.utc_now(),
+            monotonic_seconds=10.0,
+            bean_temp_c=None,
+            env_temp_c=200.0,
+        ),
+    )
+
+    assert compute_bean_temp_delta_60s_c(session) is None
+    assert compute_env_temp_delta_60s_c(session) is None
+
+
 def test_compute_development_time_seconds_returns_none_before_first_crack() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
