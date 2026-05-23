@@ -56,7 +56,8 @@ def export_roast_snapshot(
         Export file paths and readiness metadata.
 
     Raises:
-        ValueError: If the session has no log writer target.
+        ValueError: If the session has no log writer target or the JSONL path
+            is not a regular file.
     """
     if session.log_writer is None:
         raise ValueError("Session log target is unavailable.")
@@ -67,7 +68,10 @@ def export_roast_snapshot(
     summary_path = log_dir / "summary.json"
 
     log_dir.mkdir(parents=True, exist_ok=True)
-    _write_event_jsonl(jsonl_path, session=session)
+    if jsonl_path.exists() and not jsonl_path.is_file():
+        raise ValueError(f"JSONL export path exists but is not a file: {jsonl_path}")
+    if not jsonl_path.exists():
+        _write_event_jsonl(jsonl_path, session=session)
     _write_event_csv(csv_path, session=session)
     _write_summary_json(
         summary_path,
@@ -84,8 +88,8 @@ def export_roast_snapshot(
         summary_path=summary_path,
         ready=True,
         note=(
-            "Snapshot export written from the current in-process session. "
-            "Append-only telemetry writers and final log schemas land in Epic 5."
+            "Snapshot CSV and summary export written from the current "
+            "in-process session. JSONL is append-only during the roast."
         ),
     )
 

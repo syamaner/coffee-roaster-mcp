@@ -101,6 +101,20 @@ session:
     assert config.session.ror_min_sample_seconds == 12
 
 
+def test_logging_sample_interval_must_be_positive(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        """
+logging:
+  sample_interval_seconds: 0
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="logging.sample_interval_seconds"):
+        load_config(config_path, environ={})
+
+
 def test_environment_overrides_file_config(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(

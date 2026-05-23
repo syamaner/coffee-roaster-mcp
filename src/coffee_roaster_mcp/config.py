@@ -245,7 +245,7 @@ def _audio_from_mapping(raw: Mapping[str, Any]) -> AudioConfig:
 def _logging_from_mapping(raw: Mapping[str, Any]) -> LoggingConfig:
     return LoggingConfig(
         log_dir=_path(raw, "log_dir", Path("./logs"), label="logging.log_dir"),
-        sample_interval_seconds=_float(
+        sample_interval_seconds=_positive_float(
             raw,
             "sample_interval_seconds",
             1.0,

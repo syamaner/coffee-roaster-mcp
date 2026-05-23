@@ -7,6 +7,8 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from coffee_roaster_mcp.exports import export_roast_snapshot
 from coffee_roaster_mcp.session import EventPayloadValue, RoastSessionStore, TelemetrySample
 
@@ -113,3 +115,21 @@ def test_snapshot_export_uses_configured_ror_parameters(tmp_path: Path) -> None:
     summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
     assert summary["metrics"]["bean_ror_c_per_min"] is None
     assert summary["metrics"]["env_ror_c_per_min"] is None
+
+
+def test_snapshot_export_rejects_existing_jsonl_directory(tmp_path: Path) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    assert session.log_writer is not None
+    jsonl_path = session.log_writer.log_dir / "roast.jsonl"
+    jsonl_path.unlink()
+    jsonl_path.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="JSONL export path exists but is not a file"):
+        export_roast_snapshot(session)
