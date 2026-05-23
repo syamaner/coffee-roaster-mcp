@@ -176,9 +176,19 @@ session clock. `roast_elapsed_seconds` is now computed through
 counts from authoritative T0 to the current session clock before drop, and
 freezes at authoritative drop time after `beans_dropped`. The existing MCP
 state and snapshot summary metrics use this helper through
-`compute_roast_metrics(...)`. Development time/percent, 60-second deltas, RoR,
-append-only telemetry writers, final JSONL/CSV/summary schemas, and broad
-release validation remain later Epic 5/E7 work.
+`compute_roast_metrics(...)`.
+
+E5-S3 added explicit development time and development percent computation from
+the authoritative session clock. `development_time_seconds` is now computed
+through `compute_development_time_seconds(...)`: it is `None` before first
+crack, counts from authoritative first crack to the current session clock before
+drop, and freezes at authoritative drop time after `beans_dropped`.
+`development_percent` is now computed through `compute_development_percent(...)`
+as `development_time_seconds / roast_elapsed_seconds * 100`, using the E5-S2
+roast elapsed helper for the denominator. Existing MCP state and snapshot
+summary metrics use these helpers through `compute_roast_metrics(...)`.
+60-second deltas, RoR, append-only telemetry writers, final JSONL/CSV/summary
+schemas, and broad release validation remain later Epic 5/E7 work.
 
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
@@ -186,7 +196,7 @@ first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E5-S3: compute development time and percent.
+The next story is E5-S4: compute 60s bean/env deltas.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

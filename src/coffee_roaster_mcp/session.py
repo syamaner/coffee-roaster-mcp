@@ -354,22 +354,17 @@ def compute_roast_metrics(
         session,
         monotonic_now=clock,
     )
-    development_time_seconds = _elapsed_since(
+    development_time_seconds = compute_development_time_seconds(
         session,
-        start_seconds=session.first_crack_monotonic_seconds,
         monotonic_now=clock,
     )
-    development_percent = None
-    if (
-        roast_elapsed_seconds is not None
-        and roast_elapsed_seconds > 0
-        and development_time_seconds is not None
-    ):
-        development_percent = round((development_time_seconds / roast_elapsed_seconds) * 100, 3)
     return RoastMetrics(
         roast_elapsed_seconds=roast_elapsed_seconds,
         development_time_seconds=development_time_seconds,
-        development_percent=development_percent,
+        development_percent=_compute_development_percent_from_values(
+            roast_elapsed_seconds=roast_elapsed_seconds,
+            development_time_seconds=development_time_seconds,
+        ),
     )
 
 
@@ -399,6 +394,79 @@ def compute_roast_elapsed_seconds(
     else:
         end_seconds = session.elapsed_monotonic_seconds(clock)
     return round(max(0.0, end_seconds - session.beans_added_monotonic_seconds), 3)
+
+
+def compute_development_time_seconds(
+    session: RoastSession,
+    *,
+    monotonic_now: Callable[[], float] | None = None,
+) -> float | None:
+    """Compute development seconds from first crack to drop or now.
+
+    Args:
+        session: Session snapshot to inspect.
+        monotonic_now: Optional monotonic clock supplier for active sessions.
+
+    Returns:
+        Seconds from `first_crack_detected` to `beans_dropped` when drop
+        exists, from `first_crack_detected` to the current session clock
+        otherwise, or `None` before first crack.
+    """
+    import time
+
+    clock = monotonic_now or time.monotonic
+    return _elapsed_since(
+        session,
+        start_seconds=session.first_crack_monotonic_seconds,
+        monotonic_now=clock,
+    )
+
+
+def compute_development_percent(
+    session: RoastSession,
+    *,
+    monotonic_now: Callable[[], float] | None = None,
+) -> float | None:
+    """Compute development time as a percentage of roast elapsed time.
+
+    Args:
+        session: Session snapshot to inspect.
+        monotonic_now: Optional monotonic clock supplier for active sessions.
+
+    Returns:
+        `development_time_seconds / roast_elapsed_seconds * 100`, rounded to
+        three decimal places, or `None` before both values are available.
+    """
+    import time
+
+    clock = monotonic_now or time.monotonic
+    roast_elapsed_seconds = compute_roast_elapsed_seconds(
+        session,
+        monotonic_now=clock,
+    )
+    development_time_seconds = compute_development_time_seconds(
+        session,
+        monotonic_now=clock,
+    )
+    return _compute_development_percent_from_values(
+        roast_elapsed_seconds=roast_elapsed_seconds,
+        development_time_seconds=development_time_seconds,
+    )
+
+
+def _compute_development_percent_from_values(
+    *,
+    roast_elapsed_seconds: float | None,
+    development_time_seconds: float | None,
+) -> float | None:
+    """Return development percent from precomputed elapsed values."""
+    if (
+        roast_elapsed_seconds is None
+        or roast_elapsed_seconds <= 0
+        or development_time_seconds is None
+    ):
+        return None
+    return round((development_time_seconds / roast_elapsed_seconds) * 100, 3)
 
 
 class SessionLifecycleError(RuntimeError):
