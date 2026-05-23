@@ -64,6 +64,16 @@ Full validation:
 - `./.venv/bin/coffee-roaster-mcp --help`: passed
 - `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
 
+## Usage Snapshot
+
+Operator-provided context snapshot after PR #124 creation:
+
+- Context window: `56% left (121K used / 258K)`
+- 5h limit: `90% left`, resets `02:17`
+- Weekly limit: `98% left`, resets `21:17 on 30 May`
+- GPT-5.3-Codex-Spark 5h limit: `100% left`, resets `05:16`
+- GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `00:16 on 31 May`
+
 ## Restart Prompt
 
 Resume in the local clone of `syamaner/coffee-roaster-mcp`. PR for E5-S7 should
