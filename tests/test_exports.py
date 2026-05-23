@@ -53,6 +53,7 @@ class ClockHarness:
 
 
 def test_snapshot_export_preserves_first_crack_detector_metadata(tmp_path: Path) -> None:
+    """Export first-crack detector metadata in JSONL, CSV, and summary files."""
     clock = ClockHarness()
     store = RoastSessionStore(
         utc_now=clock.utc_now,
@@ -114,6 +115,7 @@ def test_snapshot_export_preserves_first_crack_detector_metadata(tmp_path: Path)
 
 
 def test_snapshot_export_uses_configured_ror_parameters(tmp_path: Path) -> None:
+    """Apply configured RoR parameters consistently to summary and CSV rows."""
     clock = ClockHarness()
     store = RoastSessionStore(
         utc_now=clock.utc_now,
@@ -153,6 +155,7 @@ def test_snapshot_export_uses_configured_ror_parameters(tmp_path: Path) -> None:
 def test_snapshot_export_csv_includes_plan_columns_for_telemetry_and_events(
     tmp_path: Path,
 ) -> None:
+    """Export telemetry and event rows with the planned CSV schema."""
     clock = ClockHarness()
     store = RoastSessionStore(
         utc_now=clock.utc_now,
@@ -253,6 +256,7 @@ def test_snapshot_export_csv_includes_plan_columns_for_telemetry_and_events(
 def test_snapshot_export_csv_orders_same_time_events_before_telemetry(
     tmp_path: Path,
 ) -> None:
+    """Emit same-time event rows before telemetry without future sample data."""
     clock = ClockHarness()
     store = RoastSessionStore(
         utc_now=clock.utc_now,
@@ -281,12 +285,18 @@ def test_snapshot_export_csv_orders_same_time_events_before_telemetry(
         rows = list(csv.DictReader(csv_file))
     assert [row["event"] for row in rows] == ["beans_added", ""]
     assert rows[0]["phase"] == "roasting"
+    assert rows[0]["bean_temp_c"] == ""
+    assert rows[0]["heat_level_percent"] == ""
+    assert rows[0]["bean_delta_60s_c"] == ""
     assert rows[1]["phase"] == "roasting"
+    assert rows[1]["bean_temp_c"] == "150.0"
+    assert rows[1]["heat_level_percent"] == "50"
 
 
 def test_snapshot_export_csv_keeps_same_time_event_rows_chronological(
     tmp_path: Path,
 ) -> None:
+    """Keep same-time event rows scoped to their own lifecycle order."""
     clock = ClockHarness()
     store = RoastSessionStore(
         utc_now=clock.utc_now,
@@ -322,6 +332,7 @@ def test_snapshot_export_csv_keeps_same_time_event_rows_chronological(
 def test_snapshot_export_csv_event_rows_use_transition_control_state(
     tmp_path: Path,
 ) -> None:
+    """Use event transition state instead of stale telemetry on event rows."""
     clock = ClockHarness()
     store = RoastSessionStore(
         utc_now=clock.utc_now,
@@ -346,6 +357,20 @@ def test_snapshot_export_csv_event_rows_use_transition_control_state(
     clock.monotonic_value = 180.0
     store.record_event(session, "beans_dropped")
     store.record_event(session, "cooling_started")
+    store.append_telemetry(
+        session,
+        TelemetrySample(
+            recorded_at_utc=datetime(2026, 5, 17, 14, 1, 5, tzinfo=UTC),
+            monotonic_seconds=82.0,
+            bean_temp_c=168.0,
+            env_temp_c=200.0,
+            heat_level_percent=0,
+            fan_level_percent=40,
+            cooling_on=True,
+        ),
+    )
+    clock.monotonic_value = 185.0
+    store.record_event(session, "cooling_stopped")
 
     export = export_roast_snapshot(session)
 
@@ -353,12 +378,15 @@ def test_snapshot_export_csv_event_rows_use_transition_control_state(
         rows = list(csv.DictReader(csv_file))
     drop_row = next(row for row in rows if row["event"] == "beans_dropped")
     cooling_row = next(row for row in rows if row["event"] == "cooling_started")
+    cooling_stopped_row = next(row for row in rows if row["event"] == "cooling_stopped")
     assert drop_row["heat_level_percent"] == "0"
     assert drop_row["cooling_on"] == "False"
     assert cooling_row["cooling_on"] == "True"
+    assert cooling_stopped_row["cooling_on"] == "False"
 
 
 def test_snapshot_export_rejects_existing_jsonl_directory(tmp_path: Path) -> None:
+    """Reject non-file JSONL export paths instead of reporting readiness."""
     clock = ClockHarness()
     store = RoastSessionStore(
         utc_now=clock.utc_now,

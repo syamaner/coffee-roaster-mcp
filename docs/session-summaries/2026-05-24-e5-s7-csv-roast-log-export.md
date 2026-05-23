@@ -102,6 +102,26 @@ Validation after review fixes:
 - `./.venv/bin/coffee-roaster-mcp --help`: passed
 - `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
 
+Second review-fix round:
+
+- event rows now exclude same-timestamp telemetry from direct sample lookup and
+  per-row metric snapshots, so event rows do not include values from later CSV
+  telemetry rows
+- cooling transition tests now cover `cooling_stopped` against stale prior
+  `cooling_on=True` telemetry
+- touched export tests now include docstrings for the CodeRabbit docstring
+  coverage warning
+
+Validation after second review fixes:
+
+- `./.venv/bin/python -m pytest tests/test_exports.py`: 7 passed
+- `./.venv/bin/python -m pytest`: 331 passed
+- `./.venv/bin/python -m ruff check .`: passed
+- `./.venv/bin/python -m ruff format --check .`: passed
+- `./.venv/bin/python -m pyright`: 0 errors
+- `./.venv/bin/coffee-roaster-mcp --help`: passed
+- `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
+
 ## Restart Prompt
 
 Resume in the local clone of `syamaner/coffee-roaster-mcp`. PR for E5-S7 should

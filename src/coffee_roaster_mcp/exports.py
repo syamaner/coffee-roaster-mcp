@@ -238,7 +238,7 @@ def _csv_rows(
                 )
             )
             continue
-        event_sample = _latest_sample_at_or_before(
+        event_sample = _latest_sample_before(
             session.telemetry_buffer,
             monotonic_seconds=item.monotonic_seconds,
         )
@@ -317,6 +317,7 @@ def _csv_event_row(
             session,
             monotonic_seconds=event.monotonic_seconds,
             visible_events=scoped_events,
+            include_same_time_telemetry=False,
         ),
         monotonic_now=lambda: session.monotonic_start + event.monotonic_seconds,
         ror_window_seconds=ror_window_seconds,
@@ -360,6 +361,7 @@ def _session_view_at(
     *,
     monotonic_seconds: float,
     visible_events: list[RoastEvent],
+    include_same_time_telemetry: bool = True,
 ) -> RoastSession:
     """Return a point-in-time session view for metric computation."""
     view = RoastSession(
@@ -370,7 +372,8 @@ def _session_view_at(
         telemetry_buffer=deque(
             sample
             for sample in session.telemetry_buffer
-            if sample.monotonic_seconds <= monotonic_seconds
+            if sample.monotonic_seconds < monotonic_seconds
+            or (include_same_time_telemetry and sample.monotonic_seconds == monotonic_seconds)
         ),
         log_writer=session.log_writer,
         stopped_at_utc=session.created_at_utc,
@@ -478,15 +481,15 @@ def _event_monotonic_seconds(events: list[RoastEvent], kind: str) -> float | Non
     return None
 
 
-def _latest_sample_at_or_before(
+def _latest_sample_before(
     samples: deque[TelemetrySample],
     *,
     monotonic_seconds: float,
 ) -> TelemetrySample | None:
-    """Return the latest telemetry sample at or before one timestamp."""
+    """Return the latest telemetry sample strictly before one timestamp."""
     latest: TelemetrySample | None = None
     for sample in samples:
-        if sample.monotonic_seconds > monotonic_seconds:
+        if sample.monotonic_seconds >= monotonic_seconds:
             break
         latest = sample
     return latest
