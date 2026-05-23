@@ -243,6 +243,8 @@ class RoastSessionState:
     roast_elapsed_seconds: float | None
     development_time_seconds: float | None
     development_percent: float | None
+    bean_temp_delta_60s_c: float | None
+    env_temp_delta_60s_c: float | None
     device_state: RoasterDeviceState | None
     t0_status: T0Status
     first_crack_status: FirstCrackStatus
@@ -967,6 +969,8 @@ def _serialize_session_state(
         roast_elapsed_seconds=metrics.roast_elapsed_seconds,
         development_time_seconds=metrics.development_time_seconds,
         development_percent=metrics.development_percent,
+        bean_temp_delta_60s_c=metrics.bean_temp_delta_60s_c,
+        env_temp_delta_60s_c=metrics.env_temp_delta_60s_c,
         device_state=device_state,
         t0_status=_serialize_t0_status(session, config=config),
         first_crack_status=_serialize_first_crack_status(

@@ -135,6 +135,8 @@ def _write_summary_json(path: Path, *, session: RoastSession) -> None:
             "roast_elapsed_seconds": metrics.roast_elapsed_seconds,
             "development_time_seconds": metrics.development_time_seconds,
             "development_percent": metrics.development_percent,
+            "bean_temp_delta_60s_c": metrics.bean_temp_delta_60s_c,
+            "env_temp_delta_60s_c": metrics.env_temp_delta_60s_c,
         },
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

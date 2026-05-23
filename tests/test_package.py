@@ -23,6 +23,7 @@ _T = TypeVar("_T")
 
 _EXPECTED_ROAST_STATE_KEYS = {
     "active",
+    "bean_temp_delta_60s_c",
     "beans_added_at_utc",
     "beans_added_monotonic_seconds",
     "beans_dropped_at_utc",
@@ -37,6 +38,7 @@ _EXPECTED_ROAST_STATE_KEYS = {
     "development_time_seconds",
     "device_state",
     "elapsed_monotonic_seconds",
+    "env_temp_delta_60s_c",
     "events",
     "fan_level_percent",
     "faulted_at_utc",
