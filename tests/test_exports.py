@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from coffee_roaster_mcp.exports import export_roast_snapshot
-from coffee_roaster_mcp.session import EventPayloadValue, RoastSessionStore
+from coffee_roaster_mcp.session import EventPayloadValue, RoastSessionStore, TelemetrySample
 
 
 class ClockHarness:
@@ -78,5 +78,38 @@ def test_snapshot_export_preserves_first_crack_detector_metadata(tmp_path: Path)
     assert summary["first_crack_at_utc"] == "2026-05-17T14:00:37.250000+00:00"
     assert summary["metrics"]["development_time_seconds"] == 32.75
     assert summary["metrics"]["development_percent"] == 50.385
+    assert summary["metrics"]["bean_ror_c_per_min"] is None
+    assert summary["metrics"]["env_ror_c_per_min"] is None
+
+
+def test_snapshot_export_uses_configured_ror_parameters(tmp_path: Path) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    for monotonic_seconds, bean_temp_c, env_temp_c in (
+        (0.0, 150.0, 180.0),
+        (12.0, 160.0, 192.0),
+    ):
+        store.append_telemetry(
+            session,
+            TelemetrySample(
+                recorded_at_utc=clock.utc_now(),
+                monotonic_seconds=monotonic_seconds,
+                bean_temp_c=bean_temp_c,
+                env_temp_c=env_temp_c,
+            ),
+        )
+
+    export = export_roast_snapshot(
+        session,
+        ror_window_seconds=60,
+        ror_min_sample_seconds=20,
+    )
+
+    summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
     assert summary["metrics"]["bean_ror_c_per_min"] is None
     assert summary["metrics"]["env_ror_c_per_min"] is None

@@ -44,6 +44,12 @@ sensor samples is less than the configured minimum sample span.
 `get_roast_state` and snapshot summary metric surfaces can return them without
 adding a new logging pipeline or final schema work.
 
+After review, the snapshot export path now accepts the same RoR window and
+minimum sample-span settings used by MCP session state, and `export_roast_log`
+passes the runtime config into `export_roast_snapshot(...)`. This keeps
+`summary.json` RoR values consistent with `get_roast_state` when operators tune
+`session.ror_window_seconds` or `session.ror_min_sample_seconds`.
+
 Durable state updates:
 
 - `docs/state/epics/coffee-roaster-mcp-v0.1.md` marks `E5-S5` complete.
@@ -54,7 +60,9 @@ Durable state updates:
 
 Local validation:
 
-- `./.venv/bin/python -m pytest`: 318 passed
+- `./.venv/bin/python -m pytest tests/test_exports.py tests/test_package.py tests/test_session.py`:
+  79 passed
+- `./.venv/bin/python -m pytest`: 319 passed
 - `./.venv/bin/python -m ruff check .`: passed
 - `./.venv/bin/python -m ruff format --check .`: passed
 - `./.venv/bin/python -m pyright`: 0 errors

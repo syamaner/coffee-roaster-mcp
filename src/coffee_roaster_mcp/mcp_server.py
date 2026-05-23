@@ -595,7 +595,11 @@ def create_mcp_server(
         """Write a snapshot export for one roast session."""
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
-        export = export_roast_snapshot(session)
+        export = export_roast_snapshot(
+            session,
+            ror_window_seconds=server_context.config.session.ror_window_seconds,
+            ror_min_sample_seconds=server_context.config.session.ror_min_sample_seconds,
+        )
         return ExportRoastLogResult(
             session_id=export.session_id,
             log_dir=str(export.log_dir),
