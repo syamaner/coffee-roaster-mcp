@@ -122,6 +122,43 @@ Validation after second review fixes:
 - `./.venv/bin/coffee-roaster-mcp --help`: passed
 - `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
 
+## Code Review Analysis
+
+PR #124 benefited from overlapping CodeRabbit and Codex review coverage. Both
+reviewers focused on the same highest-risk part of the story: whether exported
+CSV rows preserve a defensible point-in-time timeline when session events and
+telemetry samples share monotonic timestamps.
+
+CodeRabbit provided the broadest structured review surface. Its walkthrough
+identified the intended CSV export shape, related prior metric stories, and the
+out-of-scope boundaries. Its actionable comments were strongest where a direct
+local patch was obvious: flip same-time row ordering, derive cooling transition
+state from events, exclude same-timestamp telemetry from event rows, and add a
+`cooling_stopped` regression test. It also surfaced the docstring coverage
+warning, which was useful for keeping the touched test surface within project
+quality expectations.
+
+Codex review was more behavior-oriented. It independently flagged that same-time
+ordering was not just a presentation issue: telemetry rows, event rows, event
+flags, first-crack metadata, and metric snapshots could all disagree if the
+exporter mixed inclusive `<=` views with event-before-telemetry ordering. The
+Codex comments pushed the implementation from a row-ordering fix toward a
+consistent point-in-time model: scoped same-time events for each event row,
+configured RoR parameters for CSV metrics, strict-before telemetry lookup for
+event rows, and strict-before telemetry in event metric snapshots.
+
+The review overlap was useful rather than redundant. CodeRabbit usually
+provided concrete edit targets and regression-test prompts, while Codex exposed
+the broader invariant that each CSV row must describe only the state visible at
+that row in exported order. The combined result was stronger than either review
+alone: event rows now avoid later same-time events and later same-time telemetry,
+telemetry rows still include same-time event state only after the event row is
+emitted, metric configuration stays aligned with `summary.json`, and cooling
+transition rows are covered by explicit regression tests.
+
+All CodeRabbit and Codex actionable review threads are resolved as of commit
+`351ba85`.
+
 ## Restart Prompt
 
 Resume in the local clone of `syamaner/coffee-roaster-mcp`. PR for E5-S7 should
