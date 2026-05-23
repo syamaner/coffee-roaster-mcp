@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E5-S4`
-- Current target: Compute 60s bean/env deltas
+- Active story: `E5-S5`
+- Current target: Compute bean/env RoR
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -224,6 +224,15 @@ The first implementation milestone is a mock vertical slice that requires no roa
   `get_roast_state` and snapshot summary metrics use these helpers through
   `compute_roast_metrics(...)`. 60-second deltas, RoR, append-only telemetry
   writers, and final log schemas remain later Epic 5 work.
+- `E5-S4` makes 60-second bean and environment temperature deltas explicit
+  through `compute_bean_temp_delta_60s_c(...)` and
+  `compute_env_temp_delta_60s_c(...)`. The helpers use the E5-S1 rolling
+  telemetry buffer, anchor the inclusive 60-second window at the latest
+  retained telemetry sample, skip missing sensor values per sensor, and return
+  latest minus oldest retained temperature in that window. Existing
+  `get_roast_state` and snapshot summary metric surfaces use these helpers
+  through `compute_roast_metrics(...)`. RoR, append-only telemetry writers, and
+  final log schemas remain later Epic 5 work.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -510,7 +519,7 @@ Goal: compute roast metrics from one session clock and export durable logs.
 - [x] `E5-S3` Compute development time and percent.
   - Done when development time starts at first crack and development percent is `development_time_seconds / roast_elapsed_seconds * 100`.
 
-- [ ] `E5-S4` Compute 60s bean/env deltas.
+- [x] `E5-S4` Compute 60s bean/env deltas.
   - Done when latest minus oldest sample in rolling 60s window is returned for bean and environment temps.
 
 - [ ] `E5-S5` Compute bean/env RoR.
@@ -1349,6 +1358,28 @@ After completing a story:
     broad release validation out of scope.
   - Ran `./.venv/bin/python -m pytest tests/test_session.py`: 53 passed.
   - Ran `./.venv/bin/python -m pytest`: 309 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+- Validation run for E5-S4:
+  - Added `compute_bean_temp_delta_60s_c(...)` and
+    `compute_env_temp_delta_60s_c(...)` as explicit helpers for 60-second
+    temperature deltas from the E5-S1 rolling telemetry buffer.
+  - Wired `compute_roast_metrics(...)` to expose `bean_temp_delta_60s_c` and
+    `env_temp_delta_60s_c` through the existing `get_roast_state` and snapshot
+    summary metric surfaces.
+  - Added delta tests for regular 60-second sample intervals, irregular sample
+    intervals anchored to the latest retained sample, and per-sensor missing
+    temperature values.
+  - Kept RoR, append-only telemetry log files, final JSONL/CSV/summary schemas,
+    model training/export/sync, real microphone validation, live Hottop
+    validation, end-to-end agent roast validation, and broad release validation
+    out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_session.py tests/test_package.py tests/test_exports.py`:
+    72 passed.
+  - Ran `./.venv/bin/python -m pytest`: 312 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

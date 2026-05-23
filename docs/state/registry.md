@@ -187,8 +187,17 @@ drop, and freezes at authoritative drop time after `beans_dropped`.
 as `development_time_seconds / roast_elapsed_seconds * 100`, using the E5-S2
 roast elapsed helper for the denominator. Existing MCP state and snapshot
 summary metrics use these helpers through `compute_roast_metrics(...)`.
-60-second deltas, RoR, append-only telemetry writers, final JSONL/CSV/summary
-schemas, and broad release validation remain later Epic 5/E7 work.
+
+E5-S4 added explicit 60-second bean and environment temperature deltas from the
+E5-S1 rolling telemetry buffer. `bean_temp_delta_60s_c` and
+`env_temp_delta_60s_c` are computed as latest minus oldest retained
+temperature sample inside the inclusive 60-second window ending at the latest
+telemetry sample. Missing sensor values are skipped per sensor, and the metric
+returns `None` when no retained temperature value is available for that sensor.
+Existing MCP state and snapshot summary metric surfaces use these helpers
+through `compute_roast_metrics(...)`. RoR, append-only telemetry writers, final
+JSONL/CSV/summary schemas, and broad release validation remain later Epic 5/E7
+work.
 
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
@@ -196,7 +205,7 @@ first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E5-S4: compute 60s bean/env deltas.
+The next story is E5-S5: compute bean/env RoR.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

@@ -11,8 +11,10 @@ from coffee_roaster_mcp.session import (
     RoastSessionStore,
     SessionLifecycleError,
     TelemetrySample,
+    compute_bean_temp_delta_60s_c,
     compute_development_percent,
     compute_development_time_seconds,
+    compute_env_temp_delta_60s_c,
     compute_roast_elapsed_seconds,
     compute_roast_metrics,
 )
@@ -940,6 +942,8 @@ def test_compute_roast_metrics_from_event_timestamps() -> None:
     assert metrics.roast_elapsed_seconds == 50.0
     assert metrics.development_time_seconds == 15.0
     assert metrics.development_percent == 30.0
+    assert metrics.bean_temp_delta_60s_c is None
+    assert metrics.env_temp_delta_60s_c is None
 
 
 def test_compute_roast_metrics_returns_none_before_beans_added() -> None:
@@ -955,6 +959,8 @@ def test_compute_roast_metrics_returns_none_before_beans_added() -> None:
     assert metrics.roast_elapsed_seconds is None
     assert metrics.development_time_seconds is None
     assert metrics.development_percent is None
+    assert metrics.bean_temp_delta_60s_c is None
+    assert metrics.env_temp_delta_60s_c is None
 
 
 def test_compute_roast_metrics_uses_clock_for_active_session() -> None:
@@ -978,6 +984,95 @@ def test_compute_roast_metrics_uses_clock_for_active_session() -> None:
     assert metrics.roast_elapsed_seconds == 45.0
     assert metrics.development_time_seconds == 30.0
     assert metrics.development_percent == 66.667
+    assert metrics.bean_temp_delta_60s_c is None
+    assert metrics.env_temp_delta_60s_c is None
+
+
+def test_compute_temperature_deltas_60s_uses_regular_sample_window() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    for monotonic_seconds, bean_temp_c, env_temp_c in (
+        (0.0, 150.0, 180.0),
+        (30.0, 160.0, 195.0),
+        (60.0, 171.25, 211.5),
+    ):
+        store.append_telemetry(
+            session,
+            TelemetrySample(
+                recorded_at_utc=clock.utc_now(),
+                monotonic_seconds=monotonic_seconds,
+                bean_temp_c=bean_temp_c,
+                env_temp_c=env_temp_c,
+            ),
+        )
+
+    metrics = compute_roast_metrics(session, monotonic_now=clock.monotonic_now)
+
+    assert compute_bean_temp_delta_60s_c(session) == 21.25
+    assert compute_env_temp_delta_60s_c(session) == 31.5
+    assert metrics.bean_temp_delta_60s_c == 21.25
+    assert metrics.env_temp_delta_60s_c == 31.5
+
+
+def test_compute_temperature_deltas_60s_uses_irregular_latest_window() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    for monotonic_seconds, bean_temp_c, env_temp_c in (
+        (3.0, 140.0, 180.0),
+        (12.0, 145.0, 188.0),
+        (64.0, 171.0, 218.0),
+        (71.25, 178.0, 225.5),
+    ):
+        store.append_telemetry(
+            session,
+            TelemetrySample(
+                recorded_at_utc=clock.utc_now(),
+                monotonic_seconds=monotonic_seconds,
+                bean_temp_c=bean_temp_c,
+                env_temp_c=env_temp_c,
+            ),
+        )
+
+    assert compute_bean_temp_delta_60s_c(session) == 33.0
+    assert compute_env_temp_delta_60s_c(session) == 37.5
+
+
+def test_compute_temperature_deltas_60s_skip_missing_sensor_values() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    for monotonic_seconds, bean_temp_c, env_temp_c in (
+        (1.0, 150.0, None),
+        (4.0, None, 200.0),
+        (20.0, 158.0, None),
+        (40.0, None, 215.0),
+    ):
+        store.append_telemetry(
+            session,
+            TelemetrySample(
+                recorded_at_utc=clock.utc_now(),
+                monotonic_seconds=monotonic_seconds,
+                bean_temp_c=bean_temp_c,
+                env_temp_c=env_temp_c,
+            ),
+        )
+
+    assert compute_bean_temp_delta_60s_c(session) == 8.0
+    assert compute_env_temp_delta_60s_c(session) == 15.0
 
 
 def test_compute_development_time_seconds_returns_none_before_first_crack() -> None:

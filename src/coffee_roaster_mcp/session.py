@@ -217,11 +217,15 @@ class RoastMetrics:
         roast_elapsed_seconds: Seconds from beans added to drop or now.
         development_time_seconds: Seconds from first crack to drop, stop, or now.
         development_percent: Development time as a percentage of roast elapsed time.
+        bean_temp_delta_60s_c: Bean-temperature delta across the rolling 60s window.
+        env_temp_delta_60s_c: Environment-temperature delta across the rolling 60s window.
     """
 
     roast_elapsed_seconds: float | None
     development_time_seconds: float | None
     development_percent: float | None
+    bean_temp_delta_60s_c: float | None
+    env_temp_delta_60s_c: float | None
 
 
 @dataclass
@@ -365,6 +369,8 @@ def compute_roast_metrics(
             roast_elapsed_seconds=roast_elapsed_seconds,
             development_time_seconds=development_time_seconds,
         ),
+        bean_temp_delta_60s_c=compute_bean_temp_delta_60s_c(session),
+        env_temp_delta_60s_c=compute_env_temp_delta_60s_c(session),
     )
 
 
@@ -454,6 +460,40 @@ def compute_development_percent(
     )
 
 
+def compute_bean_temp_delta_60s_c(session: RoastSession) -> float | None:
+    """Compute bean-temperature delta across the latest rolling 60-second window.
+
+    Args:
+        session: Session snapshot with retained telemetry samples.
+
+    Returns:
+        Latest minus oldest bean temperature in the 60-second window ending at
+        the latest retained telemetry sample, or `None` when no bean
+        temperature sample is available in that window.
+    """
+    return _compute_temperature_delta_60s_c(
+        session,
+        temperature_field="bean_temp_c",
+    )
+
+
+def compute_env_temp_delta_60s_c(session: RoastSession) -> float | None:
+    """Compute environment-temperature delta across the latest rolling 60-second window.
+
+    Args:
+        session: Session snapshot with retained telemetry samples.
+
+    Returns:
+        Latest minus oldest environment temperature in the 60-second window
+        ending at the latest retained telemetry sample, or `None` when no
+        environment temperature sample is available in that window.
+    """
+    return _compute_temperature_delta_60s_c(
+        session,
+        temperature_field="env_temp_c",
+    )
+
+
 def _compute_development_percent_from_values(
     *,
     roast_elapsed_seconds: float | None,
@@ -467,6 +507,32 @@ def _compute_development_percent_from_values(
     ):
         return None
     return round((development_time_seconds / roast_elapsed_seconds) * 100, 3)
+
+
+def _compute_temperature_delta_60s_c(
+    session: RoastSession,
+    *,
+    temperature_field: Literal["bean_temp_c", "env_temp_c"],
+) -> float | None:
+    """Return latest minus oldest temperature in the retained 60s sample window."""
+    if not session.telemetry_buffer:
+        return None
+    latest_sample_seconds = session.telemetry_buffer[-1].monotonic_seconds
+    window_start_seconds = latest_sample_seconds - 60.0
+    oldest_temp_c: float | None = None
+    latest_temp_c: float | None = None
+    for sample in session.telemetry_buffer:
+        if sample.monotonic_seconds < window_start_seconds:
+            continue
+        temp_c = getattr(sample, temperature_field)
+        if temp_c is None:
+            continue
+        if oldest_temp_c is None:
+            oldest_temp_c = temp_c
+        latest_temp_c = temp_c
+    if oldest_temp_c is None or latest_temp_c is None:
+        return None
+    return round(latest_temp_c - oldest_temp_c, 3)
 
 
 class SessionLifecycleError(RuntimeError):
