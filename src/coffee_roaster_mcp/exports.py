@@ -56,7 +56,8 @@ def export_roast_snapshot(
         Export file paths and readiness metadata.
 
     Raises:
-        ValueError: If the session has no log writer target.
+        ValueError: If the session has no log writer target or the JSONL path
+            is not a regular file.
     """
     if session.log_writer is None:
         raise ValueError("Session log target is unavailable.")
@@ -67,6 +68,8 @@ def export_roast_snapshot(
     summary_path = log_dir / "summary.json"
 
     log_dir.mkdir(parents=True, exist_ok=True)
+    if jsonl_path.exists() and not jsonl_path.is_file():
+        raise ValueError(f"JSONL export path exists but is not a file: {jsonl_path}")
     if not jsonl_path.exists():
         _write_event_jsonl(jsonl_path, session=session)
     _write_event_csv(csv_path, session=session)

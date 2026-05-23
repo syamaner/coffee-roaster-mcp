@@ -333,6 +333,12 @@ def test_reserved_driver_drop_log_failure_clears_reservation(
     )
     session = store.start_session()
     store.record_event(session, "beans_added")
+    store.apply_driver_control_state(
+        session,
+        heat_level_percent=35,
+        fan_level_percent=25,
+        cooling_on=False,
+    )
     drop_reservation = store.reserve_driver_drop(session)
     assert drop_reservation.reservation is not None
 
@@ -355,6 +361,59 @@ def test_reserved_driver_drop_log_failure_clears_reservation(
 
     assert session.pending_driver_command_token is None
     assert session.pending_driver_command_kind is None
+    assert session.heat_level_percent == 35
+    assert session.fan_level_percent == 25
+    assert session.cooling_on is False
+    assert session.beans_dropped_at_utc is None
+    assert session.phase == "roasting"
+
+
+def test_reserved_driver_start_cooling_log_failure_rolls_back_controls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    store.record_event(session, "beans_dropped")
+    store.apply_driver_control_state(
+        session,
+        heat_level_percent=30,
+        fan_level_percent=40,
+        cooling_on=False,
+    )
+    cooling_reservation = store.reserve_driver_start_cooling(session)
+    assert cooling_reservation.reservation is not None
+
+    def fail_event_log_write(
+        _session: session_module.RoastSession,
+        _event: session_module.RoastEvent,
+    ) -> None:
+        raise OSError("log unavailable")
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_event_log_write)
+
+    with pytest.raises(OSError, match="log unavailable"):
+        store.complete_reserved_driver_start_cooling_snapshot(
+            session,
+            reservation=cooling_reservation.reservation,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
+        )
+
+    assert session.pending_driver_command_token is None
+    assert session.pending_driver_command_kind is None
+    assert session.heat_level_percent == 30
+    assert session.fan_level_percent == 40
+    assert session.cooling_on is False
+    assert session.cooling_started_at_utc is None
+    assert session.phase == "dropped"
 
 
 def test_record_active_telemetry_sample_returns_none_when_session_is_stale() -> None:

@@ -44,7 +44,8 @@ so the default remains 1 Hz while config can tune the interval.
 `export_roast_snapshot(...)` still writes `roast.csv` and `summary.json`, but it
 does not overwrite an existing append-only runtime `roast.jsonl`. If a legacy
 snapshot has no runtime JSONL file yet, export can still create the current
-event-only JSONL fallback.
+event-only JSONL fallback. Export now fails closed if `roast.jsonl` exists as a
+directory or other non-file path instead of reporting a ready export.
 
 Durable state updates:
 
@@ -55,7 +56,7 @@ Durable state updates:
 
 Local validation:
 
-- `./.venv/bin/python -m pytest`: 325 passed
+- `./.venv/bin/python -m pytest`: 327 passed
 - `./.venv/bin/python -m ruff check .`: passed
 - `./.venv/bin/python -m ruff format --check .`: passed
 - `./.venv/bin/python -m pyright`: 0 errors
@@ -129,11 +130,44 @@ Review quality comparison:
   covered the same root issue as two of the Codex findings.
 - The overlap was useful: both reviewers independently flagged JSONL durability
   atomicity, which was the highest-risk issue in the story.
-- CodeRabbit's follow-up after `4bdf412` reported only one low-value nitpick:
-  the `_telemetry_log_row_if_due(...)` docstring still says "configured 1 Hz"
-  even though the interval is configurable. This is documentation polish, not a
-  behavior blocker, and all review threads from the first pass are marked
-  resolved.
+
+Codex review `4351526483` added three actionable edge-case findings after
+`4bdf412`:
+
+- `export_roast_snapshot(...)` treated an existing `roast.jsonl` directory as a
+  valid append-only log path and could still return `ready=True`.
+- Reserved driver drop completion applied driver control state before recording
+  `beans_dropped`, so a failed JSONL event append could leave control state
+  updated without the matching event and phase transition.
+- Reserved driver start-cooling completion had the same rollback gap for
+  `cooling_started`.
+
+The follow-up fix addressed those findings:
+
+- Existing non-file `roast.jsonl` paths now raise `ValueError` during export.
+- Reserved driver drop completion restores the previous heat, fan, and cooling
+  fields if event logging fails before completion.
+- Reserved driver start-cooling completion restores the previous heat, fan, and
+  cooling fields if event logging fails before completion.
+- Regression tests cover the non-file export path plus control rollback for
+  failed drop and cooling-start event appends.
+
+CodeRabbit's follow-up after `4bdf412` reported only one low-value nitpick: the
+`_telemetry_log_row_if_due(...)` docstring still said "configured 1 Hz" even
+though the interval is configurable. The follow-up fix also changed that wording
+to "configured logging interval."
+
+Updated review quality comparison:
+
+- Codex stayed strongest on state/log atomicity and fail-closed behavior. Its
+  second pass found two hardware-control consistency gaps that were adjacent to
+  the first-pass reservation cleanup finding.
+- CodeRabbit stayed strongest on documentation, handoff, and consistency drift.
+  Its only second-pass note was documentation polish after the functional review
+  fixes were in place.
+- The combined review coverage was useful: Codex drove the risk-bearing runtime
+  fixes, while CodeRabbit improved durable handoff quality and caught stale
+  wording around configurable behavior.
 
 ## Restart Prompt
 

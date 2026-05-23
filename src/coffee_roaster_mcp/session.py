@@ -155,7 +155,7 @@ def _telemetry_log_row_if_due(
     *,
     log_interval_seconds: float,
 ) -> Mapping[str, object] | None:
-    """Return one telemetry log row when the configured 1 Hz interval is due."""
+    """Return one telemetry log row when the configured logging interval is due."""
     last_logged = session.last_logged_telemetry_monotonic_seconds
     if last_logged is not None and sample.monotonic_seconds - last_logged < log_interval_seconds:
         return None
@@ -1156,6 +1156,11 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_driver_command_reservation(session, reservation)
+            previous_control_state = (
+                session.heat_level_percent,
+                session.fan_level_percent,
+                session.cooling_on,
+            )
             self.apply_driver_control_state(
                 session,
                 heat_level_percent=heat_level_percent,
@@ -1166,6 +1171,13 @@ class RoastSessionStore:
                 event = self.record_event(session, "beans_dropped")
                 if cooling_on:
                     self.record_event(session, "cooling_started")
+            except Exception:
+                (
+                    session.heat_level_percent,
+                    session.fan_level_percent,
+                    session.cooling_on,
+                ) = previous_control_state
+                raise
             finally:
                 self._clear_driver_command_reservation_locked(session, reservation)
             return event, _copy_session_for_read(session)
@@ -1182,6 +1194,11 @@ class RoastSessionStore:
         """Complete a reserved cooling-start command and record the event."""
         with self._lock:
             self._assert_driver_command_reservation(session, reservation)
+            previous_control_state = (
+                session.heat_level_percent,
+                session.fan_level_percent,
+                session.cooling_on,
+            )
             self.apply_driver_control_state(
                 session,
                 heat_level_percent=heat_level_percent,
@@ -1190,6 +1207,13 @@ class RoastSessionStore:
             )
             try:
                 event = self.record_event(session, "cooling_started")
+            except Exception:
+                (
+                    session.heat_level_percent,
+                    session.fan_level_percent,
+                    session.cooling_on,
+                ) = previous_control_state
+                raise
             finally:
                 self._clear_driver_command_reservation_locked(session, reservation)
             return event, _copy_session_for_read(session)
