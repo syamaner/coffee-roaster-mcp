@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E5-S1`
-- Current target: Implement rolling telemetry buffer
+- Active story: `E5-S2`
+- Current target: Compute elapsed roast time
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -196,6 +196,15 @@ The first implementation milestone is a mock vertical slice that requires no roa
   detected bean temperature, drop, and threshold diagnostics in the event
   payload and `get_roast_state.t0_status`. `mark_beans_added` remains an
   explicit idempotent override.
+- `E5-S1` implements the rolling telemetry buffer capture path owned by the
+  authoritative `RoastSessionStore`. Successful operational `get_roast_state`
+  polling now appends normalized samples from the configured
+  `RoasterDriver.read_state()` result for the latest active session, preserving
+  UTC and monotonic timestamp order, bean/environment temperatures, heat/fan
+  levels, and cooling state for later Epic 5 derived metrics. Driver read
+  failures still do not mutate session state, stopped or non-latest sessions do
+  not receive new samples, and final log schemas/RoR/development metrics remain
+  later Epic 5 work.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -473,7 +482,7 @@ Goal: compute roast metrics from one session clock and export durable logs.
 
 ### Stories
 
-- [ ] `E5-S1` Implement rolling telemetry buffer.
+- [x] `E5-S1` Implement rolling telemetry buffer.
   - Done when bean/env samples are retained for rolling metric calculations.
 
 - [ ] `E5-S2` Compute elapsed roast time.
@@ -699,6 +708,8 @@ After completing a story:
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
 - Validation run for E2-S3:
   - Extended `src/coffee_roaster_mcp/session.py` with authoritative per-event timestamp fields and store-owned `record_event(...)`.
   - Kept singleton event writes idempotent for `beans_added`, `first_crack_detected`, `beans_dropped`, `cooling_started`, and `cooling_stopped` while allowing `fault` timeline rows.
@@ -1254,3 +1265,27 @@ After completing a story:
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
+- Validation run for E5-S1:
+  - Added store-owned normalized telemetry capture through
+    `RoastSessionStore.record_telemetry_sample(...)`, using the authoritative
+    session UTC and monotonic clocks and preserving retained samples in read
+    snapshots for later Epic 5 metrics.
+  - Wired successful operational `get_roast_state` driver reads to append one
+    telemetry sample for the latest active session while keeping driver-read
+    failures, stopped sessions, and non-latest sessions from mutating the
+    telemetry buffer.
+  - Enforced monotonic timestamp ordering for appended telemetry samples and
+    retained the existing per-session rolling buffer limit.
+  - Kept RoR calculations, development percent changes, final log schemas,
+    append-only telemetry log files, CSV/summary schema changes, model
+    training/export/sync, real microphone validation, live Hottop validation,
+    end-to-end agent roast validation, and broad release validation out of
+    scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_session.py tests/test_mcp_server.py`:
+    69 passed.
+  - Ran `./.venv/bin/python -m pytest`: 301 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.

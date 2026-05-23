@@ -100,6 +100,11 @@ def _append_telemetry_with_limit(
     """Append telemetry to one session with an explicit retention limit."""
     if max_samples < 0:
         raise ValueError("max_samples must be >= 0.")
+    if (
+        session.telemetry_buffer
+        and sample.monotonic_seconds < session.telemetry_buffer[-1].monotonic_seconds
+    ):
+        raise SessionLifecycleError("Telemetry samples must be appended in timestamp order.")
     session.telemetry_buffer.append(sample)
     while len(session.telemetry_buffer) > max_samples:
         session.telemetry_buffer.popleft()
@@ -517,6 +522,97 @@ class RoastSessionStore:
                 sample,
                 max_samples=self._telemetry_buffer_limit,
             )
+
+    def record_telemetry_sample(
+        self,
+        session: RoastSession,
+        *,
+        bean_temp_c: float | None,
+        env_temp_c: float | None,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> RoastSession:
+        """Record one normalized telemetry sample using the session clock.
+
+        Args:
+            session: Latest active session that owns the sample.
+            bean_temp_c: Normalized bean temperature in Celsius, when available.
+            env_temp_c: Normalized environment temperature in Celsius, when available.
+            heat_level_percent: Current heat control level.
+            fan_level_percent: Current fan control level.
+            cooling_on: Current cooling state.
+
+        Returns:
+            A lightweight read snapshot after appending the sample.
+
+        Raises:
+            SessionLifecycleError: If the session is not the latest active session.
+        """
+        with self._lock:
+            self._assert_latest_active_session(session)
+            sample = TelemetrySample(
+                recorded_at_utc=self._utc_now(),
+                monotonic_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
+                bean_temp_c=bean_temp_c,
+                env_temp_c=env_temp_c,
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=fan_level_percent,
+                cooling_on=cooling_on,
+            )
+            _append_telemetry_with_limit(
+                session,
+                sample,
+                max_samples=self._telemetry_buffer_limit,
+            )
+            return _copy_session_for_read(session)
+
+    def record_active_telemetry_sample(
+        self,
+        *,
+        session_id: str | None,
+        bean_temp_c: float | None,
+        env_temp_c: float | None,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> RoastSession | None:
+        """Record telemetry for the latest active session when it still matches.
+
+        Args:
+            session_id: Requested session id, or `None` for the active session.
+            bean_temp_c: Normalized bean temperature in Celsius, when available.
+            env_temp_c: Normalized environment temperature in Celsius, when available.
+            heat_level_percent: Current heat control level.
+            fan_level_percent: Current fan control level.
+            cooling_on: Current cooling state.
+
+        Returns:
+            A lightweight read snapshot after appending the sample, or `None`
+            when no matching active session still exists.
+        """
+        with self._lock:
+            if self._latest_session is None or not self._latest_session.active:
+                return None
+            if session_id is not None and self._latest_session.id != session_id:
+                return None
+            sample = TelemetrySample(
+                recorded_at_utc=self._utc_now(),
+                monotonic_seconds=self._latest_session.elapsed_monotonic_seconds(
+                    self._monotonic_now
+                ),
+                bean_temp_c=bean_temp_c,
+                env_temp_c=env_temp_c,
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=fan_level_percent,
+                cooling_on=cooling_on,
+            )
+            _append_telemetry_with_limit(
+                self._latest_session,
+                sample,
+                max_samples=self._telemetry_buffer_limit,
+            )
+            return _copy_session_for_read(self._latest_session)
 
     def set_heat(
         self,
@@ -1426,7 +1522,7 @@ def _payload_control_percent(
 
 
 def _copy_session_for_read(session: RoastSession) -> RoastSession:
-    """Return a lightweight read snapshot without telemetry buffer retention."""
+    """Return a lightweight read snapshot with retained telemetry samples."""
     return RoastSession(
         id=session.id,
         created_at_utc=session.created_at_utc,
@@ -1451,7 +1547,7 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         auto_t0_current_drop_c=session.auto_t0_current_drop_c,
         auto_t0_preheat_sample_count=session.auto_t0_preheat_sample_count,
         event_timeline=deepcopy(session.event_timeline),
-        telemetry_buffer=deque(),
+        telemetry_buffer=deque(session.telemetry_buffer),
         log_writer=session.log_writer,
         stopped_at_utc=session.stopped_at_utc,
         monotonic_stop=session.monotonic_stop,

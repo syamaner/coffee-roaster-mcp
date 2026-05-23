@@ -146,6 +146,82 @@ def test_session_telemetry_buffer_retains_only_recent_samples() -> None:
     assert [sample.monotonic_seconds for sample in samples] == [2.0, 3.0]
 
 
+def test_record_telemetry_sample_uses_session_clock_and_snapshot_retains_buffer() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 0, 5, tzinfo=UTC)
+    clock.monotonic_value = 105.5
+    snapshot = store.record_telemetry_sample(
+        session,
+        bean_temp_c=151.25,
+        env_temp_c=204.5,
+        heat_level_percent=55,
+        fan_level_percent=35,
+        cooling_on=False,
+    )
+
+    samples = list(snapshot.telemetry_buffer)
+    assert len(samples) == 1
+    assert samples[0].recorded_at_utc == datetime(2026, 5, 4, 12, 0, 5, tzinfo=UTC)
+    assert samples[0].monotonic_seconds == 5.5
+    assert samples[0].bean_temp_c == 151.25
+    assert samples[0].env_temp_c == 204.5
+    assert samples[0].heat_level_percent == 55
+    assert samples[0].fan_level_percent == 35
+    assert samples[0].cooling_on is False
+    assert list(store.get_session_snapshot().telemetry_buffer) == samples
+
+
+def test_record_active_telemetry_sample_returns_none_when_session_is_stale() -> None:
+    clock = ClockHarness()
+    issued_ids = iter(["session-001", "session-002"])
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        session_id_factory=lambda: next(issued_ids),
+    )
+    first_session = store.start_session()
+    store.stop_session()
+    second_session = store.start_session()
+
+    assert (
+        store.record_active_telemetry_sample(
+            session_id=first_session.id,
+            bean_temp_c=151.25,
+            env_temp_c=204.5,
+            heat_level_percent=55,
+            fan_level_percent=35,
+            cooling_on=False,
+        )
+        is None
+    )
+    assert list(second_session.telemetry_buffer) == []
+
+
+def test_append_telemetry_rejects_out_of_order_samples() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    store.append_telemetry(
+        session,
+        TelemetrySample(recorded_at_utc=clock.utc_now(), monotonic_seconds=2.0),
+    )
+    with pytest.raises(SessionLifecycleError, match="timestamp order"):
+        store.append_telemetry(
+            session,
+            TelemetrySample(recorded_at_utc=clock.utc_now(), monotonic_seconds=1.0),
+        )
+
+
 def test_start_session_allows_new_session_after_previous_stop() -> None:
     clock = ClockHarness()
     issued_ids = iter(["session-001", "session-002"])

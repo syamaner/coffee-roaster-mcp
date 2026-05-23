@@ -201,6 +201,39 @@ def test_get_roast_state_exposes_current_driver_state_and_event_timestamps(
     assert state.t0_status.auto_detection_enabled is False
 
 
+def test_get_roast_state_appends_normalized_driver_telemetry_samples(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(bean_temp_c=151.25, env_temp_c=204.5)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+    driver.bean_temp_c = 152.0
+    driver.env_temp_c = 205.25
+    driver.heat_level_percent = 45
+    driver.fan_level_percent = 25
+    driver.cooling_on = True
+    _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+
+    session = server_context.session_store.get_session_snapshot(
+        session_id=start_result.session.session_id
+    )
+    samples = list(session.telemetry_buffer)
+    assert len(samples) == 2
+    assert [sample.bean_temp_c for sample in samples] == [151.25, 152.0]
+    assert [sample.env_temp_c for sample in samples] == [204.5, 205.25]
+    assert samples[1].heat_level_percent == 45
+    assert samples[1].fan_level_percent == 25
+    assert samples[1].cooling_on is True
+    assert samples[0].monotonic_seconds <= samples[1].monotonic_seconds
+
+
 def test_get_roast_state_driver_read_failure_does_not_mutate_session(
     tmp_path: Path,
 ) -> None:
