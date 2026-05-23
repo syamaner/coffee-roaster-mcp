@@ -170,13 +170,23 @@ do not mutate the telemetry buffer. RoR, development percent, final log
 schemas, append-only telemetry writers, CSV/summary schema changes, and broad
 release validation remain later Epic 5/E7 work.
 
+E5-S2 added explicit roast elapsed time computation from the authoritative
+session clock. `roast_elapsed_seconds` is now computed through
+`compute_roast_elapsed_seconds(...)`: it is `None` before beans are added,
+counts from authoritative T0 to the current session clock before drop, and
+freezes at authoritative drop time after `beans_dropped`. The existing MCP
+state and snapshot summary metrics use this helper through
+`compute_roast_metrics(...)`. Development time/percent, 60-second deltas, RoR,
+append-only telemetry writers, final JSONL/CSV/summary schemas, and broad
+release validation remain later Epic 5/E7 work.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E5-S2: compute elapsed roast time.
+The next story is E5-S3: compute development time and percent.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

@@ -214,7 +214,7 @@ class RoastMetrics:
     """Timestamp-derived roast metrics for the current session snapshot.
 
     Attributes:
-        roast_elapsed_seconds: Seconds from beans added to drop, stop, or now.
+        roast_elapsed_seconds: Seconds from beans added to drop or now.
         development_time_seconds: Seconds from first crack to drop, stop, or now.
         development_percent: Development time as a percentage of roast elapsed time.
     """
@@ -350,9 +350,8 @@ def compute_roast_metrics(
     import time
 
     clock = monotonic_now or time.monotonic
-    roast_elapsed_seconds = _elapsed_since(
+    roast_elapsed_seconds = compute_roast_elapsed_seconds(
         session,
-        start_seconds=session.beans_added_monotonic_seconds,
         monotonic_now=clock,
     )
     development_time_seconds = _elapsed_since(
@@ -372,6 +371,34 @@ def compute_roast_metrics(
         development_time_seconds=development_time_seconds,
         development_percent=development_percent,
     )
+
+
+def compute_roast_elapsed_seconds(
+    session: RoastSession,
+    *,
+    monotonic_now: Callable[[], float] | None = None,
+) -> float | None:
+    """Compute roast elapsed seconds from authoritative T0 to drop or now.
+
+    Args:
+        session: Session snapshot to inspect.
+        monotonic_now: Optional monotonic clock supplier for active sessions.
+
+    Returns:
+        Seconds from `beans_added` to `beans_dropped` when drop exists, from
+        `beans_added` to the current session clock otherwise, or `None` before
+        beans are added.
+    """
+    import time
+
+    clock = monotonic_now or time.monotonic
+    if session.beans_added_monotonic_seconds is None:
+        return None
+    if session.beans_dropped_monotonic_seconds is not None:
+        end_seconds = session.beans_dropped_monotonic_seconds
+    else:
+        end_seconds = session.elapsed_monotonic_seconds(clock)
+    return round(max(0.0, end_seconds - session.beans_added_monotonic_seconds), 3)
 
 
 class SessionLifecycleError(RuntimeError):

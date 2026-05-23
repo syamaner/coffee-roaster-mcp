@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E5-S2`
-- Current target: Compute elapsed roast time
+- Active story: `E5-S3`
+- Current target: Compute development time and percent
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -205,6 +205,14 @@ The first implementation milestone is a mock vertical slice that requires no roa
   failures still do not mutate session state, stopped or non-latest sessions do
   not receive new samples, and final log schemas/RoR/development metrics remain
   later Epic 5 work.
+- `E5-S2` makes roast elapsed time explicit through
+  `compute_roast_elapsed_seconds(...)`. The value is `None` before T0, then
+  runs from authoritative `beans_added` monotonic time to the current session
+  clock until drop, and freezes at authoritative `beans_dropped` monotonic time
+  after drop. Existing `get_roast_state` and snapshot summary metrics now use
+  this helper through `compute_roast_metrics(...)`. Development time/percent,
+  60-second deltas, RoR, append-only telemetry writers, and final log schemas
+  remain later Epic 5 work.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -485,7 +493,7 @@ Goal: compute roast metrics from one session clock and export durable logs.
 - [x] `E5-S1` Implement rolling telemetry buffer.
   - Done when bean/env samples are retained for rolling metric calculations.
 
-- [ ] `E5-S2` Compute elapsed roast time.
+- [x] `E5-S2` Compute elapsed roast time.
   - Done when `roast_elapsed_seconds` is computed from `beans_added_at` to now or drop.
 
 - [ ] `E5-S3` Compute development time and percent.
@@ -1284,6 +1292,28 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest tests/test_session.py tests/test_mcp_server.py`:
     69 passed.
   - Ran `./.venv/bin/python -m pytest`: 301 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+- Validation run for E5-S2:
+  - Added `compute_roast_elapsed_seconds(...)` as the explicit helper for
+    `roast_elapsed_seconds` from authoritative T0 to current session clock or
+    authoritative drop time.
+  - Wired `compute_roast_metrics(...)` to use the helper so existing
+    `get_roast_state` and snapshot summary metric surfaces share the E5-S2
+    elapsed-time contract.
+  - Added elapsed-time tests for `None` before beans are added, active elapsed
+    time before drop, and frozen elapsed time after drop even when the current
+    clock advances.
+  - Kept development time/percent behavior, 60-second deltas, RoR,
+    append-only telemetry log files, final JSONL/CSV/summary schemas, model
+    training/export/sync, real microphone validation, live Hottop validation,
+    end-to-end agent roast validation, and broad release validation out of
+    scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_session.py`: 49 passed.
+  - Ran `./.venv/bin/python -m pytest`: 305 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
