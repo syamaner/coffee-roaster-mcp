@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -96,6 +97,7 @@ def _append_telemetry_with_limit(
     sample: TelemetrySample,
     *,
     max_samples: int,
+    log_interval_seconds: float,
 ) -> None:
     """Append telemetry to one session with an explicit retention limit."""
     if max_samples < 0:
@@ -106,8 +108,66 @@ def _append_telemetry_with_limit(
     ):
         raise SessionLifecycleError("Telemetry samples must be appended in timestamp order.")
     session.telemetry_buffer.append(sample)
+    _append_telemetry_log_row_if_due(
+        session,
+        sample,
+        log_interval_seconds=log_interval_seconds,
+    )
     while len(session.telemetry_buffer) > max_samples:
         session.telemetry_buffer.popleft()
+
+
+def _append_jsonl_log_row(session: RoastSession, row: Mapping[str, object]) -> None:
+    """Append one JSON row to the session's durable roast log."""
+    if session.log_writer is None:
+        return
+    path = session.log_writer.log_dir / "roast.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(row, sort_keys=True))
+        output.write("\n")
+
+
+def _append_event_log_row(session: RoastSession, event: RoastEvent) -> None:
+    """Append one event row to the session's durable roast log."""
+    _append_jsonl_log_row(
+        session,
+        {
+            "session_id": session.id,
+            "type": "event",
+            "kind": event.kind,
+            "recorded_at_utc": event.recorded_at_utc.isoformat(),
+            "monotonic_seconds": event.monotonic_seconds,
+            "payload": dict(event.payload),
+        },
+    )
+
+
+def _append_telemetry_log_row_if_due(
+    session: RoastSession,
+    sample: TelemetrySample,
+    *,
+    log_interval_seconds: float,
+) -> None:
+    """Append one telemetry log row when the configured 1 Hz interval is due."""
+    last_logged = session.last_logged_telemetry_monotonic_seconds
+    if last_logged is not None and sample.monotonic_seconds - last_logged < log_interval_seconds:
+        return
+    _append_jsonl_log_row(
+        session,
+        {
+            "session_id": session.id,
+            "type": "telemetry",
+            "recorded_at_utc": sample.recorded_at_utc.isoformat(),
+            "monotonic_seconds": sample.monotonic_seconds,
+            "bean_temp_c": sample.bean_temp_c,
+            "env_temp_c": sample.env_temp_c,
+            "heat_level_percent": sample.heat_level_percent,
+            "fan_level_percent": sample.fan_level_percent,
+            "cooling_on": sample.cooling_on,
+        },
+    )
+    session.last_logged_telemetry_monotonic_seconds = sample.monotonic_seconds
 
 
 @dataclass(frozen=True)
@@ -266,6 +326,8 @@ class RoastSession:
         event_timeline: Shared ordered event timeline for future runtime stories.
         telemetry_buffer: Rolling telemetry sample buffer.
         log_writer: Append-only log writer reference when available.
+        last_logged_telemetry_monotonic_seconds: Latest telemetry timestamp
+            written to the append-only JSONL log.
         stopped_at_utc: Wall-clock UTC stop time once the session is stopped.
         monotonic_stop: Monotonic clock value captured when the session stops.
     """
@@ -295,6 +357,7 @@ class RoastSession:
     event_timeline: list[RoastEvent] = field(default_factory=_event_timeline_default)
     telemetry_buffer: deque[TelemetrySample] = field(default_factory=_telemetry_buffer_default)
     log_writer: LogWriterReference | None = None
+    last_logged_telemetry_monotonic_seconds: float | None = None
     stopped_at_utc: datetime | None = None
     monotonic_stop: float | None = None
     pending_driver_command_token: str | None = None
@@ -670,6 +733,7 @@ class RoastSessionStore:
         monotonic_now: Callable[[], float] | None = None,
         session_id_factory: Callable[[], str] | None = None,
         default_log_dir: Path = Path("./logs/roasts"),
+        telemetry_log_interval_seconds: float = 1.0,
     ) -> None:
         """Initialize the single-session store.
 
@@ -680,6 +744,8 @@ class RoastSessionStore:
             monotonic_now: Optional monotonic clock supplier.
             session_id_factory: Optional session id supplier.
             default_log_dir: Base directory for future log writer references.
+            telemetry_log_interval_seconds: Minimum seconds between telemetry
+                rows in the append-only JSONL log.
         """
         import time
 
@@ -687,8 +753,11 @@ class RoastSessionStore:
             raise ValueError("telemetry_buffer_limit must be >= 0.")
         if session_history_limit < 1:
             raise ValueError("session_history_limit must be >= 1.")
+        if not math.isfinite(telemetry_log_interval_seconds) or telemetry_log_interval_seconds <= 0:
+            raise ValueError("telemetry_log_interval_seconds must be greater than 0.")
 
         self._telemetry_buffer_limit = telemetry_buffer_limit
+        self._telemetry_log_interval_seconds = telemetry_log_interval_seconds
         self._session_history_limit = session_history_limit
         self._utc_now = utc_now or (lambda: datetime.now(UTC))
         self._monotonic_now = monotonic_now or time.monotonic
@@ -792,6 +861,7 @@ class RoastSessionStore:
                 session,
                 sample,
                 max_samples=self._telemetry_buffer_limit,
+                log_interval_seconds=self._telemetry_log_interval_seconds,
             )
 
     def record_telemetry_sample(
@@ -835,6 +905,7 @@ class RoastSessionStore:
                 session,
                 sample,
                 max_samples=self._telemetry_buffer_limit,
+                log_interval_seconds=self._telemetry_log_interval_seconds,
             )
             return _copy_session_for_read(session)
 
@@ -882,6 +953,7 @@ class RoastSessionStore:
                 self._latest_session,
                 sample,
                 max_samples=self._telemetry_buffer_limit,
+                log_interval_seconds=self._telemetry_log_interval_seconds,
             )
             return _copy_session_for_read(self._latest_session)
 
@@ -1247,6 +1319,7 @@ class RoastSessionStore:
             )
             session.event_timeline.append(event)
             _apply_event_timestamp(session, event)
+            _append_event_log_row(session, event)
             return event
 
     def record_event_snapshot(
@@ -1377,6 +1450,7 @@ class RoastSessionStore:
             )
             session.event_timeline.append(event)
             _apply_event_timestamp(session, event)
+            _append_event_log_row(session, event)
             return event, _copy_session_for_read(session)
 
     def emergency_stop(
@@ -1607,6 +1681,7 @@ class RoastSessionStore:
         )
         session.event_timeline.append(event)
         _apply_event_timestamp(session, event)
+        _append_event_log_row(session, event)
         return event
 
 

@@ -77,7 +77,8 @@ def test_in_process_mcp_tools_cover_mock_roast_and_export(tmp_path: Path) -> Non
     assert Path(export.csv_path).exists()
     assert Path(export.summary_path).exists()
 
-    events = [json.loads(line) for line in Path(export.jsonl_path).read_text().splitlines()]
+    rows = [json.loads(line) for line in Path(export.jsonl_path).read_text().splitlines()]
+    events = [row for row in rows if row["type"] == "event"]
     assert [event["kind"] for event in events] == [
         "beans_added",
         "first_crack_detected",

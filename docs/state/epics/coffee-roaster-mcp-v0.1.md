@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E5-S6`
-- Current target: Write append-only JSONL roast log
+- Active story: `E5-S7`
+- Current target: Export CSV roast log
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -243,6 +243,14 @@ The first implementation milestone is a mock vertical slice that requires no roa
   defaulting to 10 seconds. Existing `get_roast_state` and snapshot summary
   metric surfaces use these helpers through `compute_roast_metrics(...)`.
   Append-only telemetry writers and final log schemas remain later Epic 5 work.
+- `E5-S6` writes append-only runtime JSONL logs from the authoritative
+  `RoastSessionStore`. Event rows are appended to `roast.jsonl` immediately
+  when new timeline events are recorded, and telemetry rows are appended from
+  the existing E5-S1 polling path at the configured
+  `logging.sample_interval_seconds`, defaulting to 1 Hz. Snapshot export keeps
+  writing CSV and `summary.json` from the current session but no longer
+  overwrites an existing append-only JSONL log. Final CSV and summary schemas
+  remain later Epic 5 work.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -535,7 +543,7 @@ Goal: compute roast metrics from one session clock and export durable logs.
 - [x] `E5-S5` Compute bean/env RoR.
   - Done when RoR is normalized to C/min and returns null before 10 seconds of samples.
 
-- [ ] `E5-S6` Write append-only JSONL roast log.
+- [x] `E5-S6` Write append-only JSONL roast log.
   - Done when telemetry rows are written at 1 Hz and event rows are written immediately.
 
 - [ ] `E5-S7` Export CSV roast log.
@@ -1411,6 +1419,26 @@ After completing a story:
     validation, end-to-end agent roast validation, and broad release validation
     out of scope.
   - Ran `./.venv/bin/python -m pytest`: 318 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+- Validation run for E5-S6:
+  - Added append-only `roast.jsonl` runtime writes behind the authoritative
+    `RoastSessionStore` mutation boundary.
+  - Event rows are written immediately when new session timeline events are
+    recorded, including automatic first-crack and emergency fault paths.
+  - Telemetry rows are written from the existing E5-S1 polling sample path at
+    `logging.sample_interval_seconds`, defaulting to 1 Hz, while still
+    preserving the rolling telemetry buffer for derived metrics.
+  - Snapshot export still writes CSV and `summary.json`, but does not overwrite
+    an existing append-only JSONL runtime log.
+  - Kept final CSV schema work, final summary schema work, model
+    training/export/sync, real microphone validation, live Hottop validation,
+    end-to-end agent roast validation, and broad release validation out of
+    scope.
+  - Ran `./.venv/bin/python -m pytest`: 321 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

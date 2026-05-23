@@ -366,9 +366,10 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert export_jsonl_path.exists()
         assert export_csv_path.exists()
         assert export_summary_path.exists()
-        exported_events = [
+        exported_rows = [
             json.loads(line) for line in export_jsonl_path.read_text(encoding="utf-8").splitlines()
         ]
+        exported_events = [row for row in exported_rows if row["type"] == "event"]
         assert [event["kind"] for event in exported_events] == [
             "beans_added",
             "first_crack_detected",

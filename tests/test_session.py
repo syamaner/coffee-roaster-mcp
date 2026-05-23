@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -182,6 +183,90 @@ def test_record_telemetry_sample_uses_session_clock_and_snapshot_retains_buffer(
     assert samples[0].fan_level_percent == 35
     assert samples[0].cooling_on is False
     assert list(store.get_session_snapshot().telemetry_buffer) == samples
+
+
+def test_append_only_jsonl_log_writes_events_immediately_and_telemetry_at_1hz(
+    tmp_path: Path,
+) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+        session_id_factory=lambda: "session-001",
+        telemetry_log_interval_seconds=1.0,
+    )
+    session = store.start_session()
+
+    clock.monotonic_value = 100.0
+    store.record_telemetry_sample(
+        session,
+        bean_temp_c=151.25,
+        env_temp_c=204.5,
+        heat_level_percent=55,
+        fan_level_percent=35,
+        cooling_on=False,
+    )
+    clock.monotonic_value = 100.5
+    store.record_telemetry_sample(
+        session,
+        bean_temp_c=151.5,
+        env_temp_c=205.0,
+        heat_level_percent=55,
+        fan_level_percent=35,
+        cooling_on=False,
+    )
+    clock.monotonic_value = 100.7
+    event = store.record_event(session, "beans_added")
+    clock.monotonic_value = 101.2
+    store.record_telemetry_sample(
+        session,
+        bean_temp_c=152.0,
+        env_temp_c=206.0,
+        heat_level_percent=60,
+        fan_level_percent=40,
+        cooling_on=False,
+    )
+
+    log_path = tmp_path / "roasts" / "session-001" / "roast.jsonl"
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [row["type"] for row in rows] == ["telemetry", "event", "telemetry"]
+    assert rows[0]["session_id"] == "session-001"
+    assert rows[0]["bean_temp_c"] == 151.25
+    assert rows[0]["monotonic_seconds"] == 0.0
+    assert rows[1]["kind"] == "beans_added"
+    assert rows[1]["recorded_at_utc"] == event.recorded_at_utc.isoformat()
+    assert round(rows[1]["monotonic_seconds"], 3) == 0.7
+    assert rows[2]["bean_temp_c"] == 152.0
+    assert rows[2]["env_temp_c"] == 206.0
+    assert rows[2]["heat_level_percent"] == 60
+    assert rows[2]["fan_level_percent"] == 40
+
+
+def test_append_only_jsonl_log_includes_automatic_first_crack_events(tmp_path: Path) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+        session_id_factory=lambda: "session-001",
+    )
+    session = store.start_session()
+
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 110.0
+    store.record_first_crack_detection_snapshot(
+        session,
+        detected_at_monotonic_seconds=109.25,
+        payload={"source": "first_crack_detector"},
+    )
+
+    log_path = tmp_path / "roasts" / "session-001" / "roast.jsonl"
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [row["kind"] for row in rows] == ["beans_added", "first_crack_detected"]
+    assert rows[1]["payload"] == {"source": "first_crack_detector"}
+    assert rows[1]["monotonic_seconds"] == 9.25
 
 
 def test_record_active_telemetry_sample_returns_none_when_session_is_stale() -> None:

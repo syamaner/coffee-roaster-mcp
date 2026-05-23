@@ -67,7 +67,8 @@ def export_roast_snapshot(
     summary_path = log_dir / "summary.json"
 
     log_dir.mkdir(parents=True, exist_ok=True)
-    _write_event_jsonl(jsonl_path, session=session)
+    if not jsonl_path.exists():
+        _write_event_jsonl(jsonl_path, session=session)
     _write_event_csv(csv_path, session=session)
     _write_summary_json(
         summary_path,
@@ -84,8 +85,8 @@ def export_roast_snapshot(
         summary_path=summary_path,
         ready=True,
         note=(
-            "Snapshot export written from the current in-process session. "
-            "Append-only telemetry writers and final log schemas land in Epic 5."
+            "Snapshot CSV and summary export written from the current "
+            "in-process session. JSONL is append-only during the roast."
         ),
     )
 

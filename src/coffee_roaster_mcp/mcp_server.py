@@ -323,7 +323,10 @@ def build_server_context(
     return ServerContext(
         config=config,
         transport=transport,
-        session_store=RoastSessionStore(default_log_dir=config.logging.log_dir / "roasts"),
+        session_store=RoastSessionStore(
+            default_log_dir=config.logging.log_dir / "roasts",
+            telemetry_log_interval_seconds=config.logging.sample_interval_seconds,
+        ),
         roaster_driver=roaster_driver,
         first_crack_runtime=build_first_crack_session_runtime(config),
         started_at_utc=datetime.now(UTC),
