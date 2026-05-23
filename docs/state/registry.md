@@ -160,13 +160,23 @@ and `get_roast_state.t0_status`. The explicit `mark_beans_added` override
 remains available and idempotent. Driver read failures still surface without
 session mutation, and normal CI remains mock-safe.
 
+E5-S1 added rolling telemetry capture owned by the authoritative
+`RoastSessionStore`. Successful operational `get_roast_state` polling now
+appends normalized samples from the configured `RoasterDriver.read_state()` for
+the latest active session, retaining ordered UTC/monotonic timestamps,
+bean/environment temperatures, heat/fan levels, and cooling state for later
+Epic 5 metrics. Driver read failures, stopped sessions, and non-latest sessions
+do not mutate the telemetry buffer. RoR, development percent, final log
+schemas, append-only telemetry writers, CSV/summary schema changes, and broad
+release validation remain later Epic 5/E7 work.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E5-S1: implement rolling telemetry buffer.
+The next story is E5-S2: compute elapsed roast time.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

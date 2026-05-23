@@ -448,7 +448,14 @@ def create_mcp_server(
         """Return the current authoritative roast session state."""
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
-        device_state = _read_current_device_state(server_context)
+        driver_state = _read_current_driver_state(server_context)
+        device_state = _serialize_device_state(driver_state)
+        session = _record_polling_telemetry_for_active_session(
+            server_context,
+            session=session,
+            requested_session_id=session_id,
+            driver_state=driver_state,
+        )
         auto_t0_recorded = _process_auto_t0_for_active_session(
             server_context,
             session_id=session_id,
@@ -895,17 +902,35 @@ def _snapshot_session(
         raise ValueError(str(exc)) from exc
 
 
-def _read_current_device_state(server_context: ServerContext) -> RoasterDeviceState:
-    """Read and serialize the configured driver state for MCP output."""
+def _read_current_driver_state(server_context: ServerContext) -> RoasterState:
+    """Read the configured driver state for MCP output and telemetry capture."""
     try:
-        driver_state = server_context.roaster_driver.read_state()
+        return server_context.roaster_driver.read_state()
     except Exception as exc:
         driver_name = server_context.config.roaster.driver
         raise RuntimeError(
             f"Could not read current roaster state from driver {driver_name}: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
-    return _serialize_device_state(driver_state)
+
+
+def _record_polling_telemetry_for_active_session(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    requested_session_id: str | None,
+    driver_state: RoasterState,
+) -> RoastSession:
+    """Append one driver-state telemetry sample when polling the active session."""
+    snapshot = server_context.session_store.record_active_telemetry_sample(
+        session_id=requested_session_id,
+        bean_temp_c=driver_state.bean_temp_c,
+        env_temp_c=driver_state.env_temp_c,
+        heat_level_percent=driver_state.heat_level_percent,
+        fan_level_percent=driver_state.fan_level_percent,
+        cooling_on=driver_state.cooling_on,
+    )
+    return session if snapshot is None else snapshot
 
 
 def _serialize_session_state(
