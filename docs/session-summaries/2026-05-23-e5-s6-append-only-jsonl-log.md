@@ -55,7 +55,7 @@ Durable state updates:
 
 Local validation:
 
-- `./.venv/bin/python -m pytest`: 321 passed
+- `./.venv/bin/python -m pytest`: 325 passed
 - `./.venv/bin/python -m ruff check .`: passed
 - `./.venv/bin/python -m ruff format --check .`: passed
 - `./.venv/bin/python -m pyright`: 0 errors
@@ -64,8 +64,8 @@ Local validation:
 
 ## Restart Prompt
 
-Resume in `/Users/sertanyamaner/git/coffee-roaster-mcp`. PR for E5-S6 should be
-checked first. If it has merged, verify issue #45 is closed, check out `main`,
+Resume in the local clone of `syamaner/coffee-roaster-mcp`. PR for E5-S6 should
+be checked first. If it has merged, verify issue #45 is closed, check out `main`,
 run `git pull --ff-only origin main`, then begin E5-S7 from updated main on the
 appropriate `feature/46-...` branch after reading the registry, active epic,
 this summary, and the GitHub issue for E5-S7. Keep E5-S7 scoped to CSV roast log

@@ -107,12 +107,18 @@ def _append_telemetry_with_limit(
         and sample.monotonic_seconds < session.telemetry_buffer[-1].monotonic_seconds
     ):
         raise SessionLifecycleError("Telemetry samples must be appended in timestamp order.")
-    session.telemetry_buffer.append(sample)
-    _append_telemetry_log_row_if_due(
+
+    telemetry_row = _telemetry_log_row_if_due(
         session,
         sample,
         log_interval_seconds=log_interval_seconds,
     )
+    if telemetry_row is not None:
+        _append_jsonl_log_row(session, telemetry_row)
+
+    session.telemetry_buffer.append(sample)
+    if telemetry_row is not None:
+        session.last_logged_telemetry_monotonic_seconds = sample.monotonic_seconds
     while len(session.telemetry_buffer) > max_samples:
         session.telemetry_buffer.popleft()
 
@@ -143,31 +149,27 @@ def _append_event_log_row(session: RoastSession, event: RoastEvent) -> None:
     )
 
 
-def _append_telemetry_log_row_if_due(
+def _telemetry_log_row_if_due(
     session: RoastSession,
     sample: TelemetrySample,
     *,
     log_interval_seconds: float,
-) -> None:
-    """Append one telemetry log row when the configured 1 Hz interval is due."""
+) -> Mapping[str, object] | None:
+    """Return one telemetry log row when the configured 1 Hz interval is due."""
     last_logged = session.last_logged_telemetry_monotonic_seconds
     if last_logged is not None and sample.monotonic_seconds - last_logged < log_interval_seconds:
-        return
-    _append_jsonl_log_row(
-        session,
-        {
-            "session_id": session.id,
-            "type": "telemetry",
-            "recorded_at_utc": sample.recorded_at_utc.isoformat(),
-            "monotonic_seconds": sample.monotonic_seconds,
-            "bean_temp_c": sample.bean_temp_c,
-            "env_temp_c": sample.env_temp_c,
-            "heat_level_percent": sample.heat_level_percent,
-            "fan_level_percent": sample.fan_level_percent,
-            "cooling_on": sample.cooling_on,
-        },
-    )
-    session.last_logged_telemetry_monotonic_seconds = sample.monotonic_seconds
+        return None
+    return {
+        "session_id": session.id,
+        "type": "telemetry",
+        "recorded_at_utc": sample.recorded_at_utc.isoformat(),
+        "monotonic_seconds": sample.monotonic_seconds,
+        "bean_temp_c": sample.bean_temp_c,
+        "env_temp_c": sample.env_temp_c,
+        "heat_level_percent": sample.heat_level_percent,
+        "fan_level_percent": sample.fan_level_percent,
+        "cooling_on": sample.cooling_on,
+    }
 
 
 @dataclass(frozen=True)
@@ -1160,10 +1162,12 @@ class RoastSessionStore:
                 fan_level_percent=fan_level_percent,
                 cooling_on=cooling_on,
             )
-            event = self.record_event(session, "beans_dropped")
-            if cooling_on:
-                self.record_event(session, "cooling_started")
-            self._clear_driver_command_reservation_locked(session, reservation)
+            try:
+                event = self.record_event(session, "beans_dropped")
+                if cooling_on:
+                    self.record_event(session, "cooling_started")
+            finally:
+                self._clear_driver_command_reservation_locked(session, reservation)
             return event, _copy_session_for_read(session)
 
     def complete_reserved_driver_start_cooling_snapshot(
@@ -1184,8 +1188,10 @@ class RoastSessionStore:
                 fan_level_percent=fan_level_percent,
                 cooling_on=cooling_on,
             )
-            event = self.record_event(session, "cooling_started")
-            self._clear_driver_command_reservation_locked(session, reservation)
+            try:
+                event = self.record_event(session, "cooling_started")
+            finally:
+                self._clear_driver_command_reservation_locked(session, reservation)
             return event, _copy_session_for_read(session)
 
     def complete_reserved_driver_stop_cooling_snapshot(
@@ -1212,16 +1218,18 @@ class RoastSessionStore:
                 fan_level_percent,
                 label="fan_level_percent",
             )
-            event = self.record_event(session, "cooling_stopped")
-            session.heat_level_percent = validated_heat
-            session.fan_level_percent = validated_fan
-            session.cooling_on = False
-            session.stop(
-                utc_now=self._utc_now,
-                monotonic_now=self._monotonic_now,
-                phase="complete",
-            )
-            self._clear_driver_command_reservation_locked(session, reservation)
+            try:
+                event = self.record_event(session, "cooling_stopped")
+                session.heat_level_percent = validated_heat
+                session.fan_level_percent = validated_fan
+                session.cooling_on = False
+                session.stop(
+                    utc_now=self._utc_now,
+                    monotonic_now=self._monotonic_now,
+                    phase="complete",
+                )
+            finally:
+                self._clear_driver_command_reservation_locked(session, reservation)
             return event, _copy_session_for_read(session)
 
     def clear_driver_command_reservation(
@@ -1317,9 +1325,9 @@ class RoastSessionStore:
                 monotonic_seconds=monotonic_seconds,
                 payload={} if payload is None else dict(payload),
             )
+            _append_event_log_row(session, event)
             session.event_timeline.append(event)
             _apply_event_timestamp(session, event)
-            _append_event_log_row(session, event)
             return event
 
     def record_event_snapshot(
@@ -1448,9 +1456,9 @@ class RoastSessionStore:
                 monotonic_seconds=detected_elapsed_seconds,
                 payload={} if payload is None else dict(payload),
             )
+            _append_event_log_row(session, event)
             session.event_timeline.append(event)
             _apply_event_timestamp(session, event)
-            _append_event_log_row(session, event)
             return event, _copy_session_for_read(session)
 
     def emergency_stop(
@@ -1679,9 +1687,9 @@ class RoastSessionStore:
             monotonic_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
             payload=dict(payload),
         )
+        _append_event_log_row(session, event)
         session.event_timeline.append(event)
         _apply_event_timestamp(session, event)
-        _append_event_log_row(session, event)
         return event
 
 
@@ -1895,6 +1903,7 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         event_timeline=deepcopy(session.event_timeline),
         telemetry_buffer=deque(session.telemetry_buffer),
         log_writer=session.log_writer,
+        last_logged_telemetry_monotonic_seconds=(session.last_logged_telemetry_monotonic_seconds),
         stopped_at_utc=session.stopped_at_utc,
         monotonic_stop=session.monotonic_stop,
         pending_driver_command_token=session.pending_driver_command_token,

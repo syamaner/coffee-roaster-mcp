@@ -7,6 +7,7 @@ from typing import cast
 
 import pytest
 
+import coffee_roaster_mcp.session as session_module
 from coffee_roaster_mcp.session import (
     RoastEventKind,
     RoastSessionStore,
@@ -241,6 +242,9 @@ def test_append_only_jsonl_log_writes_events_immediately_and_telemetry_at_1hz(
     assert rows[2]["env_temp_c"] == 206.0
     assert rows[2]["heat_level_percent"] == 60
     assert rows[2]["fan_level_percent"] == 40
+    latest_logged = store.get_session_snapshot().last_logged_telemetry_monotonic_seconds
+    assert latest_logged is not None
+    assert round(latest_logged, 3) == 1.2
 
 
 def test_append_only_jsonl_log_includes_automatic_first_crack_events(tmp_path: Path) -> None:
@@ -267,6 +271,90 @@ def test_append_only_jsonl_log_includes_automatic_first_crack_events(tmp_path: P
     assert [row["kind"] for row in rows] == ["beans_added", "first_crack_detected"]
     assert rows[1]["payload"] == {"source": "first_crack_detector"}
     assert rows[1]["monotonic_seconds"] == 9.25
+
+
+def test_event_log_write_failure_does_not_commit_event(tmp_path: Path) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+        session_id_factory=lambda: "session-001",
+    )
+    session = store.start_session()
+    blocked_log_dir = tmp_path / "roasts" / "session-001"
+    blocked_log_dir.parent.mkdir(parents=True)
+    blocked_log_dir.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(OSError):
+        store.record_event(session, "beans_added")
+
+    assert session.event_timeline == []
+    assert session.phase == "pre_roast"
+    assert session.beans_added_at_utc is None
+
+
+def test_telemetry_log_write_failure_does_not_advance_buffer(tmp_path: Path) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+        session_id_factory=lambda: "session-001",
+    )
+    session = store.start_session()
+    blocked_log_dir = tmp_path / "roasts" / "session-001"
+    blocked_log_dir.parent.mkdir(parents=True)
+    blocked_log_dir.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(OSError):
+        store.record_telemetry_sample(
+            session,
+            bean_temp_c=151.25,
+            env_temp_c=204.5,
+            heat_level_percent=55,
+            fan_level_percent=35,
+            cooling_on=False,
+        )
+
+    assert list(session.telemetry_buffer) == []
+    assert session.last_logged_telemetry_monotonic_seconds is None
+
+
+def test_reserved_driver_drop_log_failure_clears_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    drop_reservation = store.reserve_driver_drop(session)
+    assert drop_reservation.reservation is not None
+
+    def fail_event_log_write(
+        _session: session_module.RoastSession,
+        _event: session_module.RoastEvent,
+    ) -> None:
+        raise OSError("log unavailable")
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_event_log_write)
+
+    with pytest.raises(OSError, match="log unavailable"):
+        store.complete_reserved_driver_drop_snapshot(
+            session,
+            reservation=drop_reservation.reservation,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
+        )
+
+    assert session.pending_driver_command_token is None
+    assert session.pending_driver_command_kind is None
 
 
 def test_record_active_telemetry_sample_returns_none_when_session_is_stale() -> None:

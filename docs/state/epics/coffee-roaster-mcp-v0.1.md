@@ -1438,7 +1438,7 @@ After completing a story:
     training/export/sync, real microphone validation, live Hottop validation,
     end-to-end agent roast validation, and broad release validation out of
     scope.
-  - Ran `./.venv/bin/python -m pytest`: 321 passed.
+  - Ran `./.venv/bin/python -m pytest`: 325 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
