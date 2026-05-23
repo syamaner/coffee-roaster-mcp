@@ -11,6 +11,7 @@ from coffee_roaster_mcp.session import (
     RoastSessionStore,
     SessionLifecycleError,
     TelemetrySample,
+    compute_roast_elapsed_seconds,
     compute_roast_metrics,
 )
 
@@ -975,6 +976,49 @@ def test_compute_roast_metrics_uses_clock_for_active_session() -> None:
     assert metrics.roast_elapsed_seconds == 45.0
     assert metrics.development_time_seconds == 30.0
     assert metrics.development_percent == 66.667
+
+
+def test_compute_roast_elapsed_seconds_returns_none_before_beans_added() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    assert compute_roast_elapsed_seconds(session, monotonic_now=clock.monotonic_now) is None
+
+
+def test_compute_roast_elapsed_seconds_uses_current_clock_before_drop() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 142.25
+
+    assert compute_roast_elapsed_seconds(session, monotonic_now=clock.monotonic_now) == 37.25
+
+
+def test_compute_roast_elapsed_seconds_freezes_at_drop() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 155.0
+    store.record_event(session, "beans_dropped")
+    clock.monotonic_value = 210.0
+
+    assert compute_roast_elapsed_seconds(session, monotonic_now=clock.monotonic_now) == 50.0
 
 
 def test_record_event_is_idempotent_for_singleton_event_kinds() -> None:
