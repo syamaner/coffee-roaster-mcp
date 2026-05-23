@@ -74,6 +74,34 @@ Operator-provided context snapshot after PR #124 creation:
 - GPT-5.3-Codex-Spark 5h limit: `100% left`, resets `05:16`
 - GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `00:16 on 31 May`
 
+## Review Fixes
+
+PR #124 review feedback from CodeRabbit and Codex was checked with
+thread-aware GitHub review state. The actionable comments were addressed in the
+CSV exporter:
+
+- same-timestamp rows now emit event rows before telemetry rows so telemetry
+  does not show post-event state before the event row
+- CSV per-row metric calculations now use the same configured RoR window and
+  minimum sample span as `summary.json`
+- event rows now derive state only through the current event, preventing later
+  same-time events from leaking into earlier event rows
+- event transition rows now prefer authoritative post-event control/cooling
+  state where applicable, including `beans_dropped` heat off and cooling
+  transition states
+- private CSV helper docstrings were added for the CodeRabbit docstring
+  coverage warning
+
+Validation after review fixes:
+
+- `./.venv/bin/python -m pytest tests/test_exports.py`: 7 passed
+- `./.venv/bin/python -m pytest`: 331 passed
+- `./.venv/bin/python -m ruff check .`: passed
+- `./.venv/bin/python -m ruff format --check .`: passed
+- `./.venv/bin/python -m pyright`: 0 errors
+- `./.venv/bin/coffee-roaster-mcp --help`: passed
+- `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
+
 ## Restart Prompt
 
 Resume in the local clone of `syamaner/coffee-roaster-mcp`. PR for E5-S7 should

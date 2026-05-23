@@ -144,6 +144,10 @@ def test_snapshot_export_uses_configured_ror_parameters(tmp_path: Path) -> None:
     summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
     assert summary["metrics"]["bean_ror_c_per_min"] is None
     assert summary["metrics"]["env_ror_c_per_min"] is None
+    with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
+        csv_rows = list(csv.DictReader(csv_file))
+    assert csv_rows[-1]["bean_ror_c_per_min"] == ""
+    assert csv_rows[-1]["env_ror_c_per_min"] == ""
 
 
 def test_snapshot_export_csv_includes_plan_columns_for_telemetry_and_events(
@@ -244,6 +248,114 @@ def test_snapshot_export_csv_includes_plan_columns_for_telemetry_and_events(
     assert drop_event["phase"] == "dropped"
     assert drop_event["elapsed_seconds"] == "75.0"
     assert drop_event["beans_dropped"] == "True"
+
+
+def test_snapshot_export_csv_orders_same_time_events_before_telemetry(
+    tmp_path: Path,
+) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    store.append_telemetry(
+        session,
+        TelemetrySample(
+            recorded_at_utc=datetime(2026, 5, 17, 14, 0, 5, tzinfo=UTC),
+            monotonic_seconds=5.0,
+            bean_temp_c=150.0,
+            env_temp_c=180.0,
+            heat_level_percent=50,
+            fan_level_percent=20,
+            cooling_on=False,
+        ),
+    )
+
+    export = export_roast_snapshot(session)
+
+    with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    assert [row["event"] for row in rows] == ["beans_added", ""]
+    assert rows[0]["phase"] == "roasting"
+    assert rows[1]["phase"] == "roasting"
+
+
+def test_snapshot_export_csv_keeps_same_time_event_rows_chronological(
+    tmp_path: Path,
+) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    store.record_event(
+        session,
+        "first_crack_detected",
+        payload={
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "revision": "v0.1.0",
+            "precision": "int8",
+        },
+    )
+
+    export = export_roast_snapshot(session)
+
+    with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    assert [row["event"] for row in rows] == ["beans_added", "first_crack_detected"]
+    assert rows[0]["phase"] == "roasting"
+    assert rows[0]["first_crack_detected"] == "False"
+    assert rows[0]["fc_model_repo"] == ""
+    assert rows[1]["phase"] == "development"
+    assert rows[1]["first_crack_detected"] == "True"
+    assert rows[1]["fc_model_repo"] == "syamaner/coffee-first-crack-detection"
+
+
+def test_snapshot_export_csv_event_rows_use_transition_control_state(
+    tmp_path: Path,
+) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    store.append_telemetry(
+        session,
+        TelemetrySample(
+            recorded_at_utc=datetime(2026, 5, 17, 14, 1, 0, tzinfo=UTC),
+            monotonic_seconds=60.0,
+            bean_temp_c=170.0,
+            env_temp_c=204.0,
+            heat_level_percent=45,
+            fan_level_percent=40,
+            cooling_on=False,
+        ),
+    )
+    clock.monotonic_value = 180.0
+    store.record_event(session, "beans_dropped")
+    store.record_event(session, "cooling_started")
+
+    export = export_roast_snapshot(session)
+
+    with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    drop_row = next(row for row in rows if row["event"] == "beans_dropped")
+    cooling_row = next(row for row in rows if row["event"] == "cooling_started")
+    assert drop_row["heat_level_percent"] == "0"
+    assert drop_row["cooling_on"] == "False"
+    assert cooling_row["cooling_on"] == "True"
 
 
 def test_snapshot_export_rejects_existing_jsonl_directory(tmp_path: Path) -> None:
