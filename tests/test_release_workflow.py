@@ -106,6 +106,9 @@ def test_release_workflow_metadata_validation_reports_clear_shape_errors() -> No
     assert "not isinstance(packages, list)" in run_script
     assert "len(packages) == 0" in run_script
     assert "server.json must contain a non-empty 'packages' array." in run_script
+    assert "not isinstance(package, dict)" in run_script
+    assert 'not isinstance(package.get("version"), str)' in run_script
+    assert "server.json packages[0] must be an object with a string 'version' field." in run_script
 
 
 def test_release_runbook_documents_operator_prerequisites() -> None:

@@ -100,7 +100,8 @@ The review concerns were valid and addressed locally:
 - Follow-up CodeRabbit metadata-validation comments were also addressed:
   missing `__version__` and missing or empty `server.json.packages` now fail
   with explicit release-operator error messages instead of generic Python
-  exceptions.
+  exceptions. The first package entry is also validated before reading its
+  `version` field.
 
 Durable state updates:
 

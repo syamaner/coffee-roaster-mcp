@@ -293,7 +293,7 @@ GitHub Actions refs to commit SHAs, disables checkout credential persistence,
 and pins the `mcp-publisher` v1.7.9 Linux amd64 asset with SHA-256
 verification before execution. Follow-up metadata-validation hardening gives
 explicit release-operator errors for missing `__version__` and missing or empty
-`server.json.packages`. `docs/release.md`
+`server.json.packages`, plus malformed first package entries. `docs/release.md`
 documents PyPI account ownership, 2FA/recovery codes, Trusted Publishing setup
 for `release.yml`/`release`/`publish-pypi`, protected `v*` tag rules, TestPyPI
 status, and the exact `PYPI_API_TOKEN` fallback secret name. Focused workflow

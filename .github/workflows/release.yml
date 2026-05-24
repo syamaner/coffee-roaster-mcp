@@ -106,6 +106,13 @@ jobs:
               sys.exit(1)
 
           package = packages[0]
+          if not isinstance(package, dict) or not isinstance(package.get("version"), str):
+              print(
+                  "server.json packages[0] must be an object with a string 'version' field.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
           if package["version"] != version:
               print("server.json package version must match the package version.", file=sys.stderr)
               sys.exit(1)
