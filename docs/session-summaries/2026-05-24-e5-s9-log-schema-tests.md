@@ -41,9 +41,9 @@ E5-S7 field order through `EXPECTED_CSV_FIELDNAMES`.
 Durable state updates:
 
 - `docs/state/epics/coffee-roaster-mcp-v0.1.md` marks `E5-S9` complete and sets
-  the active story to `E6-S1`.
-- `docs/state/registry.md` says the next story is `E6-S1: add PyPI package
-  metadata`.
+  the active story to `E5-S10`.
+- `docs/state/registry.md` says the next story is `E5-S10: add autonomous
+  telemetry sampler`.
 
 ## Validation
 
@@ -71,8 +71,8 @@ Operator-provided cumulative session usage:
 
 Resume in the local clone of `syamaner/coffee-roaster-mcp`. PR for E5-S9 should
 be checked first. If it has merged, verify issue #48 is closed, check out
-`main`, run `git pull --ff-only origin main`, then begin E6-S1 from updated main
-on the appropriate `feature/49-...` branch after reading the registry, active
-epic, this summary, and the GitHub issue for E6-S1. Keep E6-S1 scoped to PyPI
-package metadata unless its issue explicitly requires more, and preserve the
-mock-safe CI and runtime behavior boundaries from Epic 5.
+`main`, run `git pull --ff-only origin main`, then begin E5-S10 from updated
+main on the appropriate `feature/127-...` branch after reading the registry,
+active epic, this summary, and GitHub issue #127. Keep E5-S10 scoped to the
+autonomous telemetry sampler, with `logging.sample_interval_seconds` defaulting
+to 5 seconds and MCP tool calls allowed to refresh telemetry opportunistically.

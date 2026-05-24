@@ -214,7 +214,7 @@ E5-S6 added the append-only runtime JSONL roast log. `RoastSessionStore` now
 writes event rows to each session's `roast.jsonl` immediately when new
 authoritative timeline events are recorded, and writes telemetry rows from the
 existing E5-S1 driver polling path no more often than
-`logging.sample_interval_seconds`, defaulting to 1 Hz. The existing rolling
+`logging.sample_interval_seconds`, defaulting to 5 seconds. The existing rolling
 telemetry buffer, metric helpers, one-session store boundary, mock-safe MCP
 flow, and final CSV/summary schema boundaries remained unchanged. Snapshot export
 continues to write CSV and `summary.json`, but no longer overwrites an existing
@@ -245,9 +245,10 @@ E5-S10 is added before distribution to close the autonomous telemetry sampling
 gap. Telemetry capture currently happens when an MCP client calls
 `get_roast_state`; E5-S10 should make `start_roast_session` start a
 session-owned sampler that polls the configured driver at
-`logging.sample_interval_seconds`, appends telemetry through the existing
-`RoastSessionStore` path, and lets append-only JSONL telemetry plus RoR/delta
-metrics advance even without client polling.
+`logging.sample_interval_seconds`, defaulting to 5 seconds, appends telemetry
+through the existing `RoastSessionStore` path, and lets append-only JSONL
+telemetry plus RoR/delta metrics advance even without client polling. MCP tool
+calls may still refresh telemetry opportunistically.
 
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX

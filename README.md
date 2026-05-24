@@ -269,7 +269,7 @@ audio:
 
 logging:
   log_dir: ./logs
-  sample_interval_seconds: 1.0
+  sample_interval_seconds: 5.0
   export_formats:
     - jsonl
     - csv

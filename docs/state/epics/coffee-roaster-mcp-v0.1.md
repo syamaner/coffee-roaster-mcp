@@ -247,8 +247,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
   `RoastSessionStore`. Event rows are appended to `roast.jsonl` immediately
   when new timeline events are recorded, and telemetry rows are appended from
   the existing E5-S1 polling path at the configured
-  `logging.sample_interval_seconds`, defaulting to 1 Hz. Snapshot export keeps
-  writing CSV and `summary.json` from the current session but no longer
+  `logging.sample_interval_seconds`, defaulting to 5 seconds. Snapshot export
+  keeps writing CSV and `summary.json` from the current session but no longer
   overwrites an existing append-only JSONL log. Final CSV and summary schemas
   remain later Epic 5 work.
 - `E5-S7` adds the planned CSV roast log export schema to snapshot
@@ -276,10 +276,11 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E5-S10` is added before distribution because telemetry capture currently
   depends on MCP clients calling `get_roast_state`. `start_roast_session` should
   start a session-owned sampler that polls the configured driver at
-  `logging.sample_interval_seconds`, appends telemetry through the existing
-  `RoastSessionStore` boundary, and lets append-only JSONL logging plus
-  RoR/delta metrics advance even when the agent or MCP client does not poll
-  state reliably. The sampler must preserve the one-session boundary,
+  `logging.sample_interval_seconds`, defaulting to 5 seconds, appends telemetry
+  through the existing `RoastSessionStore` boundary, and lets append-only JSONL
+  logging plus RoR/delta metrics advance even when the agent or MCP client does
+  not poll state reliably. MCP tool calls may still refresh telemetry
+  opportunistically. The sampler must preserve the one-session boundary,
   configured-driver control wiring, mock-safe CI, fail-closed safety behavior,
   automatic T0 behavior, and session-owned first-crack runtime behavior.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
@@ -575,7 +576,7 @@ Goal: compute roast metrics from one session clock and export durable logs.
   - Done when RoR is normalized to C/min and returns null before 10 seconds of samples.
 
 - [x] `E5-S6` Write append-only JSONL roast log.
-  - Done when telemetry rows are written at 1 Hz and event rows are written immediately.
+  - Done when telemetry rows are written at the configured interval and event rows are written immediately.
 
 - [x] `E5-S7` Export CSV roast log.
   - Done when CSV includes all required columns from the plan.
@@ -589,7 +590,10 @@ Goal: compute roast metrics from one session clock and export durable logs.
 - [ ] `E5-S10` Add autonomous telemetry sampler.
   - Done when `start_roast_session` starts a session-owned telemetry sampler
     that polls the configured roaster driver at `logging.sample_interval_seconds`
-    without requiring `get_roast_state` polling.
+    without requiring `get_roast_state` polling; the default configured interval
+    is 5 seconds.
+  - Done when MCP tool calls may refresh telemetry opportunistically without
+    being the only path that advances telemetry.
   - Done when sampled driver state is appended through the existing
     `RoastSessionStore` telemetry path so rolling metrics and append-only JSONL
     telemetry rows advance on the sampler cadence.
@@ -609,7 +613,7 @@ Goal: compute roast metrics from one session clock and export durable logs.
 - RoR is null before 10 seconds of samples.
 - RoR and deltas are correct for regular and irregular sample intervals.
 - JSONL, CSV, and summary include required fields.
-- Event rows are written immediately, not only on the 1 Hz sample loop.
+- Event rows are written immediately, not only on the sampled telemetry loop.
 - Telemetry rows and rolling metrics advance at the configured sampler cadence
   even when an MCP client does not poll `get_roast_state`.
 
@@ -1481,7 +1485,7 @@ After completing a story:
   - Event rows are written immediately when new session timeline events are
     recorded, including automatic first-crack and emergency fault paths.
   - Telemetry rows are written from the existing E5-S1 polling sample path at
-    `logging.sample_interval_seconds`, defaulting to 1 Hz, while still
+    `logging.sample_interval_seconds`, defaulting to 5 seconds, while still
     preserving the rolling telemetry buffer for derived metrics.
   - Snapshot export still writes CSV and `summary.json`, but does not overwrite
     an existing append-only JSONL runtime log.
