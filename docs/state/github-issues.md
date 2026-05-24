@@ -82,6 +82,7 @@ Milestone: `v0.1`
 - #46 E5-S7: Export CSV roast log
 - #47 E5-S8: Export summary.json
 - #48 E5-S9: Add log schema tests
+- #127 E5-S10: Add autonomous telemetry sampler
 
 ## Epic 6 Stories
 
