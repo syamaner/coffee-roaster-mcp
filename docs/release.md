@@ -92,5 +92,60 @@ After all prerequisites are confirmed:
    stdio transport.
 
 MCP Registry publishing runs only after the PyPI publish job succeeds. The
-registry job authenticates with GitHub OIDC through `mcp-publisher login
-github-oidc` and then publishes `server.json`.
+registry job validates `server.json` against the preview Registry API before
+authenticating, authenticates with GitHub OIDC through `mcp-publisher login
+github-oidc`, and then publishes `server.json`.
+
+## MCP Registry Verification
+
+The MCP Registry is preview. Before a live v0.1 release, use the current
+official registry docs and schema, then repeat the non-destructive checks below:
+
+1. Confirm `server.json` uses the current schema URI:
+   `https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json`.
+2. Confirm `server.json.name` is `io.github.syamaner/coffee-roaster-mcp`.
+3. Confirm the PyPI package entry uses `registryType: pypi`, identifier
+   `coffee-roaster-mcp`, package version `0.1.0`, runtime hint `uvx`, and
+   stdio transport.
+4. Confirm README contains exactly one PyPI ownership verification marker:
+   `<!-- mcp-name: io.github.syamaner/coffee-roaster-mcp -->`.
+5. Download the pinned `mcp-publisher` release asset and verify its SHA-256
+   before execution. The release workflow uses
+   `mcp-publisher_linux_amd64.tar.gz` from `v1.7.9` with SHA-256
+   `ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac`.
+6. Run `./mcp-publisher validate server.json` before authenticating.
+
+E6-S6 verified the template and flow non-destructively:
+
+- `server.json` validated against the downloaded `2025-12-11` JSON schema.
+- `./mcp-publisher validate server.json` returned
+  `server.json is valid` against the preview Registry API.
+- The pinned Linux workflow asset checksum matched the expected SHA-256.
+- The same `mcp-publisher` version's Darwin arm64 build showed the publishing
+  flow as `login github-oidc` followed by `publish server.json`.
+- `mcp-publisher login github-oidc` fails outside GitHub Actions without
+  `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, confirming this authentication path must
+  run from a job with `id-token: write`.
+- `https://pypi.org/pypi/coffee-roaster-mcp/json` returned `Not Found` before
+  the first live release.
+- The Registry search API returned no existing listing for
+  `io.github.syamaner/coffee-roaster-mcp` before the first live release.
+
+The first destructive registry operation is `./mcp-publisher publish server.json`.
+Execute it only after:
+
+- the matching package version exists on production PyPI
+- the PyPI package README includes the exact `mcp-name` verification marker
+- the GitHub `release` environment has been approved
+- `./mcp-publisher validate server.json` has passed
+
+Expected outcome: the Registry accepts the metadata and the search endpoint
+`https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.syamaner/coffee-roaster-mcp`
+returns a listing whose package identifier is `coffee-roaster-mcp` and whose
+transport is `stdio`.
+
+Risk: Registry preview behavior, schema validation, package verification, or
+listing data can change or reset before general availability. A failed publish
+after PyPI succeeds leaves PyPI live without Registry discoverability and should
+be retried only after checking Registry status and confirming no partial
+version entry was created.

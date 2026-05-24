@@ -54,8 +54,9 @@ def test_release_workflow_uses_trusted_publishing_and_release_environment() -> N
 
     assert registry_job["environment"] == "release"
     assert registry_job["permissions"] == {"contents": "read", "id-token": "write"}
+    assert _step_runs(registry_job, "./mcp-publisher validate server.json")
     assert _step_runs(registry_job, "./mcp-publisher login github-oidc")
-    assert _step_runs(registry_job, "./mcp-publisher publish --file=server.json")
+    assert _step_runs(registry_job, "./mcp-publisher publish server.json")
 
 
 def test_release_workflow_pins_actions_and_checkout_credentials() -> None:
@@ -126,6 +127,8 @@ def test_release_runbook_documents_operator_prerequisites() -> None:
         "GitHub environment secret `PYPI_API_TOKEN`",
         "TestPyPI rehearsal is not enabled in the workflow.",
         "MCP Registry publishing runs only after the PyPI publish job succeeds.",
+        "Run `./mcp-publisher validate server.json` before authenticating.",
+        "The first destructive registry operation is `./mcp-publisher publish server.json`.",
     ]
 
     for phrase in expected_phrases:

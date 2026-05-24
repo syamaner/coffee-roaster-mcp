@@ -224,8 +224,11 @@ jobs:
           tar xzf /tmp/mcp-publisher.tar.gz mcp-publisher
           chmod +x mcp-publisher
 
+      - name: Validate server metadata with MCP Registry
+        run: ./mcp-publisher validate server.json
+
       - name: Authenticate to MCP Registry
         run: ./mcp-publisher login github-oidc
 
       - name: Publish server metadata to MCP Registry
-        run: ./mcp-publisher publish --file=server.json
+        run: ./mcp-publisher publish server.json

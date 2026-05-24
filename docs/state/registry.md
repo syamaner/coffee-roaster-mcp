@@ -300,7 +300,21 @@ status, and the exact `PYPI_API_TOKEN` fallback secret name. Focused workflow
 tests pin the trigger, job ordering, environment/OIDC permissions, immutable
 action refs, publisher verification, release metadata failure messages, publish
 actions, and prerequisite runbook text. Live publishing is not executed by this
-story; E6-S6 remains the MCP Registry verification spike.
+story.
+
+E6-S6 completed the MCP Registry publishing verification spike without a live
+PyPI release or live Registry publish. `server.json` validated against the
+downloaded official `2025-12-11` Registry JSON schema and the preview Registry
+API through `mcp-publisher validate server.json`. The pinned
+`mcp-publisher` v1.7.9 Linux amd64 workflow asset checksum matched the expected
+SHA-256, and the workflow now validates `server.json` before GitHub OIDC
+authentication and publish. `docs/release.md` documents the PyPI README
+verification marker, non-destructive validation commands, exact live-publish
+stop point, prerequisites, expected outcome, and preview Registry risk.
+Production PyPI still returns `Not Found` for `coffee-roaster-mcp`, and the
+Registry search API returns no current listing for
+`io.github.syamaner/coffee-roaster-mcp`; the first destructive step remains the
+tag-triggered live release path after PyPI publication succeeds.
 
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
@@ -308,7 +322,7 @@ first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E6-S6: run the MCP Registry publishing verification spike.
+The next story is E6-S7: document install and hardware setup.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
