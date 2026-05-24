@@ -1,6 +1,7 @@
 """Package and CLI smoke coverage for RoastPilot."""
 
 import asyncio
+import csv
 import json
 import os
 import sys
@@ -265,6 +266,13 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
     async with stdio_client(server_params) as (read, write), ClientSession(read, write) as session:
         await _call_with_timeout(session.initialize())
 
+        runtime_config = cast(
+            Any, await _call_with_timeout(session.call_tool("get_runtime_config", {}))
+        )
+        assert runtime_config.structuredContent["roaster_driver"] == "mock"
+        assert runtime_config.structuredContent["first_crack_mode"] == "disabled"
+        assert runtime_config.structuredContent["auto_t0_detection_enabled"] is False
+
         start_result = cast(
             Any,
             await _call_with_timeout(session.call_tool("start_roast_session", {})),
@@ -432,6 +440,7 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert export_jsonl_path.exists()
         assert export_csv_path.exists()
         assert export_summary_path.exists()
+
         exported_rows = [
             json.loads(line) for line in export_jsonl_path.read_text(encoding="utf-8").splitlines()
         ]
@@ -443,10 +452,34 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
             "cooling_started",
             "cooling_stopped",
         ]
+
+        with export_csv_path.open(encoding="utf-8", newline="") as export_csv:
+            csv_rows = list(csv.DictReader(export_csv))
+        assert [row["event"] for row in csv_rows] == [
+            "beans_added",
+            "first_crack_detected",
+            "beans_dropped",
+            "cooling_started",
+            "cooling_stopped",
+        ]
+        assert csv_rows[0]["phase"] == "roasting"
+        assert csv_rows[1]["phase"] == "development"
+        assert csv_rows[2]["phase"] == "dropped"
+        assert csv_rows[3]["phase"] == "cooling"
+        assert csv_rows[4]["phase"] == "complete"
+        assert csv_rows[1]["first_crack_detected"] == "True"
+
         export_summary = json.loads(export_summary_path.read_text(encoding="utf-8"))
         assert export_summary["session_id"] == session_id
         assert export_summary["phase"] == "complete"
         assert export_summary["event_count"] == 5
+        assert export_summary["roaster_driver"] == "mock"
+        assert export_summary["first_crack_model"] == {
+            "repo_id": None,
+            "revision": None,
+            "precision": None,
+        }
+        assert export_summary["metrics"]["development_percent"] is not None
         assert export_summary["metrics"]["roast_elapsed_seconds"] is not None
         assert export_summary["metrics"]["development_time_seconds"] is not None
 

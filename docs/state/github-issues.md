@@ -99,8 +99,8 @@ Milestone: `v0.1`
 
 - #56 E7-S1: Test full mock roast through MCP tools
 - #57 E7-S2: Test package install smoke flow
-- #58 E7-S3: Test MCP client connection
-- #59 E7-S4: Run Hottop manual hardware validation
+- #58 E7-S3: Test Warp MCP client connection
+- #59 E7-S4: Run Warp manual Hottop MCP control validation
 - #60 E7-S5: Produce v0.1 release checklist
 - #112 E7-S6: Run end-to-end agent roast validation with HF ONNX audio path
 
