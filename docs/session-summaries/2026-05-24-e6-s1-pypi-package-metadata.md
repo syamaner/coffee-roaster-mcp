@@ -83,6 +83,12 @@ Review-fix validation:
 - `./.venv/bin/python -m ruff format --check .`: passed
 - `./.venv/bin/python -m pyright`: 0 errors
 
+## Usage Snapshot
+
+Operator-provided cumulative session usage:
+
+- Tokens used so far in this session: `355K used`
+
 ## Restart Prompt
 
 Resume in the local clone of `syamaner/coffee-roaster-mcp`. PR for E6-S1 should
