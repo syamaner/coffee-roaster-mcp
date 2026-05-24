@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E6-S6`
-- Current target: Run MCP Registry publishing verification spike
+- Active story: `E6-S7`
+- Current target: Document install and hardware setup
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -332,14 +332,28 @@ The first implementation milestone is a mock vertical slice that requires no roa
   Trusted Publishing setup for `release.yml`/`release`/
   `publish-pypi`, protected `v*` tag rules, TestPyPI status, and the
   `PYPI_API_TOKEN` fallback secret name. Live publishing was not executed by
-  this story; E6-S6 remains the MCP Registry publishing verification spike.
+  E6-S5.
+- `E6-S6` completes the MCP Registry publishing verification spike without
+  executing a live PyPI release or live Registry publish. `server.json`
+  validated against the downloaded official `2025-12-11` Registry schema and
+  against the preview Registry API through `mcp-publisher validate server.json`.
+  The pinned `mcp-publisher` v1.7.9 Linux amd64 workflow asset checksum matched
+  the expected SHA-256, GitHub OIDC authentication was confirmed to require the
+  GitHub Actions OIDC environment, and the release workflow now validates
+  `server.json` before authenticating and publishing. `docs/release.md`
+  documents the PyPI verification marker, non-destructive validation commands,
+  live publish stop point, prerequisites, expected outcome, and preview
+  Registry risk. The remaining destructive step is the tag-triggered live
+  release path after production PyPI publication succeeds.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
 
 ## Current Risks
 
-- MCP Registry publishing is preview and needs verification before release.
+- MCP Registry publishing is preview; live publish can still fail or reset even
+  though the metadata template and publisher flow have been verified
+  non-destructively.
 - First-crack event integration must preserve one authoritative session timeline.
 - Log schema changes need compatibility discipline once users start collecting roast logs.
 
@@ -709,11 +723,32 @@ Goal: make RoastPilot installable and discoverable through PyPI and the MCP Regi
     tag trigger plus the `release` GitHub environment; this story did not run a
     live release.
 
-- [ ] `E6-S6` Run MCP Registry publishing verification spike.
+- [x] `E6-S6` Run MCP Registry publishing verification spike.
   - Done when `server.json`, PyPI verification, and `mcp-publisher` flow are documented and tested before v0.1 release.
+  - Verified against the official `2025-12-11` schema and preview Registry API
+    with `mcp-publisher validate server.json`. The live publish command remains
+    guarded behind the release workflow because it requires production PyPI
+    publication and Registry mutation.
 
 - [ ] `E6-S7` Document install and hardware setup.
   - Done when docs cover mock install, Hottop config, Hugging Face model config, offline model path, and log output paths.
+
+- [ ] `E6-S8` Execute live PyPI and MCP Registry publish.
+  - GitHub issue: #135
+  - Done when production PyPI contains the matching `coffee-roaster-mcp`
+    version, the published PyPI long description includes
+    `<!-- mcp-name: io.github.syamaner/coffee-roaster-mcp -->`, the package
+    installs from PyPI with CLI smoke checks passing, `mcp-publisher validate
+    server.json` passes against the live package and preview Registry API, the
+    guarded release workflow publishes Registry metadata after PyPI succeeds,
+    Registry search returns `io.github.syamaner/coffee-roaster-mcp`, and the
+    listing points to PyPI package `coffee-roaster-mcp` with stdio transport.
+  - Live publish outcome, links, commands, risks, and any rollback or retry
+    notes must be recorded in `docs/release.md`, this active epic, registry
+    state, and a session summary.
+  - Do not run the live Registry publish until production PyPI shows the
+    matching package version and its long description includes the exact
+    `mcp-name` marker.
 
 ### Epic Acceptance Criteria
 
@@ -1774,3 +1809,21 @@ After completing a story:
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
   - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
   - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+- Validation run for E6-S6:
+  - Confirmed official MCP Registry docs still mark the Registry as preview,
+    use schema URI
+    `https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json`,
+    require PyPI packages to use `registryType: pypi`, and verify PyPI
+    ownership through an `mcp-name: $SERVER_NAME` README marker.
+  - Validated `server.json` against the downloaded `2025-12-11` JSON schema.
+  - Ran `./mcp-publisher validate server.json` with pinned `mcp-publisher`
+    v1.7.9: passed against the preview Registry API.
+  - Verified the workflow's pinned Linux amd64 `mcp-publisher` asset SHA-256:
+    `ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac`.
+  - Confirmed `mcp-publisher login github-oidc` fails outside GitHub Actions
+    without `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, so live auth must run from the
+    release job with `id-token: write`.
+  - Confirmed production PyPI currently returns `Not Found` for
+    `coffee-roaster-mcp` and the Registry search API returns no current listing
+    for `io.github.syamaner/coffee-roaster-mcp`; live publish remains the first
+    destructive decision point after production PyPI publication.

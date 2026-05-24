@@ -511,6 +511,9 @@ Stories:
   publish after PyPI succeeds.
 - Add MCP Registry publishing verification spike.
 - Document install and hardware setup.
+- Execute live PyPI and MCP Registry publish after the package is present on
+  production PyPI and the published long description exposes the exact
+  `mcp-name` verification marker.
 
 Acceptance criteria:
 
