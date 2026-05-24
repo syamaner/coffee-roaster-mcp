@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E7-S2`
-- Current target: Package install smoke validation
+- Active story: `E7-S3`
+- Current target: Warp MCP client connection validation
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -35,6 +35,11 @@ The first implementation milestone is a mock vertical slice that requires no roa
   a default-config server uses the mock driver, first-crack mode remains
   disabled, auto-T0 remains disabled, and exported JSONL, CSV, and
   `summary.json` outputs are verified from the completed mock roast.
+- `E7-S2` keeps package install smoke validation on built local distributions:
+  CI and release package-build jobs now build the wheel, install that built
+  wheel into a clean virtual environment, run the installed CLI `--help` and
+  `--version` smoke checks, and confirm installed default config stays on
+  roaster driver `mock`, first-crack mode `disabled`, and INT8 precision.
 - `E2-S1` keeps the initial MCP tool surface bootstrap-safe with `get_server_info` and `get_runtime_config`. Roast-session lifecycle and roast-control tools remain later Epic 2 work.
 - `E2-S2` uses one in-process `RoastSessionStore` with at most one active `RoastSession` at a time. Session state now owns monotonic timing, phase, event timeline storage, telemetry retention, and log-writer references before tool wiring lands.
 - `E2-S3` keeps event writes behind `RoastSessionStore.record_event(...)`. The session timeline now records deterministic append order, authoritative UTC plus monotonic timestamps for core roast events, and idempotent singleton handling for beans added, first crack, bean drop, and cooling transitions.
@@ -785,7 +790,7 @@ Goal: prove the package works from install through mock roast, MCP client calls,
 - [x] `E7-S1` Test full mock roast through MCP tools.
   - Done when a mock roast works from session start to exported logs.
 
-- [ ] `E7-S2` Test package install smoke flow.
+- [x] `E7-S2` Test package install smoke flow.
   - Done when a built wheel can be installed and `coffee-roaster-mcp --help` works.
 
 - [ ] `E7-S3` Test Warp MCP client connection.
@@ -1014,6 +1019,69 @@ After completing a story:
   - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
   - Ran `./.venv/bin/coffee-roaster-mcp --version`:
     `coffee-roaster-mcp 0.1.0`.
+
+- Validation run for E7-S2:
+  - Verified PR #138 was merged and issue #56 was closed before starting.
+  - Synced `main` to merge commit `30a1887c07d50f8a968cc155f22718d54d57ef69`
+    and created branch `feature/57-package-install-smoke-flow`.
+  - Added built-wheel install smoke steps to the CI and release package-build
+    jobs. Each job builds distributions, creates a clean virtual environment,
+    installs the built wheel, runs installed CLI `--help` and `--version`, and
+    verifies installed default config returns `mock disabled int8`.
+  - Addressed PR review feedback from CodeRabbit and Codex by extracting the
+    duplicated smoke logic into `.github/scripts/smoke_install_built_wheel.py`
+    and changing the installed default-config smoke from print-only output to
+    an explicit assertion that fails on any value other than
+    `mock disabled int8`.
+  - Built local distributions with `./.venv/bin/python -m build`: successfully
+    built `coffee_roaster_mcp-0.1.0.tar.gz` and
+    `coffee_roaster_mcp-0.1.0-py3-none-any.whl`.
+  - Created clean install environment
+    `/tmp/coffee-roaster-mcp-e7-s2-wheel-smoke`.
+  - Initial sandboxed wheel install could not resolve dependencies because
+    network access was blocked; reran with approved network access.
+  - Installed built wheel
+    `dist/coffee_roaster_mcp-0.1.0-py3-none-any.whl` successfully into the
+    clean environment.
+  - Ran
+    `/tmp/coffee-roaster-mcp-e7-s2-wheel-smoke/bin/coffee-roaster-mcp --help`:
+    passed.
+  - Ran
+    `/tmp/coffee-roaster-mcp-e7-s2-wheel-smoke/bin/coffee-roaster-mcp --version`:
+    `coffee-roaster-mcp 0.1.0`.
+  - Ran the installed default config smoke from an empty temporary directory:
+    returned `mock disabled int8`.
+  - Ran
+    `./.venv/bin/python -m pytest tests/test_package_metadata.py tests/test_package.py::test_main_prints_help`:
+    3 passed.
+  - Ran `./.venv/bin/python -m pytest`: 356 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: 30 files already
+    formatted.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors, 0 warnings,
+    0 informations.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`:
+    `coffee-roaster-mcp 0.1.0`.
+  - GitHub Actions CI run `26368815098` completed successfully:
+    `Checks` passed and `Build Package` passed, including the new
+    `Smoke install built wheel` step.
+  - Review-fix validation:
+    `./.venv/bin/python .github/scripts/smoke_install_built_wheel.py --venv-path /tmp/coffee-roaster-mcp-e7-s2-review-wheel-smoke`
+    passed with approved network access and printed `mock disabled int8`;
+    `./.venv/bin/python -m pytest tests/test_package_metadata.py tests/test_package.py::test_main_prints_help`
+    passed with 3 tests; `./.venv/bin/python -m pytest` passed with 356 tests;
+    `./.venv/bin/python -m ruff check .`, `./.venv/bin/python -m ruff format --check .`,
+    `./.venv/bin/python -m pyright`, and `git diff --check` passed.
+  - Second CodeRabbit review hardening changed the helper script so installed
+    `--help` and `--version` smokes capture and assert output content instead
+    of checking process success only. The updated smoke script passed with
+    approved network access using
+    `/tmp/coffee-roaster-mcp-e7-s2-output-review-wheel-smoke`, and focused
+    pytest, ruff, format check, and helper-script compile checks passed.
+  - Kept hardware validation, Warp MCP validation, ChatGPT MCP validation,
+    model training/export/sync, real microphone validation, and live release
+    publishing out of scope.
 
 - Validation run for E6-S4:
   - Added focused version alignment coverage in `tests/test_server_json.py`.

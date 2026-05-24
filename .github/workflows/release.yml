@@ -145,6 +145,9 @@ jobs:
       - name: Build distribution artifacts
         run: python -m build
 
+      - name: Smoke install built wheel
+        run: python .github/scripts/smoke_install_built_wheel.py
+
       - name: Upload distribution artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
