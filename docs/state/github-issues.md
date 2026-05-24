@@ -93,6 +93,7 @@ Milestone: `v0.1`
 - #53 E6-S5: Add release workflow
 - #54 E6-S6: Run MCP Registry publishing verification spike
 - #55 E6-S7: Document install and hardware setup
+- #135 E6-S8: Execute live PyPI and MCP Registry publish
 
 ## Epic 7 Stories
 

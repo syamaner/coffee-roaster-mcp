@@ -96,6 +96,9 @@ Durable state updates:
   the active story to `E6-S7`.
 - `docs/state/registry.md` says the next story is `E6-S7: document install and
   hardware setup`.
+- Follow-up GitHub issue #135 now tracks `E6-S8: Execute live PyPI and MCP
+  Registry publish` in Epic 6 for the controlled live publish after PyPI
+  publication and verification-marker checks.
 
 ## Decision Point
 
@@ -150,4 +153,5 @@ be checked first. If it has merged, verify issue #54 is closed, check out
 main on the appropriate `feature/55-...` branch after reading the registry,
 active epic, this summary, and the GitHub issue for E6-S7. Keep E6-S7 scoped to
 install and hardware setup documentation unless the issue explicitly expands
-the work.
+the work. E6-S8 is now tracked separately as issue #135 for the later live PyPI
+and MCP Registry publish.

@@ -316,6 +316,11 @@ Registry search API returns no current listing for
 `io.github.syamaner/coffee-roaster-mcp`; the first destructive step remains the
 tag-triggered live release path after PyPI publication succeeds.
 
+Epic 6 now includes follow-up issue #135, `E6-S8: Execute live PyPI and MCP
+Registry publish`, for the controlled live publish after PyPI contains the
+matching package version and the published long description exposes the exact
+`mcp-name` verification marker.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log

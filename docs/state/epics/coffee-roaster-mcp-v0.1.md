@@ -733,6 +733,23 @@ Goal: make RoastPilot installable and discoverable through PyPI and the MCP Regi
 - [ ] `E6-S7` Document install and hardware setup.
   - Done when docs cover mock install, Hottop config, Hugging Face model config, offline model path, and log output paths.
 
+- [ ] `E6-S8` Execute live PyPI and MCP Registry publish.
+  - GitHub issue: #135
+  - Done when production PyPI contains the matching `coffee-roaster-mcp`
+    version, the published PyPI long description includes
+    `<!-- mcp-name: io.github.syamaner/coffee-roaster-mcp -->`, the package
+    installs from PyPI with CLI smoke checks passing, `mcp-publisher validate
+    server.json` passes against the live package and preview Registry API, the
+    guarded release workflow publishes Registry metadata after PyPI succeeds,
+    Registry search returns `io.github.syamaner/coffee-roaster-mcp`, and the
+    listing points to PyPI package `coffee-roaster-mcp` with stdio transport.
+  - Live publish outcome, links, commands, risks, and any rollback or retry
+    notes must be recorded in `docs/release.md`, this active epic, registry
+    state, and a session summary.
+  - Do not run the live Registry publish until production PyPI shows the
+    matching package version and its long description includes the exact
+    `mcp-name` marker.
+
 ### Epic Acceptance Criteria
 
 - Package installs from PyPI.
