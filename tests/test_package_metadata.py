@@ -1,6 +1,6 @@
 """Package metadata coverage for RoastPilot distributions."""
 
-from importlib import metadata
+from importlib import metadata, resources
 
 
 def test_installed_distribution_metadata_is_complete() -> None:
@@ -15,7 +15,7 @@ def test_installed_distribution_metadata_is_complete() -> None:
     assert package_metadata["Author"] == "Sertan Yamaner"
     assert package_metadata["Maintainer"] == "Sertan Yamaner"
 
-    keywords = set(package_metadata["Keywords"].split(","))
+    keywords = {token.strip() for token in package_metadata["Keywords"].split(",") if token.strip()}
     assert {
         "autonomous-roasting",
         "coffee",
@@ -50,6 +50,8 @@ def test_installed_distribution_metadata_is_complete() -> None:
         "Repository, https://github.com/syamaner/coffee-roaster-mcp",
         "Issues, https://github.com/syamaner/coffee-roaster-mcp/issues",
     } <= project_urls
+
+    assert resources.files("coffee_roaster_mcp").joinpath("py.typed").is_file()
 
 
 def test_console_entrypoint_metadata_targets_cli_main() -> None:

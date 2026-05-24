@@ -39,6 +39,9 @@ for package identity, `RoastPilot` summary text, Python requirement,
 author/maintainer metadata, keywords, classifiers, project URLs, and the
 `coffee-roaster-mcp` console script target.
 
+Review hardening normalized package keyword parsing before assertions and added
+explicit installed-file coverage for `coffee_roaster_mcp/py.typed`.
+
 Durable state updates:
 
 - `docs/state/epics/coffee-roaster-mcp-v0.1.md` marks `E6-S1` complete and sets
@@ -69,6 +72,16 @@ Full validation:
 - `./.venv/bin/python -m pyright`: 0 errors
 - `./.venv/bin/coffee-roaster-mcp --help`: passed
 - `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
+
+Review-fix validation:
+
+- `./.venv/bin/python -m pytest tests/test_package_metadata.py`: 2 passed
+- `./.venv/bin/python -m pytest tests/test_package_metadata.py tests/test_package.py`:
+  21 passed
+- `./.venv/bin/python -m pytest`: 343 passed
+- `./.venv/bin/python -m ruff check .`: passed
+- `./.venv/bin/python -m ruff format --check .`: passed
+- `./.venv/bin/python -m pyright`: 0 errors
 
 ## Restart Prompt
 
