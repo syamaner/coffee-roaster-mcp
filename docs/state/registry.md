@@ -270,8 +270,16 @@ E6-S3 added the root MCP Registry `server.json` with metadata for
 `io.github.syamaner/coffee-roaster-mcp`: title `RoastPilot`, PyPI package
 `coffee-roaster-mcp`, runtime hint `uvx`, stdio transport, repository metadata,
 and the current MCP schema URI. Focused schema and acceptance coverage now pins
-the story fields. Version alignment automation, PyPI publishing, MCP Registry
-publishing, release workflow behavior, live hardware validation, model
+the story fields, including URI format validation for registry URL fields.
+Version alignment automation, PyPI publishing, MCP Registry publishing, release
+workflow behavior, live hardware validation, model training/export/sync, real
+microphone validation, and broad release validation remain later stories.
+
+E6-S4 added the version alignment check only. Focused `server.json` coverage
+now compares both top-level `server.json.version` and the PyPI package entry
+version against the package `coffee_roaster_mcp.__version__`, so registry
+metadata and package metadata cannot drift unnoticed. PyPI publishing, MCP
+Registry publishing, release workflow behavior, live hardware validation, model
 training/export/sync, real microphone validation, and broad release validation
 remain later stories.
 
@@ -281,7 +289,7 @@ first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E6-S4: add a version alignment check.
+The next story is E6-S5: add the release workflow.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

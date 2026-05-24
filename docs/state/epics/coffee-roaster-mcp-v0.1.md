@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E6-S4`
-- Current target: Add version alignment check
+- Active story: `E6-S5`
+- Current target: Add release workflow
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -308,10 +308,18 @@ The first implementation milestone is a mock vertical slice that requires no roa
   title `RoastPilot`, PyPI package `coffee-roaster-mcp`, package runtime hint
   `uvx`, stdio transport, repository metadata, and the current MCP schema URI.
   Focused coverage validates the metadata shape against the relevant MCP
-  Registry schema constraints and pins the E6-S3 acceptance fields. Version
-  alignment automation, PyPI publishing, MCP Registry publishing, release
-  workflow behavior, live hardware validation, model training/export/sync, real
-  microphone validation, and broad release validation remain later stories.
+  Registry schema constraints, including URI format validation, and pins the
+  E6-S3 acceptance fields. Version alignment automation, PyPI publishing, MCP
+  Registry publishing, release workflow behavior, live hardware validation,
+  model training/export/sync, real microphone validation, and broad release
+  validation remain later stories.
+- `E6-S4` adds the version alignment check only. Focused `server.json` coverage
+  now compares both top-level `server.json.version` and the PyPI package entry
+  version against `coffee_roaster_mcp.__version__`, so registry metadata and
+  package metadata cannot drift unnoticed. PyPI publishing, MCP Registry
+  publishing, release workflow behavior, live hardware validation, model
+  training/export/sync, real microphone validation, and broad release validation
+  remain later stories.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -663,7 +671,7 @@ Goal: make RoastPilot installable and discoverable through PyPI and the MCP Regi
 - [x] `E6-S3` Add `server.json`.
   - Done when registry metadata uses name `io.github.syamaner/coffee-roaster-mcp`, title `RoastPilot`, package `coffee-roaster-mcp`, and stdio transport.
 
-- [ ] `E6-S4` Add version alignment check.
+- [x] `E6-S4` Add version alignment check.
   - Done when package version and `server.json.version` cannot drift unnoticed.
 
 - [ ] `E6-S5` Add release workflow.
@@ -852,6 +860,22 @@ After completing a story:
   - Wired the MCP server lifespan to own one authoritative `RoastSessionStore` for later tool stories.
   - Added `tests/test_session.py` covering session creation, single-owner enforcement, clean stop semantics, and rolling telemetry retention.
   - Ran `./.venv/bin/python -m pytest`: 24 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+
+- Validation run for E6-S4:
+  - Added focused version alignment coverage in `tests/test_server_json.py`.
+  - Pinned top-level `server.json.version` to `coffee_roaster_mcp.__version__`.
+  - Pinned the PyPI package entry version in `server.json` to
+    `coffee_roaster_mcp.__version__`.
+  - Kept PyPI publishing, MCP Registry publishing, release workflow behavior,
+    live hardware validation, model training/export/sync, real microphone
+    validation, and broad release validation out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_server_json.py`: 4 passed.
+  - Ran `./.venv/bin/python -m pytest`: 348 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

@@ -12,6 +12,8 @@ from jsonschema import (  # type: ignore[import-untyped]
     ValidationError,
 )
 
+from coffee_roaster_mcp import __version__
+
 SCHEMA_URI = "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json"
 URI_FORMAT_CHECKER = FormatChecker()
 
@@ -108,6 +110,14 @@ def test_server_json_schema_rejects_malformed_uri_fields() -> None:
 
     with pytest.raises(ValidationError):
         _validate_server_json(server_json)
+
+
+def test_server_json_versions_match_package_version() -> None:
+    """Check registry metadata versions stay aligned with the package version."""
+    server_json = _load_server_json()
+
+    assert server_json["version"] == __version__
+    assert server_json["packages"][0]["version"] == __version__
 
 
 def _load_server_json() -> dict[str, Any]:
