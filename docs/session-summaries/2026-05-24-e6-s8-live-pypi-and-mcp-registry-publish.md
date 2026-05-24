@@ -149,6 +149,10 @@ Final documentation and repo validation after updating release/state docs:
   still says PyPI publication was planned. The marker and metadata are correct;
   README wording was corrected after release for future publications.
 
+## Usage Snapshot
+
+- Token usage: `448K used`
+
 ## Restart Prompt
 
 Resume in the local clone of `syamaner/coffee-roaster-mcp`. E6-S8 live PyPI and
