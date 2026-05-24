@@ -250,13 +250,22 @@ MCP tool calls may still refresh telemetry opportunistically. Successful sampler
 reads also run existing automatic T0 and first-crack runtime processing. Driver
 read failures fail closed with a diagnosable fault event and stop the sampler.
 
+E6-S1 completed PyPI package metadata for `coffee-roaster-mcp` while keeping
+publishing and MCP Registry work out of scope. Project metadata now includes
+maintainer metadata, a fuller keyword set, PyPI classifiers for console usage,
+Apache licensing, OS independence, hardware/utilities topics, typed-package
+status, and a documentation project URL. `RoastPilot` remains the human-facing
+title in the package summary. The distribution includes a `py.typed` marker,
+and package metadata tests inspect the installed distribution metadata plus the
+console script entry point.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E6-S1: add PyPI package metadata.
+The next story is E6-S2: add README MCP verification string.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
