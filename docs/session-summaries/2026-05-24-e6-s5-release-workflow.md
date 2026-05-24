@@ -1,0 +1,102 @@
+# E6-S5 Release Workflow
+
+This summary captures the E6-S5 implementation, validation state, and restart
+context.
+
+## Scope
+
+Story: `E6-S5` / issue `#53`, add release workflow.
+
+Branch: `feature/53-release-workflow`
+
+The implementation stayed inside the E6-S5 boundary:
+
+- add a guarded GitHub Actions release workflow
+- run tests, lint, format, typecheck, CLI smoke checks, metadata validation, and
+  package build before any publish step
+- support a manual release dry run that proves checks and package artifacts
+  without uploading to production PyPI
+- publish to PyPI through Trusted Publishing on tag releases after `release`
+  environment approval
+- publish MCP Registry metadata with `mcp-publisher` GitHub OIDC only after the
+  PyPI publish job succeeds
+- document operator prerequisites for PyPI, Trusted Publishing, release
+  environment approvals, protected tags, TestPyPI status, and token fallback
+
+No live PyPI upload, live MCP Registry publish, TestPyPI rehearsal, hardware
+validation, model training/export/sync, real microphone validation, or broad
+release validation was performed.
+
+## Implementation Summary
+
+`.github/workflows/release.yml` now defines the release path:
+
+- `workflow_dispatch` with `dry_run: true` builds and validates without upload.
+- `push` tags matching `v*` run the live release path.
+- `checks` runs pytest, ruff, format check, pyright, and CLI smoke checks.
+- `validate-release-metadata` requires a tag such as `v0.1.0` to match
+  `coffee_roaster_mcp.__version__` and both `server.json` version fields.
+- `build-package` builds and uploads wheel/source distribution artifacts.
+- `release-dry-run` confirms wheel and source distribution artifacts exist and
+  does not run upload actions.
+- `publish-pypi` uses the `release` GitHub environment, `id-token: write`, and
+  `pypa/gh-action-pypi-publish@release/v1`.
+- `publish-mcp-registry` depends on `publish-pypi`, uses the same `release`
+  environment and OIDC permission, installs `mcp-publisher`, authenticates with
+  `github-oidc`, and publishes `server.json`.
+
+`docs/release.md` documents the operator prerequisites before live publishing:
+
+- PyPI account and project ownership/reservation for `coffee-roaster-mcp`
+- PyPI 2FA and recovery-code handling
+- Trusted Publishing configuration for repository `syamaner/coffee-roaster-mcp`,
+  workflow file `release.yml`, environment `release`, and job `publish-pypi`
+- GitHub `release` environment approvals
+- protected `v*` tag rules
+- TestPyPI not enabled in this workflow
+- token fallback with exact environment secret name `PYPI_API_TOKEN`
+
+`tests/test_release_workflow.py` pins the release workflow and runbook contract:
+
+- tag and manual dry-run triggers
+- build/test before publish ordering
+- PyPI publish before MCP Registry publish ordering
+- `release` environment and `id-token: write` permissions for live publish jobs
+- PyPI Trusted Publishing action
+- MCP Registry `mcp-publisher login github-oidc` and `publish --file=server.json`
+- required operator prerequisite runbook text
+
+Durable state updates:
+
+- `docs/state/epics/coffee-roaster-mcp-v0.1.md` marks `E6-S5` complete and sets
+  the active story to `E6-S6`.
+- `docs/state/registry.md` says the next story is `E6-S6: run the MCP Registry
+  publishing verification spike`.
+
+## Validation
+
+Focused validation:
+
+- `./.venv/bin/python -m pytest tests/test_release_workflow.py`: 4 passed
+
+Full validation:
+
+- `./.venv/bin/python -m pytest`: 352 passed
+- `./.venv/bin/python -m build`: built
+  `coffee_roaster_mcp-0.1.0.tar.gz` and
+  `coffee_roaster_mcp-0.1.0-py3-none-any.whl`
+- `./.venv/bin/python -m ruff check .`: passed
+- `./.venv/bin/python -m ruff format --check .`: passed
+- `./.venv/bin/python -m pyright`: 0 errors
+- `./.venv/bin/coffee-roaster-mcp --help`: passed
+- `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
+
+## Restart Prompt
+
+Resume in the local clone of `syamaner/coffee-roaster-mcp`. PR for E6-S5 should
+be checked first. If it has merged, verify issue #53 is closed, check out
+`main`, run `git pull --ff-only origin main`, then begin E6-S6 from updated
+main on the appropriate `feature/54-...` branch after reading the registry,
+active epic, this summary, and the GitHub issue for E6-S6. Keep E6-S6 scoped to
+the MCP Registry publishing verification spike unless the issue explicitly
+expands the work.

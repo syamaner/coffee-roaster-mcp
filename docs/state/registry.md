@@ -283,13 +283,26 @@ Registry publishing, release workflow behavior, live hardware validation, model
 training/export/sync, real microphone validation, and broad release validation
 remain later stories.
 
+E6-S5 added the guarded release workflow and operator prerequisite runbook.
+`.github/workflows/release.yml` now runs checks, validates release tag/version
+alignment, builds package artifacts, supports a manual dry run that does not
+upload, publishes to PyPI through Trusted Publishing after `release`
+environment approval, and publishes MCP Registry metadata with `mcp-publisher`
+GitHub OIDC only after the PyPI publish job succeeds. `docs/release.md`
+documents PyPI account ownership, 2FA/recovery codes, Trusted Publishing setup
+for `release.yml`/`release`/`publish-pypi`, protected `v*` tag rules, TestPyPI
+status, and the exact `PYPI_API_TOKEN` fallback secret name. Focused workflow
+tests pin the trigger, job ordering, environment/OIDC permissions, publish
+actions, and prerequisite runbook text. Live publishing is not executed by this
+story; E6-S6 remains the MCP Registry verification spike.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E6-S5: add the release workflow.
+The next story is E6-S6: run the MCP Registry publishing verification spike.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

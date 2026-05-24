@@ -1,0 +1,194 @@
+name: Release
+
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and validate without publishing to PyPI or the MCP Registry."
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Run lint
+        run: python -m ruff check .
+
+      - name: Run format check
+        run: python -m ruff format --check .
+
+      - name: Run typecheck
+        run: python -m pyright --pythonpath "${pythonLocation}/bin/python"
+
+      - name: Run CLI smoke checks
+        run: |
+          coffee-roaster-mcp --help
+          coffee-roaster-mcp --version
+
+  validate-release-metadata:
+    name: Validate Release Metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate release tag, package version, and registry metadata
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          ref = os.environ["GITHUB_REF"]
+          version = re.search(r'__version__ = "([^"]+)"', Path("src/coffee_roaster_mcp/__init__.py").read_text()).group(1)
+          server_json = json.loads(Path("server.json").read_text())
+
+          expected_tag = f"refs/tags/v{version}"
+          if ref.startswith("refs/tags/") and ref != expected_tag:
+              print(f"Release tag {ref!r} must match package version tag {expected_tag!r}.", file=sys.stderr)
+              sys.exit(1)
+
+          if server_json["version"] != version:
+              print("server.json.version must match the package version.", file=sys.stderr)
+              sys.exit(1)
+
+          package = server_json["packages"][0]
+          if package["version"] != version:
+              print("server.json package version must match the package version.", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+  build-package:
+    name: Build Package
+    runs-on: ubuntu-latest
+    needs:
+      - checks
+      - validate-release-metadata
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Build distribution artifacts
+        run: python -m build
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  release-dry-run:
+    name: Release Dry Run
+    runs-on: ubuntu-latest
+    needs: build-package
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Confirm dry-run artifacts
+        run: |
+          test -n "$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          {
+            echo "## Release Dry Run"
+            echo
+            echo "Checks passed and package artifacts were built. No upload steps ran."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-pypi:
+    name: Publish PyPI
+    runs-on: ubuntu-latest
+    needs: build-package
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-mcp-registry:
+    name: Publish MCP Registry
+    runs-on: ubuntu-latest
+    needs: publish-pypi
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+          chmod +x mcp-publisher
+
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server metadata to MCP Registry
+        run: ./mcp-publisher publish --file=server.json
