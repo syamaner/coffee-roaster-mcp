@@ -11,7 +11,9 @@ Use this skill for the mock-first local workflow.
 
 - `E2-S1` provides a real stdio MCP server entrypoint.
 - `E2-S4` now provides the first roast-session MCP tool surface on the mock path.
-- This workflow validates the mock-safe bootstrap path and the early in-process tool flow without claiming the final export/logging slice is done yet.
+- This workflow validates the mock-safe bootstrap path and the in-process tool
+  flow without roaster hardware, microphone access, model download, or network.
+  For full operator setup details, use `docs/install-and-hardware-setup.md`.
 
 ## Current Validation
 
@@ -38,9 +40,9 @@ mock disabled int8
 - Local bootstrap does not require roaster hardware, microphone access, or model download.
 - The MCP server now exposes the first session-control tool surface for the mock path.
 
-## Do Not Claim Yet
+## Do Not Claim Here
 
-- Do not claim a fully exported mock roast before `E2-S7`, `E5`, and `E7-S1`.
+- Do not claim final end-to-end release readiness before `E7-S1`.
 - Do not add model download, model export, or Hugging Face sync steps here. Those stay in `coffee-first-crack-detection`.
 
 ## Current MCP Tool Flow
@@ -59,11 +61,12 @@ The current mock-path tools are:
 - `export_roast_log`
 - `emergency_stop`
 
-`export_roast_log` currently returns the planned export manifest only. The real JSONL, CSV, and summary writers land in Epic 5.
+`export_roast_log` writes `roast.jsonl`, `roast.csv`, and `summary.json` under
+the configured log directory for the active session.
 
 ## Extend Later
 
-Once the MCP runtime exists, extend this workflow with:
+Extend this workflow with:
 
 - full mock roast start-to-export smoke checks
 - log file content validation

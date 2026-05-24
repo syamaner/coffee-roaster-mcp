@@ -10,9 +10,12 @@ Use this skill for Hottop-facing work and release-readiness review.
 ## Current Scope
 
 - Hottop lifecycle, command-loop streaming, packet build/parse, control command state, and temperature-unit handling exist behind the `HottopRoasterDriver` boundary.
-- The MCP roast-session tools still preserve their current one-session store semantics; do not assume MCP heat, fan, drop, or cooling tools are wired to live Hottop hardware until a later story explicitly does that work.
+- The MCP roast-session tools call the configured `RoasterDriver` boundary
+  while preserving the one-session store semantics and fail-closed behavior.
 - The runnable validation entrypoint is `coffee-roaster-mcp hottop-validate`.
 - Hardware stories are not complete from mock tests alone.
+- For operator setup details, including the Hottop config block and log output
+  paths, use `docs/install-and-hardware-setup.md`.
 
 ## Pre-Validation Gates
 
