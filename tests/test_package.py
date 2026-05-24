@@ -195,14 +195,17 @@ def test_stdio_server_supports_basic_mock_roast_tool_flow(tmp_path: Path) -> Non
 
 
 def test_stdio_server_autonomous_sampler_logs_without_state_polling(tmp_path: Path) -> None:
+    """Verify the stdio sampler writes telemetry without client state polling."""
     asyncio.run(_assert_autonomous_sampler_logs_without_state_polling(tmp_path))
 
 
 def test_stdio_server_state_polling_still_refreshes_telemetry(tmp_path: Path) -> None:
+    """Verify `get_roast_state` remains an opportunistic telemetry refresh path."""
     asyncio.run(_assert_state_polling_still_refreshes_telemetry(tmp_path))
 
 
 def test_telemetry_sampler_shutdown_stops_background_reads(tmp_path: Path) -> None:
+    """Verify sampler shutdown stops a mock-safe background reader."""
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text("logging:\n  sample_interval_seconds: 0.01\n", encoding="utf-8")
     server_context = build_server_context(config_path=config_path)
@@ -220,6 +223,7 @@ def test_telemetry_sampler_shutdown_stops_background_reads(tmp_path: Path) -> No
 
 
 def test_telemetry_sampler_driver_read_failure_faults_session(tmp_path: Path) -> None:
+    """Verify sampler driver-read failure faults closed and exits the worker."""
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text("logging:\n  sample_interval_seconds: 0.01\n", encoding="utf-8")
     server_context = build_server_context(config_path=config_path)
@@ -233,12 +237,19 @@ def test_telemetry_sampler_driver_read_failure_faults_session(tmp_path: Path) ->
     snapshot = server_context.session_store.get_session_snapshot(session_id=session.id)
     assert snapshot.active is False
     assert snapshot.phase == "fault"
+    assert snapshot.heat_level_percent == 0
+    assert snapshot.fan_level_percent == 100
+    assert snapshot.cooling_on is True
     assert driver.emergency_stop_called is True
     fault_event = snapshot.event_timeline[-1]
     assert fault_event.kind == "fault"
+    assert fault_event.payload["driver_safety_method_called"] is True
+    assert fault_event.payload["heat_level_percent"] == 0
+    assert fault_event.payload["fan_level_percent"] == 100
+    assert fault_event.payload["cooling_on"] is True
     assert (
         fault_event.payload["reason"]
-        == "autonomous telemetry sampler driver read failed: RuntimeError: read offline"
+        == "autonomous telemetry sampler failed: RuntimeError: read offline"
     )
     assert server_context.telemetry_sampler.active_session_id is None
 
@@ -793,11 +804,18 @@ def _telemetry_row_count(path: Path) -> int:
     """Return the number of telemetry rows in an append-only JSONL log."""
     if not path.exists():
         return 0
-    return sum(
-        1
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if json.loads(line)["type"] == "telemetry"
-    )
+    lines = path.read_text(encoding="utf-8").splitlines()
+    telemetry_rows = 0
+    for index, line in enumerate(lines):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            if index == len(lines) - 1:
+                break
+            raise
+        if row.get("type") == "telemetry":
+            telemetry_rows += 1
+    return telemetry_rows
 
 
 def _wait_for_condition(condition: Callable[[], bool], timeout_seconds: float = 1.0) -> None:

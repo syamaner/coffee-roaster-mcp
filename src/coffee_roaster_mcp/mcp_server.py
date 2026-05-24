@@ -81,8 +81,12 @@ class _TelemetrySampler:
 
     def start_for_session(self, session_id: str) -> None:
         """Start autonomous sampling for one session id."""
+        thread: Thread | None
         with self._lock:
-            self._stop_locked()
+            thread = self._stop_locked()
+        self._join_thread(thread)
+
+        with self._lock:
             self._stop_event = Event()
             self._active_session_id = session_id
             self._last_error = None
@@ -97,15 +101,19 @@ class _TelemetrySampler:
     def stop_for_session(self, session_id: str, *, reason: str) -> None:
         """Stop sampling if the supplied session currently owns the sampler."""
         _ = reason
+        thread: Thread | None
         with self._lock:
             if self._active_session_id != session_id:
                 return
-            self._stop_locked()
+            thread = self._stop_locked()
+        self._join_thread(thread)
 
     def shutdown(self) -> None:
         """Stop any active sampler worker."""
+        thread: Thread | None
         with self._lock:
-            self._stop_locked()
+            thread = self._stop_locked()
+        self._join_thread(thread)
 
     @property
     def active_session_id(self) -> str | None:
@@ -134,11 +142,15 @@ class _TelemetrySampler:
                         self._active_session_id = None
                 return
 
-    def _stop_locked(self) -> None:
+    def _stop_locked(self) -> Thread | None:
         thread = self._thread
         self._active_session_id = None
         self._thread = None
         self._stop_event.set()
+        return thread
+
+    def _join_thread(self, thread: Thread | None) -> None:
+        """Wait briefly for a sampler worker after releasing the sampler lock."""
         if thread is not None and thread.is_alive():
             thread.join(timeout=max(1.0, self._interval_seconds * 2))
 
@@ -1069,50 +1081,49 @@ def _sample_active_session_telemetry(
 
     try:
         driver_state = server_context.roaster_driver.read_state()
-    except Exception as exc:  # noqa: BLE001 - driver implementations vary.
-        _fault_active_session_after_sampler_read_failure(
+        device_state = _serialize_device_state(driver_state)
+        snapshot = server_context.session_store.record_active_telemetry_sample(
+            session_id=session_id,
+            bean_temp_c=driver_state.bean_temp_c,
+            env_temp_c=driver_state.env_temp_c,
+            heat_level_percent=driver_state.heat_level_percent,
+            fan_level_percent=driver_state.fan_level_percent,
+            cooling_on=driver_state.cooling_on,
+        )
+        if snapshot is None:
+            return False
+
+        auto_t0_recorded = _process_auto_t0_for_active_session(
+            server_context,
+            session_id=session_id,
+            device_state=device_state,
+        )
+        if auto_t0_recorded:
+            server_context.first_crack_runtime.discard_queued_windows_for_session(
+                session_id,
+                reason="Dropped queued pre-T0 detector windows after automatic T0.",
+            )
+        _process_first_crack_runtime_for_active_session(server_context, session_id=session_id)
+    except Exception as exc:  # noqa: BLE001 - background safety path must catch all failures.
+        _fault_active_session_after_sampler_failure(
             server_context,
             session=active_session,
             error=exc,
         )
         return False
 
-    device_state = _serialize_device_state(driver_state)
-    snapshot = server_context.session_store.record_active_telemetry_sample(
-        session_id=session_id,
-        bean_temp_c=driver_state.bean_temp_c,
-        env_temp_c=driver_state.env_temp_c,
-        heat_level_percent=driver_state.heat_level_percent,
-        fan_level_percent=driver_state.fan_level_percent,
-        cooling_on=driver_state.cooling_on,
-    )
-    if snapshot is None:
-        return False
-
-    auto_t0_recorded = _process_auto_t0_for_active_session(
-        server_context,
-        session_id=session_id,
-        device_state=device_state,
-    )
-    if auto_t0_recorded:
-        server_context.first_crack_runtime.discard_queued_windows_for_session(
-            session_id,
-            reason="Dropped queued pre-T0 detector windows after automatic T0.",
-        )
-    _process_first_crack_runtime_for_active_session(server_context, session_id=session_id)
-
     active_session = server_context.session_store.get_active_session()
     return active_session is not None and active_session.id == session_id
 
 
-def _fault_active_session_after_sampler_read_failure(
+def _fault_active_session_after_sampler_failure(
     server_context: ServerContext,
     *,
     session: RoastSession,
     error: BaseException,
 ) -> None:
-    """Fail closed when the autonomous sampler cannot read the configured driver."""
-    reason = f"autonomous telemetry sampler driver read failed: {type(error).__name__}: {error}"
+    """Fail closed when autonomous sampling cannot safely continue."""
+    reason = f"autonomous telemetry sampler failed: {type(error).__name__}: {error}"
     safety_payload = run_driver_emergency_stop(server_context, reason=reason)
     try:
         _, snapshot = server_context.session_store.emergency_stop_snapshot(
@@ -1125,7 +1136,7 @@ def _fault_active_session_after_sampler_read_failure(
         return
     server_context.first_crack_runtime.stop_for_session(
         snapshot.id,
-        reason="autonomous telemetry sampler driver read failure",
+        reason="autonomous telemetry sampler failure",
     )
 
 
