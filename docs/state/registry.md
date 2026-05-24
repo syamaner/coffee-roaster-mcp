@@ -349,6 +349,16 @@ beans-added and first-crack override, drop, cooling stop, state read, and
 result without hardware, model download, real microphone input, or live release
 publishing.
 
+E7-S2 completed package install smoke validation from built local
+distributions. The CI and release package-build jobs now create a clean virtual
+environment after `python -m build`, install the built wheel, run installed
+`coffee-roaster-mcp --help` and `coffee-roaster-mcp --version`, and verify the
+installed default config remains `mock disabled int8`. The local validation run
+built both wheel and sdist, installed
+`dist/coffee_roaster_mcp-0.1.0-py3-none-any.whl` into
+`/tmp/coffee-roaster-mcp-e7-s2-wheel-smoke`, and confirmed the installed CLI
+and default config smoke path.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
@@ -360,9 +370,9 @@ Warp as the local MCP client on the mock-safe path. E7-S4 validates manual
 operator-approved Hottop device control through Warp MCP tool calls, with no
 autonomous hardware-control decisions.
 
-The next story is E7-S2: test the package install smoke flow before Warp MCP
-client connection validation, Warp manual Hottop control validation, or full
-end-to-end agent roast validation.
+The next story is E7-S3: test Warp MCP client connection on the mock-safe path
+before Warp manual Hottop control validation or full end-to-end agent roast
+validation.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
