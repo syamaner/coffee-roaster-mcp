@@ -1,5 +1,7 @@
 # RoastPilot
 
+<!-- mcp-name: io.github.syamaner/coffee-roaster-mcp -->
+
 RoastPilot is a spec-driven MCP server for autonomous coffee roasting.
 
 The package name is `coffee-roaster-mcp`. PyPI publishing is planned for the v0.1 release; this repository currently contains the local package scaffold and project plan.
