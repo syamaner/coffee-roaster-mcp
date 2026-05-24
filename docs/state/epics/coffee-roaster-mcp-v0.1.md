@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E6-S1`
-- Current target: Add PyPI package metadata
+- Active story: `E6-S2`
+- Current target: Add README MCP verification string
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -288,6 +288,14 @@ The first implementation milestone is a mock vertical slice that requires no roa
   configured-driver control wiring, mock-safe CI, automatic T0 processing,
   session-owned first-crack runtime processing, append-only JSONL logging, CSV
   and summary export schemas, and Hottop/model/audio validation boundaries.
+- `E6-S1` completes PyPI package metadata for `coffee-roaster-mcp` without
+  adding publishing or MCP Registry behavior. Project metadata now includes
+  maintainer metadata, a fuller keyword set, PyPI classifiers for console
+  usage, Apache licensing, OS independence, hardware/utilities topics, and
+  typed-package status, plus a documentation project URL. `RoastPilot` remains
+  the human-facing title in the package summary. The distribution includes a
+  `py.typed` marker, and tests inspect installed package metadata plus the
+  console script entry point.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -630,7 +638,7 @@ Goal: make RoastPilot installable and discoverable through PyPI and the MCP Regi
 
 ### Stories
 
-- [ ] `E6-S1` Add PyPI package metadata.
+- [x] `E6-S1` Add PyPI package metadata.
   - Done when package metadata is complete for `coffee-roaster-mcp`.
 
 - [ ] `E6-S2` Add README MCP verification string.
@@ -1591,6 +1599,29 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest tests/test_mcp_server.py tests/test_package.py`:
     43 passed.
   - Ran `./.venv/bin/python -m pytest`: 341 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+- Validation run for E6-S1:
+  - Completed PyPI package metadata for `coffee-roaster-mcp` while keeping
+    PyPI publishing, MCP Registry metadata, live hardware validation, model
+    training/export/sync, real microphone validation, and broad release
+    validation out of scope.
+  - Added maintainer metadata, package keywords, project classifiers,
+    documentation URL metadata, and a `py.typed` marker for the typed package.
+  - Added installed-distribution metadata coverage for package identity,
+    `RoastPilot` summary text, Python requirement, author/maintainer metadata,
+    keywords, classifiers, project URLs, and the console script entry point.
+  - Ran `./.venv/bin/python -m pytest tests/test_package_metadata.py tests/test_package.py`:
+    21 passed.
+  - Ran `./.venv/bin/python -m build`: built
+    `coffee_roaster_mcp-0.1.0.tar.gz` and
+    `coffee_roaster_mcp-0.1.0-py3-none-any.whl`.
+  - Inspected built wheel metadata and confirmed package name, `RoastPilot`
+    summary, Python requirement, project URLs, and classifiers.
+  - Ran `./.venv/bin/python -m pytest`: 343 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

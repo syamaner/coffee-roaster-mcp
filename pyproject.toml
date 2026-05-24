@@ -12,20 +12,32 @@ license = { file = "LICENSE" }
 authors = [
   { name = "Sertan Yamaner" }
 ]
+maintainers = [
+  { name = "Sertan Yamaner" }
+]
 keywords = [
+  "autonomous-roasting",
   "coffee",
   "coffee-roasting",
   "mcp",
   "model-context-protocol",
+  "roast-logging",
   "roastpilot"
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
+  "Environment :: Console",
   "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Natural Language :: English",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
-  "Topic :: Scientific/Engineering :: Artificial Intelligence"
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: System :: Hardware",
+  "Topic :: Utilities",
+  "Typing :: Typed"
 ]
 dependencies = [
   "huggingface_hub>=0.23,<1",
@@ -39,6 +51,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/syamaner/coffee-roaster-mcp"
+Documentation = "https://github.com/syamaner/coffee-roaster-mcp#readme"
 Repository = "https://github.com/syamaner/coffee-roaster-mcp"
 Issues = "https://github.com/syamaner/coffee-roaster-mcp/issues"
 
