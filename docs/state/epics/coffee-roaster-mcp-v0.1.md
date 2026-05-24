@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E5-S10`
-- Current target: Add autonomous telemetry sampler
+- Active story: `E6-S1`
+- Current target: Add PyPI package metadata
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -273,16 +273,21 @@ The first implementation milestone is a mock vertical slice that requires no roa
   metadata key-set coverage. Existing metric helpers, append-only JSONL writes,
   CSV/summary values, session/runtime boundaries, and mock-safe behavior remain
   unchanged.
-- `E5-S10` is added before distribution because telemetry capture currently
-  depends on MCP clients calling `get_roast_state`. `start_roast_session` should
-  start a session-owned sampler that polls the configured driver at
-  `logging.sample_interval_seconds`, defaulting to 5 seconds, appends telemetry
-  through the existing `RoastSessionStore` boundary, and lets append-only JSONL
-  logging plus RoR/delta metrics advance even when the agent or MCP client does
-  not poll state reliably. MCP tool calls may still refresh telemetry
-  opportunistically. The sampler must preserve the one-session boundary,
-  configured-driver control wiring, mock-safe CI, fail-closed safety behavior,
-  automatic T0 behavior, and session-owned first-crack runtime behavior.
+- `E5-S10` added the autonomous telemetry sampler before distribution.
+  Starting a roast session now starts a session-owned background sampler that
+  polls the configured driver at `logging.sample_interval_seconds`, defaulting
+  to 5 seconds. Sampled state is appended through the existing
+  `RoastSessionStore.record_active_telemetry_sample(...)` path, so rolling
+  metrics and append-only JSONL telemetry rows advance even when no MCP client
+  polls `get_roast_state`. MCP state reads still refresh telemetry
+  opportunistically. The sampler waits for the configured interval before its
+  first autonomous sample so explicit tool reads remain deterministic, stops
+  when the owning session is no longer active or when the MCP process shuts
+  down, and fails closed with a diagnosable fault event if the configured driver
+  read fails. The implementation preserves the one-session boundary,
+  configured-driver control wiring, mock-safe CI, automatic T0 processing,
+  session-owned first-crack runtime processing, append-only JSONL logging, CSV
+  and summary export schemas, and Hottop/model/audio validation boundaries.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -587,7 +592,7 @@ Goal: compute roast metrics from one session clock and export durable logs.
 - [x] `E5-S9` Add log schema tests.
   - Done when JSONL, CSV, and summary schema completeness is covered by tests.
 
-- [ ] `E5-S10` Add autonomous telemetry sampler.
+- [x] `E5-S10` Add autonomous telemetry sampler.
   - Done when `start_roast_session` starts a session-owned telemetry sampler
     that polls the configured roaster driver at `logging.sample_interval_seconds`
     without requiring `get_roast_state` polling; the default configured interval
@@ -616,6 +621,8 @@ Goal: compute roast metrics from one session clock and export durable logs.
 - Event rows are written immediately, not only on the sampled telemetry loop.
 - Telemetry rows and rolling metrics advance at the configured sampler cadence
   even when an MCP client does not poll `get_roast_state`.
+- Epic 5 is complete through E5-S10. Runtime telemetry now advances both from
+  the autonomous sampler cadence and from opportunistic MCP state reads.
 
 ## Epic 6: Distribution And MCP Registry Publishing
 
@@ -1551,6 +1558,39 @@ After completing a story:
   - Ran `./.venv/bin/python -m pytest tests/test_session.py tests/test_exports.py`:
     81 passed.
   - Ran `./.venv/bin/python -m pytest`: 337 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+- Validation run for E5-S10:
+  - Added a session-owned autonomous telemetry sampler to the MCP runtime.
+  - `start_roast_session` starts the sampler for the new session; MCP lifespan
+    shutdown stops it, and cooling completion or emergency stop stop the owning
+    sampler explicitly.
+  - The sampler polls the configured `RoasterDriver.read_state()` boundary at
+    `logging.sample_interval_seconds`, defaulting to 5 seconds, and appends
+    samples through `RoastSessionStore.record_active_telemetry_sample(...)`.
+  - Successful sampler reads also run the existing automatic T0 and
+    session-owned first-crack processing paths so those runtime paths no longer
+    depend only on `get_roast_state` polling.
+  - MCP `get_roast_state` continues to refresh telemetry opportunistically.
+  - Driver read failures fail closed through the existing emergency-stop safety
+    payload path, record a diagnosable fault event, stop first-crack processing,
+    and stop the sampler without issuing unrelated hardware commands.
+  - Added mock-safe MCP/runtime tests for no-client-poll telemetry logging,
+    opportunistic state-read refresh, sampler shutdown, driver-read failure, and
+    background-worker lifecycle behavior.
+  - Kept append-only JSONL runtime logging, the CSV schema, the summary schema,
+    the one-session store boundary, configured-driver control/state wiring,
+    automatic T0 behavior, session-owned first-crack runtime behavior, Hottop
+    validation boundaries, first-crack artifact/audio boundaries, and all
+    E5-S1 through E5-S9 metric/log/export helpers unchanged.
+  - Ran `./.venv/bin/python -m pytest tests/test_config.py tests/test_session.py tests/test_package.py`:
+    108 passed.
+  - Ran `./.venv/bin/python -m pytest tests/test_mcp_server.py tests/test_package.py`:
+    43 passed.
+  - Ran `./.venv/bin/python -m pytest`: 341 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

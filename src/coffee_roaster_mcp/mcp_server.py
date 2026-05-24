@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event, RLock, Thread
 from typing import Literal
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -45,6 +46,7 @@ class ServerContext:
         session_store: Authoritative in-process roast session owner.
         roaster_driver: Configured driver boundary.
         first_crack_runtime: Session-owned first-crack detector runtime.
+        telemetry_sampler: Session-owned autonomous telemetry sampler.
         started_at_utc: UTC time when the MCP process initialized.
     """
 
@@ -53,7 +55,92 @@ class ServerContext:
     session_store: RoastSessionStore
     roaster_driver: RoasterDriver
     first_crack_runtime: FirstCrackSessionRuntime
+    telemetry_sampler: _TelemetrySampler
     started_at_utc: datetime
+
+
+TelemetrySampleCallback = Callable[[str], bool]
+
+
+class _TelemetrySampler:
+    """Poll driver telemetry for the currently owning roast session."""
+
+    def __init__(
+        self,
+        *,
+        interval_seconds: float,
+        sample_callback: TelemetrySampleCallback,
+    ) -> None:
+        self._interval_seconds = interval_seconds
+        self._sample_callback = sample_callback
+        self._lock = RLock()
+        self._stop_event = Event()
+        self._thread: Thread | None = None
+        self._active_session_id: str | None = None
+        self._last_error: str | None = None
+
+    def start_for_session(self, session_id: str) -> None:
+        """Start autonomous sampling for one session id."""
+        with self._lock:
+            self._stop_locked()
+            self._stop_event = Event()
+            self._active_session_id = session_id
+            self._last_error = None
+            self._thread = Thread(
+                target=self._run,
+                args=(session_id, self._stop_event),
+                name=f"roast-telemetry-sampler-{session_id}",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop_for_session(self, session_id: str, *, reason: str) -> None:
+        """Stop sampling if the supplied session currently owns the sampler."""
+        _ = reason
+        with self._lock:
+            if self._active_session_id != session_id:
+                return
+            self._stop_locked()
+
+    def shutdown(self) -> None:
+        """Stop any active sampler worker."""
+        with self._lock:
+            self._stop_locked()
+
+    @property
+    def active_session_id(self) -> str | None:
+        """Return the session id currently owned by the sampler."""
+        with self._lock:
+            return self._active_session_id
+
+    @property
+    def last_error(self) -> str | None:
+        """Return the latest sampler error, if any."""
+        with self._lock:
+            return self._last_error
+
+    def _run(self, session_id: str, stop_event: Event) -> None:
+        while not stop_event.wait(self._interval_seconds):
+            try:
+                keep_sampling = self._sample_callback(session_id)
+            except Exception as exc:  # noqa: BLE001 - background worker must not escape.
+                with self._lock:
+                    if self._active_session_id == session_id:
+                        self._last_error = f"{type(exc).__name__}: {exc}"
+                keep_sampling = False
+            if not keep_sampling:
+                with self._lock:
+                    if self._active_session_id == session_id:
+                        self._active_session_id = None
+                return
+
+    def _stop_locked(self) -> None:
+        thread = self._thread
+        self._active_session_id = None
+        self._thread = None
+        self._stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(1.0, self._interval_seconds * 2))
 
 
 @dataclass(frozen=True)
@@ -320,7 +407,18 @@ def build_server_context(
         )
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
-    return ServerContext(
+    server_context: ServerContext | None = None
+
+    def sample_active_session(session_id: str) -> bool:
+        if server_context is None:
+            return False
+        return _sample_active_session_telemetry(server_context, session_id=session_id)
+
+    telemetry_sampler = _TelemetrySampler(
+        interval_seconds=config.logging.sample_interval_seconds,
+        sample_callback=sample_active_session,
+    )
+    server_context = ServerContext(
         config=config,
         transport=transport,
         session_store=RoastSessionStore(
@@ -329,8 +427,10 @@ def build_server_context(
         ),
         roaster_driver=roaster_driver,
         first_crack_runtime=build_first_crack_session_runtime(config),
+        telemetry_sampler=telemetry_sampler,
         started_at_utc=datetime.now(UTC),
     )
+    return server_context
 
 
 def create_mcp_server(
@@ -355,6 +455,7 @@ def create_mcp_server(
         try:
             yield server_context
         finally:
+            server_context.telemetry_sampler.shutdown()
             server_context.first_crack_runtime.shutdown()
 
     mcp = FastMCP(
@@ -439,6 +540,7 @@ def create_mcp_server(
             server_context.session_store.clear_session_start_reservation(reservation)
             raise
         _start_first_crack_runtime(server_context, session=session)
+        server_context.telemetry_sampler.start_for_session(session.id)
         return StartRoastSessionResult(
             session=_serialize_session_state(
                 session,
@@ -564,6 +666,8 @@ def create_mcp_server(
             snapshot.id,
             reason="beans dropped",
         )
+        if not snapshot.active:
+            server_context.telemetry_sampler.stop_for_session(snapshot.id, reason="beans dropped")
         return _serialize_event_result(snapshot=snapshot, event=event)
 
     @mcp.tool()
@@ -585,6 +689,10 @@ def create_mcp_server(
         session = _require_active_session(server_context)
         event, snapshot = _run_reserved_driver_stop_cooling(server_context, session)
         server_context.first_crack_runtime.stop_for_session(
+            snapshot.id,
+            reason="cooling stopped",
+        )
+        server_context.telemetry_sampler.stop_for_session(
             snapshot.id,
             reason="cooling stopped",
         )
@@ -631,6 +739,10 @@ def create_mcp_server(
             allow_stopped_latest=True,
         )
         server_context.first_crack_runtime.stop_for_session(
+            snapshot.id,
+            reason="emergency stop",
+        )
+        server_context.telemetry_sampler.stop_for_session(
             snapshot.id,
             reason="emergency stop",
         )
@@ -943,6 +1055,78 @@ def _record_polling_telemetry_for_active_session(
         cooling_on=driver_state.cooling_on,
     )
     return session if snapshot is None else snapshot
+
+
+def _sample_active_session_telemetry(
+    server_context: ServerContext,
+    *,
+    session_id: str,
+) -> bool:
+    """Append one autonomous telemetry sample for the owning active session."""
+    active_session = server_context.session_store.get_active_session()
+    if active_session is None or active_session.id != session_id:
+        return False
+
+    try:
+        driver_state = server_context.roaster_driver.read_state()
+    except Exception as exc:  # noqa: BLE001 - driver implementations vary.
+        _fault_active_session_after_sampler_read_failure(
+            server_context,
+            session=active_session,
+            error=exc,
+        )
+        return False
+
+    device_state = _serialize_device_state(driver_state)
+    snapshot = server_context.session_store.record_active_telemetry_sample(
+        session_id=session_id,
+        bean_temp_c=driver_state.bean_temp_c,
+        env_temp_c=driver_state.env_temp_c,
+        heat_level_percent=driver_state.heat_level_percent,
+        fan_level_percent=driver_state.fan_level_percent,
+        cooling_on=driver_state.cooling_on,
+    )
+    if snapshot is None:
+        return False
+
+    auto_t0_recorded = _process_auto_t0_for_active_session(
+        server_context,
+        session_id=session_id,
+        device_state=device_state,
+    )
+    if auto_t0_recorded:
+        server_context.first_crack_runtime.discard_queued_windows_for_session(
+            session_id,
+            reason="Dropped queued pre-T0 detector windows after automatic T0.",
+        )
+    _process_first_crack_runtime_for_active_session(server_context, session_id=session_id)
+
+    active_session = server_context.session_store.get_active_session()
+    return active_session is not None and active_session.id == session_id
+
+
+def _fault_active_session_after_sampler_read_failure(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    error: BaseException,
+) -> None:
+    """Fail closed when the autonomous sampler cannot read the configured driver."""
+    reason = f"autonomous telemetry sampler driver read failed: {type(error).__name__}: {error}"
+    safety_payload = run_driver_emergency_stop(server_context, reason=reason)
+    try:
+        _, snapshot = server_context.session_store.emergency_stop_snapshot(
+            session,
+            reason=reason,
+            safety_payload=safety_payload,
+            allow_stopped_latest=True,
+        )
+    except SessionLifecycleError:
+        return
+    server_context.first_crack_runtime.stop_for_session(
+        snapshot.id,
+        reason="autonomous telemetry sampler driver read failure",
+    )
 
 
 def _serialize_session_state(

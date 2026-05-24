@@ -4,7 +4,8 @@ import asyncio
 import json
 import os
 import sys
-from collections.abc import Awaitable
+import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypeVar, cast
@@ -16,6 +17,7 @@ from mcp.client.stdio import stdio_client
 from coffee_roaster_mcp import __version__, cli
 from coffee_roaster_mcp.cli import build_parser, main
 from coffee_roaster_mcp.config import ConfigError
+from coffee_roaster_mcp.drivers import EmergencyStopResult, RoasterState
 from coffee_roaster_mcp.mcp_server import build_server_context, run_driver_emergency_stop
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -190,6 +192,55 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
 
 def test_stdio_server_supports_basic_mock_roast_tool_flow(tmp_path: Path) -> None:
     asyncio.run(_assert_basic_mock_roast_flow(tmp_path))
+
+
+def test_stdio_server_autonomous_sampler_logs_without_state_polling(tmp_path: Path) -> None:
+    asyncio.run(_assert_autonomous_sampler_logs_without_state_polling(tmp_path))
+
+
+def test_stdio_server_state_polling_still_refreshes_telemetry(tmp_path: Path) -> None:
+    asyncio.run(_assert_state_polling_still_refreshes_telemetry(tmp_path))
+
+
+def test_telemetry_sampler_shutdown_stops_background_reads(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("logging:\n  sample_interval_seconds: 0.01\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = _CountingDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    session = server_context.session_store.start_session()
+
+    server_context.telemetry_sampler.start_for_session(session.id)
+    _wait_for_condition(lambda: driver.read_count >= 2)
+    server_context.telemetry_sampler.shutdown()
+    reads_after_shutdown = driver.read_count
+    time.sleep(0.05)
+
+    assert driver.read_count == reads_after_shutdown
+
+
+def test_telemetry_sampler_driver_read_failure_faults_session(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("logging:\n  sample_interval_seconds: 0.01\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = _FailingReadDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    session = server_context.session_store.start_session()
+
+    server_context.telemetry_sampler.start_for_session(session.id)
+    _wait_for_condition(lambda: server_context.session_store.get_active_session() is None)
+
+    snapshot = server_context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.active is False
+    assert snapshot.phase == "fault"
+    assert driver.emergency_stop_called is True
+    fault_event = snapshot.event_timeline[-1]
+    assert fault_event.kind == "fault"
+    assert (
+        fault_event.payload["reason"]
+        == "autonomous telemetry sampler driver read failed: RuntimeError: read offline"
+    )
+    assert server_context.telemetry_sampler.active_session_id is None
 
 
 async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
@@ -437,6 +488,73 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert old_session_state_after_rollover.structuredContent["active"] is False
 
 
+async def _assert_autonomous_sampler_logs_without_state_polling(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("logging:\n  sample_interval_seconds: 0.01\n", encoding="utf-8")
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "coffee_roaster_mcp.cli", "serve"],
+        env=_build_clean_server_env(),
+        cwd=tmp_path,
+    )
+
+    async with stdio_client(server_params) as (read, write), ClientSession(read, write) as session:
+        await _call_with_timeout(session.initialize())
+
+        start_result = cast(
+            Any,
+            await _call_with_timeout(session.call_tool("start_roast_session", {})),
+        )
+        session_id = start_result.structuredContent["session"]["session_id"]
+        log_path = tmp_path / "logs" / "roasts" / session_id / "roast.jsonl"
+        await _wait_for_async_condition(lambda: _telemetry_row_count(log_path) >= 2)
+
+        export_result = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool("export_roast_log", {"session_id": session_id})
+            ),
+        )
+        assert export_result.structuredContent["ready"] is True
+        rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+        assert [row["type"] for row in rows[:2]] == ["telemetry", "telemetry"]
+
+
+async def _assert_state_polling_still_refreshes_telemetry(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("logging:\n  sample_interval_seconds: 60\n", encoding="utf-8")
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "coffee_roaster_mcp.cli", "serve"],
+        env=_build_clean_server_env(),
+        cwd=tmp_path,
+    )
+
+    async with stdio_client(server_params) as (read, write), ClientSession(read, write) as session:
+        await _call_with_timeout(session.initialize())
+
+        start_result = cast(
+            Any,
+            await _call_with_timeout(session.call_tool("start_roast_session", {})),
+        )
+        session_id = start_result.structuredContent["session"]["session_id"]
+        log_path = tmp_path / "logs" / "roasts" / session_id / "roast.jsonl"
+        assert _telemetry_row_count(log_path) == 0
+
+        state_result = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool("get_roast_state", {"session_id": session_id})
+            ),
+        )
+
+        assert state_result.structuredContent["session_id"] == session_id
+        state_log_rows = [
+            json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        assert len([row for row in state_log_rows if row["type"] == "telemetry"]) == 1
+
+
 def test_stdio_server_rejects_manual_first_crack_override_when_disabled(tmp_path: Path) -> None:
     asyncio.run(_assert_manual_override_disabled(tmp_path))
 
@@ -604,6 +722,50 @@ class _FailingSafetyDriver:
         raise RuntimeError("driver offline")
 
 
+class _CountingDriver:
+    """Mock-safe driver that counts autonomous state reads."""
+
+    name = "mock"
+
+    def __init__(self) -> None:
+        self.read_count = 0
+        self.emergency_stop_called = False
+
+    def read_state(self) -> RoasterState:
+        """Return incrementing deterministic telemetry."""
+        self.read_count += 1
+        return RoasterState(
+            driver="mock",
+            connected=True,
+            bean_temp_c=150.0 + self.read_count,
+            env_temp_c=200.0 + self.read_count,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=False,
+        )
+
+    def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
+        """Record fail-closed safety invocation."""
+        _ = reason
+        self.emergency_stop_called = True
+        return EmergencyStopResult(
+            driver="mock",
+            safety_method="emergency_stop",
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
+        )
+
+
+class _FailingReadDriver(_CountingDriver):
+    """Driver double that fails state reads."""
+
+    def read_state(self) -> RoasterState:
+        """Raise a deterministic read failure."""
+        self.read_count += 1
+        raise RuntimeError("read offline")
+
+
 def _build_clean_server_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
     """Return a minimal subprocess environment for MCP startup tests."""
     pythonpath_parts = [str(REPO_ROOT / "src")]
@@ -625,3 +787,37 @@ def _build_clean_server_env(overrides: dict[str, str] | None = None) -> dict[str
 async def _call_with_timeout(awaitable: Awaitable[_T], timeout_seconds: float = 5.0) -> _T:
     """Fail fast if the MCP smoke test subprocess stops responding."""
     return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+
+
+def _telemetry_row_count(path: Path) -> int:
+    """Return the number of telemetry rows in an append-only JSONL log."""
+    if not path.exists():
+        return 0
+    return sum(
+        1
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["type"] == "telemetry"
+    )
+
+
+def _wait_for_condition(condition: Callable[[], bool], timeout_seconds: float = 1.0) -> None:
+    """Wait for a synchronous test condition to become true."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.005)
+    raise AssertionError("Timed out waiting for condition.")
+
+
+async def _wait_for_async_condition(
+    condition: Callable[[], bool],
+    timeout_seconds: float = 2.0,
+) -> None:
+    """Wait for an async test condition to become true."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("Timed out waiting for condition.")
