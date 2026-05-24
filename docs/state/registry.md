@@ -259,13 +259,20 @@ title in the package summary. The distribution includes a `py.typed` marker,
 and package metadata tests inspect the installed distribution metadata plus the
 console script entry point.
 
+E6-S2 added the exact MCP Registry README verification string
+`<!-- mcp-name: io.github.syamaner/coffee-roaster-mcp -->` and focused README
+coverage that verifies the string appears once. `server.json`, PyPI publishing,
+MCP Registry publishing, release workflow behavior, live hardware validation,
+model training/export/sync, real microphone validation, and broad release
+validation remain out of scope for E6-S2.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E6-S2: add README MCP verification string.
+The next story is E6-S3: add `server.json`.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
