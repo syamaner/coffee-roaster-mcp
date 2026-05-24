@@ -4,7 +4,9 @@
 
 RoastPilot is a spec-driven MCP server for autonomous coffee roasting.
 
-The package name is `coffee-roaster-mcp`. PyPI publishing is planned for the v0.1 release; this repository currently contains the local package scaffold, release workflow, registry metadata, and project plan.
+The package name is `coffee-roaster-mcp`. Version `0.1.0` is published on
+production PyPI and listed in the MCP Registry as
+`io.github.syamaner/coffee-roaster-mcp`.
 
 RoastPilot will provide one local MCP runtime for roaster control, telemetry, first-crack detection integration, roast metrics, and log export.
 
@@ -35,7 +37,11 @@ python -m pip install --upgrade pip
 python -m pip install -e . --group dev
 ```
 
-The future user-facing install target is the `coffee-roaster-mcp` package. PyPI publication is planned later in v0.1 after the controlled live release story lands.
+The user-facing install target is the published `coffee-roaster-mcp` package:
+
+```bash
+python -m pip install coffee-roaster-mcp
+```
 
 For operator setup, including mock install, Hottop configuration, Hugging Face
 model configuration, offline model paths, and log output paths, see
