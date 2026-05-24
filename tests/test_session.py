@@ -416,6 +416,43 @@ def test_reserved_driver_start_cooling_log_failure_rolls_back_controls(
     assert session.phase == "dropped"
 
 
+def test_reserved_driver_start_cooling_rejects_inactive_driver_result() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    store.record_event(session, "beans_dropped")
+    store.apply_driver_control_state(
+        session,
+        heat_level_percent=30,
+        fan_level_percent=40,
+        cooling_on=False,
+    )
+    cooling_reservation = store.reserve_driver_start_cooling(session)
+    assert cooling_reservation.reservation is not None
+
+    with pytest.raises(SessionLifecycleError, match="cooling inactive after start_cooling"):
+        store.complete_reserved_driver_start_cooling_snapshot(
+            session,
+            reservation=cooling_reservation.reservation,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=False,
+        )
+
+    assert session.pending_driver_command_token is None
+    assert session.pending_driver_command_kind is None
+    assert session.heat_level_percent == 30
+    assert session.fan_level_percent == 40
+    assert session.cooling_on is False
+    assert session.cooling_started_at_utc is None
+    assert session.event_timeline[-1].kind == "beans_dropped"
+    assert session.phase == "dropped"
+
+
 def test_record_active_telemetry_sample_returns_none_when_session_is_stale() -> None:
     clock = ClockHarness()
     issued_ids = iter(["session-001", "session-002"])

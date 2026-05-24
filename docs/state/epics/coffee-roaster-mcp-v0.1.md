@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E5-S7`
-- Current target: Export CSV roast log
+- Active story: `E5-S8`
+- Current target: Export `summary.json`
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -251,6 +251,14 @@ The first implementation milestone is a mock vertical slice that requires no roa
   writing CSV and `summary.json` from the current session but no longer
   overwrites an existing append-only JSONL log. Final CSV and summary schemas
   remain later Epic 5 work.
+- `E5-S7` adds the planned CSV roast log export schema to snapshot
+  `export_roast_log` output. `roast.csv` now includes telemetry and event rows
+  with the required plan columns for timestamps, elapsed seconds, inferred
+  phase, temperatures, controls, cooling state, event markers, event flags,
+  development percent, RoR/delta metrics, and first-crack model metadata.
+  Append-only JSONL runtime logging, existing metric helpers, the one-session
+  store boundary, mock-safe MCP behavior, and `summary.json` behavior remain
+  unchanged. Final `summary.json` schema work remains later Epic 5 work.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -546,7 +554,7 @@ Goal: compute roast metrics from one session clock and export durable logs.
 - [x] `E5-S6` Write append-only JSONL roast log.
   - Done when telemetry rows are written at 1 Hz and event rows are written immediately.
 
-- [ ] `E5-S7` Export CSV roast log.
+- [x] `E5-S7` Export CSV roast log.
   - Done when CSV includes all required columns from the plan.
 
 - [ ] `E5-S8` Export `summary.json`.
@@ -1439,6 +1447,27 @@ After completing a story:
     end-to-end agent roast validation, and broad release validation out of
     scope.
   - Ran `./.venv/bin/python -m pytest`: 325 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+- Validation run for E5-S7:
+  - Added the plan-required CSV roast log columns to snapshot `roast.csv`
+    export: timestamp, elapsed seconds, phase, temperatures, controls, cooling
+    state, event marker, event flags, development percent, RoR/delta metrics,
+    and first-crack model metadata.
+  - CSV export now writes both retained telemetry samples and session timeline
+    events in monotonic order, inferring phase and event flags at each row while
+    preserving the existing append-only JSONL runtime writer and `summary.json`
+    behavior.
+  - Added CSV schema tests for telemetry and event rows plus first-crack model
+    metadata fields.
+  - Kept final `summary.json` schema work, model training/export/sync, real
+    microphone validation, live Hottop validation, end-to-end agent roast
+    validation, and broad release validation out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_exports.py`: 4 passed.
+  - Ran `./.venv/bin/python -m pytest`: 328 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

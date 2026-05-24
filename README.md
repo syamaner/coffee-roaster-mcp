@@ -378,11 +378,14 @@ the active in-process session.
 
 Current export files:
 
-- `roast.jsonl` with the current event timeline snapshot
-- `roast.csv` with the current event timeline snapshot
+- `roast.jsonl` with append-only event and sampled telemetry rows during the
+  roast
+- `roast.csv` with telemetry and event rows using the planned CSV columns for
+  timestamps, elapsed seconds, phase, temperatures, controls, event flags,
+  development percent, RoR/delta metrics, and first-crack model metadata
 - `summary.json` with current session-level metadata and timestamp-derived
   metrics
 - output under `logs/roasts/{session_id}/`
 
-Append-only telemetry logging, rolling RoR metrics, development percentage
-hardening, and final log schemas land in Epic 5.
+Final `summary.json` schema work and broad release validation land in later
+stories.
