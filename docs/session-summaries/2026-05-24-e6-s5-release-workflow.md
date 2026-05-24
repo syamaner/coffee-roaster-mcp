@@ -75,6 +75,8 @@ Pre-review context token usage snapshot: `386K used`
 
 Post-review context token usage snapshot: `495K used`
 
+Final context token usage snapshot after all review follow-ups: `769K used`
+
 CodeRabbit and Codex review comments raised overlapping supply-chain hardening
 concerns:
 
@@ -102,6 +104,13 @@ The review concerns were valid and addressed locally:
   with explicit release-operator error messages instead of generic Python
   exceptions. The first package entry is also validated before reading its
   `version` field.
+- The final CodeRabbit review thread on PR #133 asked for an explicit
+  `packages[0]` shape check. Commit `73b227b` addressed it by requiring the
+  first package entry to be an object with a string `version` field before the
+  workflow reads `package["version"]`; CodeRabbit marked the thread resolved.
+- GitHub checks on commit `73b227b` passed for `Build Package` and `Checks`.
+  CodeRabbit was still processing when the final token usage snapshot was
+  recorded.
 
 Durable state updates:
 
