@@ -241,13 +241,21 @@ coverage, CSV export remains pinned to the E5-S7 field order, and `summary.json`
 now has exact top-level, nested metrics, and first-crack model metadata key-set
 coverage. Epic 5 metric/log/export helper behavior remains unchanged.
 
+E5-S10 is added before distribution to close the autonomous telemetry sampling
+gap. Telemetry capture currently happens when an MCP client calls
+`get_roast_state`; E5-S10 should make `start_roast_session` start a
+session-owned sampler that polls the configured driver at
+`logging.sample_interval_seconds`, appends telemetry through the existing
+`RoastSessionStore` path, and lets append-only JSONL telemetry plus RoR/delta
+metrics advance even without client polling.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E6-S1: add PyPI package metadata.
+The next story is E5-S10: add autonomous telemetry sampler.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

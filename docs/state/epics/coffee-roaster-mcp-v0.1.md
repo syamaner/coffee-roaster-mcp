@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E6-S1`
-- Current target: Add PyPI package metadata
+- Active story: `E5-S10`
+- Current target: Add autonomous telemetry sampler
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -273,6 +273,15 @@ The first implementation milestone is a mock vertical slice that requires no roa
   metadata key-set coverage. Existing metric helpers, append-only JSONL writes,
   CSV/summary values, session/runtime boundaries, and mock-safe behavior remain
   unchanged.
+- `E5-S10` is added before distribution because telemetry capture currently
+  depends on MCP clients calling `get_roast_state`. `start_roast_session` should
+  start a session-owned sampler that polls the configured driver at
+  `logging.sample_interval_seconds`, appends telemetry through the existing
+  `RoastSessionStore` boundary, and lets append-only JSONL logging plus
+  RoR/delta metrics advance even when the agent or MCP client does not poll
+  state reliably. The sampler must preserve the one-session boundary,
+  configured-driver control wiring, mock-safe CI, fail-closed safety behavior,
+  automatic T0 behavior, and session-owned first-crack runtime behavior.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -577,12 +586,32 @@ Goal: compute roast metrics from one session clock and export durable logs.
 - [x] `E5-S9` Add log schema tests.
   - Done when JSONL, CSV, and summary schema completeness is covered by tests.
 
+- [ ] `E5-S10` Add autonomous telemetry sampler.
+  - Done when `start_roast_session` starts a session-owned telemetry sampler
+    that polls the configured roaster driver at `logging.sample_interval_seconds`
+    without requiring `get_roast_state` polling.
+  - Done when sampled driver state is appended through the existing
+    `RoastSessionStore` telemetry path so rolling metrics and append-only JSONL
+    telemetry rows advance on the sampler cadence.
+  - Done when the sampler stops cleanly on drop/cooling completion, emergency
+    stop, session stop, driver read failure, and MCP process shutdown without
+    leaking background workers.
+  - Done when driver read failures surface as diagnosable fault/unavailable
+    state without unsafe hardware commands, and normal mock-safe CI requires no
+    Hottop hardware, microphone, model download, or network.
+  - Required tests: mock-safe sampler lifecycle tests, no-client-poll telemetry
+    accumulation/logging test, sampler shutdown tests, driver-read failure test,
+    and MCP smoke coverage proving metrics/logs advance without repeated
+    `get_roast_state` calls.
+
 ### Epic Acceptance Criteria
 
 - RoR is null before 10 seconds of samples.
 - RoR and deltas are correct for regular and irregular sample intervals.
 - JSONL, CSV, and summary include required fields.
 - Event rows are written immediately, not only on the 1 Hz sample loop.
+- Telemetry rows and rolling metrics advance at the configured sampler cadence
+  even when an MCP client does not poll `get_roast_state`.
 
 ## Epic 6: Distribution And MCP Registry Publishing
 
