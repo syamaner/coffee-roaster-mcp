@@ -3,10 +3,27 @@
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from jsonschema import Draft7Validator  # type: ignore[import-untyped]
+import pytest
+from jsonschema import (  # type: ignore[import-untyped]
+    Draft7Validator,
+    FormatChecker,
+    ValidationError,
+)
 
 SCHEMA_URI = "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json"
+URI_FORMAT_CHECKER = FormatChecker()
+
+
+def _is_uri(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    parsed = urlparse(value)
+    return bool(parsed.scheme) and not any(character.isspace() for character in value)
+
+
+URI_FORMAT_CHECKER.checks("uri")(_is_uri)
 
 SERVER_JSON_SCHEMA: dict[str, Any] = {
     "$schema": "http://json-schema.org/draft-07/schema#",
@@ -62,7 +79,7 @@ def test_server_json_validates_against_mcp_registry_schema() -> None:
     """Validate server.json against the current MCP Registry schema constraints."""
     server_json = _load_server_json()
 
-    Draft7Validator(SERVER_JSON_SCHEMA).validate(server_json)  # type: ignore[reportUnknownMemberType]
+    _validate_server_json(server_json)
 
 
 def test_server_json_declares_roastpilot_pypi_stdio_package() -> None:
@@ -84,6 +101,22 @@ def test_server_json_declares_roastpilot_pypi_stdio_package() -> None:
     ]
 
 
+def test_server_json_schema_rejects_malformed_uri_fields() -> None:
+    """Check schema validation enforces URI formats for registry metadata."""
+    server_json = _load_server_json()
+    server_json["websiteUrl"] = "not a uri"
+
+    with pytest.raises(ValidationError):
+        _validate_server_json(server_json)
+
+
 def _load_server_json() -> dict[str, Any]:
     path = Path(__file__).resolve().parents[1] / "server.json"
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _validate_server_json(server_json: dict[str, Any]) -> None:
+    Draft7Validator(
+        SERVER_JSON_SCHEMA,
+        format_checker=URI_FORMAT_CHECKER,
+    ).validate(server_json)  # type: ignore[reportUnknownMemberType]

@@ -1689,13 +1689,13 @@ After completing a story:
     publishing, release workflow behavior, live hardware validation, model
     training/export/sync, real microphone validation, and broad release
     validation out of scope.
-  - Ran `./.venv/bin/python -m pytest tests/test_server_json.py`: 2 passed.
+  - Ran `./.venv/bin/python -m pytest tests/test_server_json.py`: 3 passed.
   - Ran `./.venv/bin/python -m ruff check tests/test_server_json.py pyproject.toml`:
     passed.
   - Ran `./.venv/bin/python -m ruff format --check tests/test_server_json.py`:
     passed.
   - Ran `./.venv/bin/python -m pyright tests/test_server_json.py`: 0 errors.
-  - Ran `./.venv/bin/python -m pytest`: 346 passed.
+  - Ran `./.venv/bin/python -m pytest`: 347 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

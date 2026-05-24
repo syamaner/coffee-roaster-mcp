@@ -49,7 +49,7 @@ Durable state updates:
 
 Focused validation:
 
-- `./.venv/bin/python -m pytest tests/test_server_json.py`: 2 passed
+- `./.venv/bin/python -m pytest tests/test_server_json.py`: 3 passed
 - `./.venv/bin/python -m ruff check tests/test_server_json.py pyproject.toml`:
   passed
 - `./.venv/bin/python -m ruff format --check tests/test_server_json.py`: passed
@@ -57,7 +57,7 @@ Focused validation:
 
 Full validation:
 
-- `./.venv/bin/python -m pytest`: 346 passed
+- `./.venv/bin/python -m pytest`: 347 passed
 - `./.venv/bin/python -m ruff check .`: passed
 - `./.venv/bin/python -m ruff format --check .`: passed
 - `./.venv/bin/python -m pyright`: 0 errors
@@ -75,6 +75,28 @@ Publishing is not usable, release environment approvals, protected-tag rules,
 and dry-run validation before live publishing.
 
 GitHub issue `#53` was updated with the same detailed E6-S5 requirements.
+
+## Review Agent Comparison
+
+PR `#131` received review comments from CodeRabbit and Codex.
+
+- CodeRabbit posted one valid actionable inline comment on
+  `tests/test_server_json.py`: `Draft7Validator(...).validate(...)` does not
+  enforce JSON Schema `format: uri` without a format checker. It also posted a
+  pre-merge docstring-coverage warning, but that warning does not map to the
+  repository's configured local gates for this PR.
+- Codex posted the same valid actionable inline comment, with a more direct
+  explanation that malformed URI fields such as `websiteUrl` or repository URLs
+  could otherwise pass CI and fail later during registry publishing.
+
+Outcome: both agents found the same real issue. Codex's comment was cleaner and
+more project-relevant. CodeRabbit's actionable comment was useful, but its
+additional docstring-coverage warning was noisy for this repository because the
+current required gates are `pytest`, `ruff`, `pyright`, and CLI smoke checks.
+
+Action taken: `tests/test_server_json.py` now constructs `Draft7Validator` with
+a URI `FormatChecker` and includes a malformed-URI regression test so URI fields
+are validated by the schema test.
 
 ## Restart Prompt
 
