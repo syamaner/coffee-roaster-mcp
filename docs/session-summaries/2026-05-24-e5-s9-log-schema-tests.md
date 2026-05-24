@@ -61,6 +61,12 @@ Full validation:
 - `./.venv/bin/coffee-roaster-mcp --help`: passed
 - `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
 
+## Usage Snapshot
+
+Operator-provided cumulative session usage:
+
+- Tokens used so far in this session: `258K`
+
 ## Restart Prompt
 
 Resume in the local clone of `syamaner/coffee-roaster-mcp`. PR for E5-S9 should
