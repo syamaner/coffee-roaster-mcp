@@ -788,11 +788,18 @@ Goal: prove the package works from install through mock roast, MCP client calls,
 - [ ] `E7-S2` Test package install smoke flow.
   - Done when a built wheel can be installed and `coffee-roaster-mcp --help` works.
 
-- [ ] `E7-S3` Test MCP client connection.
-  - Done when a real MCP client can discover and call the server tools.
+- [ ] `E7-S3` Test Warp MCP client connection.
+  - Done when Warp can configure, start, discover, and call the local stdio
+    MCP server on the mock-safe path, confirm `mock` / `disabled` defaults,
+    complete a full mock roast through public MCP tools, and verify exported
+    JSONL, CSV, and summary outputs.
 
-- [ ] `E7-S4` Run Hottop manual hardware validation.
-  - Done when manual validation results are recorded against the checklist.
+- [ ] `E7-S4` Run Warp manual Hottop MCP control validation.
+  - Done when Warp can connect to the Hottop-configured RoastPilot MCP server
+    and the operator manually approves each hardware-affecting tool call for
+    connect, telemetry, heat, fan, drop, cooling, stop-cooling, emergency stop,
+    and exported-log review. No autonomous hardware-control decisions are in
+    scope.
 
 - [ ] `E7-S5` Produce v0.1 release checklist.
   - Done when release steps cover tests, package build, version alignment, HF revision pin, PyPI publish, registry publish, GitHub release, and hardware-ready labeling.
@@ -809,8 +816,9 @@ Goal: prove the package works from install through mock roast, MCP client calls,
 ### Epic Acceptance Criteria
 
 - Full mock roast works from install to exported logs.
-- MCP client can discover and call tools.
-- Manual hardware results are recorded.
+- Warp can discover and call tools through the local stdio MCP server.
+- Warp manual Hottop hardware-control results are recorded with explicit
+  operator approvals.
 - A real MCP client or agent can complete an end-to-end roast validation using
   configured hardware, real audio, and released Hugging Face ONNX first-crack
   artifacts, with correct state, stats, and exported logs recorded as evidence.

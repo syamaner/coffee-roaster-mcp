@@ -355,9 +355,14 @@ first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E7-S2: test the package install smoke flow before hardware
-validation, real MCP client connection validation, or full end-to-end agent
-roast validation.
+Epic 7 client validation is routed through Warp, not ChatGPT. E7-S3 validates
+Warp as the local MCP client on the mock-safe path. E7-S4 validates manual
+operator-approved Hottop device control through Warp MCP tool calls, with no
+autonomous hardware-control decisions.
+
+The next story is E7-S2: test the package install smoke flow before Warp MCP
+client connection validation, Warp manual Hottop control validation, or full
+end-to-end agent roast validation.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
