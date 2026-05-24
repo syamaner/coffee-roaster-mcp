@@ -74,6 +74,10 @@ Operator-provided context snapshot after PR #124 creation:
 - GPT-5.3-Codex-Spark 5h limit: `100% left`, resets `05:16`
 - GPT-5.3-Codex-Spark weekly limit: `100% left`, resets `00:16 on 31 May`
 
+Operator-provided cumulative session usage after the third review-fix round:
+
+- Tokens used so far in this session: `656K`
+
 ## Review Fixes
 
 PR #124 review feedback from CodeRabbit and Codex was checked with
