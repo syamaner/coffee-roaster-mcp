@@ -71,6 +71,10 @@ Commands run:
 - `./.venv/bin/python -m pyright`: 0 errors, 0 warnings, 0 informations.
 - `./.venv/bin/coffee-roaster-mcp --help`: passed.
 - `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+- GitHub Actions CI run `26368815098`: passed.
+  - `Checks`: success.
+  - `Build Package`: success, including the new
+    `Smoke install built wheel` step.
 
 ## Risks And Notes
 

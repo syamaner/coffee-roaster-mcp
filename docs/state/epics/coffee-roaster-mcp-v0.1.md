@@ -1058,6 +1058,9 @@ After completing a story:
   - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
   - Ran `./.venv/bin/coffee-roaster-mcp --version`:
     `coffee-roaster-mcp 0.1.0`.
+  - GitHub Actions CI run `26368815098` completed successfully:
+    `Checks` passed and `Build Package` passed, including the new
+    `Smoke install built wheel` step.
   - Kept hardware validation, Warp MCP validation, ChatGPT MCP validation,
     model training/export/sync, real microphone validation, and live release
     publishing out of scope.
