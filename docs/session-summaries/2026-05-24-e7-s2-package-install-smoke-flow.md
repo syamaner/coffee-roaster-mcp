@@ -122,6 +122,7 @@ Commands run:
 ## Usage Snapshot
 
 - Before review fixes: `121K used`.
+- After review fixes: `280K used`.
 
 ## Restart Prompt
 
