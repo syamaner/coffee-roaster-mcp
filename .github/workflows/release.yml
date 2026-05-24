@@ -146,22 +146,7 @@ jobs:
         run: python -m build
 
       - name: Smoke install built wheel
-        run: |
-          python -m venv /tmp/coffee-roaster-mcp-wheel-smoke
-          wheel="$(python - <<'PY'
-          from pathlib import Path
-
-          wheels = sorted(Path("dist").glob("coffee_roaster_mcp-*.whl"))
-          if len(wheels) != 1:
-              raise SystemExit(f"Expected exactly one built wheel, found {len(wheels)}")
-          print(wheels[0])
-          PY
-          )"
-          /tmp/coffee-roaster-mcp-wheel-smoke/bin/python -m pip install --upgrade pip
-          /tmp/coffee-roaster-mcp-wheel-smoke/bin/python -m pip install "$wheel"
-          /tmp/coffee-roaster-mcp-wheel-smoke/bin/coffee-roaster-mcp --help
-          /tmp/coffee-roaster-mcp-wheel-smoke/bin/coffee-roaster-mcp --version
-          /tmp/coffee-roaster-mcp-wheel-smoke/bin/python -c "import os, tempfile; from coffee_roaster_mcp.config import load_config; tmp = tempfile.TemporaryDirectory(); os.chdir(tmp.name); c = load_config(environ={}); print(c.roaster.driver, c.first_crack.mode, c.first_crack.precision); tmp.cleanup()"
+        run: python .github/scripts/smoke_install_built_wheel.py
 
       - name: Upload distribution artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

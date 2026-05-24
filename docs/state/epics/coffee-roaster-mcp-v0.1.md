@@ -1028,6 +1028,11 @@ After completing a story:
     jobs. Each job builds distributions, creates a clean virtual environment,
     installs the built wheel, runs installed CLI `--help` and `--version`, and
     verifies installed default config returns `mock disabled int8`.
+  - Addressed PR review feedback from CodeRabbit and Codex by extracting the
+    duplicated smoke logic into `.github/scripts/smoke_install_built_wheel.py`
+    and changing the installed default-config smoke from print-only output to
+    an explicit assertion that fails on any value other than
+    `mock disabled int8`.
   - Built local distributions with `./.venv/bin/python -m build`: successfully
     built `coffee_roaster_mcp-0.1.0.tar.gz` and
     `coffee_roaster_mcp-0.1.0-py3-none-any.whl`.
@@ -1061,6 +1066,13 @@ After completing a story:
   - GitHub Actions CI run `26368815098` completed successfully:
     `Checks` passed and `Build Package` passed, including the new
     `Smoke install built wheel` step.
+  - Review-fix validation:
+    `./.venv/bin/python .github/scripts/smoke_install_built_wheel.py --venv-path /tmp/coffee-roaster-mcp-e7-s2-review-wheel-smoke`
+    passed with approved network access and printed `mock disabled int8`;
+    `./.venv/bin/python -m pytest tests/test_package_metadata.py tests/test_package.py::test_main_prints_help`
+    passed with 3 tests; `./.venv/bin/python -m pytest` passed with 356 tests;
+    `./.venv/bin/python -m ruff check .`, `./.venv/bin/python -m ruff format --check .`,
+    `./.venv/bin/python -m pyright`, and `git diff --check` passed.
   - Kept hardware validation, Warp MCP validation, ChatGPT MCP validation,
     model training/export/sync, real microphone validation, and live release
     publishing out of scope.

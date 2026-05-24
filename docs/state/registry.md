@@ -353,7 +353,10 @@ E7-S2 completed package install smoke validation from built local
 distributions. The CI and release package-build jobs now create a clean virtual
 environment after `python -m build`, install the built wheel, run installed
 `coffee-roaster-mcp --help` and `coffee-roaster-mcp --version`, and verify the
-installed default config remains `mock disabled int8`. The local validation run
+installed default config remains `mock disabled int8`. PR review hardening
+moved the duplicated smoke logic into
+`.github/scripts/smoke_install_built_wheel.py` and changed the default-config
+check from print-only output to an explicit assertion. The local validation run
 built both wheel and sdist, installed
 `dist/coffee_roaster_mcp-0.1.0-py3-none-any.whl` into
 `/tmp/coffee-roaster-mcp-e7-s2-wheel-smoke`, and confirmed the installed CLI

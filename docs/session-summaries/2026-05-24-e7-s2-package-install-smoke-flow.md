@@ -27,13 +27,28 @@ was performed.
 - Updated `.github/workflows/ci.yml` so the `build-package` job now creates a
   clean virtual environment after `python -m build`, installs the built wheel,
   runs installed `coffee-roaster-mcp --help`, runs installed
-  `coffee-roaster-mcp --version`, and verifies installed default config prints
+  `coffee-roaster-mcp --version`, and verifies installed default config matches
   `mock disabled int8`.
-- Updated `.github/workflows/release.yml` with the same built-wheel install
-  smoke in the release `build-package` job before artifacts are uploaded.
+- Updated `.github/workflows/release.yml` with the same built-wheel smoke in
+  the release `build-package` job before artifacts are uploaded.
+- Addressed PR review feedback by extracting the duplicated smoke logic into
+  `.github/scripts/smoke_install_built_wheel.py`, which fails non-zero if the
+  installed default config differs from `mock disabled int8`.
 - Updated `docs/state/registry.md` and
   `docs/state/epics/coffee-roaster-mcp-v0.1.md` to mark E7-S2 complete and
   route the next story to E7-S3 Warp MCP client connection validation.
+
+## Review Comparison
+
+- CodeRabbit and Codex both identified the same substantive issue: the original
+  workflow command printed `mock disabled int8` but did not assert it, so CI
+  would still pass if the installed defaults regressed.
+- CodeRabbit also raised two maintainability points: the config check was too
+  long as a one-liner, and the smoke-install logic was duplicated across CI and
+  release workflows.
+- The fix addresses both reviewers by using one reusable Python smoke script
+  from both workflows and making the installed default-config smoke an explicit
+  assertion.
 
 ## Validation
 
@@ -75,6 +90,22 @@ Commands run:
   - `Checks`: success.
   - `Build Package`: success, including the new
     `Smoke install built wheel` step.
+- PR review fix validation:
+  - Thread-aware PR review fetch confirmed three unresolved actionable threads:
+    two CodeRabbit threads and one Codex thread.
+  - `./.venv/bin/python .github/scripts/smoke_install_built_wheel.py --venv-path /tmp/coffee-roaster-mcp-e7-s2-review-wheel-smoke`:
+    initial sandboxed run failed to resolve dependencies because network access
+    was blocked.
+  - `./.venv/bin/python .github/scripts/smoke_install_built_wheel.py --venv-path /tmp/coffee-roaster-mcp-e7-s2-review-wheel-smoke`
+    with approved network access: passed and printed `mock disabled int8`.
+  - `./.venv/bin/python -m pytest tests/test_package_metadata.py tests/test_package.py::test_main_prints_help`:
+    3 passed.
+  - `./.venv/bin/python -m pytest`: 356 passed.
+  - `./.venv/bin/python -m ruff check .`: passed after removing unused imports
+    from the new helper script.
+  - `./.venv/bin/python -m ruff format --check .`: 31 files already formatted.
+  - `./.venv/bin/python -m pyright`: 0 errors, 0 warnings, 0 informations.
+  - `git diff --check`: passed.
 
 ## Risks And Notes
 
@@ -90,7 +121,7 @@ Commands run:
 
 ## Usage Snapshot
 
-- Token usage: not provided.
+- Before review fixes: `121K used`.
 
 ## Restart Prompt
 
