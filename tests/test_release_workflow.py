@@ -89,6 +89,25 @@ def test_release_workflow_pins_and_verifies_mcp_publisher() -> None:
     assert "curl" in run_script and "| tar" not in run_script
 
 
+def test_release_workflow_metadata_validation_reports_clear_shape_errors() -> None:
+    """Check release metadata validation guards produce clear operator errors."""
+    validation_job = _load_release_workflow()["jobs"]["validate-release-metadata"]
+    validation_step = _step_named(
+        validation_job,
+        "Validate release tag, package version, and registry metadata",
+    )
+    run_script = validation_step["run"]
+
+    assert "version_match = re.search" in run_script
+    assert "if version_match is None:" in run_script
+    assert "Could not find __version__" in run_script
+    assert "Expected __version__" in run_script
+    assert 'packages = server_json.get("packages")' in run_script
+    assert "not isinstance(packages, list)" in run_script
+    assert "len(packages) == 0" in run_script
+    assert "server.json must contain a non-empty 'packages' array." in run_script
+
+
 def test_release_runbook_documents_operator_prerequisites() -> None:
     """Check the release runbook documents the operator setup required by E6-S5."""
     runbook = (Path(__file__).resolve().parents[1] / "docs" / "release.md").read_text(

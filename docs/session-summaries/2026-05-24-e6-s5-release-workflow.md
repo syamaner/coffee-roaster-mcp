@@ -97,6 +97,10 @@ The review concerns were valid and addressed locally:
   extraction.
 - `tests/test_release_workflow.py` now verifies pinned action refs, checkout
   credential hardening, and the pinned/checksum-verified publisher install.
+- Follow-up CodeRabbit metadata-validation comments were also addressed:
+  missing `__version__` and missing or empty `server.json.packages` now fail
+  with explicit release-operator error messages instead of generic Python
+  exceptions.
 
 Durable state updates:
 
@@ -109,11 +113,11 @@ Durable state updates:
 
 Focused validation:
 
-- `./.venv/bin/python -m pytest tests/test_release_workflow.py`: 6 passed
+- `./.venv/bin/python -m pytest tests/test_release_workflow.py`: 7 passed
 
 Full validation:
 
-- `./.venv/bin/python -m pytest`: 354 passed
+- `./.venv/bin/python -m pytest`: 355 passed
 - `./.venv/bin/python -m build`: built
   `coffee_roaster_mcp-0.1.0.tar.gz` and
   `coffee_roaster_mcp-0.1.0-py3-none-any.whl`

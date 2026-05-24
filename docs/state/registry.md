@@ -291,14 +291,16 @@ environment approval, and publishes MCP Registry metadata with `mcp-publisher`
 GitHub OIDC only after the PyPI publish job succeeds. Review hardening pins
 GitHub Actions refs to commit SHAs, disables checkout credential persistence,
 and pins the `mcp-publisher` v1.7.9 Linux amd64 asset with SHA-256
-verification before execution. `docs/release.md`
+verification before execution. Follow-up metadata-validation hardening gives
+explicit release-operator errors for missing `__version__` and missing or empty
+`server.json.packages`. `docs/release.md`
 documents PyPI account ownership, 2FA/recovery codes, Trusted Publishing setup
 for `release.yml`/`release`/`publish-pypi`, protected `v*` tag rules, TestPyPI
 status, and the exact `PYPI_API_TOKEN` fallback secret name. Focused workflow
 tests pin the trigger, job ordering, environment/OIDC permissions, immutable
-action refs, publisher verification, publish actions, and prerequisite runbook
-text. Live publishing is not executed by this story; E6-S6 remains the MCP
-Registry verification spike.
+action refs, publisher verification, release metadata failure messages, publish
+actions, and prerequisite runbook text. Live publishing is not executed by this
+story; E6-S6 remains the MCP Registry verification spike.
 
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX

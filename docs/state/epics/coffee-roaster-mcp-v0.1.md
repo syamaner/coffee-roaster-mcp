@@ -1748,20 +1748,23 @@ After completing a story:
     Trusted Publishing, and MCP Registry publishing after PyPI succeeds.
     Review hardening pins GitHub Actions refs to commit SHAs, disables checkout
     credential persistence, and verifies the pinned `mcp-publisher` v1.7.9
-    Linux amd64 asset SHA-256 before execution.
+    Linux amd64 asset SHA-256 before execution. Follow-up metadata-validation
+    hardening gives explicit release-operator errors for missing `__version__`
+    and missing or empty `server.json.packages`.
   - Added `docs/release.md` documenting PyPI owner prerequisites, 2FA and
     recovery-code setup, Trusted Publishing configuration for
     `release.yml`/`release`/`publish-pypi`, protected `v*` tag rules, TestPyPI
     status, and the `PYPI_API_TOKEN` fallback secret name.
   - Added focused release workflow coverage in `tests/test_release_workflow.py`,
     including pinned action refs, checkout credential persistence, and
-    `mcp-publisher` checksum verification.
+    `mcp-publisher` checksum verification. Follow-up coverage pins the clear
+    metadata-validation failure messages.
   - Kept live PyPI upload, live MCP Registry publish, TestPyPI rehearsal,
     hardware validation, model training/export/sync, real microphone
     validation, and broad release validation out of scope.
   - Ran `./.venv/bin/python -m pytest tests/test_release_workflow.py`:
-    6 passed.
-  - Ran `./.venv/bin/python -m pytest`: 354 passed.
+    7 passed.
+  - Ran `./.venv/bin/python -m pytest`: 355 passed.
   - Ran `./.venv/bin/python -m build`: built
     `coffee_roaster_mcp-0.1.0.tar.gz` and
     `coffee_roaster_mcp-0.1.0-py3-none-any.whl`.

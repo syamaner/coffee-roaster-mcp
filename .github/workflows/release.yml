@@ -79,7 +79,16 @@ jobs:
           from pathlib import Path
 
           ref = os.environ["GITHUB_REF"]
-          version = re.search(r'__version__ = "([^"]+)"', Path("src/coffee_roaster_mcp/__init__.py").read_text()).group(1)
+          init_path = Path("src/coffee_roaster_mcp/__init__.py")
+          version_match = re.search(r'__version__ = "([^"]+)"', init_path.read_text())
+          if version_match is None:
+              print(
+                  f"Could not find __version__ in {init_path}. Expected __version__ = \"...\".",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          version = version_match.group(1)
           server_json = json.loads(Path("server.json").read_text())
 
           expected_tag = f"refs/tags/v{version}"
@@ -91,7 +100,12 @@ jobs:
               print("server.json.version must match the package version.", file=sys.stderr)
               sys.exit(1)
 
-          package = server_json["packages"][0]
+          packages = server_json.get("packages")
+          if not isinstance(packages, list) or len(packages) == 0:
+              print("server.json must contain a non-empty 'packages' array.", file=sys.stderr)
+              sys.exit(1)
+
+          package = packages[0]
           if package["version"] != version:
               print("server.json package version must match the package version.", file=sys.stderr)
               sys.exit(1)
