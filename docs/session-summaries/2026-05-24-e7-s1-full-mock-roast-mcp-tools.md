@@ -85,6 +85,10 @@ Commands run:
   public `mark_first_crack` override while default first-crack mode remains
   `disabled`.
 
+## Usage Snapshot
+
+- Token usage: `275K used`
+
 ## Restart Prompt
 
 Resume in the local clone of `syamaner/coffee-roaster-mcp`. E7-S1 is complete
