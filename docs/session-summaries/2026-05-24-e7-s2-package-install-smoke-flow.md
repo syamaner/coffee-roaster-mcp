@@ -106,6 +106,21 @@ Commands run:
   - `./.venv/bin/python -m ruff format --check .`: 31 files already formatted.
   - `./.venv/bin/python -m pyright`: 0 errors, 0 warnings, 0 informations.
   - `git diff --check`: passed.
+- Second CodeRabbit review fix validation:
+  - New review `4353238457` identified that installed `--help` and `--version`
+    checks asserted process success but not output content.
+  - Updated `.github/scripts/smoke_install_built_wheel.py` to capture CLI
+    output, assert help output contains expected help text, and assert version
+    output matches `coffee-roaster-mcp X.Y.Z`.
+  - `./.venv/bin/python .github/scripts/smoke_install_built_wheel.py --venv-path /tmp/coffee-roaster-mcp-e7-s2-output-review-wheel-smoke`
+    with approved network access: passed, including asserted help output,
+    version output, and default config output.
+  - `./.venv/bin/python -m pytest tests/test_package_metadata.py tests/test_package.py::test_main_prints_help`:
+    3 passed.
+  - `./.venv/bin/python -m ruff check .`: passed.
+  - `./.venv/bin/python -m ruff format --check .`: 31 files already formatted.
+  - `./.venv/bin/python -m py_compile .github/scripts/smoke_install_built_wheel.py`:
+    passed.
 
 ## Risks And Notes
 

@@ -1073,6 +1073,12 @@ After completing a story:
     passed with 3 tests; `./.venv/bin/python -m pytest` passed with 356 tests;
     `./.venv/bin/python -m ruff check .`, `./.venv/bin/python -m ruff format --check .`,
     `./.venv/bin/python -m pyright`, and `git diff --check` passed.
+  - Second CodeRabbit review hardening changed the helper script so installed
+    `--help` and `--version` smokes capture and assert output content instead
+    of checking process success only. The updated smoke script passed with
+    approved network access using
+    `/tmp/coffee-roaster-mcp-e7-s2-output-review-wheel-smoke`, and focused
+    pytest, ruff, format check, and helper-script compile checks passed.
   - Kept hardware validation, Warp MCP validation, ChatGPT MCP validation,
     model training/export/sync, real microphone validation, and live release
     publishing out of scope.

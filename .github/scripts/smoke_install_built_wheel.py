@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import venv
@@ -39,8 +40,8 @@ def main() -> int:
 
     _run([python, "-m", "pip", "install", "--upgrade", "pip"])
     _run([python, "-m", "pip", "install", str(wheel)])
-    _run([coffee_roaster_mcp, "--help"])
-    _run([coffee_roaster_mcp, "--version"])
+    _assert_cli_help(coffee_roaster_mcp)
+    _assert_cli_version(coffee_roaster_mcp)
     _assert_installed_default_config(python)
 
     return 0
@@ -66,6 +67,31 @@ def _venv_bin(venv_path: Path) -> Path:
 
 def _run(command: list[Path | str]) -> None:
     subprocess.run([str(part) for part in command], check=True)
+
+
+def _run_capture(command: list[Path | str]) -> str:
+    completed = subprocess.run(
+        [str(part) for part in command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _assert_cli_help(coffee_roaster_mcp: Path) -> None:
+    help_output = _run_capture([coffee_roaster_mcp, "--help"])
+    normalized_help = help_output.lower()
+    if "usage:" not in normalized_help or "roastpilot" not in normalized_help:
+        raise SystemExit("CLI --help output did not include expected help text.")
+    print(help_output)
+
+
+def _assert_cli_version(coffee_roaster_mcp: Path) -> None:
+    version_output = _run_capture([coffee_roaster_mcp, "--version"])
+    if re.fullmatch(r"coffee-roaster-mcp \d+\.\d+\.\d+", version_output) is None:
+        raise SystemExit(f"Unexpected --version output: {version_output!r}")
+    print(version_output)
 
 
 def _assert_installed_default_config(python: Path) -> None:
