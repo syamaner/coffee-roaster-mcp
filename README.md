@@ -383,9 +383,9 @@ Current export files:
 - `roast.csv` with telemetry and event rows using the planned CSV columns for
   timestamps, elapsed seconds, phase, temperatures, controls, event flags,
   development percent, RoR/delta metrics, and first-crack model metadata
-- `summary.json` with current session-level metadata and timestamp-derived
-  metrics
+- `summary.json` with session timestamps, total roast seconds, development
+  metrics, roaster driver, and first-crack model metadata
 - output under `logs/roasts/{session_id}/`
 
-Final `summary.json` schema work and broad release validation land in later
-stories.
+Final cross-format log schema completeness tests and broad release validation
+land in later stories.

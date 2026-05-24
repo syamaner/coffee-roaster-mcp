@@ -69,6 +69,7 @@ class RoastLogExport:
 def export_roast_snapshot(
     session: RoastSession,
     *,
+    roaster_driver: str = "mock",
     ror_window_seconds: float = 60.0,
     ror_min_sample_seconds: float = 10.0,
 ) -> RoastLogExport:
@@ -80,6 +81,7 @@ def export_roast_snapshot(
 
     Args:
         session: Copied session snapshot to export.
+        roaster_driver: Configured roaster driver used for the session.
         ror_window_seconds: Rolling telemetry window for RoR calculations.
         ror_min_sample_seconds: Minimum valid sensor sample span required for RoR.
 
@@ -112,6 +114,7 @@ def export_roast_snapshot(
     _write_summary_json(
         summary_path,
         session=session,
+        roaster_driver=roaster_driver,
         ror_window_seconds=ror_window_seconds,
         ror_min_sample_seconds=ror_min_sample_seconds,
     )
@@ -161,19 +164,22 @@ def _write_summary_json(
     path: Path,
     *,
     session: RoastSession,
+    roaster_driver: str,
     ror_window_seconds: float = 60.0,
     ror_min_sample_seconds: float = 10.0,
 ) -> None:
-    """Write a compact summary for the exported session snapshot."""
+    """Write a session-level summary with the planned summary schema fields."""
     metrics = compute_roast_metrics(
         session,
         ror_window_seconds=ror_window_seconds,
         ror_min_sample_seconds=ror_min_sample_seconds,
     )
+    first_crack_model = _summary_first_crack_model(session)
     payload: dict[str, Any] = {
         "session_id": session.id,
         "active": session.active,
         "phase": session.phase,
+        "started_at_utc": session.created_at_utc.isoformat(),
         "created_at_utc": session.created_at_utc.isoformat(),
         "stopped_at_utc": _iso_or_none(session.stopped_at_utc),
         "beans_added_at_utc": _iso_or_none(session.beans_added_at_utc),
@@ -186,10 +192,16 @@ def _write_summary_json(
         "fan_level_percent": session.fan_level_percent,
         "cooling_on": session.cooling_on,
         "event_count": len(session.event_timeline),
+        "total_roast_seconds": metrics.roast_elapsed_seconds,
+        "development_time_seconds": metrics.development_time_seconds,
+        "development_time_percent": metrics.development_percent,
+        "roaster_driver": roaster_driver,
+        "first_crack_model": first_crack_model,
         "metrics": {
             "roast_elapsed_seconds": metrics.roast_elapsed_seconds,
             "development_time_seconds": metrics.development_time_seconds,
             "development_percent": metrics.development_percent,
+            "development_time_percent": metrics.development_percent,
             "bean_temp_delta_60s_c": metrics.bean_temp_delta_60s_c,
             "env_temp_delta_60s_c": metrics.env_temp_delta_60s_c,
             "bean_ror_c_per_min": metrics.bean_ror_c_per_min,
@@ -209,6 +221,21 @@ def _event_row(*, session: RoastSession, event: RoastEvent) -> dict[str, Any]:
         "monotonic_seconds": event.monotonic_seconds,
         "payload": dict(event.payload),
     }
+
+
+def _summary_first_crack_model(session: RoastSession) -> dict[str, str | None]:
+    """Return first-crack model metadata for summary export."""
+    payload = _first_crack_payload_from(session.event_timeline)
+    return {
+        "repo_id": _string_payload_value(payload.get("repo_id")),
+        "revision": _string_payload_value(payload.get("revision")),
+        "precision": _string_payload_value(payload.get("precision")),
+    }
+
+
+def _string_payload_value(value: EventPayloadValue | None) -> str | None:
+    """Return a payload value only when it is string metadata."""
+    return value if isinstance(value, str) else None
 
 
 def _csv_rows(

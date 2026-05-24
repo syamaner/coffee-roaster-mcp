@@ -107,11 +107,74 @@ def test_snapshot_export_preserves_first_crack_detector_metadata(tmp_path: Path)
     assert first_crack_csv_row["fc_model_precision"] == "int8"
 
     summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
+    assert summary["started_at_utc"] == "2026-05-17T14:00:00+00:00"
     assert summary["first_crack_at_utc"] == "2026-05-17T14:00:37.250000+00:00"
+    assert summary["total_roast_seconds"] == 65.0
+    assert summary["development_time_seconds"] == 32.75
+    assert summary["development_time_percent"] == 50.385
+    assert summary["roaster_driver"] == "mock"
+    assert summary["first_crack_model"] == {
+        "repo_id": "syamaner/coffee-first-crack-detection",
+        "revision": "v0.1.0",
+        "precision": "int8",
+    }
     assert summary["metrics"]["development_time_seconds"] == 32.75
     assert summary["metrics"]["development_percent"] == 50.385
+    assert summary["metrics"]["development_time_percent"] == 50.385
     assert summary["metrics"]["bean_ror_c_per_min"] is None
     assert summary["metrics"]["env_ror_c_per_min"] is None
+
+
+def test_snapshot_export_summary_includes_plan_required_schema(
+    tmp_path: Path,
+) -> None:
+    """Export summary.json with session timing, driver, and model fields."""
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    clock.utc_value = datetime(2026, 5, 17, 14, 0, 10, tzinfo=UTC)
+    clock.monotonic_value = 110.0
+    store.record_event(session, "beans_added")
+    clock.utc_value = datetime(2026, 5, 17, 14, 1, tzinfo=UTC)
+    clock.monotonic_value = 160.0
+    store.record_event(
+        session,
+        "first_crack_detected",
+        payload={
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "revision": "release-2026-05",
+            "precision": "fp32",
+            "confidence": 0.91,
+        },
+    )
+    clock.utc_value = datetime(2026, 5, 17, 14, 1, 30, tzinfo=UTC)
+    clock.monotonic_value = 190.0
+    store.record_event(session, "beans_dropped")
+
+    export = export_roast_snapshot(
+        session,
+        roaster_driver="hottop_kn8828b_2k_plus",
+    )
+
+    summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
+    assert summary["session_id"] == session.id
+    assert summary["started_at_utc"] == "2026-05-17T14:00:00+00:00"
+    assert summary["beans_added_at_utc"] == "2026-05-17T14:00:10+00:00"
+    assert summary["first_crack_at_utc"] == "2026-05-17T14:01:00+00:00"
+    assert summary["beans_dropped_at_utc"] == "2026-05-17T14:01:30+00:00"
+    assert summary["total_roast_seconds"] == 80.0
+    assert summary["development_time_seconds"] == 30.0
+    assert summary["development_time_percent"] == 37.5
+    assert summary["roaster_driver"] == "hottop_kn8828b_2k_plus"
+    assert summary["first_crack_model"] == {
+        "repo_id": "syamaner/coffee-first-crack-detection",
+        "revision": "release-2026-05",
+        "precision": "fp32",
+    }
 
 
 def test_snapshot_export_uses_configured_ror_parameters(tmp_path: Path) -> None:
