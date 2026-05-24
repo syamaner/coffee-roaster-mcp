@@ -1,11 +1,13 @@
 """Release workflow coverage for PyPI and MCP Registry publishing."""
 
+import re
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml"
+PINNED_ACTION_REF = re.compile(r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}$")
 
 
 def test_release_workflow_runs_on_tags_and_manual_dry_run() -> None:
@@ -48,12 +50,43 @@ def test_release_workflow_uses_trusted_publishing_and_release_environment() -> N
 
     assert pypi_job["environment"] == "release"
     assert pypi_job["permissions"] == {"contents": "read", "id-token": "write"}
-    assert _step_uses(pypi_job, "pypa/gh-action-pypi-publish@release/v1")
+    assert _step_uses_pinned_action(pypi_job, "pypa/gh-action-pypi-publish")
 
     assert registry_job["environment"] == "release"
     assert registry_job["permissions"] == {"contents": "read", "id-token": "write"}
     assert _step_runs(registry_job, "./mcp-publisher login github-oidc")
     assert _step_runs(registry_job, "./mcp-publisher publish --file=server.json")
+
+
+def test_release_workflow_pins_actions_and_checkout_credentials() -> None:
+    """Check action steps use immutable refs and checkout does not persist credentials."""
+    jobs = _load_release_workflow()["jobs"]
+
+    for job in jobs.values():
+        for step in job["steps"]:
+            action = step.get("uses")
+            if action is None:
+                continue
+            assert PINNED_ACTION_REF.match(action), action
+            if action.startswith("actions/checkout@"):
+                assert step["with"]["persist-credentials"] is False
+
+
+def test_release_workflow_pins_and_verifies_mcp_publisher() -> None:
+    """Check MCP Registry publishing does not execute an unverified latest binary."""
+    registry_job = _load_release_workflow()["jobs"]["publish-mcp-registry"]
+    install_step = _step_named(registry_job, "Install mcp-publisher")
+    run_script = install_step["run"]
+
+    assert 'MCP_PUBLISHER_VERSION="v1.7.9"' in run_script
+    assert (
+        'MCP_PUBLISHER_SHA256="ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac"'
+        in run_script
+    )
+    assert "releases/download/${MCP_PUBLISHER_VERSION}" in run_script
+    assert "releases/latest" not in run_script
+    assert "sha256sum -c -" in run_script
+    assert "curl" in run_script and "| tar" not in run_script
 
 
 def test_release_runbook_documents_operator_prerequisites() -> None:
@@ -81,9 +114,19 @@ def _load_release_workflow() -> dict[str, Any]:
     return yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
 
 
-def _step_uses(job: dict[str, Any], action: str) -> bool:
-    return any(step.get("uses") == action for step in job["steps"])
+def _step_uses_pinned_action(job: dict[str, Any], action_name: str) -> bool:
+    return any(
+        step.get("uses", "").startswith(f"{action_name}@") and PINNED_ACTION_REF.match(step["uses"])
+        for step in job["steps"]
+    )
 
 
 def _step_runs(job: dict[str, Any], command: str) -> bool:
     return any(step.get("run") == command for step in job["steps"])
+
+
+def _step_named(job: dict[str, Any], name: str) -> dict[str, Any]:
+    for step in job["steps"]:
+        if step.get("name") == name:
+            return step  # type: ignore[no-any-return]
+    raise AssertionError(f"Step {name!r} was not found.")

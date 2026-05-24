@@ -40,9 +40,10 @@ release validation was performed.
 - `release-dry-run` confirms wheel and source distribution artifacts exist and
   does not run upload actions.
 - `publish-pypi` uses the `release` GitHub environment, `id-token: write`, and
-  `pypa/gh-action-pypi-publish@release/v1`.
+  a commit-pinned `pypa/gh-action-pypi-publish` action.
 - `publish-mcp-registry` depends on `publish-pypi`, uses the same `release`
-  environment and OIDC permission, installs `mcp-publisher`, authenticates with
+  environment and OIDC permission, installs the pinned `mcp-publisher` v1.7.9
+  Linux amd64 asset after SHA-256 verification, authenticates with
   `github-oidc`, and publishes `server.json`.
 
 `docs/release.md` documents the operator prerequisites before live publishing:
@@ -62,9 +63,40 @@ release validation was performed.
 - build/test before publish ordering
 - PyPI publish before MCP Registry publish ordering
 - `release` environment and `id-token: write` permissions for live publish jobs
+- commit-pinned GitHub Actions refs and disabled checkout credential persistence
 - PyPI Trusted Publishing action
+- pinned and SHA-256 verified `mcp-publisher` install
 - MCP Registry `mcp-publisher login github-oidc` and `publish --file=server.json`
 - required operator prerequisite runbook text
+
+## Review Follow-Up
+
+Pre-review context token usage snapshot: `386K used`
+
+Post-review context token usage snapshot: `495K used`
+
+CodeRabbit and Codex review comments raised overlapping supply-chain hardening
+concerns:
+
+- Add `persist-credentials: false` to every checkout step.
+- Pin mutable GitHub Actions refs to immutable commit SHAs.
+- Stop downloading `mcp-publisher` from `releases/latest`.
+- Verify the downloaded `mcp-publisher` asset before executing it.
+- Update workflow tests so the PyPI publish action expectation requires an
+  immutable 40-character SHA ref.
+
+The review concerns were valid and addressed locally:
+
+- All `actions/checkout`, `actions/setup-python`, `actions/upload-artifact`,
+  `actions/download-artifact`, and `pypa/gh-action-pypi-publish` references are
+  now pinned to commit SHAs.
+- Every checkout step sets `persist-credentials: false`.
+- `mcp-publisher` is pinned to `v1.7.9` and the Linux amd64 release asset is
+  checked against SHA-256
+  `ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac` before
+  extraction.
+- `tests/test_release_workflow.py` now verifies pinned action refs, checkout
+  credential hardening, and the pinned/checksum-verified publisher install.
 
 Durable state updates:
 
@@ -77,11 +109,11 @@ Durable state updates:
 
 Focused validation:
 
-- `./.venv/bin/python -m pytest tests/test_release_workflow.py`: 4 passed
+- `./.venv/bin/python -m pytest tests/test_release_workflow.py`: 6 passed
 
 Full validation:
 
-- `./.venv/bin/python -m pytest`: 352 passed
+- `./.venv/bin/python -m pytest`: 354 passed
 - `./.venv/bin/python -m build`: built
   `coffee_roaster_mcp-0.1.0.tar.gz` and
   `coffee_roaster_mcp-0.1.0-py3-none-any.whl`

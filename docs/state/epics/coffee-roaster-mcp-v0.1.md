@@ -325,8 +325,11 @@ The first implementation milestone is a mock vertical slice that requires no roa
   builds distribution artifacts, supports manual dry run without uploading,
   publishes to PyPI through Trusted Publishing after `release` environment
   approval, and publishes MCP Registry metadata with `mcp-publisher` GitHub
-  OIDC only after PyPI succeeds. `docs/release.md` documents PyPI ownership,
-  2FA/recovery codes, Trusted Publishing setup for `release.yml`/`release`/
+  OIDC only after PyPI succeeds. Review hardening pins GitHub Actions refs to
+  commit SHAs, disables checkout credential persistence, and pins the
+  `mcp-publisher` v1.7.9 Linux amd64 asset with SHA-256 verification before
+  execution. `docs/release.md` documents PyPI ownership, 2FA/recovery codes,
+  Trusted Publishing setup for `release.yml`/`release`/
   `publish-pypi`, protected `v*` tag rules, TestPyPI status, and the
   `PYPI_API_TOKEN` fallback secret name. Live publishing was not executed by
   this story; E6-S6 remains the MCP Registry publishing verification spike.
@@ -1743,17 +1746,22 @@ After completing a story:
   - Added `.github/workflows/release.yml` with a manual dry-run path, tag-based
     live release path, checks, release metadata validation, package build, PyPI
     Trusted Publishing, and MCP Registry publishing after PyPI succeeds.
+    Review hardening pins GitHub Actions refs to commit SHAs, disables checkout
+    credential persistence, and verifies the pinned `mcp-publisher` v1.7.9
+    Linux amd64 asset SHA-256 before execution.
   - Added `docs/release.md` documenting PyPI owner prerequisites, 2FA and
     recovery-code setup, Trusted Publishing configuration for
     `release.yml`/`release`/`publish-pypi`, protected `v*` tag rules, TestPyPI
     status, and the `PYPI_API_TOKEN` fallback secret name.
-  - Added focused release workflow coverage in `tests/test_release_workflow.py`.
+  - Added focused release workflow coverage in `tests/test_release_workflow.py`,
+    including pinned action refs, checkout credential persistence, and
+    `mcp-publisher` checksum verification.
   - Kept live PyPI upload, live MCP Registry publish, TestPyPI rehearsal,
     hardware validation, model training/export/sync, real microphone
     validation, and broad release validation out of scope.
   - Ran `./.venv/bin/python -m pytest tests/test_release_workflow.py`:
-    4 passed.
-  - Ran `./.venv/bin/python -m pytest`: 352 passed.
+    6 passed.
+  - Ran `./.venv/bin/python -m pytest`: 354 passed.
   - Ran `./.venv/bin/python -m build`: built
     `coffee_roaster_mcp-0.1.0.tar.gz` and
     `coffee_roaster_mcp-0.1.0-py3-none-any.whl`.
