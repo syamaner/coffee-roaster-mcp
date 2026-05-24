@@ -34,6 +34,45 @@ EXPECTED_CSV_FIELDNAMES = [
     "fc_model_revision",
     "fc_model_precision",
 ]
+EXPECTED_SUMMARY_KEYS = {
+    "session_id",
+    "active",
+    "phase",
+    "started_at_utc",
+    "created_at_utc",
+    "stopped_at_utc",
+    "beans_added_at_utc",
+    "first_crack_at_utc",
+    "beans_dropped_at_utc",
+    "cooling_started_at_utc",
+    "cooling_stopped_at_utc",
+    "faulted_at_utc",
+    "heat_level_percent",
+    "fan_level_percent",
+    "cooling_on",
+    "event_count",
+    "total_roast_seconds",
+    "development_time_seconds",
+    "development_time_percent",
+    "roaster_driver",
+    "first_crack_model",
+    "metrics",
+}
+EXPECTED_SUMMARY_METRICS_KEYS = {
+    "roast_elapsed_seconds",
+    "development_time_seconds",
+    "development_percent",
+    "development_time_percent",
+    "bean_temp_delta_60s_c",
+    "env_temp_delta_60s_c",
+    "bean_ror_c_per_min",
+    "env_ror_c_per_min",
+}
+EXPECTED_FIRST_CRACK_MODEL_KEYS = {
+    "repo_id",
+    "revision",
+    "precision",
+}
 
 
 class ClockHarness:
@@ -175,6 +214,38 @@ def test_snapshot_export_summary_includes_plan_required_schema(
         "revision": "release-2026-05",
         "precision": "fp32",
     }
+
+
+def test_snapshot_export_summary_schema_completeness(tmp_path: Path) -> None:
+    """Pin the top-level summary, metrics, and model metadata schema keys."""
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 135.0
+    store.record_event(
+        session,
+        "first_crack_detected",
+        payload={
+            "repo_id": "syamaner/coffee-first-crack-detection",
+            "revision": "v0.1.0",
+            "precision": "int8",
+        },
+    )
+    clock.monotonic_value = 180.0
+    store.record_event(session, "beans_dropped")
+
+    export = export_roast_snapshot(session)
+
+    summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
+    assert set(summary) == EXPECTED_SUMMARY_KEYS
+    assert set(summary["metrics"]) == EXPECTED_SUMMARY_METRICS_KEYS
+    assert set(summary["first_crack_model"]) == EXPECTED_FIRST_CRACK_MODEL_KEYS
 
 
 def test_snapshot_export_uses_configured_ror_parameters(tmp_path: Path) -> None:

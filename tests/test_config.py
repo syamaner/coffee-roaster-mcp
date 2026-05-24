@@ -25,6 +25,7 @@ def test_default_config_allows_mock_run_without_file(
     assert config.audio.source == "microphone"
     assert config.audio.wav_path is None
     assert config.logging.log_dir == Path("./logs")
+    assert config.logging.sample_interval_seconds == 5.0
     assert config.logging.export_formats == ("jsonl", "csv", "summary")
     assert config.session.auto_t0_detection_enabled is False
     assert config.session.auto_t0_drop_threshold_c == 25.0

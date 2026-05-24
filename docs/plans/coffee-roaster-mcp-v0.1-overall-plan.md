@@ -83,7 +83,7 @@ audio:
 
 logging:
   log_dir: ./logs
-  sample_interval_seconds: 1.0
+  sample_interval_seconds: 5.0
   export_formats:
     - jsonl
     - csv
@@ -148,7 +148,8 @@ Environment overrides:
 - Write append-only JSONL during roast.
 - Export CSV and `summary.json`.
 - Store files under `logs/roasts/{session_id}/`.
-- Log at 1 Hz plus immediate event rows.
+- Log sampled telemetry at the configured interval, defaulting to 5 seconds,
+  plus immediate event rows.
 - Required CSV columns:
   - `timestamp_utc`
   - `elapsed_seconds`
@@ -476,7 +477,7 @@ Acceptance criteria:
 - RoR is null before 10 seconds of samples.
 - RoR and deltas are correct for regular and irregular sample intervals.
 - JSONL, CSV, and summary include required fields.
-- Event rows are written immediately, not only on the 1 Hz sample loop.
+- Event rows are written immediately, not only on the sampled telemetry loop.
 
 ### Epic 6: Distribution And MCP Registry Publishing
 

@@ -65,7 +65,7 @@ class LoggingConfig:
     """Roast logging configuration."""
 
     log_dir: Path = Path("./logs")
-    sample_interval_seconds: float = 1.0
+    sample_interval_seconds: float = 5.0
     export_formats: tuple[ExportFormat, ...] = ("jsonl", "csv", "summary")
 
 
@@ -248,7 +248,7 @@ def _logging_from_mapping(raw: Mapping[str, Any]) -> LoggingConfig:
         sample_interval_seconds=_positive_float(
             raw,
             "sample_interval_seconds",
-            1.0,
+            5.0,
             label="logging.sample_interval_seconds",
         ),
         export_formats=_export_formats(raw.get("export_formats", ("jsonl", "csv", "summary"))),
