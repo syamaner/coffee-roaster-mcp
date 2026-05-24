@@ -373,9 +373,20 @@ Warp as the local MCP client on the mock-safe path. E7-S4 validates manual
 operator-approved Hottop device control through Warp MCP tool calls, with no
 autonomous hardware-control decisions.
 
-The next story is E7-S3: test Warp MCP client connection on the mock-safe path
-before Warp manual Hottop control validation or full end-to-end agent roast
-validation.
+E7-S3 completed Warp MCP client connection validation on the mock-safe
+published-package path. Warp launched the `roastpilot` stdio MCP server through
+`uvx --from coffee-roaster-mcp==0.1.0 coffee-roaster-mcp serve`, discovered the
+expected public RoastPilot tools, confirmed runtime config `mock`, `disabled`,
+and `auto_t0_detection_enabled: false`, completed a full mock roast through
+Warp public MCP tool calls, and exported verified `roast.jsonl`, `roast.csv`,
+and `summary.json` files under
+`/private/tmp/roastpilot-warp-mock/logs/roasts/b279284880fd4263b2cc0df5366e557f/`.
+
+The next story is E7-S4: run Warp manual Hottop MCP control validation with
+operator approval for each hardware-affecting tool call. Do not run full
+end-to-end agent roast validation, ChatGPT MCP validation, model
+training/export/sync, or real microphone validation unless a later story
+explicitly requires it.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

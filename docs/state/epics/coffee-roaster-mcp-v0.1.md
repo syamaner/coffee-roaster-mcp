@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E7-S3`
-- Current target: Warp MCP client connection validation
+- Active story: `E7-S4`
+- Current target: Warp manual Hottop MCP control validation
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -40,6 +40,12 @@ The first implementation milestone is a mock vertical slice that requires no roa
   wheel into a clean virtual environment, run the installed CLI `--help` and
   `--version` smoke checks, and confirm installed default config stays on
   roaster driver `mock`, first-crack mode `disabled`, and INT8 precision.
+- `E7-S3` keeps Warp MCP client connection validation on the mock-safe
+  published-package path: Warp launches `coffee-roaster-mcp==0.1.0` through
+  `uvx`, uses an explicit mock-safe config and working directory, discovers the
+  public RoastPilot MCP tools, confirms runtime config `mock`, `disabled`, and
+  auto-T0 disabled, completes a full mock roast through public MCP tools, and
+  verifies exported JSONL, CSV, and summary outputs.
 - `E2-S1` keeps the initial MCP tool surface bootstrap-safe with `get_server_info` and `get_runtime_config`. Roast-session lifecycle and roast-control tools remain later Epic 2 work.
 - `E2-S2` uses one in-process `RoastSessionStore` with at most one active `RoastSession` at a time. Session state now owns monotonic timing, phase, event timeline storage, telemetry retention, and log-writer references before tool wiring lands.
 - `E2-S3` keeps event writes behind `RoastSessionStore.record_event(...)`. The session timeline now records deterministic append order, authoritative UTC plus monotonic timestamps for core roast events, and idempotent singleton handling for beans added, first crack, bean drop, and cooling transitions.
@@ -793,7 +799,7 @@ Goal: prove the package works from install through mock roast, MCP client calls,
 - [x] `E7-S2` Test package install smoke flow.
   - Done when a built wheel can be installed and `coffee-roaster-mcp --help` works.
 
-- [ ] `E7-S3` Test Warp MCP client connection.
+- [x] `E7-S3` Test Warp MCP client connection.
   - Done when Warp can configure, start, discover, and call the local stdio
     MCP server on the mock-safe path, confirm `mock` / `disabled` defaults,
     complete a full mock roast through public MCP tools, and verify exported
@@ -1082,6 +1088,70 @@ After completing a story:
   - Kept hardware validation, Warp MCP validation, ChatGPT MCP validation,
     model training/export/sync, real microphone validation, and live release
     publishing out of scope.
+
+- Validation run for E7-S3:
+  - Verified PR #139 was merged and issue #57 was closed before starting.
+  - Synced `main` to merge commit `efc405de392be3ec2245905c10c5ad06f0e0dfda`
+    and created branch `feature/58-warp-mcp-client-connection`.
+  - Created mock-safe Warp working directory
+    `/tmp/roastpilot-warp-mock` with `coffee-roaster-mcp.yaml` pinning
+    roaster driver `mock`, first-crack mode `disabled`, and
+    `session.auto_t0_detection_enabled: false`.
+  - Installed `uv`/`uvx` with Homebrew because `uvx` was not initially on
+    `PATH`, then verified the published package command from the Warp working
+    directory:
+    `uvx --from coffee-roaster-mcp==0.1.0 coffee-roaster-mcp --version`
+    returned `coffee-roaster-mcp 0.1.0`.
+  - Operator-provided Warp evidence in issue #58 confirmed the `roastpilot`
+    MCP server was enabled/running and discovered 13 RoastPilot tools:
+    `get_server_info`, `get_runtime_config`, `start_roast_session`,
+    `get_roast_state`, `set_heat`, `set_fan`, `mark_beans_added`,
+    `mark_first_crack`, `drop_beans`, `start_cooling`, `stop_cooling`,
+    `export_roast_log`, and `emergency_stop`.
+  - Warp `get_runtime_config` returned config source
+    `/tmp/roastpilot-warp-mock/coffee-roaster-mcp.yaml`, roaster driver
+    `mock`, first-crack mode `disabled`, model precision `int8`,
+    `log_dir: logs`, sample interval `5.0`, and
+    `auto_t0_detection_enabled: false`.
+  - Warp `get_server_info` returned product `RoastPilot`, package
+    `coffee-roaster-mcp`, version `0.1.0`, transport `stdio`,
+    `bootstrap_safe: true`, and the expected public tool list.
+  - Warp started a mock roast session successfully and then completed a full
+    mock roast through public MCP tools: `start_roast_session`, `set_heat` at
+    `60`, `set_fan` at `35`, `mark_beans_added`, `mark_first_crack`,
+    `drop_beans`, `stop_cooling`, `get_roast_state`, and `export_roast_log`.
+  - Verified exported files under
+    `/private/tmp/roastpilot-warp-mock/logs/roasts/b279284880fd4263b2cc0df5366e557f/`:
+    `roast.jsonl`, `roast.csv`, and `summary.json`.
+  - `summary.json` recorded `session_id:
+    b279284880fd4263b2cc0df5366e557f`, `phase: complete`, `active: false`,
+    `roaster_driver: mock`, `event_count: 5`, and empty first-crack model
+    metadata for disabled mode.
+  - `roast.jsonl` contained the expected event rows:
+    `beans_added`, `first_crack_detected`, `beans_dropped`,
+    `cooling_started`, and `cooling_stopped`.
+  - `roast.csv` contained the expected event lifecycle phases:
+    `roasting`, `development`, `dropped`, `cooling`, and `complete`.
+  - Ran structured artifact verification:
+    `./.venv/bin/python -c "..."`
+    validated the summary session id, complete phase, mock driver, empty
+    first-crack model metadata, JSONL event order, and CSV event phases.
+  - Ran `./.venv/bin/python -m pytest`: 356 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: 31 files already
+    formatted.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors, 0 warnings,
+    0 informations.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`:
+    `coffee-roaster-mcp 0.1.0`.
+  - No Warp MCP error logs were needed because server startup, tool discovery,
+    runtime config calls, mock roast tool calls, and export completed
+    successfully. If a future Warp validation fails, issue #58 records the
+    Warp MCP log locations to inspect.
+  - Kept Hottop hardware validation, ChatGPT MCP validation, model
+    training/export/sync, real microphone validation, live release publishing,
+    and full end-to-end agent roast validation out of scope.
 
 - Validation run for E6-S4:
   - Added focused version alignment coverage in `tests/test_server_json.py`.
