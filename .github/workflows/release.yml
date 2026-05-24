@@ -1,0 +1,231 @@
+name: Release
+
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and validate without publishing to PyPI or the MCP Registry."
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Run lint
+        run: python -m ruff check .
+
+      - name: Run format check
+        run: python -m ruff format --check .
+
+      - name: Run typecheck
+        run: python -m pyright --pythonpath "${pythonLocation}/bin/python"
+
+      - name: Run CLI smoke checks
+        run: |
+          coffee-roaster-mcp --help
+          coffee-roaster-mcp --version
+
+  validate-release-metadata:
+    name: Validate Release Metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+
+      - name: Validate release tag, package version, and registry metadata
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          ref = os.environ["GITHUB_REF"]
+          init_path = Path("src/coffee_roaster_mcp/__init__.py")
+          version_match = re.search(r'__version__ = "([^"]+)"', init_path.read_text())
+          if version_match is None:
+              print(
+                  f"Could not find __version__ in {init_path}. Expected __version__ = \"...\".",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          version = version_match.group(1)
+          server_json = json.loads(Path("server.json").read_text())
+
+          expected_tag = f"refs/tags/v{version}"
+          if ref.startswith("refs/tags/") and ref != expected_tag:
+              print(f"Release tag {ref!r} must match package version tag {expected_tag!r}.", file=sys.stderr)
+              sys.exit(1)
+
+          if server_json["version"] != version:
+              print("server.json.version must match the package version.", file=sys.stderr)
+              sys.exit(1)
+
+          packages = server_json.get("packages")
+          if not isinstance(packages, list) or len(packages) == 0:
+              print("server.json must contain a non-empty 'packages' array.", file=sys.stderr)
+              sys.exit(1)
+
+          package = packages[0]
+          if not isinstance(package, dict) or not isinstance(package.get("version"), str):
+              print(
+                  "server.json packages[0] must be an object with a string 'version' field.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          if package["version"] != version:
+              print("server.json package version must match the package version.", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+  build-package:
+    name: Build Package
+    runs-on: ubuntu-latest
+    needs:
+      - checks
+      - validate-release-metadata
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Build distribution artifacts
+        run: python -m build
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  release-dry-run:
+    name: Release Dry Run
+    runs-on: ubuntu-latest
+    needs: build-package
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Confirm dry-run artifacts
+        run: |
+          test -n "$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          {
+            echo "## Release Dry Run"
+            echo
+            echo "Checks passed and package artifacts were built. No upload steps ran."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-pypi:
+    name: Publish PyPI
+    runs-on: ubuntu-latest
+    needs: build-package
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+
+  publish-mcp-registry:
+    name: Publish MCP Registry
+    runs-on: ubuntu-latest
+    needs: publish-pypi
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install mcp-publisher
+        run: |
+          set -euo pipefail
+          MCP_PUBLISHER_VERSION="v1.7.9"
+          MCP_PUBLISHER_SHA256="ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac"
+          MCP_PUBLISHER_ASSET="mcp-publisher_linux_amd64.tar.gz"
+          MCP_PUBLISHER_URL="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/${MCP_PUBLISHER_ASSET}"
+
+          curl -fsSLo /tmp/mcp-publisher.tar.gz "${MCP_PUBLISHER_URL}"
+          echo "${MCP_PUBLISHER_SHA256}  /tmp/mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf /tmp/mcp-publisher.tar.gz mcp-publisher
+          chmod +x mcp-publisher
+
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server metadata to MCP Registry
+        run: ./mcp-publisher publish --file=server.json

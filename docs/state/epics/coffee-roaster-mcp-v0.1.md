@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E6-S5`
-- Current target: Add release workflow
+- Active story: `E6-S6`
+- Current target: Run MCP Registry publishing verification spike
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -320,6 +320,19 @@ The first implementation milestone is a mock vertical slice that requires no roa
   publishing, release workflow behavior, live hardware validation, model
   training/export/sync, real microphone validation, and broad release validation
   remain later stories.
+- `E6-S5` adds the guarded release workflow and operator prerequisite runbook.
+  `.github/workflows/release.yml` runs checks, validates tag/version alignment,
+  builds distribution artifacts, supports manual dry run without uploading,
+  publishes to PyPI through Trusted Publishing after `release` environment
+  approval, and publishes MCP Registry metadata with `mcp-publisher` GitHub
+  OIDC only after PyPI succeeds. Review hardening pins GitHub Actions refs to
+  commit SHAs, disables checkout credential persistence, and pins the
+  `mcp-publisher` v1.7.9 Linux amd64 asset with SHA-256 verification before
+  execution. `docs/release.md` documents PyPI ownership, 2FA/recovery codes,
+  Trusted Publishing setup for `release.yml`/`release`/
+  `publish-pypi`, protected `v*` tag rules, TestPyPI status, and the
+  `PYPI_API_TOKEN` fallback secret name. Live publishing was not executed by
+  this story; E6-S6 remains the MCP Registry publishing verification spike.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -674,7 +687,7 @@ Goal: make RoastPilot installable and discoverable through PyPI and the MCP Regi
 - [x] `E6-S4` Add version alignment check.
   - Done when package version and `server.json.version` cannot drift unnoticed.
 
-- [ ] `E6-S5` Add release workflow.
+- [x] `E6-S5` Add release workflow.
   - Done when CI can build, test, publish to PyPI, and publish registry
     metadata after tag release.
   - Operator prerequisites must be documented before workflow implementation:
@@ -691,6 +704,10 @@ Goal: make RoastPilot installable and discoverable through PyPI and the MCP Regi
       documented before live publishing is enabled.
     - Workflow dry run proves build/test/package steps without uploading to
       production PyPI.
+  - Implemented in `.github/workflows/release.yml` and documented in
+    `docs/release.md`. Live PyPI and MCP Registry publishing remain guarded by
+    tag trigger plus the `release` GitHub environment; this story did not run a
+    live release.
 
 - [ ] `E6-S6` Run MCP Registry publishing verification spike.
   - Done when `server.json`, PyPI verification, and `mcp-publisher` flow are documented and tested before v0.1 release.
@@ -1720,6 +1737,38 @@ After completing a story:
     passed.
   - Ran `./.venv/bin/python -m pyright tests/test_server_json.py`: 0 errors.
   - Ran `./.venv/bin/python -m pytest`: 347 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+- Validation run for E6-S5:
+  - Added `.github/workflows/release.yml` with a manual dry-run path, tag-based
+    live release path, checks, release metadata validation, package build, PyPI
+    Trusted Publishing, and MCP Registry publishing after PyPI succeeds.
+    Review hardening pins GitHub Actions refs to commit SHAs, disables checkout
+    credential persistence, and verifies the pinned `mcp-publisher` v1.7.9
+    Linux amd64 asset SHA-256 before execution. Follow-up metadata-validation
+    hardening gives explicit release-operator errors for missing `__version__`,
+    missing or empty `server.json.packages`, and malformed first package
+    entries.
+  - Added `docs/release.md` documenting PyPI owner prerequisites, 2FA and
+    recovery-code setup, Trusted Publishing configuration for
+    `release.yml`/`release`/`publish-pypi`, protected `v*` tag rules, TestPyPI
+    status, and the `PYPI_API_TOKEN` fallback secret name.
+  - Added focused release workflow coverage in `tests/test_release_workflow.py`,
+    including pinned action refs, checkout credential persistence, and
+    `mcp-publisher` checksum verification. Follow-up coverage pins the clear
+    metadata-validation failure messages.
+  - Kept live PyPI upload, live MCP Registry publish, TestPyPI rehearsal,
+    hardware validation, model training/export/sync, real microphone
+    validation, and broad release validation out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_release_workflow.py`:
+    7 passed.
+  - Ran `./.venv/bin/python -m pytest`: 355 passed.
+  - Ran `./.venv/bin/python -m build`: built
+    `coffee_roaster_mcp-0.1.0.tar.gz` and
+    `coffee_roaster_mcp-0.1.0-py3-none-any.whl`.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
