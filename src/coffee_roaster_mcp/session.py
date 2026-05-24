@@ -1167,10 +1167,15 @@ class RoastSessionStore:
                 fan_level_percent=fan_level_percent,
                 cooling_on=cooling_on,
             )
+            event_payload: dict[str, EventPayloadValue] = {
+                "heat_level_percent": heat_level_percent,
+                "fan_level_percent": fan_level_percent,
+                "cooling_on": cooling_on,
+            }
             try:
-                event = self.record_event(session, "beans_dropped")
+                event = self.record_event(session, "beans_dropped", payload=event_payload)
                 if cooling_on:
-                    self.record_event(session, "cooling_started")
+                    self.record_event(session, "cooling_started", payload=event_payload)
             except Exception:
                 (
                     session.heat_level_percent,
@@ -1206,7 +1211,15 @@ class RoastSessionStore:
                 cooling_on=cooling_on,
             )
             try:
-                event = self.record_event(session, "cooling_started")
+                event = self.record_event(
+                    session,
+                    "cooling_started",
+                    payload={
+                        "heat_level_percent": heat_level_percent,
+                        "fan_level_percent": fan_level_percent,
+                        "cooling_on": cooling_on,
+                    },
+                )
             except Exception:
                 (
                     session.heat_level_percent,
@@ -1243,7 +1256,15 @@ class RoastSessionStore:
                 label="fan_level_percent",
             )
             try:
-                event = self.record_event(session, "cooling_stopped")
+                event = self.record_event(
+                    session,
+                    "cooling_stopped",
+                    payload={
+                        "heat_level_percent": validated_heat,
+                        "fan_level_percent": validated_fan,
+                        "cooling_on": False,
+                    },
+                )
                 session.heat_level_percent = validated_heat
                 session.fan_level_percent = validated_fan
                 session.cooling_on = False

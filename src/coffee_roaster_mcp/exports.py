@@ -268,6 +268,7 @@ def _csv_telemetry_row(
             session,
             monotonic_seconds=sample.monotonic_seconds,
             visible_events=scoped_events,
+            current_sample=sample,
         ),
         monotonic_now=lambda: session.monotonic_start + sample.monotonic_seconds,
         ror_window_seconds=ror_window_seconds,
@@ -362,6 +363,7 @@ def _session_view_at(
     monotonic_seconds: float,
     visible_events: list[RoastEvent],
     include_same_time_telemetry: bool = True,
+    current_sample: TelemetrySample | None = None,
 ) -> RoastSession:
     """Return a point-in-time session view for metric computation."""
     view = RoastSession(
@@ -369,11 +371,11 @@ def _session_view_at(
         created_at_utc=session.created_at_utc,
         monotonic_start=session.monotonic_start,
         event_timeline=list(visible_events),
-        telemetry_buffer=deque(
-            sample
-            for sample in session.telemetry_buffer
-            if sample.monotonic_seconds < monotonic_seconds
-            or (include_same_time_telemetry and sample.monotonic_seconds == monotonic_seconds)
+        telemetry_buffer=_telemetry_visible_at(
+            session.telemetry_buffer,
+            monotonic_seconds=monotonic_seconds,
+            include_same_time=include_same_time_telemetry,
+            current_sample=current_sample,
         ),
         log_writer=session.log_writer,
         stopped_at_utc=session.created_at_utc,
@@ -383,6 +385,27 @@ def _session_view_at(
         _apply_view_event(view, event)
     view.phase = _phase_from(visible_events)
     return view
+
+
+def _telemetry_visible_at(
+    samples: deque[TelemetrySample],
+    *,
+    monotonic_seconds: float,
+    include_same_time: bool,
+    current_sample: TelemetrySample | None,
+) -> deque[TelemetrySample]:
+    """Return telemetry samples visible to one point-in-time row."""
+    visible: deque[TelemetrySample] = deque()
+    for sample in samples:
+        if sample.monotonic_seconds < monotonic_seconds:
+            visible.append(sample)
+            continue
+        if sample.monotonic_seconds > monotonic_seconds or not include_same_time:
+            break
+        visible.append(sample)
+        if current_sample is not None and sample is current_sample:
+            break
+    return visible
 
 
 def _apply_view_event(session: RoastSession, event: RoastEvent) -> None:

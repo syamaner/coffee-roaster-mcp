@@ -343,7 +343,11 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
             "cooling_started",
             "cooling_stopped",
         ]
-        assert state_content["events"][2]["payload"] == {}
+        assert state_content["events"][2]["payload"] == {
+            "cooling_on": True,
+            "fan_level_percent": 100,
+            "heat_level_percent": 0,
+        }
 
         export_result = cast(
             Any,

@@ -385,6 +385,96 @@ def test_snapshot_export_csv_event_rows_use_transition_control_state(
     assert cooling_stopped_row["cooling_on"] == "False"
 
 
+def test_snapshot_export_csv_uses_driver_transition_payload_state(
+    tmp_path: Path,
+) -> None:
+    """Use driver-returned transition payload state for drop and cooling rows."""
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    store.append_telemetry(
+        session,
+        TelemetrySample(
+            recorded_at_utc=datetime(2026, 5, 17, 14, 1, 0, tzinfo=UTC),
+            monotonic_seconds=60.0,
+            bean_temp_c=170.0,
+            env_temp_c=204.0,
+            heat_level_percent=45,
+            fan_level_percent=40,
+            cooling_on=False,
+        ),
+    )
+    clock.monotonic_value = 180.0
+    drop_reservation = store.reserve_driver_drop(session)
+    assert drop_reservation.reservation is not None
+    store.complete_reserved_driver_drop_snapshot(
+        session,
+        reservation=drop_reservation.reservation,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=True,
+    )
+
+    export = export_roast_snapshot(session)
+
+    with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    drop_row = next(row for row in rows if row["event"] == "beans_dropped")
+    cooling_row = next(row for row in rows if row["event"] == "cooling_started")
+    assert drop_row["heat_level_percent"] == "0"
+    assert drop_row["fan_level_percent"] == "100"
+    assert drop_row["cooling_on"] == "True"
+    assert cooling_row["heat_level_percent"] == "0"
+    assert cooling_row["fan_level_percent"] == "100"
+    assert cooling_row["cooling_on"] == "True"
+
+
+def test_snapshot_export_csv_telemetry_metrics_do_not_use_later_same_time_samples(
+    tmp_path: Path,
+) -> None:
+    """Compute telemetry row metrics only from samples visible up to that row."""
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    for bean_temp_c, env_temp_c, monotonic_seconds in (
+        (150.0, 180.0, 0.0),
+        (160.0, 192.0, 60.0),
+        (190.0, 228.0, 60.0),
+    ):
+        store.append_telemetry(
+            session,
+            TelemetrySample(
+                recorded_at_utc=datetime(2026, 5, 17, 14, 1, tzinfo=UTC),
+                monotonic_seconds=monotonic_seconds,
+                bean_temp_c=bean_temp_c,
+                env_temp_c=env_temp_c,
+            ),
+        )
+
+    export = export_roast_snapshot(session)
+
+    with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    first_same_time_row = rows[1]
+    second_same_time_row = rows[2]
+    assert first_same_time_row["bean_temp_c"] == "160.0"
+    assert first_same_time_row["bean_delta_60s_c"] == "10.0"
+    assert first_same_time_row["bean_ror_c_per_min"] == "10.0"
+    assert second_same_time_row["bean_temp_c"] == "190.0"
+    assert second_same_time_row["bean_delta_60s_c"] == "40.0"
+    assert second_same_time_row["bean_ror_c_per_min"] == "40.0"
+
+
 def test_snapshot_export_rejects_existing_jsonl_directory(tmp_path: Path) -> None:
     """Reject non-file JSONL export paths instead of reporting readiness."""
     clock = ClockHarness()

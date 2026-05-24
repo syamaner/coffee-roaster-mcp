@@ -156,8 +156,30 @@ telemetry rows still include same-time event state only after the event row is
 emitted, metric configuration stays aligned with `summary.json`, and cooling
 transition rows are covered by explicit regression tests.
 
-All CodeRabbit and Codex actionable review threads are resolved as of commit
-`351ba85`.
+The first two CodeRabbit and Codex actionable review rounds were resolved as of
+commit `351ba85`.
+
+Third review-fix round:
+
+- driver-completed drop, cooling-start, and cooling-stop events now carry the
+  driver-returned heat, fan, and cooling state in their event payloads, allowing
+  CSV and JSONL exports to preserve post-transition control state without
+  guessing from stale telemetry
+- CSV telemetry metric snapshots now include only samples visible up to the
+  current telemetry row when multiple samples share the same monotonic timestamp
+- regression coverage now verifies driver transition payload state on
+  `beans_dropped` / `cooling_started` rows and same-time telemetry metric
+  isolation
+
+Validation after third review fixes:
+
+- `./.venv/bin/python -m pytest tests/test_exports.py`: 9 passed
+- `./.venv/bin/python -m pytest`: 333 passed
+- `./.venv/bin/python -m ruff check .`: passed
+- `./.venv/bin/python -m ruff format --check .`: passed
+- `./.venv/bin/python -m pyright`: 0 errors
+- `./.venv/bin/coffee-roaster-mcp --help`: passed
+- `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
 
 ## Restart Prompt
 
