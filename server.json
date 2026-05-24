@@ -1,0 +1,24 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.syamaner/coffee-roaster-mcp",
+  "title": "RoastPilot",
+  "description": "RoastPilot controls coffee roasting sessions through local stdio MCP tools and exports logs.",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/syamaner/coffee-roaster-mcp#readme",
+  "repository": {
+    "url": "https://github.com/syamaner/coffee-roaster-mcp",
+    "source": "github",
+    "id": "1228141156"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "coffee-roaster-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
