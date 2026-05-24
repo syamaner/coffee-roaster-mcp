@@ -667,7 +667,22 @@ Goal: make RoastPilot installable and discoverable through PyPI and the MCP Regi
   - Done when package version and `server.json.version` cannot drift unnoticed.
 
 - [ ] `E6-S5` Add release workflow.
-  - Done when CI can build, test, publish to PyPI, and publish registry metadata after tag release.
+  - Done when CI can build, test, publish to PyPI, and publish registry
+    metadata after tag release.
+  - Operator prerequisites must be documented before workflow implementation:
+    - PyPI account exists for the release owner.
+    - TestPyPI account exists if the workflow supports TestPyPI rehearsal.
+    - PyPI project name `coffee-roaster-mcp` ownership is confirmed or reserved.
+    - PyPI two-factor authentication and recovery codes are configured.
+    - PyPI Trusted Publishing is configured for this GitHub repository,
+      release workflow filename, release environment, and tag-triggered
+      publishing job.
+    - A token-based fallback is documented only if Trusted Publishing is not
+      usable, including the exact GitHub secret names and rotation notes.
+    - Required GitHub release environment approvals and protected-tag rules are
+      documented before live publishing is enabled.
+    - Workflow dry run proves build/test/package steps without uploading to
+      production PyPI.
 
 - [ ] `E6-S6` Run MCP Registry publishing verification spike.
   - Done when `server.json`, PyPI verification, and `mcp-publisher` flow are documented and tested before v0.1 release.

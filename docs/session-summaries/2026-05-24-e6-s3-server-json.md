@@ -64,6 +64,18 @@ Full validation:
 - `./.venv/bin/coffee-roaster-mcp --help`: passed
 - `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
 
+## Follow-Up State Clarification
+
+After PR creation, E6-S5 was clarified to include the operator prerequisites for
+PyPI publishing. The active epic and overall plan now require PyPI account
+access, optional TestPyPI access, PyPI project ownership or reservation, PyPI
+two-factor authentication and recovery codes, PyPI Trusted Publishing setup for
+the GitHub release workflow, fallback-token documentation only if Trusted
+Publishing is not usable, release environment approvals, protected-tag rules,
+and dry-run validation before live publishing.
+
+GitHub issue `#53` was updated with the same detailed E6-S5 requirements.
+
 ## Restart Prompt
 
 Resume in the local clone of `syamaner/coffee-roaster-mcp`. PR for E6-S3 should

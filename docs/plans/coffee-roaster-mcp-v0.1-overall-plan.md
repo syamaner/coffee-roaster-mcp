@@ -215,6 +215,15 @@ Example `summary.json`:
 
 - Source repo target: `github.com/syamaner/coffee-roaster-mcp`.
 - Publish package to PyPI as `coffee-roaster-mcp`.
+- Before live publishing, confirm the release owner has a PyPI account, PyPI
+  2FA and recovery codes are configured, and the `coffee-roaster-mcp` project
+  name is owned or reserved.
+- Prefer PyPI Trusted Publishing from GitHub Actions for release uploads.
+  Document the exact GitHub repository, workflow filename, release environment,
+  and tag-triggered job configured in PyPI. Use API tokens only as a documented
+  fallback with explicit GitHub secret names and rotation notes.
+- If TestPyPI rehearsal is included, confirm the release owner also has a
+  TestPyPI account and matching Trusted Publishing or token fallback setup.
 - Add console entrypoint `coffee-roaster-mcp`.
 - Add root `server.json` for MCP Registry.
 - Register as `io.github.syamaner/coffee-roaster-mcp`.
@@ -374,6 +383,16 @@ Do not rely on code review to validate coffee roasting safety, Hottop hardware b
 - Confirm package builds cleanly.
 - Confirm `server.json.version` matches package version.
 - Confirm README contains MCP verification string.
+- Confirm release owner can access PyPI and, if used, TestPyPI.
+- Confirm PyPI account has 2FA and recovery codes configured.
+- Confirm `coffee-roaster-mcp` project ownership or reservation on PyPI.
+- Confirm PyPI Trusted Publishing is configured for the GitHub repository,
+  release workflow filename, release environment, and tag-triggered publishing
+  job.
+- If Trusted Publishing is not usable, confirm token fallback secret names,
+  least-privilege scope, and rotation notes.
+- Confirm GitHub release environment approvals and protected-tag rules before
+  live publish.
 - Pin HF model revision before release.
 - Publish package to TestPyPI if desired.
 - Install package from TestPyPI and run mock smoke test.
@@ -486,7 +505,10 @@ Stories:
 - Add PyPI metadata.
 - Add README verification string.
 - Add `server.json`.
-- Add release workflow.
+- Add release workflow, including PyPI/TestPyPI account prerequisites, PyPI
+  Trusted Publishing setup, fallback-token documentation, protected release
+  environment rules, dry-run validation, PyPI publish, and registry metadata
+  publish after PyPI succeeds.
 - Add MCP Registry publishing verification spike.
 - Document install and hardware setup.
 
