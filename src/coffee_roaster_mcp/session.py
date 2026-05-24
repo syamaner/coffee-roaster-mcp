@@ -1199,6 +1199,11 @@ class RoastSessionStore:
         """Complete a reserved cooling-start command and record the event."""
         with self._lock:
             self._assert_driver_command_reservation(session, reservation)
+            if not cooling_on:
+                self._clear_driver_command_reservation_locked(session, reservation)
+                raise SessionLifecycleError(
+                    "Driver still reports cooling inactive after start_cooling."
+                )
             previous_control_state = (
                 session.heat_level_percent,
                 session.fan_level_percent,

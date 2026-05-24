@@ -185,6 +185,25 @@ Validation after third review fixes:
 - `./.venv/bin/coffee-roaster-mcp --help`: passed
 - `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
 
+Fourth review-fix round:
+
+- completing a reserved driver `start_cooling` command now fails closed when
+  the driver still reports `cooling_on=False`, preventing a contradictory
+  `cooling_started` event payload and preserving session phase/control state
+- regression coverage verifies the failed driver result clears the pending
+  reservation, does not record `cooling_started`, and leaves the session in the
+  dropped phase
+
+Validation after fourth review fixes:
+
+- `./.venv/bin/python -m pytest tests/test_session.py::test_reserved_driver_start_cooling_rejects_inactive_driver_result tests/test_exports.py`: 10 passed
+- `./.venv/bin/python -m pytest`: 334 passed
+- `./.venv/bin/python -m ruff check .`: passed
+- `./.venv/bin/python -m ruff format --check .`: passed
+- `./.venv/bin/python -m pyright`: 0 errors
+- `./.venv/bin/coffee-roaster-mcp --help`: passed
+- `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`
+
 ## Restart Prompt
 
 Resume in the local clone of `syamaner/coffee-roaster-mcp`. PR for E5-S7 should
