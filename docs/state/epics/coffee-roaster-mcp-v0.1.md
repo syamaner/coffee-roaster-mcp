@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E7-S1`
-- Current target: Broad mock-safe release validation
+- Active story: `E7-S2`
+- Current target: Package install smoke validation
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -31,6 +31,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - Agent and n8n orchestration are out of scope.
 - Default roaster driver is `mock`.
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
+- `E7-S1` keeps broad mock-safe validation on the public stdio MCP tool path:
+  a default-config server uses the mock driver, first-crack mode remains
+  disabled, auto-T0 remains disabled, and exported JSONL, CSV, and
+  `summary.json` outputs are verified from the completed mock roast.
 - `E2-S1` keeps the initial MCP tool surface bootstrap-safe with `get_server_info` and `get_runtime_config`. Roast-session lifecycle and roast-control tools remain later Epic 2 work.
 - `E2-S2` uses one in-process `RoastSessionStore` with at most one active `RoastSession` at a time. Session state now owns monotonic timing, phase, event timeline storage, telemetry retention, and log-writer references before tool wiring lands.
 - `E2-S3` keeps event writes behind `RoastSessionStore.record_event(...)`. The session timeline now records deterministic append order, authoritative UTC plus monotonic timestamps for core roast events, and idempotent singleton handling for beans added, first crack, bean drop, and cooling transitions.
@@ -778,7 +782,7 @@ Goal: prove the package works from install through mock roast, MCP client calls,
 
 ### Stories
 
-- [ ] `E7-S1` Test full mock roast through MCP tools.
+- [x] `E7-S1` Test full mock roast through MCP tools.
   - Done when a mock roast works from session start to exported logs.
 
 - [ ] `E7-S2` Test package install smoke flow.
@@ -973,6 +977,35 @@ After completing a story:
     `uvx`, and stdio transport.
   - Did not run hardware validation, model training/export/sync, or real
     microphone validation.
+- Validation run for E7-S1:
+  - Verified PR #137 was merged and issue #135 was closed before starting.
+  - Synced `main` to merge commit `5052ab29ec142cfe6e28bfb3e5bf17d529d006c3`
+    and created branch `feature/56-full-mock-roast-mcp-tools`.
+  - Tightened the stdio MCP mock-roast flow in `tests/test_package.py` so it
+    verifies the default runtime config stays on roaster driver `mock`,
+    first-crack mode `disabled`, and automatic T0 disabled before driving the
+    public MCP tools.
+  - Verified the mock roast from `start_roast_session` through heat/fan,
+    manual beans-added and first-crack override, drop, cooling stop, state read,
+    and `export_roast_log` using stdio MCP calls.
+  - Verified exported `roast.jsonl`, `roast.csv`, and `summary.json` outputs
+    from the MCP export result, including event order, CSV lifecycle phases,
+    mock roaster metadata, empty model metadata for disabled first crack, and
+    populated roast/development metrics.
+  - Kept hardware validation, model training/export/sync, real microphone
+    validation, and live release publishing out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_package.py::test_stdio_server_supports_basic_mock_roast_tool_flow`:
+    1 passed.
+  - Ran `./.venv/bin/python -m pytest tests/test_package.py`: 19 passed.
+  - Ran `./.venv/bin/python -m pytest`: 356 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: 30 files already
+    formatted.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors, 0 warnings,
+    0 informations.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`:
+    `coffee-roaster-mcp 0.1.0`.
 
 - Validation run for E6-S4:
   - Added focused version alignment coverage in `tests/test_server_json.py`.
