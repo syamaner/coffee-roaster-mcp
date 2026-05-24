@@ -204,6 +204,10 @@ Required repo checks:
   microphone/audio input, ChatGPT MCP compatibility, live publishing, or a full
   end-to-end agent roast.
 
+## Usage Snapshot
+
+- `293K used`.
+
 ## Restart Prompt
 
 Resume in the local clone of `syamaner/coffee-roaster-mcp`. E7-S3 is complete
