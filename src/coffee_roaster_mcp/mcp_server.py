@@ -600,6 +600,7 @@ def create_mcp_server(
         session = _resolve_session(server_context, session_id=session_id)
         export = export_roast_snapshot(
             session,
+            roaster_driver=server_context.config.roaster.driver,
             ror_window_seconds=server_context.config.session.ror_window_seconds,
             ror_min_sample_seconds=server_context.config.session.ror_min_sample_seconds,
         )

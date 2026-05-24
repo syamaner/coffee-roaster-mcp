@@ -228,13 +228,20 @@ percent, RoR/delta metrics, and first-crack model metadata. Append-only JSONL
 runtime logging, the one-session `RoastSessionStore` mutation boundary, existing
 metric helpers, and `summary.json` behavior remain unchanged.
 
+E5-S8 added the planned `summary.json` session-level schema. Snapshot summary
+export now includes session timestamps, total roast seconds, development
+seconds/percent, the configured roaster driver, and first-crack model metadata
+from the authoritative first-crack event payload while preserving append-only
+JSONL runtime logging, the CSV schema, the one-session store boundary, and
+existing metric helpers.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E5-S8: export `summary.json`.
+The next story is E5-S9: add log schema tests.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
