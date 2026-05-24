@@ -316,10 +316,19 @@ Registry search API returns no current listing for
 `io.github.syamaner/coffee-roaster-mcp`; the first destructive step remains the
 tag-triggered live release path after PyPI publication succeeds.
 
-Epic 6 now includes follow-up issue #135, `E6-S8: Execute live PyPI and MCP
-Registry publish`, for the controlled live publish after PyPI contains the
-matching package version and the published long description exposes the exact
-`mcp-name` verification marker.
+E6-S8 executed the controlled live PyPI and MCP Registry publish for
+`coffee-roaster-mcp` `0.1.0`. GitHub Actions release run `26367482422`
+published the production PyPI package from tag `v0.1.0` and then published
+MCP Registry metadata only after the PyPI job succeeded. Production PyPI now
+exposes version `0.1.0`, the published long description contains the exact
+`<!-- mcp-name: io.github.syamaner/coffee-roaster-mcp -->` verification
+marker, and a clean PyPI install smoke passed from
+`/tmp/coffee-roaster-mcp-pypi-smoke`. `mcp-publisher validate server.json`
+passed against the live Registry API, and Registry search now returns
+`io.github.syamaner/coffee-roaster-mcp` with PyPI package
+`coffee-roaster-mcp`, version `0.1.0`, runtime hint `uvx`, and stdio
+transport. `docs/release.md` records links, commands, outcomes, risks, and
+retry/rollback notes.
 
 E6-S7 added `docs/install-and-hardware-setup.md` as the setup runbook for mock
 install, Hottop configuration, Hugging Face model configuration, offline model
@@ -336,9 +345,8 @@ first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E6-S8: execute live PyPI and MCP Registry publish after
-production PyPI exposes the matching package version and README verification
-marker.
+The next story is E7-S1: run broad mock-safe release validation before any
+hardware-ready labeling or full end-to-end agent roast validation.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

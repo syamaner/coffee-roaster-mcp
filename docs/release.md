@@ -155,3 +155,76 @@ listing data can change or reset before general availability. A failed publish
 after PyPI succeeds leaves PyPI live without Registry discoverability and should
 be retried only after checking Registry status and confirming no partial
 version entry was created.
+
+## v0.1.0 Live Publish Outcome
+
+The first live release completed on 2026-05-24 through GitHub Actions run
+`26367482422`:
+
+- Tag: `v0.1.0`
+- Commit: `276ec81056e05ed8a863c5e5bb9bf28e45308383`
+- Workflow: `https://github.com/syamaner/coffee-roaster-mcp/actions/runs/26367482422`
+- PyPI project: `https://pypi.org/project/coffee-roaster-mcp/`
+- PyPI release: `https://pypi.org/project/coffee-roaster-mcp/0.1.0/`
+- MCP Registry search:
+  `https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.syamaner/coffee-roaster-mcp`
+
+Release job outcomes:
+
+- `Validate Release Metadata`: success
+- `Checks`: success
+- `Build Package`: success
+- `Publish PyPI`: success after `release` environment approval
+- `Publish MCP Registry`: success after PyPI publish
+- `Release Dry Run`: skipped, as expected for a tag push
+
+Verification commands and outcomes:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+curl -L https://pypi.org/pypi/coffee-roaster-mcp/json
+curl -L https://pypi.org/pypi/coffee-roaster-mcp/json | jq -r '.info.version, (.info.description | contains("<!-- mcp-name: io.github.syamaner/coffee-roaster-mcp -->")), .info.package_url, .info.release_url, (.urls[] | [.filename, .packagetype, .digests.sha256] | @tsv)'
+/tmp/mcp-publisher validate server.json
+curl -L 'https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.syamaner/coffee-roaster-mcp'
+python3.11 -m venv /tmp/coffee-roaster-mcp-pypi-smoke
+/tmp/coffee-roaster-mcp-pypi-smoke/bin/python -m pip install --no-cache-dir coffee-roaster-mcp==0.1.0
+/tmp/coffee-roaster-mcp-pypi-smoke/bin/coffee-roaster-mcp --help
+/tmp/coffee-roaster-mcp-pypi-smoke/bin/coffee-roaster-mcp --version
+/tmp/coffee-roaster-mcp-pypi-smoke/bin/python -c "import os, tempfile; from coffee_roaster_mcp.config import load_config; tmp = tempfile.TemporaryDirectory(); os.chdir(tmp.name); c = load_config(environ={}); print(c.roaster.driver, c.first_crack.mode, c.first_crack.precision); tmp.cleanup()"
+```
+
+Confirmed outcomes:
+
+- Production PyPI exposes `coffee-roaster-mcp` version `0.1.0`.
+- The published PyPI long description contains
+  `<!-- mcp-name: io.github.syamaner/coffee-roaster-mcp -->`.
+- PyPI artifacts:
+  - `coffee_roaster_mcp-0.1.0-py3-none-any.whl`, SHA-256
+    `d8cd00257bf30ddf89b98eff07d2b3d93369e3b441d9ef60f99b825e45436f33`
+  - `coffee_roaster_mcp-0.1.0.tar.gz`, SHA-256
+    `8c6ea87f4ccbae4654ac6df2c1588b86f79bdf1e54e19ec301aa7ef87b283e0c`
+- `mcp-publisher validate server.json` returned `server.json is valid`.
+- Registry search returns `io.github.syamaner/coffee-roaster-mcp` with
+  PyPI package `coffee-roaster-mcp`, version `0.1.0`, runtime hint `uvx`, and
+  stdio transport.
+- Clean production-PyPI install succeeded in
+  `/tmp/coffee-roaster-mcp-pypi-smoke`.
+- Installed-package smokes returned `coffee-roaster-mcp 0.1.0` and
+  mock-safe defaults `mock disabled int8`.
+
+Retry and rollback notes:
+
+- The `v0.1.0` tag creation bypassed a protected-tag creation rule, as reported
+  by GitHub during `git push origin v0.1.0`; keep tag protection and release
+  environment ownership under review before the next release.
+- PyPI releases cannot be overwritten. If a package problem is found, fix
+  forward with a new version and document the issue; yank `0.1.0` only if the
+  package is actively harmful.
+- If the Registry listing drifts or resets while the preview Registry is still
+  mutable, rerun `mcp-publisher validate server.json`, confirm PyPI still
+  exposes the matching package and marker, then retry the Registry publish path.
+- The published `0.1.0` long description came from the pre-release README text
+  and still says PyPI publication was planned. The verification marker and
+  package metadata are correct; README wording was corrected after release for
+  future publications.
