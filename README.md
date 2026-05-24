@@ -4,7 +4,7 @@
 
 RoastPilot is a spec-driven MCP server for autonomous coffee roasting.
 
-The package name is `coffee-roaster-mcp`. PyPI publishing is planned for the v0.1 release; this repository currently contains the local package scaffold and project plan.
+The package name is `coffee-roaster-mcp`. PyPI publishing is planned for the v0.1 release; this repository currently contains the local package scaffold, release workflow, registry metadata, and project plan.
 
 RoastPilot will provide one local MCP runtime for roaster control, telemetry, first-crack detection integration, roast metrics, and log export.
 
@@ -22,7 +22,7 @@ The v0.1 direction is one local stdio MCP server that will own:
 - derived roast metrics
 - roast log export
 
-The current repo state is still bootstrap. The package scaffold, config loading, local development commands, pull-request CI, stdio MCP entrypoint, mock roast-session tool surface, and one-process mock vertical slice are in place.
+The current repo state is still bootstrap. The package scaffold, config loading, local development commands, pull-request CI, stdio MCP entrypoint, mock roast-session tool surface, one-process mock vertical slice, release workflow, and MCP Registry metadata are in place.
 
 ## Install
 
@@ -35,7 +35,11 @@ python -m pip install --upgrade pip
 python -m pip install -e . --group dev
 ```
 
-The future user-facing install target is the `coffee-roaster-mcp` package. PyPI publication is planned later in v0.1 after the runtime and distribution stories land.
+The future user-facing install target is the `coffee-roaster-mcp` package. PyPI publication is planned later in v0.1 after the controlled live release story lands.
+
+For operator setup, including mock install, Hottop configuration, Hugging Face
+model configuration, offline model paths, and log output paths, see
+`docs/install-and-hardware-setup.md`.
 
 ## Local Development
 
@@ -121,7 +125,9 @@ The current MCP tool surface includes:
 - `export_roast_log`
 - `emergency_stop`
 
-`export_roast_log` writes snapshot `roast.jsonl`, `roast.csv`, and `summary.json` files for the current in-process session. Append-only telemetry writers and final log schemas land in Epic 5.
+`export_roast_log` writes `roast.jsonl`, `roast.csv`, and `summary.json` files
+for the current in-process session. Runtime events and sampled telemetry are
+also appended to `roast.jsonl` during the roast.
 
 ### Operational MCP Flow
 
@@ -189,6 +195,9 @@ This confirms the bootstrap defaults are still aligned with the mock vertical-sl
 
 ## Hottop Configuration And Validation
 
+The concise setup path is in `docs/install-and-hardware-setup.md`; this section
+summarizes the guarded validation workflow.
+
 Hottop support lives behind the `RoasterDriver` abstraction. The current driver has lifecycle, command-loop, packet, control-state, and temperature-unit support, but it still requires guarded manual validation before any hardware-ready release label.
 
 Configuration lives in `coffee-roaster-mcp.yaml`. Keep local development on the mock driver unless you are intentionally validating connected Hottop hardware:
@@ -242,6 +251,10 @@ be treated as a failed validation and should not be required by normal CI.
 ## Configuration
 
 RoastPilot loads configuration from `coffee-roaster-mcp.yaml` in the current directory by default. If the file is absent, mock-safe defaults are used so local development does not require roaster hardware, audio hardware, or model downloads.
+
+See `docs/install-and-hardware-setup.md` for setup-focused examples covering
+mock install, Hottop configuration, Hugging Face model configuration, offline
+model paths, and log output paths.
 
 ```yaml
 transport:
@@ -389,5 +402,5 @@ Current export files:
   metrics, roaster driver, and first-crack model metadata
 - output under `logs/roasts/{session_id}/`
 
-Final cross-format log schema completeness tests and broad release validation
-land in later stories.
+Cross-format log schema completeness tests are in place. Broad release
+validation and end-to-end agent roast validation land in later stories.

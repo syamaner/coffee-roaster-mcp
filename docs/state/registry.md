@@ -321,13 +321,24 @@ Registry publish`, for the controlled live publish after PyPI contains the
 matching package version and the published long description exposes the exact
 `mcp-name` verification marker.
 
+E6-S7 added `docs/install-and-hardware-setup.md` as the setup runbook for mock
+install, Hottop configuration, Hugging Face model configuration, offline model
+paths, and log output paths. README and the release runbook now cross-reference
+that setup guide so release operators can distinguish mock-safe setup from
+guarded Hottop operation, audio-mode model setup, and later live validation.
+This documentation story did not execute live PyPI publish, live MCP Registry
+publish, hardware validation, model training/export/sync, or real microphone
+validation.
+
 Epic 7 now includes a final end-to-end agent roast validation story that uses a
 real MCP client or agent, configured Hottop hardware, released Hugging Face ONNX
 first-crack artifacts, real microphone/audio input, and the Epic 5 stat/log
 surface to prove the release candidate can support full roasts with recorded
 evidence.
 
-The next story is E6-S7: document install and hardware setup.
+The next story is E6-S8: execute live PyPI and MCP Registry publish after
+production PyPI exposes the matching package version and README verification
+marker.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

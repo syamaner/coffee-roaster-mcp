@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E6-S7`
-- Current target: Document install and hardware setup
+- Active story: `E6-S8`
+- Current target: Execute live PyPI and MCP Registry publish
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -345,6 +345,13 @@ The first implementation milestone is a mock vertical slice that requires no roa
   live publish stop point, prerequisites, expected outcome, and preview
   Registry risk. The remaining destructive step is the tag-triggered live
   release path after production PyPI publication succeeds.
+- `E6-S7` documents install and hardware setup without executing any live
+  publishing, hardware validation, model training/export/sync, or real
+  microphone validation. `docs/install-and-hardware-setup.md` now covers the
+  mock install path, Hottop configuration, Hugging Face model configuration,
+  offline model directory layout, and log output paths. README and
+  `docs/release.md` cross-reference that setup guide for release and operator
+  readiness.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -730,7 +737,7 @@ Goal: make RoastPilot installable and discoverable through PyPI and the MCP Regi
     guarded behind the release workflow because it requires production PyPI
     publication and Registry mutation.
 
-- [ ] `E6-S7` Document install and hardware setup.
+- [x] `E6-S7` Document install and hardware setup.
   - Done when docs cover mock install, Hottop config, Hugging Face model config, offline model path, and log output paths.
 
 - [ ] `E6-S8` Execute live PyPI and MCP Registry publish.
@@ -1827,3 +1834,24 @@ After completing a story:
     `coffee-roaster-mcp` and the Registry search API returns no current listing
     for `io.github.syamaner/coffee-roaster-mcp`; live publish remains the first
     destructive decision point after production PyPI publication.
+- Validation run for E6-S7:
+  - Added `docs/install-and-hardware-setup.md` with setup-focused coverage for
+    mock install, `coffee-roaster-mcp.yaml`, Hottop configuration, Hugging Face
+    model configuration, offline model directory layout, and log output paths.
+  - Updated README to point operators at the setup guide and corrected current
+    log-export wording now that append-only JSONL, CSV, and summary schemas
+    exist.
+  - Updated `docs/release.md` so release operators review the setup guide
+    before live release and before hardware-ready labeling.
+  - Added focused documentation coverage in `tests/test_readme.py` to pin the
+    E6-S7 required topics and cross-references.
+  - Kept live PyPI publish, live MCP Registry publish, hardware validation,
+    model training/export/sync, and real microphone validation out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_readme.py tests/test_release_workflow.py`:
+    9 passed.
+  - Ran `./.venv/bin/python -m pytest`: 356 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.

@@ -15,6 +15,9 @@ Before enabling a live release, the release owner must confirm:
 - A PyPI account exists for the release owner.
 - The PyPI project name `coffee-roaster-mcp` is owned or reserved by the
   release owner.
+- `docs/install-and-hardware-setup.md` has been reviewed for the target release
+  install mode, Hottop configuration, Hugging Face model configuration, offline
+  model path, and log output paths.
 - PyPI two-factor authentication is enabled and recovery codes are stored in
   the project owner password manager.
 - PyPI Trusted Publishing is configured for:
@@ -90,6 +93,9 @@ After all prerequisites are confirmed:
 6. Confirm the MCP Registry entry for
    `io.github.syamaner/coffee-roaster-mcp` shows the expected PyPI package and
    stdio transport.
+7. Run the install smoke and setup checks from
+   `docs/install-and-hardware-setup.md` for the intended deployment mode before
+   any hardware-ready labeling.
 
 MCP Registry publishing runs only after the PyPI publish job succeeds. The
 registry job validates `server.json` against the preview Registry API before
