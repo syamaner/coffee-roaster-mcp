@@ -16,8 +16,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E5-S9`
-- Current target: Add log schema tests
+- Active story: `E6-S1`
+- Current target: Add PyPI package metadata
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -266,6 +266,13 @@ The first implementation milestone is a mock vertical slice that requires no roa
   Existing summary fields and metric helper values are preserved, and the
   append-only JSONL runtime writer, CSV schema, one-session store boundary, and
   mock-safe MCP behavior remain unchanged.
+- `E5-S9` adds narrow log schema completeness tests without changing runtime
+  behavior. The append-only JSONL runtime log now has exact key-set coverage for
+  telemetry and event rows, CSV export remains pinned to the E5-S7 field order,
+  and `summary.json` has exact top-level, nested metrics, and first-crack model
+  metadata key-set coverage. Existing metric helpers, append-only JSONL writes,
+  CSV/summary values, session/runtime boundaries, and mock-safe behavior remain
+  unchanged.
 - Configuration loads from mock-safe defaults, optional `coffee-roaster-mcp.yaml`, and environment overrides. YAML file support uses PyYAML as a declared runtime dependency.
 - Agent rules and repo-local workflows are now part of the scaffold. `AGENTS.md`, `.claude/skills/code-quality`, `.claude/skills/mcp-dev`, `.claude/skills/mock-roast`, `.claude/skills/hottop-validation`, `.claude/skills/release-registry`, and Copilot review instructions should be kept current as story workflow changes.
 - The old `coffee-roasting` POC is a behavior reference for Epic 2, especially `roaster_control/mcp_server.py`, `roaster_control/server.py`, `roaster_control/session_manager.py`, and `roaster_control/roast_tracker.py`. It is not a template for carrying forward the old split MCP, Auth0, SSE, or `n8n` architecture.
@@ -567,7 +574,7 @@ Goal: compute roast metrics from one session clock and export durable logs.
 - [x] `E5-S8` Export `summary.json`.
   - Done when summary includes session timestamps, total roast seconds, development metrics, roaster driver, and first-crack model metadata.
 
-- [ ] `E5-S9` Add log schema tests.
+- [x] `E5-S9` Add log schema tests.
   - Done when JSONL, CSV, and summary schema completeness is covered by tests.
 
 ### Epic Acceptance Criteria
@@ -1493,6 +1500,24 @@ After completing a story:
     validation scope unchanged.
   - Ran `./.venv/bin/python -m pytest tests/test_exports.py`: 10 passed.
   - Ran `./.venv/bin/python -m pytest`: 335 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+- Validation run for E5-S9:
+  - Added exact key-set coverage for append-only JSONL runtime telemetry and
+    event rows.
+  - Pinned `summary.json` schema completeness for top-level fields, nested
+    metrics, and first-crack model metadata fields.
+  - Kept CSV schema completeness pinned to the E5-S7 field order and preserved
+    append-only JSONL runtime logging, the CSV schema, the summary schema,
+    one-session store ownership, existing metric helpers, mock-safe CI behavior,
+    first-crack artifact/audio boundaries, Hottop validation boundary, and
+    release validation scope unchanged.
+  - Ran `./.venv/bin/python -m pytest tests/test_session.py tests/test_exports.py`:
+    81 passed.
+  - Ran `./.venv/bin/python -m pytest`: 337 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.

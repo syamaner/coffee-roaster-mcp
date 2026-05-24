@@ -23,6 +23,26 @@ from coffee_roaster_mcp.session import (
     compute_roast_metrics,
 )
 
+EXPECTED_JSONL_EVENT_KEYS = {
+    "session_id",
+    "type",
+    "kind",
+    "recorded_at_utc",
+    "monotonic_seconds",
+    "payload",
+}
+EXPECTED_JSONL_TELEMETRY_KEYS = {
+    "session_id",
+    "type",
+    "recorded_at_utc",
+    "monotonic_seconds",
+    "bean_temp_c",
+    "env_temp_c",
+    "heat_level_percent",
+    "fan_level_percent",
+    "cooling_on",
+}
+
 
 class ClockHarness:
     """Deterministic wall-clock and monotonic clock supplier for session tests."""
@@ -245,6 +265,65 @@ def test_append_only_jsonl_log_writes_events_immediately_and_telemetry_at_1hz(
     latest_logged = store.get_session_snapshot().last_logged_telemetry_monotonic_seconds
     assert latest_logged is not None
     assert round(latest_logged, 3) == 1.2
+
+
+def test_append_only_jsonl_log_schema_completeness(tmp_path: Path) -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+        session_id_factory=lambda: "session-001",
+        telemetry_log_interval_seconds=1.0,
+    )
+    session = store.start_session()
+
+    store.record_telemetry_sample(
+        session,
+        bean_temp_c=151.25,
+        env_temp_c=204.5,
+        heat_level_percent=55,
+        fan_level_percent=35,
+        cooling_on=False,
+    )
+    clock.monotonic_value = 101.0
+    store.record_event(
+        session,
+        "beans_added",
+        payload={
+            "charge_temp_c": 151.25,
+            "detected": False,
+        },
+    )
+
+    log_path = tmp_path / "roasts" / "session-001" / "roast.jsonl"
+    telemetry_row, event_row = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert set(telemetry_row) == EXPECTED_JSONL_TELEMETRY_KEYS
+    assert telemetry_row == {
+        "session_id": "session-001",
+        "type": "telemetry",
+        "recorded_at_utc": "2026-05-04T12:00:00+00:00",
+        "monotonic_seconds": 0.0,
+        "bean_temp_c": 151.25,
+        "env_temp_c": 204.5,
+        "heat_level_percent": 55,
+        "fan_level_percent": 35,
+        "cooling_on": False,
+    }
+    assert set(event_row) == EXPECTED_JSONL_EVENT_KEYS
+    assert event_row == {
+        "session_id": "session-001",
+        "type": "event",
+        "kind": "beans_added",
+        "recorded_at_utc": "2026-05-04T12:00:00+00:00",
+        "monotonic_seconds": 1.0,
+        "payload": {
+            "charge_temp_c": 151.25,
+            "detected": False,
+        },
+    }
 
 
 def test_append_only_jsonl_log_includes_automatic_first_crack_events(tmp_path: Path) -> None:
