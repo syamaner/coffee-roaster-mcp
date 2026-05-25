@@ -399,14 +399,16 @@ training/export/sync, or real microphone validation unless a later story
 explicitly requires it.
 
 E7-S4 is started on branch
-`feature/59-warp-manual-hottop-control-validation`, but live Warp Hottop
-validation is blocked until the actual Hottop USB serial adapter is visible and
-the operator explicitly approves each hardware-affecting MCP call. The local
-preflight confirmed `uvx` at `/opt/homebrew/bin/uvx`, but `ls /dev/cu.*` showed
-only `/dev/cu.Bluetooth-Incoming-Port` and `/dev/cu.debug-console`; no
-`/dev/cu.usbserial-*` Hottop device was available. Do not create a fake
-hardware config, launch Warp hardware controls, export hardware logs, or apply
-a hardware-ready release label from this partial evidence.
+`feature/59-warp-manual-hottop-control-validation`. The local preflight
+confirmed `uvx` at `/opt/homebrew/bin/uvx`; after the operator reconnected the
+Hottop adapter, `ls /dev/cu.*` showed `/dev/cu.usbserial-DN016OJ3`. The
+dedicated config now exists at
+`/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` with the Hottop driver,
+that serial port, first-crack mode disabled, and auto-T0 disabled. Live Warp
+Hottop validation still requires Warp tool-discovery/config/state evidence and
+explicit operator approval for each hardware-affecting MCP call. Do not launch
+Warp hardware controls, export hardware logs, or apply a hardware-ready release
+label from adapter/config preflight alone.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

@@ -1,7 +1,7 @@
 # E7-S4 Warp Manual Hottop MCP Control Validation
 
 This summary captures the E7-S4 start, safety boundary, preflight evidence,
-current blocker, and restart context.
+current manual-validation status, and restart context.
 
 ## Scope
 
@@ -42,7 +42,7 @@ transport:
 
 roaster:
   driver: hottop_kn8828b_2k_plus
-  port: /dev/cu.usbserial-XXXX
+  port: /dev/cu.usbserial-DN016OJ3
   baudrate: 115200
   temperature_unit: auto
   command_interval_seconds: 0.3
@@ -54,9 +54,10 @@ session:
   auto_t0_detection_enabled: false
 ```
 
-The `roaster.port` value must be replaced with the actual Hottop serial device
-visible on the validation host. Do not use a placeholder or stale port value for
-live hardware validation.
+The `roaster.port` value was set to the actual Hottop serial device visible on
+the validation host during preflight:
+
+- `/dev/cu.usbserial-DN016OJ3`
 
 Warp MCP server JSON:
 
@@ -113,7 +114,19 @@ Local command preflight:
   - `/dev/cu.Bluetooth-Incoming-Port`
   - `/dev/cu.debug-console`
 
-No `/dev/cu.usbserial-*` Hottop adapter was visible during this preflight.
+Initial preflight did not show a Hottop adapter. After the operator reconnected
+the device, `/dev/cu.usbserial-DN016OJ3` appeared.
+
+Config creation and local non-hardware verification:
+
+- Created `/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` with
+  `roaster.driver: hottop_kn8828b_2k_plus`,
+  `roaster.port: /dev/cu.usbserial-DN016OJ3`,
+  `first_crack.mode: disabled`, and
+  `session.auto_t0_detection_enabled: false`.
+- Ran local config-load verification without connecting to hardware:
+  `./.venv/bin/python -c "..."` returned
+  `hottop_kn8828b_2k_plus /dev/cu.usbserial-DN016OJ3 disabled False`.
 
 Required repo checks:
 
@@ -126,32 +139,29 @@ Required repo checks:
 
 ## Current Status
 
-Status: blocked before live Warp hardware validation.
+Status: ready for supervised Warp tool discovery and read-only config/state
+checks, but hardware-affecting validation is not yet run.
 
-Reason: no actual Hottop USB serial adapter was visible, so the required
-`roaster.port` could not be set to a verified device path.
+Reason: the Hottop serial adapter is now visible and the config file exists, but
+the required Warp evidence and explicit operator approvals for hardware-affecting
+MCP tool calls have not been captured yet.
 
 Actions deliberately not taken:
 
-- did not create `/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` with a
-  fake or stale serial port
 - did not launch the Hottop-configured server through Warp
 - did not call `start_roast_session`, `set_heat`, `set_fan`, `drop_beans`,
   `start_cooling`, `stop_cooling`, or `emergency_stop` against hardware
 - did not export or claim hardware validation artifacts
 
-Hardware-ready release-label decision: blocked. Partial preflight evidence does
-not support a hardware-ready release label.
+Hardware-ready release-label decision: still blocked. Adapter/config preflight
+alone does not support a hardware-ready release label.
 
 ## Resume Checklist
 
 Before resuming hardware validation:
 
-- connect the Hottop USB serial adapter
-- confirm the actual port appears with `ls /dev/cu.*`
+- confirm the Hottop USB serial adapter still appears with `ls /dev/cu.*`
 - keep the physical stop plan ready
-- create `/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` with the actual
-  `roaster.port`
 - configure Warp with the `roastpilot-hottop` MCP JSON
 - confirm Warp discovers the expected tools
 - call `get_runtime_config` and confirm:
@@ -168,20 +178,21 @@ Before resuming hardware validation:
 ## Restart Prompt
 
 Resume in `/Users/sertanyamaner/git/coffee-roaster-mcp` on branch
-`feature/59-warp-manual-hottop-control-validation`. E7-S4 is started but blocked
-before live Warp Hottop validation because no actual Hottop USB serial adapter
-was visible: `ls /dev/cu.*` showed only `/dev/cu.Bluetooth-Incoming-Port` and
-`/dev/cu.debug-console`. PR #140 is merged, issue #58 is closed, `main` was
-fast-forwarded to `c480afc`, and `uvx` is available at `/opt/homebrew/bin/uvx`
-with version `0.11.16`. Read `docs/state/registry.md`,
+`feature/59-warp-manual-hottop-control-validation`. E7-S4 is started and the
+Hottop adapter is now visible at `/dev/cu.usbserial-DN016OJ3`. The config file
+`/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` was created with driver
+`hottop_kn8828b_2k_plus`, port `/dev/cu.usbserial-DN016OJ3`,
+`first_crack.mode: disabled`, and
+`session.auto_t0_detection_enabled: false`; local config-load verification
+returned `hottop_kn8828b_2k_plus /dev/cu.usbserial-DN016OJ3 disabled False`.
+PR #140 is merged, issue #58 is closed, `main` was fast-forwarded to `c480afc`,
+and `uvx` is available at `/opt/homebrew/bin/uvx` with version `0.11.16`. Read
+`docs/state/registry.md`,
 `docs/state/epics/coffee-roaster-mcp-v0.1.md`,
 `docs/session-summaries/2026-05-24-e7-s3-warp-mcp-client-connection.md`, this
 summary, and issue #59 including
 `https://github.com/syamaner/coffee-roaster-mcp/issues/59#issuecomment-4529994261`.
-After the Hottop adapter is connected, create
-`/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` with actual
-`roaster.port`, keep `first_crack.mode: disabled` and
-`session.auto_t0_detection_enabled: false`, launch through Warp using
+Next, launch through Warp using
 `uvx --from coffee-roaster-mcp==0.1.0 coffee-roaster-mcp serve` or
 `/opt/homebrew/bin/uvx`, and require explicit operator approval plus before/after
 device-state evidence for every hardware-affecting tool call. Do not run

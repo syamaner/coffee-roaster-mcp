@@ -823,9 +823,12 @@ Goal: prove the package works from install through mock roast, MCP client calls,
     and exported-log review. No autonomous hardware-control decisions are in
     scope.
   - Started from updated `main` on
-    `feature/59-warp-manual-hottop-control-validation`, but live validation is
-    blocked until the actual Hottop USB serial adapter is visible and the
-    operator explicitly approves each Warp hardware-affecting tool call.
+    `feature/59-warp-manual-hottop-control-validation`. The Hottop adapter is
+    now visible at `/dev/cu.usbserial-DN016OJ3`, and
+    `/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` has been created with
+    the Hottop driver, disabled first-crack mode, and auto-T0 disabled. Live
+    validation still requires Warp evidence and explicit operator approval for
+    each hardware-affecting tool call.
 
 - [ ] `E7-S5a` Test MCP first-crack detection with labelled WAV replay.
   - Done when a small derived WAV fixture, retimestamped label file, and
@@ -1196,17 +1199,26 @@ After completing a story:
     `/opt/homebrew/bin/uvx` if Warp cannot find `uvx`.
   - Confirmed local `uvx` resolves to `/opt/homebrew/bin/uvx` and reports
     `uvx 0.11.16`.
-  - Checked visible macOS serial devices with `ls /dev/cu.*`; only
+  - Initially checked visible macOS serial devices with `ls /dev/cu.*`; only
     `/dev/cu.Bluetooth-Incoming-Port` and `/dev/cu.debug-console` were present.
-    No actual `/dev/cu.usbserial-*` Hottop adapter was visible, so
-    `/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` was not created with
-    a fake port and Warp hardware validation was not launched.
+    No actual `/dev/cu.usbserial-*` Hottop adapter was visible, so no fake-port
+    config was created and Warp hardware validation was not launched.
+  - After the operator reconnected the Hottop adapter, `ls /dev/cu.*` showed
+    `/dev/cu.usbserial-DN016OJ3`.
+  - Created `/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` with
+    `roaster.driver: hottop_kn8828b_2k_plus`,
+    `roaster.port: /dev/cu.usbserial-DN016OJ3`,
+    `first_crack.mode: disabled`, and
+    `session.auto_t0_detection_enabled: false`.
+  - Ran local config-load verification without connecting to hardware:
+    `./.venv/bin/python -c "..."` returned
+    `hottop_kn8828b_2k_plus /dev/cu.usbserial-DN016OJ3 disabled False`.
   - No hardware-affecting MCP calls were run. This preserves the E7-S4 safety
     boundary requiring physical stop readiness, runtime config and device-state
     confirmation before controls, and explicit operator approval before each
     connect, heat, fan, drop, cooling, stop-cooling, and emergency-stop call.
-  - Hardware-ready release labeling remains blocked. Partial preflight evidence
-    does not prove Warp Hottop control behavior.
+  - Hardware-ready release labeling remains blocked. Adapter/config preflight
+    evidence does not prove Warp Hottop control behavior.
 
 - Validation run for E6-S4:
   - Added focused version alignment coverage in `tests/test_server_json.py`.
