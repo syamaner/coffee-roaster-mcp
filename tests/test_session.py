@@ -1033,6 +1033,62 @@ def test_emergency_stop_can_fault_latest_session_stopped_after_driver_call() -> 
     assert snapshot.event_timeline[-1].kind == "fault"
 
 
+def test_stop_cooling_recovery_records_new_event_after_completed_session_fault() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    store.record_event(session, "beans_dropped")
+    store.record_event(session, "cooling_started")
+    store.stop_cooling(session)
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 2, tzinfo=UTC)
+    clock.monotonic_value = 115.0
+    store.emergency_stop(
+        session,
+        reason="post-complete-fault",
+        safety_payload={
+            "driver": "test-driver",
+            "driver_safety_method": "emergency_stop",
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+        allow_stopped_latest=True,
+    )
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 3, tzinfo=UTC)
+    clock.monotonic_value = 125.0
+    reservation = store.reserve_driver_stop_cooling_recovery(session)
+    event, snapshot = store.complete_reserved_driver_stop_cooling_recovery_snapshot(
+        session,
+        reservation=reservation,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=False,
+    )
+
+    cooling_events = [
+        timeline_event
+        for timeline_event in snapshot.event_timeline
+        if timeline_event.kind == "cooling_stopped"
+    ]
+    assert event.kind == cooling_events[-1].kind
+    assert event.payload == cooling_events[-1].payload
+    assert len(cooling_events) == 2
+    assert cooling_events[0].payload == {}
+    assert cooling_events[1].payload["recovery_after_fault"] is True
+    assert cooling_events[1].recorded_at_utc == datetime(2026, 5, 4, 12, 3, tzinfo=UTC)
+    assert snapshot.phase == "fault"
+    assert snapshot.cooling_on is False
+
+
 def test_emergency_stop_faults_active_complete_session() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(

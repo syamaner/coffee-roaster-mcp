@@ -139,7 +139,10 @@ Required repo checks:
 - Export recovery phase follow-up:
   `./.venv/bin/python -m pytest tests/test_exports.py::test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop tests/test_mcp_server.py::test_stop_cooling_recovers_after_emergency_stop_leaves_cooling_on tests/test_mcp_server.py::test_stop_cooling_recovery_keeps_fault_when_driver_reports_cooling_on`:
   3 passed.
-- `./.venv/bin/python -m pytest`: 360 passed.
+- Second review follow-up targeted recovery tests:
+  `./.venv/bin/python -m pytest tests/test_session.py::test_stop_cooling_recovery_records_new_event_after_completed_session_fault tests/test_mcp_server.py::test_stop_cooling_recovers_after_emergency_stop_leaves_cooling_on tests/test_mcp_server.py::test_stop_cooling_recovery_keeps_fault_when_driver_reports_cooling_on tests/test_mcp_server.py::test_stop_cooling_recovery_rejects_driver_heat_after_fault tests/test_mcp_server.py::test_stale_stop_cooling_recovery_fails_closed tests/test_exports.py::test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop`:
+  6 passed.
+- `./.venv/bin/python -m pytest`: 363 passed.
 - `./.venv/bin/python -m ruff check .`: passed.
 - `./.venv/bin/python -m ruff format --check .`: 31 files already formatted.
 - `./.venv/bin/python -m pyright`: 0 errors, 0 warnings, 0 informations.
@@ -218,6 +221,22 @@ Code review follow-up:
   exports a `fault -> cooling_stopped(recovery_after_fault: true)` timeline and
   asserts both rows remain `phase: fault` while the recovery row reports
   `cooling_on: False`.
+- Codex review
+  `https://github.com/syamaner/coffee-roaster-mcp/pull/143#pullrequestreview-4356538487`
+  found three remaining post-fault recovery gaps:
+  `cooling_stopped` recovery events could be deduplicated against an older
+  normal `cooling_stopped` event, stale recovery completion did not use the same
+  fail-closed guard as the normal reserved command paths, and recovery
+  completion could accept a driver state with nonzero heat after a fault.
+- The follow-up fix keeps normal singleton event behavior but allows a fresh
+  `cooling_stopped` event when `recovery_after_fault: true`; rejects post-fault
+  recovery completion unless heat is off; and routes recovery completion
+  `SessionLifecycleError` failures through
+  `_fail_closed_after_stale_driver_command`.
+- Regression coverage now includes a completed-session-then-faulted recovery
+  timeline with two `cooling_stopped` events, a heat-on recovery rejection that
+  preserves fault state, and a stale recovery completion that triggers the
+  fail-closed emergency-stop driver safety path.
 
 Actions deliberately not taken:
 

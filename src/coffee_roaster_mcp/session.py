@@ -1380,6 +1380,8 @@ class RoastSessionStore:
                 fan_level_percent,
                 label="fan_level_percent",
             )
+            if validated_heat != 0:
+                raise SessionLifecycleError("Heat must be off after post-fault cooling recovery.")
             try:
                 event = self._record_stopped_session_event_locked(
                     session,
@@ -1746,7 +1748,10 @@ class RoastSessionStore:
     ) -> RoastEvent:
         """Record a narrowly allowed event for a stopped latest session."""
         existing_event = self._get_existing_singleton_event(session, kind)
-        if existing_event is not None:
+        is_post_fault_recovery = (
+            kind == "cooling_stopped" and payload.get("recovery_after_fault") is True
+        )
+        if existing_event is not None and not is_post_fault_recovery:
             return existing_event
         event = RoastEvent(
             kind=kind,

@@ -1007,13 +1007,20 @@ def _run_reserved_driver_stop_cooling_recovery(
     reservation = server_context.session_store.reserve_driver_stop_cooling_recovery(session)
     try:
         driver_state = server_context.roaster_driver.stop_cooling()
-        return server_context.session_store.complete_reserved_driver_stop_cooling_recovery_snapshot(
-            session,
-            reservation=reservation,
-            heat_level_percent=driver_state.heat_level_percent,
-            fan_level_percent=driver_state.fan_level_percent,
-            cooling_on=driver_state.cooling_on,
-        )
+        try:
+            complete_recovery = (
+                server_context.session_store.complete_reserved_driver_stop_cooling_recovery_snapshot
+            )
+            return complete_recovery(
+                session,
+                reservation=reservation,
+                heat_level_percent=driver_state.heat_level_percent,
+                fan_level_percent=driver_state.fan_level_percent,
+                cooling_on=driver_state.cooling_on,
+            )
+        except SessionLifecycleError:
+            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
+            raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
         raise

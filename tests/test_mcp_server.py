@@ -1071,6 +1071,76 @@ def test_stop_cooling_recovery_keeps_fault_when_driver_reports_cooling_on(
         "connect",
         "emergency_stop:unit-test",
         "stop_cooling",
+        "emergency_stop:stale driver command after session state changed",
+    ]
+
+
+def test_stop_cooling_recovery_rejects_driver_heat_after_fault(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(stop_cooling_heat_level_percent=20)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "emergency_stop", ctx, reason="unit-test")
+
+    with pytest.raises(SessionLifecycleError, match="Heat must be off"):
+        _call_tool(server, "stop_cooling", ctx)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+    assert state.phase == "fault"
+    assert state.active is False
+    assert state.heat_level_percent == 0
+    assert state.cooling_on is True
+    assert [event.kind for event in state.events] == ["fault"]
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:unit-test",
+        "stop_cooling",
+        "emergency_stop:stale driver command after session state changed",
+    ]
+
+
+def test_stale_stop_cooling_recovery_fails_closed(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    command_started = Event()
+    release_command = Event()
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(block_stop_cooling=(command_started, release_command))
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    errors: list[BaseException] = []
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "emergency_stop", ctx, reason="unit-test")
+    stop_thread = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "stop_cooling", ctx),
+    )
+    stop_thread.start()
+    assert command_started.wait(timeout=1.0)
+
+    latest_session = server_context.session_store.get_latest_session()
+    assert latest_session is not None
+    server_context.session_store.cancel_pending_driver_command(latest_session)
+    release_command.set()
+    stop_thread.join(timeout=1.0)
+
+    assert not stop_thread.is_alive()
+    assert isinstance(errors[0], SessionLifecycleError)
+    state = _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+    assert state.phase == "fault"
+    assert state.cooling_on is True
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:unit-test",
+        "stop_cooling",
+        "emergency_stop:stale driver command after session state changed",
     ]
 
 
@@ -1106,7 +1176,9 @@ class RecordingRoasterDriver:
         block_connect: tuple[Event, Event] | None = None,
         block_heat: tuple[Event, Event] | None = None,
         block_drop: tuple[Event, Event] | None = None,
+        block_stop_cooling: tuple[Event, Event] | None = None,
         stop_cooling_stays_on: bool = False,
+        stop_cooling_heat_level_percent: int = 0,
         bean_temp_c: float | None = None,
         env_temp_c: float | None = None,
         raw_vendor_data: dict[str, str | int | float | bool | None] | None = None,
@@ -1119,7 +1191,9 @@ class RecordingRoasterDriver:
         self.block_connect = block_connect
         self.block_heat = block_heat
         self.block_drop = block_drop
+        self.block_stop_cooling = block_stop_cooling
         self.stop_cooling_stays_on = stop_cooling_stays_on
+        self.stop_cooling_heat_level_percent = stop_cooling_heat_level_percent
         self.connected = False
         self.heat_level_percent = 0
         self.fan_level_percent = 0
@@ -1194,7 +1268,12 @@ class RecordingRoasterDriver:
     def stop_cooling(self) -> RoasterState:
         """Record cooling-stop commands."""
         self.actions.append("stop_cooling")
+        if self.block_stop_cooling is not None:
+            started, release = self.block_stop_cooling
+            started.set()
+            assert release.wait(timeout=1.0)
         self.cooling_on = self.stop_cooling_stays_on
+        self.heat_level_percent = self.stop_cooling_heat_level_percent
         return self._state()
 
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
