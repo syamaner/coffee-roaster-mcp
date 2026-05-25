@@ -240,6 +240,75 @@ def test_invalid_audio_source_fails(tmp_path: Path) -> None:
         load_config(config_path, environ={})
 
 
+@pytest.mark.parametrize(
+    ("yaml_body", "message"),
+    (
+        ("first_crack:\n  confidence_threshold: 1.5\n", "first_crack.confidence_threshold"),
+        ("first_crack:\n  confidence_threshold: nan\n", "first_crack.confidence_threshold"),
+        ("first_crack:\n  min_positive_windows: 0\n", "first_crack.min_positive_windows"),
+        (
+            "first_crack:\n  confirmation_window_seconds: -1\n",
+            "first_crack.confirmation_window_seconds",
+        ),
+        ("audio:\n  overlap: 1.0\n", "audio.overlap"),
+        ("audio:\n  overlap: -0.1\n", "audio.overlap"),
+        ("audio:\n  hop_seconds: 0\n", "audio.hop_seconds"),
+        (
+            "audio:\n  window_seconds: 1.0\n  hop_seconds: 2.0\n",
+            "audio.hop_seconds",
+        ),
+    ),
+)
+def test_invalid_detector_window_config_fails(
+    tmp_path: Path,
+    yaml_body: str,
+    message: str,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(yaml_body, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=message):
+        load_config(config_path, environ={})
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    (
+        (
+            {"COFFEE_FIRST_CRACK_CONFIDENCE_THRESHOLD": "-0.1"},
+            "COFFEE_FIRST_CRACK_CONFIDENCE_THRESHOLD",
+        ),
+        (
+            {"COFFEE_FIRST_CRACK_MIN_POSITIVE_WINDOWS": "0"},
+            "COFFEE_FIRST_CRACK_MIN_POSITIVE_WINDOWS",
+        ),
+        (
+            {"COFFEE_FIRST_CRACK_CONFIRMATION_WINDOW_SECONDS": "nan"},
+            "COFFEE_FIRST_CRACK_CONFIRMATION_WINDOW_SECONDS",
+        ),
+        ({"COFFEE_AUDIO_OVERLAP": "1.0"}, "COFFEE_AUDIO_OVERLAP"),
+        ({"COFFEE_AUDIO_HOP_SECONDS": "-1"}, "COFFEE_AUDIO_HOP_SECONDS"),
+        (
+            {
+                "COFFEE_AUDIO_WINDOW_SECONDS": "1.0",
+                "COFFEE_AUDIO_HOP_SECONDS": "2.0",
+            },
+            "COFFEE_AUDIO_HOP_SECONDS",
+        ),
+    ),
+)
+def test_invalid_detector_window_environment_overrides_fail(
+    tmp_path: Path,
+    env: dict[str, str],
+    message: str,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("roaster:\n  driver: mock\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=message):
+        load_config(config_path, environ=env)
+
+
 def test_invalid_auto_t0_threshold_fails(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text("session:\n  auto_t0_drop_threshold_c: 0\n", encoding="utf-8")

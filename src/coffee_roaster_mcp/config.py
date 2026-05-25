@@ -40,7 +40,22 @@ class RoasterConfig:
 
 @dataclass(frozen=True)
 class FirstCrackConfig:
-    """First-crack detector configuration."""
+    """First-crack detector configuration.
+
+    Attributes:
+        mode: First-crack mode: `disabled`, `audio`, or `manual`.
+        repo_id: Hugging Face model repository id for released detector artifacts.
+        revision: Optional Hub revision, branch, tag, or commit SHA to pin artifacts.
+        precision: ONNX model precision, either `int8` or `fp32`.
+        local_model_dir: Optional local directory containing released artifact files.
+        onnx_threads: Number of ONNX Runtime intra-op threads.
+        confidence_threshold: Detector confidence threshold in the inclusive
+            range `0.0` to `1.0`.
+        min_positive_windows: Number of recent positive windows required before
+            automatic first crack is confirmed.
+        confirmation_window_seconds: Recent-positive confirmation span in seconds.
+        allow_manual_override: Whether explicit `mark_first_crack` is allowed.
+    """
 
     mode: FirstCrackMode = "disabled"
     repo_id: str = "syamaner/coffee-first-crack-detection"
@@ -56,7 +71,20 @@ class FirstCrackConfig:
 
 @dataclass(frozen=True)
 class AudioConfig:
-    """Audio capture configuration."""
+    """Audio capture configuration.
+
+    Attributes:
+        source: Audio source type: `microphone` or `wav`.
+        input_device: Optional PortAudio or platform-specific input device id.
+        sample_rate: Mono detector sample rate in Hz.
+        wav_path: Optional WAV path when `source` is `wav`.
+        replay_mode: WAV replay mode: `realtime` or `detector_paced`.
+        window_seconds: Detector window duration in seconds.
+        overlap: Fraction of each window shared with the next window, from `0.0`
+            inclusive to `1.0` exclusive.
+        hop_seconds: Optional explicit hop duration in seconds. When set, this
+            overrides the cadence derived from `overlap`.
+    """
 
     source: AudioSource = "microphone"
     input_device: str | None = None
@@ -263,6 +291,13 @@ def _audio_from_mapping(raw: Mapping[str, Any]) -> AudioConfig:
         1.0,
         label="audio.window_seconds",
     )
+    hop_seconds = _optional_positive_float(raw, "hop_seconds", label="audio.hop_seconds")
+    _validate_audio_hop_seconds(
+        hop_seconds,
+        window_seconds,
+        hop_label="audio.hop_seconds",
+        window_label="audio.window_seconds",
+    )
     return AudioConfig(
         source=_audio_source(
             _string(raw, "source", "microphone", label="audio.source"),
@@ -282,7 +317,7 @@ def _audio_from_mapping(raw: Mapping[str, Any]) -> AudioConfig:
             0.0,
             label="audio.overlap",
         ),
-        hop_seconds=_optional_positive_float(raw, "hop_seconds", label="audio.hop_seconds"),
+        hop_seconds=hop_seconds,
     )
 
 
@@ -467,6 +502,12 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
                 else _parse_positive_float(hop_seconds, "COFFEE_AUDIO_HOP_SECONDS")
             ),
         )
+    _validate_audio_hop_seconds(
+        audio.hop_seconds,
+        audio.window_seconds,
+        hop_label="COFFEE_AUDIO_HOP_SECONDS",
+        window_label="COFFEE_AUDIO_WINDOW_SECONDS",
+    )
 
     if "COFFEE_ROAST_LOG_DIR" in environ:
         logging = replace(
@@ -663,6 +704,20 @@ def _parse_overlap_float(value: object, key: str) -> float:
     if not math.isfinite(parsed) or not 0.0 <= parsed < 1.0:
         raise ConfigError(f"{key} must be greater than or equal to 0 and less than 1.")
     return parsed
+
+
+def _validate_audio_hop_seconds(
+    hop_seconds: float | None,
+    window_seconds: float,
+    *,
+    hop_label: str,
+    window_label: str,
+) -> None:
+    if hop_seconds is not None and hop_seconds > window_seconds:
+        raise ConfigError(
+            f"{hop_label} must be less than or equal to {window_label} "
+            f"({hop_seconds} > {window_seconds})."
+        )
 
 
 def _parse_float(value: object, key: str) -> float:

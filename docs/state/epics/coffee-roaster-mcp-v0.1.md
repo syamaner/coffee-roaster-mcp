@@ -2323,10 +2323,10 @@ After completing a story:
     Warp manual roast validation, model training/export/sync, live PyPI/MCP
     Registry publishing, and hardware-ready release labeling out of scope.
   - Ran `./.venv/bin/python -m pytest tests/test_config.py tests/test_audio.py tests/test_detector.py tests/test_first_crack_runtime.py tests/test_first_crack_integration.py tests/test_exports.py`:
-    105 passed.
+    119 passed.
   - Ran `./.venv/bin/python scripts/validate_first_crack_wav_replay.py --timeout-seconds 180`:
     passed.
-  - Ran `./.venv/bin/python -m pytest`: 380 passed.
+  - Ran `./.venv/bin/python -m pytest`: 394 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
