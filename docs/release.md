@@ -188,6 +188,45 @@ Pre-tag checklist:
    uvx --from coffee-roaster-mcp==0.1.1 coffee-roaster-mcp --version
    ```
 
+## v0.1.1 Live Publish Outcome
+
+The fix-forward release completed on 2026-05-25 through GitHub Actions run
+`26402310473`:
+
+- Tag: `v0.1.1`
+- Commit: `810318519899e662204b78671657bd9bc7222a73`
+- Workflow: `https://github.com/syamaner/coffee-roaster-mcp/actions/runs/26402310473`
+- PyPI release: `https://pypi.org/project/coffee-roaster-mcp/0.1.1/`
+- MCP Registry search:
+  `https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.syamaner/coffee-roaster-mcp`
+
+Release job outcomes:
+
+- `Validate Release Metadata`: success
+- `Checks`: success
+- `Build Package`: success
+- `Publish PyPI`: success
+- `Publish MCP Registry`: success after PyPI publish
+- `Release Dry Run`: skipped, as expected for a tag push
+
+Confirmed outcomes:
+
+- Production PyPI exposes `coffee-roaster-mcp` version `0.1.1`.
+- PyPI artifacts:
+  - `coffee_roaster_mcp-0.1.1-py3-none-any.whl`, SHA-256
+    `a6c68ec7dbea3c428922fce525fbf0d6dc451d549dff36a56bcb731aaf5ad395`
+  - `coffee_roaster_mcp-0.1.1.tar.gz`, SHA-256
+    `744bfaa34584173158c98bfebf80b574e25b7f793ac390d61ee1688862ca73df`
+- Registry search returns `io.github.syamaner/coffee-roaster-mcp` with PyPI
+  package `coffee-roaster-mcp`, version `0.1.1`, runtime hint `uvx`, stdio
+  transport, and `isLatest: true`.
+- Published-package smoke passed after refreshing the local `uvx` cache:
+  `uvx --refresh --from coffee-roaster-mcp==0.1.1 coffee-roaster-mcp --version`
+  returned `coffee-roaster-mcp 0.1.1`.
+- The `v0.1.1` tag creation reported the same protected-tag creation rule
+  bypass as `v0.1.0`; keep tag protection and release environment ownership
+  under review before the next release.
+
 ## v0.1.0 Live Publish Outcome
 
 The first live release completed on 2026-05-24 through GitHub Actions run

@@ -22,10 +22,12 @@
 
 RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.
 
-The active release-prep branch is `release/0.1.1`, which bumps the package and
-MCP Registry metadata version to `0.1.1` for the post-E7-S4 recovery fixes.
-After the version PR merges, tag updated `main` as `v0.1.1` and let the
-release workflow publish PyPI before MCP Registry metadata.
+The `v0.1.1` fix-forward release is published for the post-E7-S4 recovery
+fixes. PR #144 merged the version bump, tag `v0.1.1` points at
+`810318519899e662204b78671657bd9bc7222a73`, GitHub Actions release run
+`26402310473` published PyPI and then MCP Registry metadata, and the published
+`uvx --refresh --from coffee-roaster-mcp==0.1.1 coffee-roaster-mcp --version`
+smoke returned `coffee-roaster-mcp 0.1.1`.
 
 Epic 3 is complete. The Hottop driver now has validated lifecycle, command-loop,
 packet, temperature-unit, heat, fan, drop, cooling, cleanup, and emergency-stop
