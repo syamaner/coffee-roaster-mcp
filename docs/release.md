@@ -227,6 +227,40 @@ Confirmed outcomes:
   bypass as `v0.1.0`; keep tag protection and release environment ownership
   under review before the next release.
 
+## v0.1.2 Release Prep
+
+The `v0.1.2` release is a metadata-only package release to expose related
+project resources on PyPI and through the README reached from the MCP Registry
+listing.
+
+Planned change set:
+
+- Bump `coffee_roaster_mcp.__version__`, `server.json.version`, and
+  `server.json.packages[0].version` from `0.1.1` to `0.1.2`.
+- Add package `Project-URL` metadata for the architecture article, original
+  prototype posts, Hugging Face first-crack model, Hugging Face dataset, and
+  Gradio demo Space.
+- Add the same links to the README under Related Project Artifacts.
+- Clarify that the current MCP package is the consolidated deterministic
+  rebuild of the prototype.
+- Keep `server.json.websiteUrl` pointed at the README instead of adding
+  non-schema registry metadata fields.
+
+After the PR merges:
+
+```bash
+git checkout main
+git pull --ff-only origin main
+git tag v0.1.2
+git push origin v0.1.2
+```
+
+Then approve the `release` environment deployment and verify:
+
+```bash
+uvx --refresh --from coffee-roaster-mcp==0.1.2 coffee-roaster-mcp --version
+```
+
 ## v0.1.0 Live Publish Outcome
 
 The first live release completed on 2026-05-24 through GitHub Actions run

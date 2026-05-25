@@ -19,6 +19,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - Active story: `E7-S4`
 - Current target: retest Warp manual Hottop MCP control validation on the
   published `coffee-roaster-mcp==0.1.1` package path
+- Next package publication target: `v0.1.2` metadata-only release for related
+  project links
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -54,6 +56,12 @@ The first implementation milestone is a mock vertical slice that requires no roa
   published PyPI and then MCP Registry metadata. Published-package smoke with
   `uvx --refresh --from coffee-roaster-mcp==0.1.1 coffee-roaster-mcp --version`
   returned `coffee-roaster-mcp 0.1.1`.
+- `v0.1.2` is reserved as a metadata-only release for related project links:
+  package project URLs and README links for the architecture article, original
+  prototype posts, Hugging Face first-crack model, Hugging Face dataset, and
+  Gradio demo Space. README wording frames this package as the consolidated
+  deterministic rebuild of the prototype. The MCP Registry JSON remains
+  schema-focused and continues to point `websiteUrl` at the README.
 - `E7-S5a` is inserted before the final release checklist to close the
   first-crack MCP validation gap without requiring Hottop hardware or live
   microphone input. It uses the mock roaster, released Hugging Face first-crack
