@@ -2022,12 +2022,15 @@ def _normalize_event_monotonic_seconds(
     if kind == "fault" or not session.event_timeline:
         return monotonic_seconds
     latest_event = session.event_timeline[-1]
-    if (
-        latest_event.kind == "first_crack_detected"
-        and monotonic_seconds < latest_event.monotonic_seconds
-    ):
+    if _has_recorded_first_crack(session) and monotonic_seconds < latest_event.monotonic_seconds:
         return latest_event.monotonic_seconds
     return monotonic_seconds
+
+
+def _has_recorded_first_crack(session: RoastSession) -> bool:
+    return session.first_crack_monotonic_seconds is not None or any(
+        event.kind == "first_crack_detected" for event in session.event_timeline
+    )
 
 
 def _elapsed_since(

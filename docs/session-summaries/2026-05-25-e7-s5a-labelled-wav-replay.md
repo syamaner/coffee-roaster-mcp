@@ -172,6 +172,10 @@ Review notes:
   inverted metrics. Also strengthened the runtime-metric scoping test so the
   completed session is zeroed and the active session still reports live
   counters.
+- Addressed the final CodeRabbit duplicate follow-up on commit `8ac3f6a` by
+  applying the shared post-first-crack normalization to any non-fault event that
+  would move behind the latest event timestamp, covering `beans_dropped`,
+  `cooling_started`, and `cooling_stopped`.
 - Follow-up review status before push: CodeRabbit completed after the local
   follow-up fix, and no additional Codex reviews were posted.
 
@@ -188,3 +192,4 @@ the next issue explicitly requires them.
 - Review follow-up start: current Codex goal token tracking is unavailable in
   this session (`remainingTokens: null`, `completionBudgetReport: null`).
 - Review completion/push handoff: `797K used`.
+- Final CodeRabbit duplicate follow-up: `994K used`.

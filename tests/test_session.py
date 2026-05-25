@@ -365,11 +365,17 @@ def test_future_first_crack_detection_allows_later_events_without_inverted_metri
         max_future_seconds=None,
     )
 
-    event = store.record_event(session, "beans_dropped")
+    drop_event = store.record_event(session, "beans_dropped")
+    cooling_started_event = store.record_event(session, "cooling_started")
+    cooling_stopped_event = store.record_event(session, "cooling_stopped")
 
-    assert event.kind == "beans_dropped"
+    assert drop_event.kind == "beans_dropped"
+    assert cooling_started_event.kind == "cooling_started"
+    assert cooling_stopped_event.kind == "cooling_stopped"
     assert session.first_crack_monotonic_seconds == 20.0
     assert session.beans_dropped_monotonic_seconds == 20.0
+    assert session.cooling_started_monotonic_seconds == 20.0
+    assert session.cooling_stopped_monotonic_seconds == 20.0
     assert compute_development_time_seconds(session) == 0.0
 
 
