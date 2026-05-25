@@ -1,0 +1,16 @@
+{
+  "annotations": [
+    {
+      "confidence": "high",
+      "end_time": 20.0,
+      "id": "chunk_000",
+      "label": "first_crack",
+      "source_end_time": 746.7350791840846,
+      "source_start_time": 665.8271039066344,
+      "start_time": 3.82710390663442
+    }
+  ],
+  "audio_file": "roastpilot-fc-replay-001.wav",
+  "duration": 20.0,
+  "sample_rate": 16000
+}

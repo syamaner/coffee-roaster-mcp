@@ -250,6 +250,35 @@ def test_audio_runtime_keeps_pending_status_when_detector_does_not_confirm() -> 
     assert [event.kind for event in session.event_timeline] == ["beans_added"]
 
 
+def test_detector_paced_wav_replay_preserves_source_audio_timeline() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    backend = MockDetectorBackend((FirstCrackDetectorOutput(confirmed=True),))
+    pipeline = FakeAudioPipeline(
+        (_audio_window(sequence_number=4, started_at_monotonic_seconds=504.0),)
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            first_crack=FirstCrackConfig(mode="audio"),
+            audio=AudioConfig(source="wav", replay_mode="detector_paced"),
+        ),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+    )
+
+    runtime.start_for_session(session)
+    detected = runtime.process_available_windows(session_store=store, session=session)
+
+    assert detected.status == "detected"
+    assert session.first_crack_monotonic_seconds == 5.0
+
+
 def test_audio_runtime_reports_unavailable_artifact_errors_without_crashing() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)

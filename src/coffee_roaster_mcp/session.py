@@ -1578,7 +1578,7 @@ class RoastSessionStore:
         session: RoastSession,
         *,
         detected_at_monotonic_seconds: float,
-        max_future_seconds: float = 0.0,
+        max_future_seconds: float | None = 0.0,
         payload: dict[str, EventPayloadValue] | None = None,
     ) -> tuple[RoastEvent, RoastSession]:
         """Record automatic first crack at the detector-provided monotonic time.
@@ -1590,7 +1590,9 @@ class RoastSessionStore:
             max_future_seconds: Allowed future timestamp tolerance. This lets
                 adapter-inferred window-end defaults record when the capture
                 window has just been emitted but its inferred end timestamp is
-                slightly ahead of the integration clock.
+                slightly ahead of the integration clock. Use `None` for
+                detector-paced replay where source-audio time can intentionally
+                advance faster than wall-clock time.
             payload: Optional structured event details.
 
         Returns:
@@ -1945,9 +1947,9 @@ def _detected_elapsed_seconds(
     *,
     detected_at_monotonic_seconds: float,
     current_elapsed_seconds: float,
-    max_future_seconds: float,
+    max_future_seconds: float | None,
 ) -> float:
-    if max_future_seconds < 0:
+    if max_future_seconds is not None and max_future_seconds < 0:
         raise SessionLifecycleError("Detected first-crack future tolerance must be >= 0.")
     detected_elapsed_seconds = round(
         float(detected_at_monotonic_seconds) - session.monotonic_start,
@@ -1961,9 +1963,10 @@ def _detected_elapsed_seconds(
         )
     if detected_elapsed_seconds > current_elapsed_seconds:
         future_delta_seconds = detected_elapsed_seconds - current_elapsed_seconds
-        if future_delta_seconds > max_future_seconds:
+        if max_future_seconds is not None and future_delta_seconds > max_future_seconds:
             raise SessionLifecycleError("Detected first-crack timestamp cannot be in the future.")
-        detected_elapsed_seconds = current_elapsed_seconds
+        if max_future_seconds is not None:
+            detected_elapsed_seconds = current_elapsed_seconds
     if (
         session.beans_added_monotonic_seconds is not None
         and detected_elapsed_seconds < session.beans_added_monotonic_seconds

@@ -390,15 +390,17 @@ Warp as the local MCP client on the mock-safe path. E7-S4 validates manual
 operator-approved Hottop device control through Warp MCP tool calls, with no
 autonomous hardware-control decisions.
 
-Epic 7 now also includes E7-S5a to close the MCP first-crack detection replay
-gap before the final release checklist and full end-to-end agent roast. E7-S5a
-uses the mock roaster plus a committed small derived labelled WAV fixture from
-the `coffee-first-crack-detection` checkout, retimestamped labels, a manifest,
-detector-paced replay, and pinned released Hugging Face INT8 artifacts at
-revision `b349a919c34b6130472da97c01817be404e4f629`. The fixture is a narrow
-documented exception to the normal no-audio-in-git rule. Real-model MCP replay
-remains opt-in or local/manual rather than default CI, while lightweight fixture
-metadata and label consistency checks may run in CI.
+E7-S5a closes the MCP first-crack detection replay gap before the final release
+checklist and full end-to-end agent roast. The story uses the mock roaster plus
+the committed small derived labelled WAV fixture
+`tests/fixtures/audio/roastpilot-fc-replay-001.wav` from the
+`coffee-first-crack-detection` checkout, retimestamped labels, a manifest,
+detector-paced replay, a 10-second detector window, and pinned released Hugging
+Face INT8 artifacts at revision
+`b349a919c34b6130472da97c01817be404e4f629`. The fixture is a narrow documented
+exception to the normal no-audio-in-git rule. Real-model MCP replay remains
+opt-in/local/manual rather than default CI, while lightweight fixture metadata
+and label consistency checks run in CI.
 
 E7-S3 completed Warp MCP client connection validation on the mock-safe
 published-package path. Warp launched the `roastpilot` stdio MCP server through
@@ -409,33 +411,13 @@ Warp public MCP tool calls, and exported verified `roast.jsonl`, `roast.csv`,
 and `summary.json` files under
 `/private/tmp/roastpilot-warp-mock/logs/roasts/b279284880fd4263b2cc0df5366e557f/`.
 
-The next story is E7-S4: run Warp manual Hottop MCP control validation with
-operator approval for each hardware-affecting tool call. Do not run full
-end-to-end agent roast validation, ChatGPT MCP validation, model
-training/export/sync, or real microphone validation unless a later story
-explicitly requires it.
-
-E7-S4 is started on branch
-`feature/59-warp-manual-hottop-control-validation`. The local preflight
-confirmed `uvx` at `/opt/homebrew/bin/uvx`; after the operator reconnected the
-Hottop adapter, `ls /dev/cu.*` showed `/dev/cu.usbserial-DN016OJ3`. The
-dedicated config now exists at
-`/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` with the Hottop driver,
-that serial port, first-crack mode disabled, and auto-T0 disabled. Live Warp
-Hottop validation still requires Warp tool-discovery/config/state evidence and
-explicit operator approval for each hardware-affecting MCP call. Do not launch
-Warp hardware controls, export hardware logs, or apply a hardware-ready release
-label from adapter/config preflight alone.
-
-Live E7-S4 Warp validation surfaced a post-emergency recovery bug: emergency
-stop correctly faulted and stopped the session while leaving cooling on, but
-MCP `stop_cooling` then failed with `No active roast session exists.` The
-branch now includes a narrow recovery path that allows `stop_cooling` only for
-the latest stopped `fault` session while cooling remains on, records
-`cooling_stopped` with `recovery_after_fault: true`, and preserves
-`phase: fault` / `active: false`. Hardware-ready release labeling remains
-blocked until that recovery path and the rest of E7-S4 are validated through
-Warp.
+E7-S4 is complete: PR #143 merged and issue #59 is closed. E7-S5a is complete
+on branch `feature/141-test-mcp-first-crack-detection-labelled-wav-replay` and
+should open a PR for issue #141. The next story after that PR merges is E7-S5:
+produce the v0.1 release checklist. Do not run live Hottop validation, real
+microphone validation, full end-to-end agent roast validation, model
+training/export/sync, live PyPI/MCP Registry publishing, or hardware-ready
+release labeling unless a later story explicitly requires it.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

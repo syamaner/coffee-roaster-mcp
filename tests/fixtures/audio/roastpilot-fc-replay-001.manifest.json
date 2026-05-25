@@ -1,0 +1,36 @@
+{
+  "adjusted_label_interval_seconds": {
+    "end": 20.0,
+    "start": 3.82710390663442
+  },
+  "description": "Derived labelled first-crack WAV replay fixture for RoastPilot MCP validation.",
+  "evaluation_split_evidence_paths": [
+    "data/splits/test/first_crack/mic2-panama-hortigal-estate-roast1_w0670.0.wav",
+    "data/splits/test/first_crack/mic2-panama-hortigal-estate-roast1_w0680.0.wav"
+  ],
+  "fixture_id": "roastpilot-fc-replay-001",
+  "generation_command": "./.venv/bin/python - <<PY ... trim 662.0-682.0s, resample to 16000 Hz mono PCM WAV ... PY",
+  "original_label_interval_seconds": {
+    "end": 746.7350791840846,
+    "start": 665.8271039066344
+  },
+  "output_audio": {
+    "channel_count": 1,
+    "duration_seconds": 20.0,
+    "format": "PCM16 mono WAV",
+    "path": "tests/fixtures/audio/roastpilot-fc-replay-001.wav",
+    "sample_rate": 16000,
+    "sample_width_bytes": 2,
+    "sha256": "923c61a456b04797c1302ed78984ab7d9b148d7dc21d3825b225b8a6043aa9fc"
+  },
+  "output_labels_path": "tests/fixtures/audio/roastpilot-fc-replay-001.labels.json",
+  "source_audio_path": "data/raw/mic2-panama-hortigal-estate-roast1.wav",
+  "source_label_path": "data/labels/mic2-panama-hortigal-estate-roast1.json",
+  "source_recording_stem": "mic2-panama-hortigal-estate-roast1",
+  "source_repository": "syamaner/coffee-first-crack-detection",
+  "storage_exception": "One small derived trimmed WAV fixture is committed for E7-S5a labelled replay validation; raw recordings, broad datasets, model artifacts, roast logs, and serial captures remain banned from git.",
+  "trim_seconds": {
+    "end": 682.0,
+    "start": 662.0
+  }
+}

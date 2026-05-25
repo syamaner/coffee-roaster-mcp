@@ -118,6 +118,8 @@ Supported environment overrides:
 - `COFFEE_AUDIO_INPUT_DEVICE`
 - `COFFEE_AUDIO_SAMPLE_RATE`
 - `COFFEE_AUDIO_WAV_PATH`
+- `COFFEE_AUDIO_REPLAY_MODE`
+- `COFFEE_AUDIO_WINDOW_SECONDS`
 - `COFFEE_ROAST_LOG_DIR`
 - `COFFEE_AUTO_T0_DROP_THRESHOLD_C`
 - `HF_HOME`
@@ -172,9 +174,11 @@ coffee-roaster-mcp hottop-validate \
   --include-emergency-stop
 ```
 
-Do not commit generated validation JSON, raw serial captures, roast logs, or
-local environment files unless a later validation story explicitly calls for a
-sanitized artifact.
+Do not commit generated validation JSON, raw serial captures, roast logs, raw
+audio recordings, or local environment files unless a later validation story
+explicitly calls for a sanitized artifact. The narrow current audio exception is
+the derived E7-S5a labelled WAV replay fixture under `tests/fixtures/audio/`;
+do not expand that exception to raw recordings or broad datasets.
 
 ## Hugging Face Model Configuration
 
@@ -212,6 +216,8 @@ audio:
   input_device: null
   sample_rate: 16000
   wav_path: null
+  replay_mode: realtime
+  window_seconds: 1.0
 ```
 
 `precision: int8` selects `onnx/int8/model_quantized.onnx`.
@@ -226,10 +232,33 @@ audio:
   input_device: null
   sample_rate: 16000
   wav_path: /path/to/replay.wav
+  replay_mode: detector_paced
+  window_seconds: 10.0
 ```
 
-The WAV sample rate must match `audio.sample_rate`. Real microphone validation
-is gated manual work and is not required for normal CI or this story.
+The WAV sample rate must match `audio.sample_rate`. `replay_mode: realtime`
+keeps the normal background capture behavior. `replay_mode: detector_paced` is
+for local labelled-fixture validation: it reads the next complete WAV window
+only when the detector drains it, so replay can run faster than wall-clock audio
+without normal detector queue drops. Use `audio.window_seconds` to match the
+released detector's expected window duration for the validation source. Real
+microphone validation is gated manual work and is not required for normal CI or
+this story.
+
+The E7-S5a labelled replay check is opt-in/local because it uses the released
+ONNX detector artifacts. From a development checkout with dependencies
+installed, run:
+
+```bash
+./.venv/bin/python scripts/validate_first_crack_wav_replay.py
+```
+
+The script starts the stdio MCP server with the mock roaster, pinned released
+INT8 Hugging Face artifacts, `audio.source: wav`, and
+`audio.replay_mode: detector_paced`; then it uses public MCP tools to start a
+session, mark T0, poll until first crack is detected, validate the detected
+time against the fixture labels, and export `roast.jsonl`, `roast.csv`, and
+`summary.json`.
 
 ## Offline Model Path
 

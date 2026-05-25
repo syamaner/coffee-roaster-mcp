@@ -234,5 +234,5 @@ def _hf_hub_download(
     revision: str | None,
 ) -> str:
     hub_module = import_module("huggingface_hub")
-    download = cast(Callable[..., str], hub_module.__dict__["hf_hub_download"])
+    download = cast(Callable[..., str], hub_module.hf_hub_download)
     return download(repo_id=repo_id, filename=filename, revision=revision)

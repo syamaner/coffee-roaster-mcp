@@ -278,6 +278,11 @@ class FirstCrackStatus:
         detected_monotonic_seconds: Authoritative monotonic detection timestamp.
         allow_manual_override: Whether the explicit override tool is enabled.
         reason: Human-readable reason when status needs extra context.
+        audio_running: Whether the session-owned audio runtime is running.
+        queued_window_count: Detector windows waiting to be processed.
+        emitted_window_count: Windows emitted by the audio runtime.
+        dropped_window_count: Windows dropped by the audio runtime.
+        processed_window_count: Windows processed by the detector runtime.
     """
 
     mode: FirstCrackMode
@@ -286,6 +291,11 @@ class FirstCrackStatus:
     detected_monotonic_seconds: float | None
     allow_manual_override: bool
     reason: str | None = None
+    audio_running: bool = False
+    queued_window_count: int = 0
+    emitted_window_count: int = 0
+    dropped_window_count: int = 0
+    processed_window_count: int = 0
 
 
 T0RuntimeStatus = Literal["disabled", "pending", "detected", "unavailable"]
@@ -1266,14 +1276,21 @@ def _serialize_first_crack_status(
 ) -> FirstCrackStatus:
     """Derive first-crack status from config and the session timeline."""
     if session.first_crack_at_utc is not None:
+        runtime = _runtime_metrics(first_crack_runtime)
         return FirstCrackStatus(
             mode=config.first_crack.mode,
             status="detected",
             detected_at_utc=session.first_crack_at_utc.isoformat(),
             detected_monotonic_seconds=session.first_crack_monotonic_seconds,
             allow_manual_override=config.first_crack.allow_manual_override,
+            audio_running=runtime.audio_running,
+            queued_window_count=runtime.queued_window_count,
+            emitted_window_count=runtime.emitted_window_count,
+            dropped_window_count=runtime.dropped_window_count,
+            processed_window_count=runtime.processed_window_count,
         )
     if session.faulted_at_utc is not None:
+        runtime = _runtime_metrics(first_crack_runtime)
         return FirstCrackStatus(
             mode=config.first_crack.mode,
             status="faulted",
@@ -1281,6 +1298,11 @@ def _serialize_first_crack_status(
             detected_monotonic_seconds=None,
             allow_manual_override=config.first_crack.allow_manual_override,
             reason="Session faulted before first crack was recorded.",
+            audio_running=runtime.audio_running,
+            queued_window_count=runtime.queued_window_count,
+            emitted_window_count=runtime.emitted_window_count,
+            dropped_window_count=runtime.dropped_window_count,
+            processed_window_count=runtime.processed_window_count,
         )
     if config.first_crack.mode == "disabled":
         return FirstCrackStatus(
@@ -1315,6 +1337,7 @@ def _serialize_first_crack_status(
         and first_crack_runtime.active_session_id == session.id
         and first_crack_runtime.status in {"faulted", "unavailable"}
     ):
+        runtime = _runtime_metrics(first_crack_runtime)
         return FirstCrackStatus(
             mode=config.first_crack.mode,
             status=first_crack_runtime.status,
@@ -1322,6 +1345,11 @@ def _serialize_first_crack_status(
             detected_monotonic_seconds=None,
             allow_manual_override=config.first_crack.allow_manual_override,
             reason=first_crack_runtime.reason,
+            audio_running=runtime.audio_running,
+            queued_window_count=runtime.queued_window_count,
+            emitted_window_count=runtime.emitted_window_count,
+            dropped_window_count=runtime.dropped_window_count,
+            processed_window_count=runtime.processed_window_count,
         )
     reason = "Audio first-crack detection has not recorded first crack for this session."
     if (
@@ -1331,6 +1359,7 @@ def _serialize_first_crack_status(
         and first_crack_runtime.reason is not None
     ):
         reason = first_crack_runtime.reason
+    runtime = _runtime_metrics(first_crack_runtime)
     return FirstCrackStatus(
         mode=config.first_crack.mode,
         status="pending",
@@ -1338,6 +1367,24 @@ def _serialize_first_crack_status(
         detected_monotonic_seconds=None,
         allow_manual_override=config.first_crack.allow_manual_override,
         reason=reason,
+        audio_running=runtime.audio_running,
+        queued_window_count=runtime.queued_window_count,
+        emitted_window_count=runtime.emitted_window_count,
+        dropped_window_count=runtime.dropped_window_count,
+        processed_window_count=runtime.processed_window_count,
+    )
+
+
+def _runtime_metrics(
+    first_crack_runtime: FirstCrackRuntimeSnapshot | None,
+) -> FirstCrackRuntimeSnapshot:
+    """Return runtime metrics or an empty disabled-style snapshot."""
+    if first_crack_runtime is not None:
+        return first_crack_runtime
+    return FirstCrackRuntimeSnapshot(
+        status="disabled",
+        active_session_id=None,
+        active=False,
     )
 
 
