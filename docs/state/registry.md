@@ -398,6 +398,16 @@ end-to-end agent roast validation, ChatGPT MCP validation, model
 training/export/sync, or real microphone validation unless a later story
 explicitly requires it.
 
+E7-S4 is started on branch
+`feature/59-warp-manual-hottop-control-validation`, but live Warp Hottop
+validation is blocked until the actual Hottop USB serial adapter is visible and
+the operator explicitly approves each hardware-affecting MCP call. The local
+preflight confirmed `uvx` at `/opt/homebrew/bin/uvx`, but `ls /dev/cu.*` showed
+only `/dev/cu.Bluetooth-Incoming-Port` and `/dev/cu.debug-console`; no
+`/dev/cu.usbserial-*` Hottop device was available. Do not create a fake
+hardware config, launch Warp hardware controls, export hardware logs, or apply
+a hardware-ready release label from this partial evidence.
+
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
 Epic 2 and Epic 3 are complete. Coverage output is visible in GitHub Actions through a concise Markdown job summary and an `html-coverage-report` artifact.

@@ -816,12 +816,16 @@ Goal: prove the package works from install through mock roast, MCP client calls,
     complete a full mock roast through public MCP tools, and verify exported
     JSONL, CSV, and summary outputs.
 
-- [ ] `E7-S4` Run Warp manual Hottop MCP control validation.
+- [!] `E7-S4` Run Warp manual Hottop MCP control validation.
   - Done when Warp can connect to the Hottop-configured RoastPilot MCP server
     and the operator manually approves each hardware-affecting tool call for
     connect, telemetry, heat, fan, drop, cooling, stop-cooling, emergency stop,
     and exported-log review. No autonomous hardware-control decisions are in
     scope.
+  - Started from updated `main` on
+    `feature/59-warp-manual-hottop-control-validation`, but live validation is
+    blocked until the actual Hottop USB serial adapter is visible and the
+    operator explicitly approves each Warp hardware-affecting tool call.
 
 - [ ] `E7-S5a` Test MCP first-crack detection with labelled WAV replay.
   - Done when a small derived WAV fixture, retimestamped label file, and
@@ -1176,6 +1180,33 @@ After completing a story:
   - Kept Hottop hardware validation, ChatGPT MCP validation, model
     training/export/sync, real microphone validation, live release publishing,
     and full end-to-end agent roast validation out of scope.
+
+- Validation preflight for E7-S4:
+  - Verified PR #140 was merged and issue #58 was closed before starting.
+  - Synced `main` from merge commit
+    `de18572edf3ea69f15a9e60a04f049a20f96ae34` to
+    `c480afc` with `git pull --ff-only origin main`.
+  - Created branch
+    `feature/59-warp-manual-hottop-control-validation`.
+  - Read issue #59 and its configuration guidance comment. The intended Warp
+    hardware configuration remains `/tmp/roastpilot-warp-hottop`, roaster
+    driver `hottop_kn8828b_2k_plus`, first-crack mode `disabled`, and
+    `session.auto_t0_detection_enabled: false`, launched through
+    `uvx --from coffee-roaster-mcp==0.1.0 coffee-roaster-mcp serve` or
+    `/opt/homebrew/bin/uvx` if Warp cannot find `uvx`.
+  - Confirmed local `uvx` resolves to `/opt/homebrew/bin/uvx` and reports
+    `uvx 0.11.16`.
+  - Checked visible macOS serial devices with `ls /dev/cu.*`; only
+    `/dev/cu.Bluetooth-Incoming-Port` and `/dev/cu.debug-console` were present.
+    No actual `/dev/cu.usbserial-*` Hottop adapter was visible, so
+    `/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` was not created with
+    a fake port and Warp hardware validation was not launched.
+  - No hardware-affecting MCP calls were run. This preserves the E7-S4 safety
+    boundary requiring physical stop readiness, runtime config and device-state
+    confirmation before controls, and explicit operator approval before each
+    connect, heat, fan, drop, cooling, stop-cooling, and emergency-stop call.
+  - Hardware-ready release labeling remains blocked. Partial preflight evidence
+    does not prove Warp Hottop control behavior.
 
 - Validation run for E6-S4:
   - Added focused version alignment coverage in `tests/test_server_json.py`.
