@@ -29,12 +29,15 @@ fixes. PR #144 merged the version bump, tag `v0.1.1` points at
 `uvx --refresh --from coffee-roaster-mcp==0.1.1 coffee-roaster-mcp --version`
 smoke returned `coffee-roaster-mcp 0.1.1`.
 
-The next package publication target is `v0.1.2`, a metadata-only release that
-adds related project links to PyPI project URLs and the README while keeping
-MCP Registry metadata schema-safe through the existing README `websiteUrl`.
-The links include the current architecture article, the original prototype
-posts, the Hugging Face model/dataset/demo artifacts, and README wording that
-frames this package as the consolidated deterministic rebuild of the prototype.
+The `v0.1.2` metadata-only release is published. PR #146 merged the related
+project links and version bump, tag `v0.1.2` points at
+`3c19d6a677cf40c769dc8394d2e2ac53308446b6`, GitHub Actions release run
+`26403620501` published PyPI and then MCP Registry metadata, and the published
+`uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.1.2 coffee-roaster-mcp --version`
+smoke returned `coffee-roaster-mcp 0.1.2`. The release adds current
+architecture, original prototype, Hugging Face model/dataset/demo links, and
+README wording that frames this package as the consolidated deterministic
+rebuild of the prototype.
 
 Epic 3 is complete. The Hottop driver now has validated lifecycle, command-loop,
 packet, temperature-unit, heat, fan, drop, cooling, cleanup, and emergency-stop

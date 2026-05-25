@@ -261,6 +261,52 @@ Then approve the `release` environment deployment and verify:
 uvx --refresh --from coffee-roaster-mcp==0.1.2 coffee-roaster-mcp --version
 ```
 
+## v0.1.2 Live Publish Outcome
+
+The metadata-only release completed on 2026-05-25 through GitHub Actions run
+`26403620501`:
+
+- Tag: `v0.1.2`
+- Commit: `3c19d6a677cf40c769dc8394d2e2ac53308446b6`
+- Workflow: `https://github.com/syamaner/coffee-roaster-mcp/actions/runs/26403620501`
+- PyPI release: `https://pypi.org/project/coffee-roaster-mcp/0.1.2/`
+- MCP Registry search:
+  `https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.syamaner/coffee-roaster-mcp`
+
+Release job outcomes:
+
+- `Validate Release Metadata`: success
+- `Checks`: success
+- `Build Package`: success
+- `Publish PyPI`: success after `release` environment approval
+- `Publish MCP Registry`: success after PyPI publish
+- `Release Dry Run`: skipped, as expected for a tag push
+
+Confirmed outcomes:
+
+- Production PyPI exposes `coffee-roaster-mcp` version `0.1.2`.
+- PyPI project URLs include the architecture article, original prototype intro,
+  original prototype MCP post, Hugging Face first-crack model, Hugging Face
+  dataset, and Gradio demo Space.
+- PyPI artifacts:
+  - `coffee_roaster_mcp-0.1.2-py3-none-any.whl`, SHA-256
+    `c548967fc239cd93786cc23287c4c55cd67dac398a61b82021bc0022bd4926db`
+  - `coffee_roaster_mcp-0.1.2.tar.gz`, SHA-256
+    `25d554bef5f7477256fac63a1c277c224de116d7251f9cd34ff11fdb42a9ef77`
+- Registry search returns `io.github.syamaner/coffee-roaster-mcp` with PyPI
+  package `coffee-roaster-mcp`, version `0.1.2`, runtime hint `uvx`, stdio
+  transport, and `isLatest: true`.
+- Published-package smoke passed after refreshing the local `uvx` package
+  cache:
+  `uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.1.2 coffee-roaster-mcp --version`
+  returned `coffee-roaster-mcp 0.1.2`.
+- The initial `uvx --refresh --from coffee-roaster-mcp==0.1.2 ...` smoke saw
+  package-index lag and reported no available `0.1.2` version; the
+  package-specific refresh succeeded immediately after.
+- The `v0.1.2` tag creation reported the same protected-tag creation rule
+  bypass as prior releases; keep tag protection and release environment
+  ownership under review.
+
 ## v0.1.0 Live Publish Outcome
 
 The first live release completed on 2026-05-24 through GitHub Actions run
