@@ -1490,6 +1490,19 @@ class RoastSessionStore:
 
             recorded_at_utc = self._utc_now()
             monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+            monotonic_seconds = _normalize_event_monotonic_seconds(
+                session,
+                monotonic_seconds=monotonic_seconds,
+            )
+            recorded_at_utc = _normalize_event_recorded_at_utc(
+                session,
+                recorded_at_utc=recorded_at_utc,
+            )
+            _validate_event_monotonic_order(
+                session,
+                kind=kind,
+                monotonic_seconds=monotonic_seconds,
+            )
             event = RoastEvent(
                 kind=kind,
                 recorded_at_utc=recorded_at_utc,
@@ -1578,7 +1591,7 @@ class RoastSessionStore:
         session: RoastSession,
         *,
         detected_at_monotonic_seconds: float,
-        max_future_seconds: float = 0.0,
+        max_future_seconds: float | None = 0.0,
         payload: dict[str, EventPayloadValue] | None = None,
     ) -> tuple[RoastEvent, RoastSession]:
         """Record automatic first crack at the detector-provided monotonic time.
@@ -1590,7 +1603,9 @@ class RoastSessionStore:
             max_future_seconds: Allowed future timestamp tolerance. This lets
                 adapter-inferred window-end defaults record when the capture
                 window has just been emitted but its inferred end timestamp is
-                slightly ahead of the integration clock.
+                slightly ahead of the integration clock. Use `None` for
+                detector-paced replay where source-audio time can intentionally
+                advance faster than wall-clock time.
             payload: Optional structured event details.
 
         Returns:
@@ -1755,10 +1770,25 @@ class RoastSessionStore:
         )
         if existing_event is not None and not is_post_fault_recovery:
             return existing_event
+        recorded_at_utc = self._utc_now()
+        monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+        monotonic_seconds = _normalize_event_monotonic_seconds(
+            session,
+            monotonic_seconds=monotonic_seconds,
+        )
+        recorded_at_utc = _normalize_event_recorded_at_utc(
+            session,
+            recorded_at_utc=recorded_at_utc,
+        )
+        _validate_event_monotonic_order(
+            session,
+            kind=kind,
+            monotonic_seconds=monotonic_seconds,
+        )
         event = RoastEvent(
             kind=kind,
-            recorded_at_utc=self._utc_now(),
-            monotonic_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
+            recorded_at_utc=recorded_at_utc,
+            monotonic_seconds=monotonic_seconds,
             payload=dict(payload),
         )
         _append_event_log_row(session, event)
@@ -1892,10 +1922,25 @@ class RoastSessionStore:
             raise SessionLifecycleError("Stopped sessions cannot be mutated.")
         if session.faulted_at_utc is None:
             _validate_event_transition(session, "fault")
+        recorded_at_utc = self._utc_now()
+        monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+        monotonic_seconds = _normalize_event_monotonic_seconds(
+            session,
+            monotonic_seconds=monotonic_seconds,
+        )
+        recorded_at_utc = _normalize_event_recorded_at_utc(
+            session,
+            recorded_at_utc=recorded_at_utc,
+        )
+        _validate_event_monotonic_order(
+            session,
+            kind="fault",
+            monotonic_seconds=monotonic_seconds,
+        )
         event = RoastEvent(
             kind="fault",
-            recorded_at_utc=self._utc_now(),
-            monotonic_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
+            recorded_at_utc=recorded_at_utc,
+            monotonic_seconds=monotonic_seconds,
             payload=dict(payload),
         )
         _append_event_log_row(session, event)
@@ -1945,9 +1990,9 @@ def _detected_elapsed_seconds(
     *,
     detected_at_monotonic_seconds: float,
     current_elapsed_seconds: float,
-    max_future_seconds: float,
+    max_future_seconds: float | None,
 ) -> float:
-    if max_future_seconds < 0:
+    if max_future_seconds is not None and max_future_seconds < 0:
         raise SessionLifecycleError("Detected first-crack future tolerance must be >= 0.")
     detected_elapsed_seconds = round(
         float(detected_at_monotonic_seconds) - session.monotonic_start,
@@ -1961,9 +2006,10 @@ def _detected_elapsed_seconds(
         )
     if detected_elapsed_seconds > current_elapsed_seconds:
         future_delta_seconds = detected_elapsed_seconds - current_elapsed_seconds
-        if future_delta_seconds > max_future_seconds:
+        if max_future_seconds is not None and future_delta_seconds > max_future_seconds:
             raise SessionLifecycleError("Detected first-crack timestamp cannot be in the future.")
-        detected_elapsed_seconds = current_elapsed_seconds
+        if max_future_seconds is not None:
+            detected_elapsed_seconds = current_elapsed_seconds
     if (
         session.beans_added_monotonic_seconds is not None
         and detected_elapsed_seconds < session.beans_added_monotonic_seconds
@@ -1985,6 +2031,51 @@ def _validate_event_transition(session: RoastSession, kind: RoastEventKind) -> N
             f"{kind} cannot be recorded while phase is {session.phase}; "
             f"allowed phases: {allowed_phase_list}."
         )
+
+
+def _validate_event_monotonic_order(
+    session: RoastSession,
+    *,
+    kind: RoastEventKind,
+    monotonic_seconds: float,
+) -> None:
+    if kind == "fault" or not session.event_timeline:
+        return
+    latest_event = session.event_timeline[-1]
+    if monotonic_seconds < latest_event.monotonic_seconds:
+        raise SessionLifecycleError("Roast events must be recorded in monotonic timestamp order.")
+
+
+def _normalize_event_monotonic_seconds(
+    session: RoastSession,
+    *,
+    monotonic_seconds: float,
+) -> float:
+    if not session.event_timeline:
+        return monotonic_seconds
+    latest_event = session.event_timeline[-1]
+    if _has_recorded_first_crack(session) and monotonic_seconds < latest_event.monotonic_seconds:
+        return latest_event.monotonic_seconds
+    return monotonic_seconds
+
+
+def _normalize_event_recorded_at_utc(
+    session: RoastSession,
+    *,
+    recorded_at_utc: datetime,
+) -> datetime:
+    if not session.event_timeline:
+        return recorded_at_utc
+    latest_event = session.event_timeline[-1]
+    if _has_recorded_first_crack(session) and recorded_at_utc < latest_event.recorded_at_utc:
+        return latest_event.recorded_at_utc
+    return recorded_at_utc
+
+
+def _has_recorded_first_crack(session: RoastSession) -> bool:
+    return session.first_crack_monotonic_seconds is not None or any(
+        event.kind == "first_crack_detected" for event in session.event_timeline
+    )
 
 
 def _elapsed_since(

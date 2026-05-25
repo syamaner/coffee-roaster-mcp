@@ -16,6 +16,7 @@ from coffee_roaster_mcp.audio import (
     AudioCapturePipeline,
     AudioCaptureSettings,
     AudioInput,
+    DetectorPacedWavReplayPipeline,
     MicrophoneAudioInput,
     WavAudioInput,
     audio_capture_settings_from_config,
@@ -157,13 +158,14 @@ class ClockHarness:
 
 def test_audio_capture_settings_use_configured_audio_input() -> None:
     settings = audio_capture_settings_from_config(
-        AudioConfig(input_device="roast-mic", sample_rate=8_000),
+        AudioConfig(input_device="roast-mic", sample_rate=8_000, replay_mode="realtime"),
         window_seconds=0.5,
         queue_limit=3,
     )
 
     assert settings.input_device == "roast-mic"
     assert settings.sample_rate == 8_000
+    assert settings.replay_mode == "realtime"
     assert settings.window_sample_count == 4_000
     assert settings.queue_limit == 3
 
@@ -177,6 +179,11 @@ def test_audio_capture_settings_reject_invalid_values() -> None:
 
     with pytest.raises(AudioCaptureError, match="queue_limit"):
         audio_capture_settings_from_config(AudioConfig(), queue_limit=0)
+
+    with pytest.raises(AudioCaptureError, match="replay_mode"):
+        audio_capture_settings_from_config(
+            AudioConfig(source="microphone", replay_mode="detector_paced")
+        )
 
 
 def test_build_audio_capture_pipeline_passes_config_to_input_factory() -> None:
@@ -214,6 +221,45 @@ def test_configured_audio_input_factory_builds_wav_source(tmp_path: Path) -> Non
 
     assert isinstance(audio_input, WavAudioInput)
     assert audio_input.read_samples(4) == (0.0, 0.5, -0.5, 32_767 / 32_768)
+
+
+def test_detector_paced_wav_pipeline_drains_without_background_thread(tmp_path: Path) -> None:
+    wav_path = tmp_path / "fixture.wav"
+    _write_pcm16_wav(
+        wav_path,
+        sample_rate=4,
+        channel_count=1,
+        samples=(0, 8192, 16384, 24576, -8192, -16384, -24576, -32768),
+    )
+
+    pipeline = build_audio_capture_pipeline(
+        AudioConfig(
+            source="wav",
+            sample_rate=4,
+            wav_path=wav_path,
+            replay_mode="detector_paced",
+        ),
+        window_seconds=1.0,
+        monotonic_now=lambda: 100.0,
+    )
+
+    start = pipeline.start()
+    first_batch = pipeline.drain_windows(max_windows=1)
+    second_batch = pipeline.drain_windows()
+    exhausted = pipeline.snapshot()
+    stopped = pipeline.stop()
+
+    assert isinstance(pipeline, DetectorPacedWavReplayPipeline)
+    assert start.running is True
+    assert first_batch[0].sequence_number == 0
+    assert first_batch[0].started_at_monotonic_seconds == 100.0
+    assert first_batch[0].samples == (0.0, 0.25, 0.5, 0.75)
+    assert second_batch[0].sequence_number == 1
+    assert second_batch[0].started_at_monotonic_seconds == 101.0
+    assert exhausted.running is False
+    assert exhausted.emitted_window_count == 2
+    assert exhausted.dropped_window_count == 0
+    assert stopped.running is False
 
 
 def test_configured_audio_input_factory_requires_wav_path() -> None:

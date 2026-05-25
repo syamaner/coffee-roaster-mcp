@@ -8,7 +8,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from types import MethodType
+from typing import Any, Literal, Protocol, cast
 
 from coffee_roaster_mcp.artifacts import (
     HuggingFaceDownloader,
@@ -331,6 +332,8 @@ def integrate_first_crack_window_with_session(
     session_store: RoastSessionStore,
     session: RoastSession,
     window: AudioWindow,
+    max_future_seconds: float | None = None,
+    allow_future_timeline: bool = False,
 ) -> FirstCrackTimelineIntegrationResult | None:
     """Process one detector window and write one first-crack event if confirmed.
 
@@ -346,6 +349,12 @@ def integrate_first_crack_window_with_session(
         session_store: Authoritative one-session mutation boundary.
         session: Active roast session to update.
         window: Audio window to process.
+        max_future_seconds: Optional override for future detector timestamps.
+            When omitted, inferred window-end timestamps may be up to one
+            detector window ahead of the integration clock.
+        allow_future_timeline: Whether to preserve detector timestamps that are
+            ahead of wall-clock elapsed time. This is only intended for
+            detector-paced replay of recorded source audio.
 
     Returns:
         Timeline integration result for confirmed output, or `None` when the
@@ -360,13 +369,35 @@ def integrate_first_crack_window_with_session(
     if detection_event is None:
         return None
 
+    future_tolerance = _future_tolerance_for_detection(
+        detection_event=detection_event,
+        window=window,
+        max_future_seconds=max_future_seconds,
+        allow_future_timeline=allow_future_timeline,
+    )
     event, snapshot = session_store.record_first_crack_detection_snapshot(
         session,
         detected_at_monotonic_seconds=detection_event.detected_at_monotonic_seconds,
-        max_future_seconds=window.duration_seconds if detection_event.detected_at_inferred else 0.0,
+        max_future_seconds=future_tolerance,
         payload=detection_event.payload(),
     )
     return FirstCrackTimelineIntegrationResult(event=event, session=snapshot)
+
+
+def _future_tolerance_for_detection(
+    *,
+    detection_event: FirstCrackDetectionEvent,
+    window: AudioWindow,
+    max_future_seconds: float | None,
+    allow_future_timeline: bool,
+) -> float | None:
+    if allow_future_timeline and detection_event.detected_at_inferred:
+        return None
+    if max_future_seconds is not None:
+        return max_future_seconds
+    if detection_event.detected_at_inferred:
+        return window.duration_seconds
+    return 0.0
 
 
 def _detection_timestamp(
@@ -460,7 +491,62 @@ def _build_ast_feature_extractor(preprocessor_config_path: Path) -> OnnxFeatureE
             "Could not initialize first-crack AST feature extractor from "
             f"{preprocessor_config_path}: {exc}"
         ) from exc
+    _patch_ast_feature_extractor_for_numpy_only_runtime(extractor)
     return cast(OnnxFeatureExtractor, extractor)
+
+
+def _patch_ast_feature_extractor_for_numpy_only_runtime(extractor: Any) -> None:
+    extractor_module = import_module(extractor.__class__.__module__)
+    if _ast_speech_backend_available(extractor_module):
+        return
+
+    try:
+        numpy_module = import_module("numpy")
+        spectrogram: Any = extractor_module.spectrogram
+    except (AttributeError, ImportError) as exc:
+        raise FirstCrackDetectorError(
+            "Could not configure AST feature extraction for ONNX-only runtime."
+        ) from exc
+    if not callable(spectrogram):
+        raise FirstCrackDetectorError(
+            "Could not configure AST feature extraction for ONNX-only runtime."
+        )
+    spectrogram_fn = cast(Any, spectrogram)
+
+    def extract_fbank_features(self: Any, waveform: Any, max_length: int) -> Any:
+        squeezed = numpy_module.squeeze(waveform)
+        spectrogram_output: Any = spectrogram_fn(
+            squeezed,
+            self.window,
+            frame_length=400,
+            hop_length=160,
+            fft_length=512,
+            power=2.0,
+            center=False,
+            preemphasis=0.97,
+            mel_filters=self.mel_filters,
+            log_mel="log",
+            mel_floor=1.192092955078125e-07,
+            remove_dc_offset=True,
+        )
+        fbank: Any = spectrogram_output.T
+
+        frame_count = int(fbank.shape[0])
+        difference = max_length - frame_count
+        if difference > 0:
+            fbank = numpy_module.pad(fbank, ((0, difference), (0, 0)), mode="constant")
+        elif difference < 0:
+            fbank = fbank[0:max_length, :]
+        return fbank
+
+    extractor._extract_fbank_features = MethodType(extract_fbank_features, extractor)
+
+
+def _ast_speech_backend_available(extractor_module: Any) -> bool:
+    is_speech_available = getattr(extractor_module, "is_speech_available", None)
+    if callable(is_speech_available):
+        return bool(is_speech_available())
+    return False
 
 
 def _first_crack_confidence(outputs: Sequence[object]) -> float:

@@ -117,6 +117,7 @@ class FirstCrackSessionRuntime:
         self._status: FirstCrackRuntimeState = _initial_status(config.first_crack)
         self._reason: str | None = _initial_reason(config.first_crack)
         self._processed_window_count = 0
+        self._last_capture_snapshot: AudioCaptureSnapshot | None = None
 
     def start_for_session(self, session: RoastSession) -> FirstCrackRuntimeSnapshot:
         """Start or prepare first-crack detection for a roast session."""
@@ -124,6 +125,7 @@ class FirstCrackSessionRuntime:
             self._stop_locked(reason="new roast session")
             self._active_session_id = session.id
             self._processed_window_count = 0
+            self._last_capture_snapshot = None
 
             if self._config.first_crack.mode != "audio":
                 self._status = _initial_status(self._config.first_crack)
@@ -135,7 +137,7 @@ class FirstCrackSessionRuntime:
             try:
                 adapter = self._detector_adapter_factory(self._config.first_crack)
                 pipeline = self._audio_pipeline_factory(self._config.audio)
-                pipeline.start()
+                self._last_capture_snapshot = pipeline.start()
             except ArtifactResolutionError as exc:
                 self._status = "unavailable"
                 self._reason = f"First-crack detector artifacts are unavailable: {exc}"
@@ -179,12 +181,14 @@ class FirstCrackSessionRuntime:
                 return self.snapshot()
 
             capture_snapshot = pipeline.snapshot()
+            self._last_capture_snapshot = capture_snapshot
             if capture_snapshot.latest_error is not None:
                 self._mark_faulted_locked(f"Audio capture failed: {capture_snapshot.latest_error}")
                 return self.snapshot()
 
+            drain_limit = 1 if _uses_detector_paced_wav_replay(self._config.audio) else None
             try:
-                for window in pipeline.drain_windows():
+                for window in pipeline.drain_windows(max_windows=drain_limit):
                     self._processed_window_count += 1
                     result = integrate_first_crack_window_with_session(
                         config=self._config.first_crack,
@@ -192,6 +196,7 @@ class FirstCrackSessionRuntime:
                         session_store=session_store,
                         session=session,
                         window=window,
+                        allow_future_timeline=_uses_detector_paced_wav_replay(self._config.audio),
                     )
                     if result is not None:
                         self._status = "detected"
@@ -230,7 +235,9 @@ class FirstCrackSessionRuntime:
         with self._lock:
             if self._active_session_id != session_id:
                 return self.snapshot()
-            if self._pipeline is not None:
+            if self._pipeline is not None and not _uses_detector_paced_wav_replay(
+                self._config.audio
+            ):
                 self._pipeline.drain_windows()
             if self._status == "pending":
                 self._reason = reason
@@ -246,6 +253,10 @@ class FirstCrackSessionRuntime:
         """Return an MCP-visible runtime snapshot."""
         with self._lock:
             capture_snapshot = self._pipeline.snapshot() if self._pipeline is not None else None
+            if capture_snapshot is not None:
+                self._last_capture_snapshot = capture_snapshot
+            elif self._last_capture_snapshot is not None:
+                capture_snapshot = _stopped_capture_snapshot(self._last_capture_snapshot)
             status = self._status
             reason = self._reason
             if (
@@ -292,7 +303,9 @@ class FirstCrackSessionRuntime:
         pipeline = self._pipeline
         if pipeline is not None:
             try:
-                pipeline.stop(timeout_seconds=self._stop_timeout_seconds)
+                self._last_capture_snapshot = _stopped_capture_snapshot(
+                    pipeline.stop(timeout_seconds=self._stop_timeout_seconds)
+                )
             except Exception as exc:  # noqa: BLE001 - shutdown should be best effort.
                 self._status = "faulted"
                 self._reason = f"Audio capture stop failed: {type(exc).__name__}: {exc}"
@@ -325,6 +338,10 @@ def _build_released_detector_adapter(config: FirstCrackConfig) -> FirstCrackDete
     return build_released_onnx_first_crack_detector_adapter(config)
 
 
+def _uses_detector_paced_wav_replay(config: AudioConfig) -> bool:
+    return config.source == "wav" and config.replay_mode == "detector_paced"
+
+
 def _initial_status(config: FirstCrackConfig) -> FirstCrackRuntimeState:
     if config.mode == "disabled":
         return "disabled"
@@ -333,6 +350,16 @@ def _initial_status(config: FirstCrackConfig) -> FirstCrackRuntimeState:
             return "unavailable"
         return "manual"
     return "pending"
+
+
+def _stopped_capture_snapshot(snapshot: AudioCaptureSnapshot) -> AudioCaptureSnapshot:
+    return AudioCaptureSnapshot(
+        running=False,
+        queued_window_count=snapshot.queued_window_count,
+        emitted_window_count=snapshot.emitted_window_count,
+        dropped_window_count=snapshot.dropped_window_count,
+        latest_error=snapshot.latest_error,
+    )
 
 
 def _initial_reason(config: FirstCrackConfig) -> str:

@@ -300,6 +300,8 @@ audio:
   input_device: null
   sample_rate: 16000
   wav_path: null
+  replay_mode: realtime
+  window_seconds: 1.0
 
 logging:
   log_dir: ./logs
@@ -332,6 +334,8 @@ Supported environment overrides:
 - `COFFEE_AUDIO_INPUT_DEVICE`
 - `COFFEE_AUDIO_SAMPLE_RATE`
 - `COFFEE_AUDIO_WAV_PATH`
+- `COFFEE_AUDIO_REPLAY_MODE`
+- `COFFEE_AUDIO_WINDOW_SECONDS`
 - `COFFEE_ROAST_LOG_DIR`
 - `COFFEE_AUTO_T0_DROP_THRESHOLD_C`
 - `HF_HOME`
@@ -341,7 +345,30 @@ PortAudio-backed `sounddevice` stream and keeps the configured device identifier
 behind the audio-input boundary for macOS, Linux, and Raspberry Pi hosts. WAV
 replay uses PCM `.wav` files, converts channels to the same mono float sample
 contract as microphone capture, and requires the file sample rate to match
-`audio.sample_rate`.
+`audio.sample_rate`. WAV replay defaults to the background `realtime` capture
+pipeline. For local labelled-fixture validation, set
+`audio.replay_mode: detector_paced` and the detector-compatible
+`audio.window_seconds` so each complete WAV window is processed as soon as the
+detector/runtime is ready, without wall-clock sleeps and without normal queue
+drops.
+
+The repository normally does not commit audio. The only current exception is
+the small derived E7-S5a labelled replay fixture under `tests/fixtures/audio/`,
+which is trimmed, resampled, retimestamped, and documented with a manifest.
+Raw recordings, broad training/evaluation audio, model artifacts, roast logs,
+and serial captures remain excluded from git.
+
+The released-model labelled replay validation is opt-in/local, not part of the
+default CI suite:
+
+```bash
+./.venv/bin/python scripts/validate_first_crack_wav_replay.py
+```
+
+That script starts the stdio MCP server on the mock roaster with pinned INT8
+Hugging Face artifacts and detector-paced WAV replay, then uses public MCP
+tools to validate first-crack detection against the fixture labels and export
+`roast.jsonl`, `roast.csv`, and `summary.json`.
 
 For microphone capture, `audio.input_device: null` uses the system default input
 device. To pin a specific microphone, set `audio.input_device` to a

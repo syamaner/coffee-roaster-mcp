@@ -12,7 +12,7 @@ Project rules and context for coding agents working in this repository.
 - The default roaster driver is `mock`. Default first-crack mode is `disabled`.
 - Model training, ONNX export, Hugging Face model sync, model cards, and dataset cards stay in `coffee-first-crack-detection`.
 - This repository consumes released Hugging Face artifacts only.
-- Do not commit model weights, audio files, roast logs, serial captures, `.env` files, or local IDE folders.
+- Do not commit model weights, audio files, roast logs, serial captures, `.env` files, or local IDE folders, except for the single small derived E7-S5a replay fixture under `tests/fixtures/audio/`.
 - One PR per story, branch: `feature/{issue-number}-{slug}`.
 - Before starting a task: read `docs/state/registry.md`, open the active epic file, then check the GitHub issue.
 
@@ -127,5 +127,5 @@ After completing a story:
 ## Storage Rules
 
 - Do not commit generated logs under `logs/`.
-- Do not commit audio recordings, model artifacts, ONNX files, or raw serial captures.
+- Do not commit audio recordings, model artifacts, ONNX files, or raw serial captures. The only current audio exception is the derived, trimmed, retimestamped E7-S5a labelled WAV replay fixture under `tests/fixtures/audio/`; raw recordings and broad datasets remain excluded.
 - Large or generated artifacts belong in Hugging Face Hub, release artifacts, or ignored local directories depending on the artifact type.

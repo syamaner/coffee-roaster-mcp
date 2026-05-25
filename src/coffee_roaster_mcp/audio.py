@@ -52,6 +52,8 @@ class AudioCaptureSettings:
         sample_rate: Audio sample rate in Hz.
         source: Configured audio source type.
         wav_path: Optional WAV source path when source is `wav`.
+        replay_mode: WAV replay mode. `detector_paced` emits windows only when
+            the detector drains them, without wall-clock sleeps or queue drops.
         window_seconds: Detector window duration in seconds.
         queue_limit: Maximum detector windows retained for downstream consumers.
         idle_sleep_seconds: Sleep duration when an input read returns no samples.
@@ -61,6 +63,7 @@ class AudioCaptureSettings:
     sample_rate: int
     source: str = "microphone"
     wav_path: Path | None = None
+    replay_mode: str = "realtime"
     window_seconds: float = DEFAULT_AUDIO_WINDOW_SECONDS
     queue_limit: int = DEFAULT_AUDIO_WINDOW_QUEUE_LIMIT
     idle_sleep_seconds: float = DEFAULT_AUDIO_IDLE_SLEEP_SECONDS
@@ -114,7 +117,7 @@ class AudioCaptureSnapshot:
 def audio_capture_settings_from_config(
     config: AudioConfig,
     *,
-    window_seconds: float = DEFAULT_AUDIO_WINDOW_SECONDS,
+    window_seconds: float | None = None,
     queue_limit: int = DEFAULT_AUDIO_WINDOW_QUEUE_LIMIT,
     idle_sleep_seconds: float = DEFAULT_AUDIO_IDLE_SLEEP_SECONDS,
 ) -> AudioCaptureSettings:
@@ -124,7 +127,8 @@ def audio_capture_settings_from_config(
         source=config.source,
         sample_rate=config.sample_rate,
         wav_path=config.wav_path,
-        window_seconds=window_seconds,
+        replay_mode=config.replay_mode,
+        window_seconds=config.window_seconds if window_seconds is None else window_seconds,
         queue_limit=queue_limit,
         idle_sleep_seconds=idle_sleep_seconds,
     )
@@ -136,7 +140,7 @@ def build_audio_capture_pipeline(
     config: AudioConfig,
     input_factory: AudioInputFactory | None = None,
     *,
-    window_seconds: float = DEFAULT_AUDIO_WINDOW_SECONDS,
+    window_seconds: float | None = None,
     queue_limit: int = DEFAULT_AUDIO_WINDOW_QUEUE_LIMIT,
     idle_sleep_seconds: float = DEFAULT_AUDIO_IDLE_SLEEP_SECONDS,
     monotonic_now: Callable[[], float] | None = None,
@@ -149,6 +153,14 @@ def build_audio_capture_pipeline(
         queue_limit=queue_limit,
         idle_sleep_seconds=idle_sleep_seconds,
     )
+    if settings.source == "wav" and settings.replay_mode == "detector_paced":
+        if settings.wav_path is None:
+            raise AudioCaptureError("audio.wav_path must be configured when audio.source is wav.")
+        return DetectorPacedWavReplayPipeline(
+            settings=settings,
+            audio_input=WavAudioInput(settings.wav_path, sample_rate=settings.sample_rate),
+            monotonic_now=monotonic_now,
+        )
     return AudioCapturePipeline(
         settings=settings,
         audio_input=resolved_input_factory(settings),
@@ -503,9 +515,135 @@ class AudioCapturePipeline:
         self._latest_error = None
 
 
+class DetectorPacedWavReplayPipeline(AudioCapturePipeline):
+    """Synchronous WAV replay that advances only when detector windows drain."""
+
+    def __init__(
+        self,
+        *,
+        settings: AudioCaptureSettings,
+        audio_input: WavAudioInput,
+        monotonic_now: Callable[[], float] | None = None,
+    ) -> None:
+        """Initialize detector-paced WAV replay.
+
+        Args:
+            settings: Validated audio capture settings.
+            audio_input: WAV input to replay.
+            monotonic_now: Optional monotonic clock supplier for tests.
+        """
+        super().__init__(settings=settings, audio_input=audio_input, monotonic_now=monotonic_now)
+        self._running = False
+        self._exhausted = False
+        self._timeline_start_monotonic_seconds: float | None = None
+        self._replay_emitted_window_count = 0
+
+    def start(self) -> AudioCaptureSnapshot:
+        """Prepare synchronous replay without starting a background thread."""
+        with self._state_lock:
+            self._reset_run_state_locked()
+            self._running = True
+            self._exhausted = False
+            self._timeline_start_monotonic_seconds = None
+        return self.snapshot()
+
+    def stop(self, *, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
+        """Stop replay and close the WAV input."""
+        if timeout_seconds < 0:
+            raise AudioCaptureError("timeout_seconds must be >= 0.")
+        with self._state_lock:
+            self._running = False
+        _close_audio_input_if_supported(self._audio_input)
+        return self.snapshot()
+
+    def drain_windows(self, *, max_windows: int | None = None) -> tuple[AudioWindow, ...]:
+        """Read and return detector windows synchronously without queueing drops."""
+        if max_windows is not None and max_windows < 0:
+            raise AudioCaptureError("max_windows must be >= 0.")
+        if max_windows == 0:
+            return ()
+
+        windows: list[AudioWindow] = []
+        try:
+            while self._should_read_next_window(max_windows=max_windows, windows=windows):
+                window = self._read_replay_window()
+                if window is None:
+                    break
+                windows.append(window)
+        except Exception as exc:  # noqa: BLE001 - backend exceptions vary.
+            with self._state_lock:
+                self._latest_error = str(exc)
+                self._running = False
+        return tuple(windows)
+
+    def snapshot(self) -> AudioCaptureSnapshot:
+        """Return detector-paced replay status."""
+        with self._state_lock:
+            return AudioCaptureSnapshot(
+                running=self._running and not self._exhausted,
+                queued_window_count=0,
+                emitted_window_count=self._replay_emitted_window_count,
+                dropped_window_count=0,
+                latest_error=self._latest_error,
+            )
+
+    def _should_read_next_window(
+        self,
+        *,
+        max_windows: int | None,
+        windows: list[AudioWindow],
+    ) -> bool:
+        with self._state_lock:
+            if not self._running or self._exhausted or self._latest_error is not None:
+                return False
+        return max_windows is None or len(windows) < max_windows
+
+    def _read_replay_window(self) -> AudioWindow | None:
+        window_sample_count = self._settings.window_sample_count
+        while len(self._sample_buffer) < window_sample_count:
+            samples = self._audio_input.read_samples(window_sample_count - len(self._sample_buffer))
+            if not samples:
+                with self._state_lock:
+                    self._exhausted = True
+                    self._running = False
+                return None
+            self._sample_buffer.extend(_normalize_sample(sample) for sample in samples)
+
+        window_samples = tuple(self._sample_buffer[:window_sample_count])
+        del self._sample_buffer[:window_sample_count]
+        with self._state_lock:
+            if self._timeline_start_monotonic_seconds is None:
+                self._timeline_start_monotonic_seconds = self._monotonic_now()
+            sequence_number = self._next_sequence_number
+            self._next_sequence_number += 1
+            self._replay_emitted_window_count += 1
+            started_at_monotonic_seconds = (
+                self._timeline_start_monotonic_seconds
+                + sequence_number * self._settings.window_seconds
+            )
+
+        return AudioWindow(
+            sequence_number=sequence_number,
+            input_device=self._settings.input_device,
+            sample_rate=self._settings.sample_rate,
+            started_at_monotonic_seconds=round(started_at_monotonic_seconds, 6),
+            duration_seconds=round(window_sample_count / self._settings.sample_rate, 6),
+            samples=window_samples,
+        )
+
+    def _reset_run_state_locked(self) -> None:
+        super()._reset_run_state_locked()
+        self._timeline_start_monotonic_seconds = None
+        self._replay_emitted_window_count = 0
+
+
 def _validate_settings(settings: AudioCaptureSettings) -> None:
     if settings.source not in {"microphone", "wav"}:
         raise AudioCaptureError("audio.source must be one of: microphone, wav.")
+    if settings.replay_mode not in {"realtime", "detector_paced"}:
+        raise AudioCaptureError("audio.replay_mode must be one of: realtime, detector_paced.")
+    if settings.source != "wav" and settings.replay_mode != "realtime":
+        raise AudioCaptureError("audio.replay_mode can only be detector_paced for WAV sources.")
     if settings.sample_rate <= 0:
         raise AudioCaptureError("audio.sample_rate must be > 0.")
     if not math.isfinite(settings.window_seconds) or settings.window_seconds <= 0:

@@ -16,6 +16,7 @@ TemperatureUnit = Literal["celsius", "fahrenheit", "auto"]
 FirstCrackMode = Literal["disabled", "audio", "manual"]
 ModelPrecision = Literal["int8", "fp32"]
 AudioSource = Literal["microphone", "wav"]
+AudioReplayMode = Literal["realtime", "detector_paced"]
 ExportFormat = Literal["jsonl", "csv", "summary"]
 
 
@@ -58,6 +59,8 @@ class AudioConfig:
     input_device: str | None = None
     sample_rate: int = 16_000
     wav_path: Path | None = None
+    replay_mode: AudioReplayMode = "realtime"
+    window_seconds: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -239,6 +242,16 @@ def _audio_from_mapping(raw: Mapping[str, Any]) -> AudioConfig:
         input_device=_optional_string(raw, "input_device", label="audio.input_device"),
         sample_rate=_integer(raw, "sample_rate", 16_000, label="audio.sample_rate"),
         wav_path=_optional_path(raw, "wav_path", label="audio.wav_path"),
+        replay_mode=_audio_replay_mode(
+            _string(raw, "replay_mode", "realtime", label="audio.replay_mode"),
+            label="audio.replay_mode",
+        ),
+        window_seconds=_positive_float(
+            raw,
+            "window_seconds",
+            1.0,
+            label="audio.window_seconds",
+        ),
     )
 
 
@@ -368,6 +381,22 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
     if "COFFEE_AUDIO_WAV_PATH" in environ:
         wav_path = _none_if_empty(environ["COFFEE_AUDIO_WAV_PATH"])
         audio = replace(audio, wav_path=Path(wav_path) if wav_path is not None else None)
+    if "COFFEE_AUDIO_REPLAY_MODE" in environ:
+        audio = replace(
+            audio,
+            replay_mode=_audio_replay_mode(
+                environ["COFFEE_AUDIO_REPLAY_MODE"],
+                label="COFFEE_AUDIO_REPLAY_MODE",
+            ),
+        )
+    if "COFFEE_AUDIO_WINDOW_SECONDS" in environ:
+        audio = replace(
+            audio,
+            window_seconds=_parse_positive_float(
+                environ["COFFEE_AUDIO_WINDOW_SECONDS"],
+                "COFFEE_AUDIO_WINDOW_SECONDS",
+            ),
+        )
 
     if "COFFEE_ROAST_LOG_DIR" in environ:
         logging = replace(
@@ -542,6 +571,13 @@ def _audio_source(value: str, label: str = "audio.source") -> AudioSource:
     if normalized not in {"microphone", "wav"}:
         raise ConfigError(f"{label} must be one of: microphone, wav.")
     return cast(AudioSource, normalized)
+
+
+def _audio_replay_mode(value: str, label: str = "audio.replay_mode") -> AudioReplayMode:
+    normalized = _normalized_token(value)
+    if normalized not in {"realtime", "detector_paced"}:
+        raise ConfigError(f"{label} must be one of: realtime, detector_paced.")
+    return cast(AudioReplayMode, normalized)
 
 
 def _export_formats(value: object) -> tuple[ExportFormat, ...]:

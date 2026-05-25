@@ -48,12 +48,15 @@ class FakeAudioPipeline:
         windows: Sequence[AudioWindow] = (),
         *,
         latest_error: str | None = None,
+        running_after_stop: bool = False,
     ) -> None:
         self._windows = list(windows)
         self.latest_error = latest_error
+        self.running_after_stop = running_after_stop
         self.started = False
         self.stopped = False
         self.stop_reasons: list[float] = []
+        self.drain_limits: list[int | None] = []
 
     def start(self) -> AudioCaptureSnapshot:
         self.started = True
@@ -65,6 +68,7 @@ class FakeAudioPipeline:
         return self.snapshot()
 
     def drain_windows(self, *, max_windows: int | None = None) -> tuple[AudioWindow, ...]:
+        self.drain_limits.append(max_windows)
         if max_windows is None:
             drained = tuple(self._windows)
             self._windows.clear()
@@ -78,7 +82,7 @@ class FakeAudioPipeline:
 
     def snapshot(self) -> AudioCaptureSnapshot:
         return AudioCaptureSnapshot(
-            running=self.started and not self.stopped,
+            running=self.started and (not self.stopped or self.running_after_stop),
             queued_window_count=len(self._windows),
             emitted_window_count=len(self._windows),
             dropped_window_count=0,
@@ -174,6 +178,96 @@ def test_audio_runtime_processes_after_beans_added_and_records_once() -> None:
     assert session.first_crack_monotonic_seconds == 6.0
 
 
+def test_detector_paced_audio_runtime_drains_one_window_per_processing_tick() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(confirmed=False),
+            FirstCrackDetectorOutput(
+                confirmed=True,
+                confidence=0.94,
+            ),
+        )
+    )
+    pipeline = FakeAudioPipeline(
+        (
+            _audio_window(sequence_number=1, started_at_monotonic_seconds=505.0),
+            _audio_window(sequence_number=2, started_at_monotonic_seconds=506.0),
+        )
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+            audio=AudioConfig(
+                source="wav",
+                wav_path=Path("replay.wav"),
+                replay_mode="detector_paced",
+            ),
+        ),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+    )
+
+    runtime.start_for_session(session)
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 510.0
+    pending = runtime.process_available_windows(session_store=store, session=session)
+    detected = runtime.process_available_windows(session_store=store, session=session)
+
+    assert pending.status == "pending"
+    assert detected.status == "detected"
+    assert pipeline.drain_limits == [1, 1]
+    assert [window.sequence_number for window in backend.windows] == [1, 2]
+    assert session.first_crack_monotonic_seconds == 7.0
+
+
+def test_audio_runtime_reports_stopped_after_pipeline_stop_returns_running_snapshot() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(
+                confirmed=True,
+                confidence=0.94,
+                detected_at_monotonic_seconds=506.0,
+            ),
+        )
+    )
+    pipeline = FakeAudioPipeline(
+        (_audio_window(sequence_number=1, started_at_monotonic_seconds=506.0),),
+        running_after_stop=True,
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+    )
+
+    runtime.start_for_session(session)
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 510.0
+    detected = runtime.process_available_windows(session_store=store, session=session)
+    snapshot = runtime.snapshot()
+
+    assert detected.active is False
+    assert detected.audio_running is False
+    assert snapshot.active is False
+    assert snapshot.audio_running is False
+
+
 def test_audio_runtime_can_discard_queued_pre_t0_windows() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
@@ -248,6 +342,35 @@ def test_audio_runtime_keeps_pending_status_when_detector_does_not_confirm() -> 
     assert snapshot.processed_window_count == 1
     assert pipeline.stopped is False
     assert [event.kind for event in session.event_timeline] == ["beans_added"]
+
+
+def test_detector_paced_wav_replay_preserves_source_audio_timeline() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    backend = MockDetectorBackend((FirstCrackDetectorOutput(confirmed=True),))
+    pipeline = FakeAudioPipeline(
+        (_audio_window(sequence_number=4, started_at_monotonic_seconds=504.0),)
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            first_crack=FirstCrackConfig(mode="audio"),
+            audio=AudioConfig(source="wav", replay_mode="detector_paced"),
+        ),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+    )
+
+    runtime.start_for_session(session)
+    detected = runtime.process_available_windows(session_store=store, session=session)
+
+    assert detected.status == "detected"
+    assert session.first_crack_monotonic_seconds == 5.0
 
 
 def test_audio_runtime_reports_unavailable_artifact_errors_without_crashing() -> None:

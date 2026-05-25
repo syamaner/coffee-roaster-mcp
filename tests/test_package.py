@@ -71,9 +71,14 @@ _EXPECTED_DEVICE_STATE_KEYS = {
 }
 _EXPECTED_FIRST_CRACK_STATUS_KEYS = {
     "allow_manual_override",
+    "audio_running",
     "detected_at_utc",
     "detected_monotonic_seconds",
+    "dropped_window_count",
+    "emitted_window_count",
     "mode",
+    "processed_window_count",
+    "queued_window_count",
     "reason",
     "status",
 }

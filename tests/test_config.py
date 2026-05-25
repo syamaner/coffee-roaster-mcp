@@ -24,6 +24,8 @@ def test_default_config_allows_mock_run_without_file(
     assert config.first_crack.precision == "int8"
     assert config.audio.source == "microphone"
     assert config.audio.wav_path is None
+    assert config.audio.replay_mode == "realtime"
+    assert config.audio.window_seconds == 1.0
     assert config.logging.log_dir == Path("./logs")
     assert config.logging.sample_interval_seconds == 5.0
     assert config.logging.export_formats == ("jsonl", "csv", "summary")
@@ -59,6 +61,7 @@ first_crack:
 audio:
   input_device: roast-mic
   sample_rate: 48000
+  window_seconds: 10.0
 logging:
   log_dir: ./roast-logs
   sample_interval_seconds: 0.5
@@ -93,6 +96,8 @@ session:
     assert config.audio.input_device == "roast-mic"
     assert config.audio.sample_rate == 48_000
     assert config.audio.wav_path is None
+    assert config.audio.replay_mode == "realtime"
+    assert config.audio.window_seconds == 10.0
     assert config.logging.log_dir == Path("./roast-logs")
     assert config.logging.sample_interval_seconds == 0.5
     assert config.logging.export_formats == ("jsonl", "summary")
@@ -130,6 +135,8 @@ audio:
   input_device: file-mic
   sample_rate: 8000
   wav_path: ./fixture.wav
+  replay_mode: detector_paced
+  window_seconds: 5.0
 logging:
   log_dir: ./file-logs
 """,
@@ -152,6 +159,8 @@ logging:
             "COFFEE_AUDIO_INPUT_DEVICE": "env-mic",
             "COFFEE_AUDIO_SAMPLE_RATE": "16000",
             "COFFEE_AUDIO_WAV_PATH": "",
+            "COFFEE_AUDIO_REPLAY_MODE": "realtime",
+            "COFFEE_AUDIO_WINDOW_SECONDS": "2.5",
             "COFFEE_ROAST_LOG_DIR": "/tmp/roasts",
             "COFFEE_AUTO_T0_DROP_THRESHOLD_C": "30",
         },
@@ -170,6 +179,8 @@ logging:
     assert config.audio.input_device == "env-mic"
     assert config.audio.sample_rate == 16_000
     assert config.audio.wav_path is None
+    assert config.audio.replay_mode == "realtime"
+    assert config.audio.window_seconds == 2.5
     assert config.logging.log_dir == Path("/tmp/roasts")
     assert config.session.auto_t0_drop_threshold_c == 30.0
 
@@ -189,6 +200,11 @@ def test_invalid_enum_value_fails(tmp_path: Path) -> None:
     config_path.write_text("first_crack:\n  precision: fp16\n", encoding="utf-8")
 
     with pytest.raises(ConfigError, match="first_crack.precision"):
+        load_config(config_path, environ={})
+
+    config_path.write_text("audio:\n  replay_mode: warp_speed\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="audio.replay_mode"):
         load_config(config_path, environ={})
 
 
