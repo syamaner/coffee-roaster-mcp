@@ -16,9 +16,9 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `v0.1.1 release prep`
-- Current target: package and MCP Registry metadata version bump for the
-  post-E7-S4 recovery fixes
+- Active story: `E7-S4`
+- Current target: retest Warp manual Hottop MCP control validation on the
+  published `coffee-roaster-mcp==0.1.1` package path
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -47,10 +47,13 @@ The first implementation milestone is a mock vertical slice that requires no roa
   public RoastPilot MCP tools, confirms runtime config `mock`, `disabled`, and
   auto-T0 disabled, completes a full mock roast through public MCP tools, and
   verifies exported JSONL, CSV, and summary outputs.
-- `v0.1.1` is the fix-forward release prep after E7-S4 merged. The version PR
-  aligns `coffee_roaster_mcp.__version__`, `server.json.version`, and
-  `server.json.packages[0].version` at `0.1.1`, then the release should be
-  tagged from updated `main` as `v0.1.1` only after the PR merges.
+- `v0.1.1` is the fix-forward release after E7-S4 merged. PR #144 aligned
+  `coffee_roaster_mcp.__version__`, `server.json.version`, and
+  `server.json.packages[0].version` at `0.1.1`; tag `v0.1.1` points at
+  `810318519899e662204b78671657bd9bc7222a73`; release run `26402310473`
+  published PyPI and then MCP Registry metadata. Published-package smoke with
+  `uvx --refresh --from coffee-roaster-mcp==0.1.1 coffee-roaster-mcp --version`
+  returned `coffee-roaster-mcp 0.1.1`.
 - `E7-S5a` is inserted before the final release checklist to close the
   first-crack MCP validation gap without requiring Hottop hardware or live
   microphone input. It uses the mock roaster, released Hugging Face first-crack
