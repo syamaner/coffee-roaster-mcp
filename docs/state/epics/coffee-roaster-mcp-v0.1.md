@@ -46,6 +46,17 @@ The first implementation milestone is a mock vertical slice that requires no roa
   public RoastPilot MCP tools, confirms runtime config `mock`, `disabled`, and
   auto-T0 disabled, completes a full mock roast through public MCP tools, and
   verifies exported JSONL, CSV, and summary outputs.
+- `E7-S5a` is inserted before the final release checklist to close the
+  first-crack MCP validation gap without requiring Hottop hardware or live
+  microphone input. It uses the mock roaster, released Hugging Face first-crack
+  artifacts pinned to revision
+  `b349a919c34b6130472da97c01817be404e4f629`, and a committed small derived
+  labelled WAV fixture generated from the
+  `coffee-first-crack-detection` checkout. The fixture is a narrow exception to
+  the normal no-audio-in-git rule, must include retimestamped labels and a
+  manifest, and the real-model MCP replay remains opt-in or local/manual rather
+  than default CI. Lightweight fixture metadata and label consistency checks may
+  run in CI.
 - `E2-S1` keeps the initial MCP tool surface bootstrap-safe with `get_server_info` and `get_runtime_config`. Roast-session lifecycle and roast-control tools remain later Epic 2 work.
 - `E2-S2` uses one in-process `RoastSessionStore` with at most one active `RoastSession` at a time. Session state now owns monotonic timing, phase, event timeline storage, telemetry retention, and log-writer references before tool wiring lands.
 - `E2-S3` keeps event writes behind `RoastSessionStore.record_event(...)`. The session timeline now records deterministic append order, authoritative UTC plus monotonic timestamps for core roast events, and idempotent singleton handling for beans added, first crack, bean drop, and cooling transitions.
@@ -812,6 +823,16 @@ Goal: prove the package works from install through mock roast, MCP client calls,
     and exported-log review. No autonomous hardware-control decisions are in
     scope.
 
+- [ ] `E7-S5a` Test MCP first-crack detection with labelled WAV replay.
+  - Done when a small derived WAV fixture, retimestamped label file, and
+    manifest are committed under test fixtures; the MCP server can run with the
+    mock roaster, `first_crack.mode: audio`, pinned released Hugging Face INT8
+    artifacts, and detector-paced WAV replay; public MCP tools can start and
+    monitor a roast until first crack is reported; the reported first-crack time
+    is validated against the fixture labels; and exported logs plus replay
+    metrics are recorded. The real-model replay test is excluded from default
+    CI unless explicitly enabled as an opt-in or slow validation path.
+
 - [ ] `E7-S5` Produce v0.1 release checklist.
   - Done when release steps cover tests, package build, version alignment, HF revision pin, PyPI publish, registry publish, GitHub release, and hardware-ready labeling.
 
@@ -830,6 +851,9 @@ Goal: prove the package works from install through mock roast, MCP client calls,
 - Warp can discover and call tools through the local stdio MCP server.
 - Warp manual Hottop hardware-control results are recorded with explicit
   operator approvals.
+- MCP first-crack detection can be validated on the mock roaster with a
+  committed labelled WAV replay fixture and pinned released Hugging Face
+  artifacts before full hardware/audio end-to-end validation.
 - A real MCP client or agent can complete an end-to-end roast validation using
   configured hardware, real audio, and released Hugging Face ONNX first-crack
   artifacts, with correct state, stats, and exported logs recorded as evidence.

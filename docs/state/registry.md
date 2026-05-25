@@ -373,6 +373,16 @@ Warp as the local MCP client on the mock-safe path. E7-S4 validates manual
 operator-approved Hottop device control through Warp MCP tool calls, with no
 autonomous hardware-control decisions.
 
+Epic 7 now also includes E7-S5a to close the MCP first-crack detection replay
+gap before the final release checklist and full end-to-end agent roast. E7-S5a
+uses the mock roaster plus a committed small derived labelled WAV fixture from
+the `coffee-first-crack-detection` checkout, retimestamped labels, a manifest,
+detector-paced replay, and pinned released Hugging Face INT8 artifacts at
+revision `b349a919c34b6130472da97c01817be404e4f629`. The fixture is a narrow
+documented exception to the normal no-audio-in-git rule. Real-model MCP replay
+remains opt-in or local/manual rather than default CI, while lightweight fixture
+metadata and label consistency checks may run in CI.
+
 E7-S3 completed Warp MCP client connection validation on the mock-safe
 published-package path. Warp launched the `roastpilot` stdio MCP server through
 `uvx --from coffee-roaster-mcp==0.1.0 coffee-roaster-mcp serve`, discovered the
