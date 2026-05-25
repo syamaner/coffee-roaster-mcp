@@ -89,7 +89,7 @@ _EXPECTED_T0_STATUS_KEYS = {
 
 
 def test_version_is_defined() -> None:
-    assert __version__ == "0.1.0"
+    assert __version__ == "0.1.1"
 
 
 def test_cli_parser_program_name() -> None:

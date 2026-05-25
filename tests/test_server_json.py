@@ -96,7 +96,7 @@ def test_server_json_declares_roastpilot_pypi_stdio_package() -> None:
         {
             "registryType": "pypi",
             "identifier": "coffee-roaster-mcp",
-            "version": "0.1.0",
+            "version": __version__,
             "runtimeHint": "uvx",
             "transport": {"type": "stdio"},
         }

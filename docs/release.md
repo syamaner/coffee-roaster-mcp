@@ -6,7 +6,7 @@ This runbook documents the operator prerequisites and CI release path for
 The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 - Manual dry run through `workflow_dispatch` with `dry_run: true`.
-- Live release through a pushed version tag such as `v0.1.0`.
+- Live release through a pushed version tag such as `v0.1.1`.
 
 ## Operator Prerequisites
 
@@ -30,7 +30,7 @@ Before enabling a live release, the release owner must confirm:
   the release owner before deployment jobs can run.
 - Protected tag rules block unapproved creation or update of `v*` tags.
 - The release tag matches the package version exactly, for example package
-  version `0.1.0` must use tag `v0.1.0`.
+  version `0.1.1` must use tag `v0.1.1`.
 - No model weights, audio files, roast logs, serial captures, `.env` files, or
   local IDE folders are included in the release artifact.
 
@@ -78,8 +78,8 @@ After all prerequisites are confirmed:
 2. Push the matching version tag:
 
    ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v0.1.1
+   git push origin v0.1.1
    ```
 
 3. Approve the `release` environment deployment in GitHub Actions.
@@ -111,7 +111,7 @@ official registry docs and schema, then repeat the non-destructive checks below:
    `https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json`.
 2. Confirm `server.json.name` is `io.github.syamaner/coffee-roaster-mcp`.
 3. Confirm the PyPI package entry uses `registryType: pypi`, identifier
-   `coffee-roaster-mcp`, package version `0.1.0`, runtime hint `uvx`, and
+   `coffee-roaster-mcp`, package version `0.1.1`, runtime hint `uvx`, and
    stdio transport.
 4. Confirm README contains exactly one PyPI ownership verification marker:
    `<!-- mcp-name: io.github.syamaner/coffee-roaster-mcp -->`.
@@ -155,6 +155,38 @@ listing data can change or reset before general availability. A failed publish
 after PyPI succeeds leaves PyPI live without Registry discoverability and should
 be retried only after checking Registry status and confirming no partial
 version entry was created.
+
+## v0.1.1 Release Prep
+
+The `v0.1.1` release is the fix-forward package release for the E7-S4 Warp
+manual Hottop validation recovery fixes. It should be tagged only after the
+version PR is merged to `main`.
+
+Pre-tag checklist:
+
+1. Confirm `server.json.version`, `server.json.packages[0].version`, and
+   `coffee_roaster_mcp.__version__` are all `0.1.1`.
+2. Confirm the local gates pass:
+   `pytest`, `ruff check .`, `ruff format --check .`, `pyright`,
+   `coffee-roaster-mcp --help`, and `coffee-roaster-mcp --version`.
+3. Build the wheel and source distribution with `python -m build`.
+4. Smoke install the built wheel from `dist/` before tagging.
+5. Merge the version PR, then tag from updated `main`:
+
+   ```bash
+   git checkout main
+   git pull --ff-only origin main
+   git tag v0.1.1
+   git push origin v0.1.1
+   ```
+
+6. Approve the GitHub `release` environment deployment.
+7. Verify production PyPI and the MCP Registry show package version `0.1.1`.
+8. Run the published-package smoke only after PyPI exposes `0.1.1`:
+
+   ```bash
+   uvx --from coffee-roaster-mcp==0.1.1 coffee-roaster-mcp --version
+   ```
 
 ## v0.1.0 Live Publish Outcome
 
