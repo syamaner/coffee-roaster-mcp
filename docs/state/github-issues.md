@@ -101,6 +101,7 @@ Milestone: `v0.1`
 - #57 E7-S2: Test package install smoke flow
 - #58 E7-S3: Test Warp MCP client connection
 - #59 E7-S4: Run Warp manual Hottop MCP control validation
+- #141 E7-S5a: Test MCP first-crack detection with labelled WAV replay
 - #60 E7-S5: Produce v0.1 release checklist
 - #112 E7-S6: Run end-to-end agent roast validation with HF ONNX audio path
 
