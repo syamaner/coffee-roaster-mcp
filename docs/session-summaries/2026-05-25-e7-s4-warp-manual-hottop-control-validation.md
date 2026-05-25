@@ -180,6 +180,45 @@ Fix:
 - Completed inactive sessions still reject `stop_cooling`, so the fix does not
   reopen normal controls after completion.
 
+Code review follow-up:
+
+- CodeRabbit review
+  `https://github.com/syamaner/coffee-roaster-mcp/pull/143#pullrequestreview-4356405938`
+  asked for explicit failure-branch coverage for the new recovery path. The
+  risk was that the happy path only proved recovery when the driver reported
+  cooling off; it did not prove safe behavior when the driver still reported
+  cooling active after `stop_cooling`.
+- Commit `32b440a` added
+  `test_stop_cooling_recovery_keeps_fault_when_driver_reports_cooling_on`.
+  That test configures the recording driver with `stop_cooling_stays_on=True`,
+  asserts `stop_cooling` raises, confirms the session remains
+  `phase: fault`, `active: false`, and `cooling_on: true`, and confirms no
+  `cooling_stopped` event is appended. The test deliberately expects the
+  driver action log to include `stop_cooling`, because the failure is only
+  knowable after the driver command returns `cooling_on: true`.
+- The same follow-up expanded the public
+  `RoastSessionStore.reserve_driver_stop_cooling_recovery` and
+  `RoastSessionStore.complete_reserved_driver_stop_cooling_recovery_snapshot`
+  docstrings with Google-style `Args`, `Returns`, `Raises`, and notes covering
+  the fault-only reservation lifecycle.
+- Codex review
+  `https://github.com/syamaner/coffee-roaster-mcp/pull/143#pullrequestreview-4356449763`
+  found an export consistency bug in the first recovery fix. The runtime state
+  stayed faulted, but CSV export phase derivation could classify the later
+  `cooling_stopped` recovery row as `complete`, because normal
+  `cooling_stopped` rows imply completion.
+- Commit `aff9fdb` updated export phase derivation so
+  `cooling_stopped` rows with `recovery_after_fault: true` remain classified as
+  `fault` when a fault is already visible. It also adjusted same-timestamp
+  event ordering so post-fault recovery `cooling_stopped` rows sort after the
+  `fault` event; this matters because stopped sessions reuse the stop monotonic
+  time for later recovery events.
+- Commit `aff9fdb` also added
+  `test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop`, which
+  exports a `fault -> cooling_stopped(recovery_after_fault: true)` timeline and
+  asserts both rows remain `phase: fault` while the recovery row reports
+  `cooling_on: False`.
+
 Actions deliberately not taken:
 
 - did not mark E7-S4 complete from partial/faulted Warp evidence
@@ -188,6 +227,10 @@ Actions deliberately not taken:
 Hardware-ready release-label decision: still blocked. The emergency-stop
 recovery bug must be validated through Warp before hardware-ready status can be
 considered.
+
+## Usage Snapshot
+
+- `792K used`.
 
 ## Resume Checklist
 
