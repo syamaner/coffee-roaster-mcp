@@ -49,6 +49,12 @@ def test_installed_distribution_metadata_is_complete() -> None:
         "Documentation, https://github.com/syamaner/coffee-roaster-mcp#readme",
         "Repository, https://github.com/syamaner/coffee-roaster-mcp",
         "Issues, https://github.com/syamaner/coffee-roaster-mcp/issues",
+        "Architecture Article, https://dev.to/syamaner/part-1-the-architecture-the-agent-spec-driven-ml-development-with-warpoz-3al6",
+        "Prototype Intro, https://dev.to/syamaner/part-1-training-a-neural-network-to-detect-coffee-first-crack-from-audio-an-agentic-development-1jei",
+        "Prototype MCP Post, https://dev.to/syamaner/part-2-building-mcp-servers-to-control-a-home-coffee-roaster-an-agentic-development-journey-with-58ik",
+        "First-Crack Model, https://huggingface.co/syamaner/coffee-first-crack-detection",
+        "First-Crack Dataset, https://huggingface.co/datasets/syamaner/coffee-first-crack-audio",
+        "First-Crack Demo, https://huggingface.co/spaces/syamaner/coffee-first-crack-detection",
     } <= project_urls
 
     assert resources.files("coffee_roaster_mcp").joinpath("py.typed").is_file()

@@ -12,6 +12,19 @@ RoastPilot will provide one local MCP runtime for roaster control, telemetry, fi
 
 The project is currently in bootstrap. See `docs/plans/coffee-roaster-mcp-v0.1-overall-plan.md` and `docs/state/registry.md` for the active plan and state.
 
+## Related Project Artifacts
+
+- Current architecture article: [The Architecture: The Agent-Spec Driven ML Development With Warp](https://dev.to/syamaner/part-1-the-architecture-the-agent-spec-driven-ml-development-with-warpoz-3al6)
+- Original prototype intro: [Training a Neural Network to Detect Coffee First Crack from Audio](https://dev.to/syamaner/part-1-training-a-neural-network-to-detect-coffee-first-crack-from-audio-an-agentic-development-1jei)
+- Original prototype MCP post: [Building MCP Servers to Control a Home Coffee Roaster](https://dev.to/syamaner/part-2-building-mcp-servers-to-control-a-home-coffee-roaster-an-agentic-development-journey-with-58ik)
+- First-crack model: [syamaner/coffee-first-crack-detection](https://huggingface.co/syamaner/coffee-first-crack-detection)
+- First-crack dataset: [syamaner/coffee-first-crack-audio](https://huggingface.co/datasets/syamaner/coffee-first-crack-audio)
+- First-crack demo: [Coffee First-Crack Detection Space](https://huggingface.co/spaces/syamaner/coffee-first-crack-detection)
+
+The current `coffee-roaster-mcp` package is a consolidated rebuild of the
+prototype with the lessons learned folded into one deterministic local MCP
+server, conservative hardware boundaries, and releaseable package metadata.
+
 ## What RoastPilot Is
 
 RoastPilot is the human-facing product name. `coffee-roaster-mcp` is the infrastructure and packaging name used for the repository, Python package, and future distribution.
