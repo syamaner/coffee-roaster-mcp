@@ -1490,6 +1490,11 @@ class RoastSessionStore:
 
             recorded_at_utc = self._utc_now()
             monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+            _validate_event_monotonic_order(
+                session,
+                kind=kind,
+                monotonic_seconds=monotonic_seconds,
+            )
             event = RoastEvent(
                 kind=kind,
                 recorded_at_utc=recorded_at_utc,
@@ -1988,6 +1993,19 @@ def _validate_event_transition(session: RoastSession, kind: RoastEventKind) -> N
             f"{kind} cannot be recorded while phase is {session.phase}; "
             f"allowed phases: {allowed_phase_list}."
         )
+
+
+def _validate_event_monotonic_order(
+    session: RoastSession,
+    *,
+    kind: RoastEventKind,
+    monotonic_seconds: float,
+) -> None:
+    if kind == "fault" or not session.event_timeline:
+        return
+    latest_event = session.event_timeline[-1]
+    if monotonic_seconds < latest_event.monotonic_seconds:
+        raise SessionLifecycleError("Roast events must be recorded in monotonic timestamp order.")
 
 
 def _elapsed_since(

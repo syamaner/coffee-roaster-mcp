@@ -253,7 +253,7 @@ class FirstCrackSessionRuntime:
             if capture_snapshot is not None:
                 self._last_capture_snapshot = capture_snapshot
             elif self._last_capture_snapshot is not None:
-                capture_snapshot = self._last_capture_snapshot
+                capture_snapshot = _stopped_capture_snapshot(self._last_capture_snapshot)
             status = self._status
             reason = self._reason
             if (
@@ -300,8 +300,8 @@ class FirstCrackSessionRuntime:
         pipeline = self._pipeline
         if pipeline is not None:
             try:
-                self._last_capture_snapshot = pipeline.stop(
-                    timeout_seconds=self._stop_timeout_seconds
+                self._last_capture_snapshot = _stopped_capture_snapshot(
+                    pipeline.stop(timeout_seconds=self._stop_timeout_seconds)
                 )
             except Exception as exc:  # noqa: BLE001 - shutdown should be best effort.
                 self._status = "faulted"
@@ -347,6 +347,16 @@ def _initial_status(config: FirstCrackConfig) -> FirstCrackRuntimeState:
             return "unavailable"
         return "manual"
     return "pending"
+
+
+def _stopped_capture_snapshot(snapshot: AudioCaptureSnapshot) -> AudioCaptureSnapshot:
+    return AudioCaptureSnapshot(
+        running=False,
+        queued_window_count=snapshot.queued_window_count,
+        emitted_window_count=snapshot.emitted_window_count,
+        dropped_window_count=snapshot.dropped_window_count,
+        latest_error=snapshot.latest_error,
+    )
 
 
 def _initial_reason(config: FirstCrackConfig) -> str:

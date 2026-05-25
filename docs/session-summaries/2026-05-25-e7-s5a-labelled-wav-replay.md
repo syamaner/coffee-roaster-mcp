@@ -141,12 +141,31 @@ Review notes:
 
 - `./.venv/bin/python -m pytest tests/test_config.py tests/test_audio.py tests/test_audio_fixtures.py tests/test_first_crack_runtime.py`: 49 passed
 - `./.venv/bin/python scripts/validate_first_crack_wav_replay.py`: passed
-- `./.venv/bin/python -m pytest`: 368 passed
+- `./.venv/bin/python -m pytest`: 371 passed
 - `./.venv/bin/python -m ruff check .`: passed
 - `./.venv/bin/python -m ruff format --check .`: 33 files already formatted
 - `./.venv/bin/python -m pyright`: 0 errors, 0 warnings, 0 informations
 - `./.venv/bin/coffee-roaster-mcp --help`: passed
 - `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.2`
+
+## Review Follow-Up
+
+- Addressed CodeRabbit review feedback by YAML-quoting replay script paths,
+  stripping inherited `COFFEE_*` environment overrides from the replay script
+  subprocess, using the AST extractor speech-backend availability helper before
+  installing the NumPy-only patch, and scoping exposed first-crack runtime
+  metrics to the serialized session id.
+- Addressed Codex review feedback by normalizing stopped capture snapshots so a
+  stopped runtime cannot continue reporting `audio_running: true`, and by
+  blocking later non-fault phase events until wall-clock elapsed time catches up
+  to a detector-paced future first-crack timestamp.
+- Added regression coverage for stopped audio snapshots, cross-session runtime
+  metric leakage, and future first-crack timeline ordering.
+- Re-ran released-model WAV replay after the review fixes:
+  detected `20.018164542000154` seconds after T0 against the
+  `3.82710390663442-20.0` second label interval, emitted `2` windows, processed
+  `2` windows, dropped `0` windows, and exported `roast.jsonl`, `roast.csv`,
+  and `summary.json` under the local temporary replay log directory.
 
 ## Next Routing
 
@@ -155,3 +174,8 @@ produce the v0.1 release checklist. Keep live Hottop validation, real
 microphone validation, full end-to-end agent roast validation, model lifecycle
 work, live publishing, and hardware-ready release labeling out of scope unless
 the next issue explicitly requires them.
+
+## Usage Snapshot
+
+- Review follow-up start: current Codex goal token tracking is unavailable in
+  this session (`remainingTokens: null`, `completionBudgetReport: null`).

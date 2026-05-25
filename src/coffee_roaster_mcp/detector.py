@@ -497,20 +497,25 @@ def _build_ast_feature_extractor(preprocessor_config_path: Path) -> OnnxFeatureE
 
 def _patch_ast_feature_extractor_for_numpy_only_runtime(extractor: Any) -> None:
     extractor_module = import_module(extractor.__class__.__module__)
-    if "torch" in extractor_module.__dict__:
+    if _ast_speech_backend_available(extractor_module):
         return
 
     try:
         numpy_module = import_module("numpy")
-        spectrogram = extractor_module.spectrogram
+        spectrogram: Any = extractor_module.spectrogram
     except (AttributeError, ImportError) as exc:
         raise FirstCrackDetectorError(
             "Could not configure AST feature extraction for ONNX-only runtime."
         ) from exc
+    if not callable(spectrogram):
+        raise FirstCrackDetectorError(
+            "Could not configure AST feature extraction for ONNX-only runtime."
+        )
+    spectrogram_fn = cast(Any, spectrogram)
 
     def extract_fbank_features(self: Any, waveform: Any, max_length: int) -> Any:
         squeezed = numpy_module.squeeze(waveform)
-        fbank = spectrogram(
+        spectrogram_output: Any = spectrogram_fn(
             squeezed,
             self.window,
             frame_length=400,
@@ -523,9 +528,10 @@ def _patch_ast_feature_extractor_for_numpy_only_runtime(extractor: Any) -> None:
             log_mel="log",
             mel_floor=1.192092955078125e-07,
             remove_dc_offset=True,
-        ).T
+        )
+        fbank: Any = spectrogram_output.T
 
-        frame_count = fbank.shape[0]
+        frame_count = int(fbank.shape[0])
         difference = max_length - frame_count
         if difference > 0:
             fbank = numpy_module.pad(fbank, ((0, difference), (0, 0)), mode="constant")
@@ -534,6 +540,13 @@ def _patch_ast_feature_extractor_for_numpy_only_runtime(extractor: Any) -> None:
         return fbank
 
     extractor._extract_fbank_features = MethodType(extract_fbank_features, extractor)
+
+
+def _ast_speech_backend_available(extractor_module: Any) -> bool:
+    is_speech_available = getattr(extractor_module, "is_speech_available", None)
+    if callable(is_speech_available):
+        return bool(is_speech_available())
+    return False
 
 
 def _first_crack_confidence(outputs: Sequence[object]) -> float:

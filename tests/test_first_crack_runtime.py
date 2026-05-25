@@ -48,9 +48,11 @@ class FakeAudioPipeline:
         windows: Sequence[AudioWindow] = (),
         *,
         latest_error: str | None = None,
+        running_after_stop: bool = False,
     ) -> None:
         self._windows = list(windows)
         self.latest_error = latest_error
+        self.running_after_stop = running_after_stop
         self.started = False
         self.stopped = False
         self.stop_reasons: list[float] = []
@@ -78,7 +80,7 @@ class FakeAudioPipeline:
 
     def snapshot(self) -> AudioCaptureSnapshot:
         return AudioCaptureSnapshot(
-            running=self.started and not self.stopped,
+            running=self.started and (not self.stopped or self.running_after_stop),
             queued_window_count=len(self._windows),
             emitted_window_count=len(self._windows),
             dropped_window_count=0,
@@ -172,6 +174,46 @@ def test_audio_runtime_processes_after_beans_added_and_records_once() -> None:
         "first_crack_detected",
     ]
     assert session.first_crack_monotonic_seconds == 6.0
+
+
+def test_audio_runtime_reports_stopped_after_pipeline_stop_returns_running_snapshot() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(
+                confirmed=True,
+                confidence=0.94,
+                detected_at_monotonic_seconds=506.0,
+            ),
+        )
+    )
+    pipeline = FakeAudioPipeline(
+        (_audio_window(sequence_number=1, started_at_monotonic_seconds=506.0),),
+        running_after_stop=True,
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+    )
+
+    runtime.start_for_session(session)
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 510.0
+    detected = runtime.process_available_windows(session_store=store, session=session)
+    snapshot = runtime.snapshot()
+
+    assert detected.active is False
+    assert detected.audio_running is False
+    assert snapshot.active is False
+    assert snapshot.audio_running is False
 
 
 def test_audio_runtime_can_discard_queued_pre_t0_windows() -> None:

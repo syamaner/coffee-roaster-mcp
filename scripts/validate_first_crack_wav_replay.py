@@ -149,6 +149,8 @@ async def _call(awaitable: Any) -> Any:
 
 
 def _write_config(config_path: Path, *, log_dir: Path) -> None:
+    wav_path = json.dumps(str(FIXTURE_DIR / f"{FIXTURE_STEM}.wav"))
+    log_dir_path = json.dumps(str(log_dir))
     config_path.write_text(
         "\n".join(
             [
@@ -166,11 +168,11 @@ def _write_config(config_path: Path, *, log_dir: Path) -> None:
                 "  source: wav",
                 "  input_device: null",
                 "  sample_rate: 16000",
-                f"  wav_path: {FIXTURE_DIR / f'{FIXTURE_STEM}.wav'}",
+                f"  wav_path: {wav_path}",
                 "  replay_mode: detector_paced",
                 "  window_seconds: 10.0",
                 "logging:",
-                f"  log_dir: {log_dir}",
+                f"  log_dir: {log_dir_path}",
                 "  sample_interval_seconds: 5.0",
                 "session:",
                 "  auto_t0_detection_enabled: false",
@@ -183,7 +185,16 @@ def _write_config(config_path: Path, *, log_dir: Path) -> None:
 
 def _server_env() -> dict[str, str]:
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    for key in tuple(env):
+        if key.startswith("COFFEE_"):
+            del env[key]
+    src_path = str(REPO_ROOT / "src")
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        src_path
+        if existing_pythonpath is None
+        else os.pathsep.join((src_path, existing_pythonpath))
+    )
     return env
 
 

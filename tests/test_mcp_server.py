@@ -16,7 +16,11 @@ from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackRuntimeSnapshot,
     FirstCrackRuntimeState,
 )
-from coffee_roaster_mcp.mcp_server import ServerContext, build_server_context, create_mcp_server
+from coffee_roaster_mcp.mcp_server import (
+    ServerContext,
+    build_server_context,
+    create_mcp_server,
+)
 from coffee_roaster_mcp.session import RoastSession, RoastSessionStore, SessionLifecycleError
 
 
@@ -763,6 +767,54 @@ def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
     assert fault_state.first_crack_status.status == "faulted"
 
 
+def test_get_roast_state_scopes_runtime_metrics_to_requested_session(tmp_path: Path) -> None:
+    config_path = tmp_path / "audio.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "first_crack:",
+                "  mode: audio",
+                f"logging:\n  log_dir: {tmp_path / 'audio-logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    _set_first_crack_runtime(
+        server_context,
+        FakeFirstCrackRuntime(
+            audio_running=True,
+            queued_window_count=2,
+            emitted_window_count=3,
+            dropped_window_count=4,
+            processed_window_count=5,
+        ),
+    )
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    first_start = _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    _call_tool(server, "mark_first_crack", ctx)
+    _call_tool(server, "drop_beans", ctx)
+    _call_tool(server, "start_cooling", ctx)
+    _call_tool(server, "stop_cooling", ctx)
+    _call_tool(server, "start_roast_session", ctx)
+    first_state = _call_tool(
+        server,
+        "get_roast_state",
+        ctx,
+        session_id=first_start.session.session_id,
+    )
+
+    assert first_state.first_crack_status.status == "detected"
+    assert first_state.first_crack_status.audio_running is False
+    assert first_state.first_crack_status.queued_window_count == 0
+    assert first_state.first_crack_status.emitted_window_count == 0
+    assert first_state.first_crack_status.dropped_window_count == 0
+    assert first_state.first_crack_status.processed_window_count == 0
+
+
 def test_driver_command_failure_does_not_mutate_session_state(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
@@ -1313,10 +1365,20 @@ class FakeFirstCrackRuntime:
         status: str = "pending",
         reason: str | None = None,
         record_first_crack_on_process: bool = False,
+        audio_running: bool = False,
+        queued_window_count: int = 0,
+        emitted_window_count: int = 0,
+        dropped_window_count: int = 0,
+        processed_window_count: int = 0,
     ) -> None:
         self.status = status
         self.reason = reason
         self.record_first_crack_on_process = record_first_crack_on_process
+        self.audio_running = audio_running
+        self.queued_window_count = queued_window_count
+        self.emitted_window_count = emitted_window_count
+        self.dropped_window_count = dropped_window_count
+        self.processed_window_count = processed_window_count
         self.active_session_id: str | None = None
         self.started_sessions: list[str] = []
         self.processed_sessions: list[str] = []
@@ -1368,6 +1430,11 @@ class FakeFirstCrackRuntime:
             active_session_id=self.active_session_id,
             active=self.active_session_id is not None,
             reason=self.reason,
+            audio_running=self.audio_running,
+            queued_window_count=self.queued_window_count,
+            emitted_window_count=self.emitted_window_count,
+            dropped_window_count=self.dropped_window_count,
+            processed_window_count=self.processed_window_count,
         )
 
 

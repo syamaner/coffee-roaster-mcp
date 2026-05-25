@@ -1276,7 +1276,10 @@ def _serialize_first_crack_status(
 ) -> FirstCrackStatus:
     """Derive first-crack status from config and the session timeline."""
     if session.first_crack_at_utc is not None:
-        runtime = _runtime_metrics(first_crack_runtime)
+        runtime = _runtime_metrics(
+            session_id=session.id,
+            first_crack_runtime=first_crack_runtime,
+        )
         return FirstCrackStatus(
             mode=config.first_crack.mode,
             status="detected",
@@ -1290,7 +1293,10 @@ def _serialize_first_crack_status(
             processed_window_count=runtime.processed_window_count,
         )
     if session.faulted_at_utc is not None:
-        runtime = _runtime_metrics(first_crack_runtime)
+        runtime = _runtime_metrics(
+            session_id=session.id,
+            first_crack_runtime=first_crack_runtime,
+        )
         return FirstCrackStatus(
             mode=config.first_crack.mode,
             status="faulted",
@@ -1337,7 +1343,10 @@ def _serialize_first_crack_status(
         and first_crack_runtime.active_session_id == session.id
         and first_crack_runtime.status in {"faulted", "unavailable"}
     ):
-        runtime = _runtime_metrics(first_crack_runtime)
+        runtime = _runtime_metrics(
+            session_id=session.id,
+            first_crack_runtime=first_crack_runtime,
+        )
         return FirstCrackStatus(
             mode=config.first_crack.mode,
             status=first_crack_runtime.status,
@@ -1359,7 +1368,10 @@ def _serialize_first_crack_status(
         and first_crack_runtime.reason is not None
     ):
         reason = first_crack_runtime.reason
-    runtime = _runtime_metrics(first_crack_runtime)
+    runtime = _runtime_metrics(
+        session_id=session.id,
+        first_crack_runtime=first_crack_runtime,
+    )
     return FirstCrackStatus(
         mode=config.first_crack.mode,
         status="pending",
@@ -1376,10 +1388,12 @@ def _serialize_first_crack_status(
 
 
 def _runtime_metrics(
+    *,
+    session_id: str,
     first_crack_runtime: FirstCrackRuntimeSnapshot | None,
 ) -> FirstCrackRuntimeSnapshot:
     """Return runtime metrics or an empty disabled-style snapshot."""
-    if first_crack_runtime is not None:
+    if first_crack_runtime is not None and first_crack_runtime.active_session_id == session_id:
         return first_crack_runtime
     return FirstCrackRuntimeSnapshot(
         status="disabled",
