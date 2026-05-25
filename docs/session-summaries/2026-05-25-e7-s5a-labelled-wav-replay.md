@@ -141,7 +141,7 @@ Review notes:
 
 - `./.venv/bin/python -m pytest tests/test_config.py tests/test_audio.py tests/test_audio_fixtures.py tests/test_first_crack_runtime.py`: 49 passed
 - `./.venv/bin/python scripts/validate_first_crack_wav_replay.py`: passed
-- `./.venv/bin/python -m pytest`: 371 passed
+- `./.venv/bin/python -m pytest`: 373 passed
 - `./.venv/bin/python -m ruff check .`: passed
 - `./.venv/bin/python -m ruff format --check .`: 33 files already formatted
 - `./.venv/bin/python -m pyright`: 0 errors, 0 warnings, 0 informations
@@ -176,6 +176,16 @@ Review notes:
   applying the shared post-first-crack normalization to any non-fault event that
   would move behind the latest event timestamp, covering `beans_dropped`,
   `cooling_started`, and `cooling_stopped`.
+- Addressed Codex review feedback on commit `466f380` by normalizing
+  post-first-crack UTC timestamps along with monotonic timestamps, limiting
+  detector-paced replay draining to one window per processing tick, and keeping
+  detector-paced future-timeline bypass scoped to inferred timestamps rather
+  than explicit backend-provided timestamps.
+- Re-ran released-model WAV replay after the Codex follow-up:
+  detected `20.018711624998417` seconds after T0 against the
+  `3.82710390663442-20.0` second label interval, emitted `2` windows, processed
+  `2` windows, dropped `0` windows, and exported `roast.jsonl`, `roast.csv`,
+  and `summary.json` under the local temporary replay log directory.
 - Follow-up review status before push: CodeRabbit completed after the local
   follow-up fix, and no additional Codex reviews were posted.
 

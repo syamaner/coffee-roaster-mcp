@@ -376,6 +376,10 @@ def test_future_first_crack_detection_allows_later_events_without_inverted_metri
     assert session.beans_dropped_monotonic_seconds == 20.0
     assert session.cooling_started_monotonic_seconds == 20.0
     assert session.cooling_stopped_monotonic_seconds == 20.0
+    assert session.first_crack_at_utc is not None
+    assert session.beans_dropped_at_utc == session.first_crack_at_utc
+    assert session.cooling_started_at_utc == session.first_crack_at_utc
+    assert session.cooling_stopped_at_utc == session.first_crack_at_utc
     assert compute_development_time_seconds(session) == 0.0
 
 

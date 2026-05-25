@@ -186,8 +186,9 @@ class FirstCrackSessionRuntime:
                 self._mark_faulted_locked(f"Audio capture failed: {capture_snapshot.latest_error}")
                 return self.snapshot()
 
+            drain_limit = 1 if _uses_detector_paced_wav_replay(self._config.audio) else None
             try:
-                for window in pipeline.drain_windows():
+                for window in pipeline.drain_windows(max_windows=drain_limit):
                     self._processed_window_count += 1
                     result = integrate_first_crack_window_with_session(
                         config=self._config.first_crack,
@@ -234,7 +235,9 @@ class FirstCrackSessionRuntime:
         with self._lock:
             if self._active_session_id != session_id:
                 return self.snapshot()
-            if self._pipeline is not None:
+            if self._pipeline is not None and not _uses_detector_paced_wav_replay(
+                self._config.audio
+            ):
                 self._pipeline.drain_windows()
             if self._status == "pending":
                 self._reason = reason

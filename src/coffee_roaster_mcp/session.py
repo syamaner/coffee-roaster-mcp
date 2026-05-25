@@ -1495,6 +1495,11 @@ class RoastSessionStore:
                 kind=kind,
                 monotonic_seconds=monotonic_seconds,
             )
+            recorded_at_utc = _normalize_event_recorded_at_utc(
+                session,
+                kind=kind,
+                recorded_at_utc=recorded_at_utc,
+            )
             _validate_event_monotonic_order(
                 session,
                 kind=kind,
@@ -2025,6 +2030,20 @@ def _normalize_event_monotonic_seconds(
     if _has_recorded_first_crack(session) and monotonic_seconds < latest_event.monotonic_seconds:
         return latest_event.monotonic_seconds
     return monotonic_seconds
+
+
+def _normalize_event_recorded_at_utc(
+    session: RoastSession,
+    *,
+    kind: RoastEventKind,
+    recorded_at_utc: datetime,
+) -> datetime:
+    if kind == "fault" or not session.event_timeline:
+        return recorded_at_utc
+    latest_event = session.event_timeline[-1]
+    if _has_recorded_first_crack(session) and recorded_at_utc < latest_event.recorded_at_utc:
+        return latest_event.recorded_at_utc
+    return recorded_at_utc
 
 
 def _has_recorded_first_crack(session: RoastSession) -> bool:

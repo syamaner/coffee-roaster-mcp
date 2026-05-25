@@ -391,7 +391,7 @@ def _future_tolerance_for_detection(
     max_future_seconds: float | None,
     allow_future_timeline: bool,
 ) -> float | None:
-    if allow_future_timeline:
+    if allow_future_timeline and detection_event.detected_at_inferred:
         return None
     if max_future_seconds is not None:
         return max_future_seconds

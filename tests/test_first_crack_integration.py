@@ -310,6 +310,43 @@ def test_explicit_future_detector_timestamp_is_rejected() -> None:
     assert session.phase == "roasting"
 
 
+def test_explicit_future_detector_timestamp_is_rejected_with_future_timeline_enabled() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 501.25
+    config = FirstCrackConfig(mode="audio")
+    adapter = build_first_crack_detector_adapter(
+        config,
+        _resolved_detector_artifacts(),
+        MockDetectorBackend(
+            (
+                FirstCrackDetectorOutput(
+                    confirmed=True,
+                    detected_at_monotonic_seconds=502.0,
+                ),
+            )
+        ),
+    )
+
+    with pytest.raises(SessionLifecycleError, match="cannot be in the future"):
+        integrate_first_crack_window_with_session(
+            config=config,
+            adapter=adapter,
+            session_store=store,
+            session=session,
+            window=_audio_window(
+                started_at_monotonic_seconds=501.0,
+                duration_seconds=1.0,
+            ),
+            allow_future_timeline=True,
+        )
+
+    assert [event.kind for event in session.event_timeline] == ["beans_added"]
+    assert session.phase == "roasting"
+
+
 def test_manual_first_crack_event_takes_precedence_over_later_detector_confirmation() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
