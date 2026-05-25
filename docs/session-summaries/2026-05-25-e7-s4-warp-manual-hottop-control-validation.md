@@ -130,7 +130,10 @@ Config creation and local non-hardware verification:
 
 Required repo checks:
 
-- `./.venv/bin/python -m pytest`: 356 passed.
+- Targeted recovery tests after Warp emergency-stop finding:
+  `./.venv/bin/python -m pytest tests/test_mcp_server.py::test_stop_cooling_recovers_after_emergency_stop_leaves_cooling_on tests/test_mcp_server.py::test_stop_cooling_still_rejects_completed_inactive_session tests/test_mcp_server.py::test_stop_cooling_uses_driver_cooling_state_before_completing`:
+  3 passed.
+- `./.venv/bin/python -m pytest`: 358 passed.
 - `./.venv/bin/python -m ruff check .`: passed.
 - `./.venv/bin/python -m ruff format --check .`: 31 files already formatted.
 - `./.venv/bin/python -m pyright`: 0 errors, 0 warnings, 0 informations.
@@ -139,22 +142,46 @@ Required repo checks:
 
 ## Current Status
 
-Status: ready for supervised Warp tool discovery and read-only config/state
-checks, but hardware-affecting validation is not yet run.
+Status: live Warp Hottop validation surfaced a recovery bug after emergency
+stop; a code fix is now on the branch.
 
-Reason: the Hottop serial adapter is now visible and the config file exists, but
-the required Warp evidence and explicit operator approvals for hardware-affecting
-MCP tool calls have not been captured yet.
+Observed Warp behavior:
+
+- `drop_beans` from `pre_roast` was rejected before the driver boundary:
+  `beans_dropped cannot be recorded while phase is pre_roast; allowed phases:
+  roasting, development`. This is expected lifecycle-guard behavior, not a bug.
+- After emergency stop, Warp reported `get_roast_state` with `phase: fault`,
+  `active: false`, `cooling_on: true`, `fan_level_percent: 100`, and
+  `cooling_motor_on: true`.
+- A subsequent `stop_cooling` attempt failed with
+  `No active roast session exists.`
+
+Bug conclusion:
+
+- Emergency stop intentionally leaves cooling on as the fail-closed hardware
+  state.
+- The MCP `stop_cooling` tool incorrectly required an active session, so the
+  operator could not stop cooling through MCP after emergency stop faulted and
+  stopped the session.
+
+Fix:
+
+- `stop_cooling` now has a narrow recovery path for the latest stopped
+  `fault` session when cooling is still on.
+- The recovery path sends only the configured driver `stop_cooling` command,
+  records a `cooling_stopped` event with `recovery_after_fault: true`, sets
+  cooling off in session state, and preserves `phase: fault` / `active: false`.
+- Completed inactive sessions still reject `stop_cooling`, so the fix does not
+  reopen normal controls after completion.
 
 Actions deliberately not taken:
 
-- did not launch the Hottop-configured server through Warp
-- did not call `start_roast_session`, `set_heat`, `set_fan`, `drop_beans`,
-  `start_cooling`, `stop_cooling`, or `emergency_stop` against hardware
+- did not mark E7-S4 complete from partial/faulted Warp evidence
 - did not export or claim hardware validation artifacts
 
-Hardware-ready release-label decision: still blocked. Adapter/config preflight
-alone does not support a hardware-ready release label.
+Hardware-ready release-label decision: still blocked. The emergency-stop
+recovery bug must be validated through Warp before hardware-ready status can be
+considered.
 
 ## Resume Checklist
 
@@ -172,6 +199,8 @@ Before resuming hardware validation:
 - require explicit operator approval before every hardware-affecting MCP call
 - record device state before and after connect, heat, fan, drop, cooling,
   stop-cooling, and emergency-stop validation
+- specifically rerun post-emergency `stop_cooling` recovery through Warp and
+  confirm cooling turns off while the session remains faulted and inactive
 - stop immediately on unexpected telemetry, command-loop errors, unsafe roaster
   behavior, or uncertainty
 
@@ -192,10 +221,16 @@ and `uvx` is available at `/opt/homebrew/bin/uvx` with version `0.11.16`. Read
 `docs/session-summaries/2026-05-24-e7-s3-warp-mcp-client-connection.md`, this
 summary, and issue #59 including
 `https://github.com/syamaner/coffee-roaster-mcp/issues/59#issuecomment-4529994261`.
-Next, launch through Warp using
-`uvx --from coffee-roaster-mcp==0.1.0 coffee-roaster-mcp serve` or
-`/opt/homebrew/bin/uvx`, and require explicit operator approval plus before/after
-device-state evidence for every hardware-affecting tool call. Do not run
-autonomous roasting, ChatGPT MCP validation, model training/export/sync, real
-microphone or ONNX audio-path validation, live PyPI/MCP Registry publishing, or
-full end-to-end agent roast validation unless separately selected.
+Warp hardware validation surfaced a recovery bug: after emergency stop,
+`get_roast_state` showed `phase: fault`, `active: false`, `cooling_on: true`,
+`fan_level_percent: 100`, and `cooling_motor_on: true`, but `stop_cooling`
+failed with `No active roast session exists.` The branch now includes a narrow
+post-emergency recovery fix allowing `stop_cooling` only for the latest stopped
+fault session with cooling still on, while preserving `phase: fault` and
+`active: false`. Next, run the updated branch locally or publish/install an
+updated package build before retesting in Warp, then specifically validate
+post-emergency `stop_cooling` recovery with explicit operator approval and
+before/after `get_roast_state`. Do not run autonomous roasting, ChatGPT MCP
+validation, model training/export/sync, real microphone or ONNX audio-path
+validation, live PyPI/MCP Registry publishing, or full end-to-end agent roast
+validation unless separately selected.

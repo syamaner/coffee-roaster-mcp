@@ -1005,6 +1005,64 @@ def test_stop_cooling_uses_driver_cooling_state_before_completing(tmp_path: Path
     ]
 
 
+def test_stop_cooling_recovers_after_emergency_stop_leaves_cooling_on(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    emergency = _call_tool(server, "emergency_stop", ctx, reason="unit-test")
+    assert emergency.phase == "fault"
+    emergency_state = _call_tool(
+        server,
+        "get_roast_state",
+        ctx,
+        session_id=start_result.session.session_id,
+    )
+    assert emergency_state.active is False
+    assert emergency_state.cooling_on is True
+
+    recovered = _call_tool(server, "stop_cooling", ctx)
+
+    assert recovered.session_id == start_result.session.session_id
+    assert recovered.event.kind == "cooling_stopped"
+    assert recovered.event.payload["recovery_after_fault"] is True
+    assert recovered.phase == "fault"
+    state = _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+    assert state.phase == "fault"
+    assert state.cooling_on is False
+    assert [event.kind for event in state.events] == ["fault", "cooling_stopped"]
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:unit-test",
+        "stop_cooling",
+    ]
+
+
+def test_stop_cooling_still_rejects_completed_inactive_session(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    _call_tool(server, "drop_beans", ctx)
+    _call_tool(server, "stop_cooling", ctx)
+
+    with pytest.raises(ValueError, match="No active roast session exists"):
+        _call_tool(server, "stop_cooling", ctx)
+
+
 class RecordingRoasterDriver:
     """Driver double that records MCP boundary calls."""
 

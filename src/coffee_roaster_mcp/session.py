@@ -1112,6 +1112,23 @@ class RoastSessionStore:
                 raise SessionLifecycleError("Cooling must be started before it can be stopped.")
             return self._reserve_driver_command_locked(session, kind="stop_cooling")
 
+    def reserve_driver_stop_cooling_recovery(
+        self,
+        session: RoastSession,
+    ) -> DriverCommandReservation:
+        """Reserve cooling-stop recovery for the latest faulted session."""
+        with self._lock:
+            self._assert_latest_session(session)
+            if session.active:
+                raise SessionLifecycleError("Recovery cooling stop requires a stopped session.")
+            if session.faulted_at_utc is None or session.phase != "fault":
+                raise SessionLifecycleError(
+                    "Recovery cooling stop is only allowed after an emergency stop."
+                )
+            if not session.cooling_on:
+                raise SessionLifecycleError("Cooling must be active before it can be stopped.")
+            return self._reserve_driver_command_locked(session, kind="stop_cooling")
+
     def complete_reserved_driver_control_snapshot(
         self,
         session: RoastSession,
@@ -1278,6 +1295,59 @@ class RoastSessionStore:
                     monotonic_now=self._monotonic_now,
                     phase="complete",
                 )
+            finally:
+                self._clear_driver_command_reservation_locked(session, reservation)
+            return event, _copy_session_for_read(session)
+
+    def complete_reserved_driver_stop_cooling_recovery_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> tuple[RoastEvent, RoastSession]:
+        """Complete cooling-stop recovery after an emergency stop."""
+        with self._lock:
+            self._assert_latest_session(session)
+            if (
+                reservation.session_id != session.id
+                or session.pending_driver_command_token != reservation.token
+                or session.pending_driver_command_kind != reservation.kind
+            ):
+                raise SessionLifecycleError("Driver command reservation is no longer active.")
+            if session.active or session.faulted_at_utc is None or session.phase != "fault":
+                raise SessionLifecycleError(
+                    "Recovery cooling stop is only allowed after an emergency stop."
+                )
+            if cooling_on:
+                raise SessionLifecycleError(
+                    "Driver still reports cooling active after stop_cooling."
+                )
+            validated_heat = validate_control_percent(
+                heat_level_percent,
+                label="heat_level_percent",
+            )
+            validated_fan = validate_control_percent(
+                fan_level_percent,
+                label="fan_level_percent",
+            )
+            try:
+                event = self._record_stopped_session_event_locked(
+                    session,
+                    "cooling_stopped",
+                    payload={
+                        "heat_level_percent": validated_heat,
+                        "fan_level_percent": validated_fan,
+                        "cooling_on": False,
+                        "recovery_after_fault": True,
+                    },
+                )
+                session.heat_level_percent = validated_heat
+                session.fan_level_percent = validated_fan
+                session.cooling_on = False
+                session.phase = "fault"
             finally:
                 self._clear_driver_command_reservation_locked(session, reservation)
             return event, _copy_session_for_read(session)
@@ -1619,6 +1689,28 @@ class RoastSessionStore:
         """Validate that one session is the latest known session."""
         if self._latest_session is not session:
             raise SessionLifecycleError("Only the latest session can be mutated.")
+
+    def _record_stopped_session_event_locked(
+        self,
+        session: RoastSession,
+        kind: RoastEventKind,
+        *,
+        payload: dict[str, EventPayloadValue],
+    ) -> RoastEvent:
+        """Record a narrowly allowed event for a stopped latest session."""
+        existing_event = self._get_existing_singleton_event(session, kind)
+        if existing_event is not None:
+            return existing_event
+        event = RoastEvent(
+            kind=kind,
+            recorded_at_utc=self._utc_now(),
+            monotonic_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
+            payload=dict(payload),
+        )
+        _append_event_log_row(session, event)
+        session.event_timeline.append(event)
+        _apply_event_timestamp(session, event)
+        return event
 
     def _start_session_locked(self) -> RoastSession:
         """Start one new active session while the store lock is already held."""

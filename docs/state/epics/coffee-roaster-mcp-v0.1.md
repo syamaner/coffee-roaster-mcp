@@ -1217,8 +1217,23 @@ After completing a story:
     boundary requiring physical stop readiness, runtime config and device-state
     confirmation before controls, and explicit operator approval before each
     connect, heat, fan, drop, cooling, stop-cooling, and emergency-stop call.
-  - Hardware-ready release labeling remains blocked. Adapter/config preflight
-    evidence does not prove Warp Hottop control behavior.
+  - Live Warp validation later surfaced a post-emergency recovery bug:
+    emergency stop correctly faulted and stopped the session while leaving
+    cooling on, but the MCP `stop_cooling` tool then failed with
+    `No active roast session exists.` This blocked operator recovery through
+    Warp while `get_roast_state` still showed `cooling_on: true`,
+    `fan_level_percent: 100`, and `cooling_motor_on: true`.
+  - Added a narrow MCP recovery path so `stop_cooling` is allowed only for the
+    latest stopped `fault` session while cooling remains on. The recovery path
+    sends the driver `stop_cooling` command, records a `cooling_stopped` event
+    with `recovery_after_fault: true`, turns cooling off in session state, and
+    preserves `phase: fault` / `active: false`. Completed inactive sessions
+    still reject `stop_cooling`.
+  - Targeted recovery validation passed:
+    `./.venv/bin/python -m pytest tests/test_mcp_server.py::test_stop_cooling_recovers_after_emergency_stop_leaves_cooling_on tests/test_mcp_server.py::test_stop_cooling_still_rejects_completed_inactive_session tests/test_mcp_server.py::test_stop_cooling_uses_driver_cooling_state_before_completing`:
+    3 passed.
+  - Hardware-ready release labeling remains blocked until the recovery fix and
+    the remaining hardware-control checklist are validated through Warp.
 
 - Validation run for E6-S4:
   - Added focused version alignment coverage in `tests/test_server_json.py`.
