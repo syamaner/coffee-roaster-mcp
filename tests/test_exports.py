@@ -519,6 +519,50 @@ def test_snapshot_export_csv_event_rows_use_transition_control_state(
     assert cooling_stopped_row["cooling_on"] == "False"
 
 
+def test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop(
+    tmp_path: Path,
+) -> None:
+    """Keep post-emergency recovery rows classified as faulted."""
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    clock.monotonic_value = 105.0
+    store.emergency_stop(
+        session,
+        reason="unit-test",
+        safety_payload={
+            "driver": "mock",
+            "driver_safety_method": "emergency_stop",
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    )
+    clock.monotonic_value = 110.0
+    reservation = store.reserve_driver_stop_cooling_recovery(session)
+    store.complete_reserved_driver_stop_cooling_recovery_snapshot(
+        session,
+        reservation=reservation,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=False,
+    )
+
+    export = export_roast_snapshot(session)
+
+    with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    fault_row = next(row for row in rows if row["event"] == "fault")
+    recovery_row = next(row for row in rows if row["event"] == "cooling_stopped")
+    assert fault_row["phase"] == "fault"
+    assert recovery_row["phase"] == "fault"
+    assert recovery_row["cooling_on"] == "False"
+
+
 def test_snapshot_export_csv_uses_driver_transition_payload_state(
     tmp_path: Path,
 ) -> None:

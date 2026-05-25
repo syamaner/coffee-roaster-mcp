@@ -516,6 +516,25 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert faulted_payload["driver"] == "mock"
         assert faulted_payload["driver_safety_method_called"] is True
 
+        recovery_stop_result = cast(
+            Any,
+            await _call_with_timeout(session.call_tool("stop_cooling", {})),
+        )
+        assert recovery_stop_result.structuredContent["session_id"] == second_session_id
+        assert recovery_stop_result.structuredContent["event"]["kind"] == "cooling_stopped"
+        assert recovery_stop_result.structuredContent["phase"] == "fault"
+        assert (
+            recovery_stop_result.structuredContent["event"]["payload"]["recovery_after_fault"]
+            is True
+        )
+        recovered_state_result = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool("get_roast_state", {"session_id": second_session_id})
+            ),
+        )
+        assert recovered_state_result.structuredContent["cooling_on"] is False
+
         third_start_result = cast(
             Any,
             await _call_with_timeout(session.call_tool("start_roast_session", {})),

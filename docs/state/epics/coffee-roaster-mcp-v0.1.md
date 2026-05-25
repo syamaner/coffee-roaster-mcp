@@ -816,12 +816,19 @@ Goal: prove the package works from install through mock roast, MCP client calls,
     complete a full mock roast through public MCP tools, and verify exported
     JSONL, CSV, and summary outputs.
 
-- [ ] `E7-S4` Run Warp manual Hottop MCP control validation.
+- [!] `E7-S4` Run Warp manual Hottop MCP control validation.
   - Done when Warp can connect to the Hottop-configured RoastPilot MCP server
     and the operator manually approves each hardware-affecting tool call for
     connect, telemetry, heat, fan, drop, cooling, stop-cooling, emergency stop,
     and exported-log review. No autonomous hardware-control decisions are in
     scope.
+  - Started from updated `main` on
+    `feature/59-warp-manual-hottop-control-validation`. The Hottop adapter is
+    now visible at `/dev/cu.usbserial-DN016OJ3`, and
+    `/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` has been created with
+    the Hottop driver, disabled first-crack mode, and auto-T0 disabled. Live
+    validation still requires Warp evidence and explicit operator approval for
+    each hardware-affecting tool call.
 
 - [ ] `E7-S5a` Test MCP first-crack detection with labelled WAV replay.
   - Done when a small derived WAV fixture, retimestamped label file, and
@@ -1176,6 +1183,57 @@ After completing a story:
   - Kept Hottop hardware validation, ChatGPT MCP validation, model
     training/export/sync, real microphone validation, live release publishing,
     and full end-to-end agent roast validation out of scope.
+
+- Validation preflight for E7-S4:
+  - Verified PR #140 was merged and issue #58 was closed before starting.
+  - Synced `main` from merge commit
+    `de18572edf3ea69f15a9e60a04f049a20f96ae34` to
+    `c480afc` with `git pull --ff-only origin main`.
+  - Created branch
+    `feature/59-warp-manual-hottop-control-validation`.
+  - Read issue #59 and its configuration guidance comment. The intended Warp
+    hardware configuration remains `/tmp/roastpilot-warp-hottop`, roaster
+    driver `hottop_kn8828b_2k_plus`, first-crack mode `disabled`, and
+    `session.auto_t0_detection_enabled: false`, launched through
+    `uvx --from coffee-roaster-mcp==0.1.0 coffee-roaster-mcp serve` or
+    `/opt/homebrew/bin/uvx` if Warp cannot find `uvx`.
+  - Confirmed local `uvx` resolves to `/opt/homebrew/bin/uvx` and reports
+    `uvx 0.11.16`.
+  - Initially checked visible macOS serial devices with `ls /dev/cu.*`; only
+    `/dev/cu.Bluetooth-Incoming-Port` and `/dev/cu.debug-console` were present.
+    No actual `/dev/cu.usbserial-*` Hottop adapter was visible, so no fake-port
+    config was created and Warp hardware validation was not launched.
+  - After the operator reconnected the Hottop adapter, `ls /dev/cu.*` showed
+    `/dev/cu.usbserial-DN016OJ3`.
+  - Created `/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` with
+    `roaster.driver: hottop_kn8828b_2k_plus`,
+    `roaster.port: /dev/cu.usbserial-DN016OJ3`,
+    `first_crack.mode: disabled`, and
+    `session.auto_t0_detection_enabled: false`.
+  - Ran local config-load verification without connecting to hardware:
+    `./.venv/bin/python -c "..."` returned
+    `hottop_kn8828b_2k_plus /dev/cu.usbserial-DN016OJ3 disabled False`.
+  - No hardware-affecting MCP calls were run. This preserves the E7-S4 safety
+    boundary requiring physical stop readiness, runtime config and device-state
+    confirmation before controls, and explicit operator approval before each
+    connect, heat, fan, drop, cooling, stop-cooling, and emergency-stop call.
+  - Live Warp validation later surfaced a post-emergency recovery bug:
+    emergency stop correctly faulted and stopped the session while leaving
+    cooling on, but the MCP `stop_cooling` tool then failed with
+    `No active roast session exists.` This blocked operator recovery through
+    Warp while `get_roast_state` still showed `cooling_on: true`,
+    `fan_level_percent: 100`, and `cooling_motor_on: true`.
+  - Added a narrow MCP recovery path so `stop_cooling` is allowed only for the
+    latest stopped `fault` session while cooling remains on. The recovery path
+    sends the driver `stop_cooling` command, records a `cooling_stopped` event
+    with `recovery_after_fault: true`, turns cooling off in session state, and
+    preserves `phase: fault` / `active: false`. Completed inactive sessions
+    still reject `stop_cooling`.
+  - Targeted recovery validation passed:
+    `./.venv/bin/python -m pytest tests/test_mcp_server.py::test_stop_cooling_recovers_after_emergency_stop_leaves_cooling_on tests/test_mcp_server.py::test_stop_cooling_still_rejects_completed_inactive_session tests/test_mcp_server.py::test_stop_cooling_uses_driver_cooling_state_before_completing`:
+    3 passed.
+  - Hardware-ready release labeling remains blocked until the recovery fix and
+    the remaining hardware-control checklist are validated through Warp.
 
 - Validation run for E6-S4:
   - Added focused version alignment coverage in `tests/test_server_json.py`.

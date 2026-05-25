@@ -398,6 +398,28 @@ end-to-end agent roast validation, ChatGPT MCP validation, model
 training/export/sync, or real microphone validation unless a later story
 explicitly requires it.
 
+E7-S4 is started on branch
+`feature/59-warp-manual-hottop-control-validation`. The local preflight
+confirmed `uvx` at `/opt/homebrew/bin/uvx`; after the operator reconnected the
+Hottop adapter, `ls /dev/cu.*` showed `/dev/cu.usbserial-DN016OJ3`. The
+dedicated config now exists at
+`/tmp/roastpilot-warp-hottop/coffee-roaster-mcp.yaml` with the Hottop driver,
+that serial port, first-crack mode disabled, and auto-T0 disabled. Live Warp
+Hottop validation still requires Warp tool-discovery/config/state evidence and
+explicit operator approval for each hardware-affecting MCP call. Do not launch
+Warp hardware controls, export hardware logs, or apply a hardware-ready release
+label from adapter/config preflight alone.
+
+Live E7-S4 Warp validation surfaced a post-emergency recovery bug: emergency
+stop correctly faulted and stopped the session while leaving cooling on, but
+MCP `stop_cooling` then failed with `No active roast session exists.` The
+branch now includes a narrow recovery path that allows `stop_cooling` only for
+the latest stopped `fault` session while cooling remains on, records
+`cooling_stopped` with `recovery_after_fault: true`, and preserves
+`phase: fault` / `active: false`. Hardware-ready release labeling remains
+blocked until that recovery path and the rest of E7-S4 are validated through
+Warp.
+
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
 Epic 2 and Epic 3 are complete. Coverage output is visible in GitHub Actions through a concise Markdown job summary and an `html-coverage-report` artifact.
