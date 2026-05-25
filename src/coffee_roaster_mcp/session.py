@@ -1116,7 +1116,27 @@ class RoastSessionStore:
         self,
         session: RoastSession,
     ) -> DriverCommandReservation:
-        """Reserve cooling-stop recovery for the latest faulted session."""
+        """Reserve cooling-stop recovery for the latest faulted session.
+
+        Args:
+            session: Latest session to recover after emergency stop.
+
+        Returns:
+            Driver command reservation that must be completed with
+            `complete_reserved_driver_stop_cooling_recovery_snapshot` or cleared
+            if the driver command fails.
+
+        Raises:
+            SessionLifecycleError: If the session is not the latest session, is
+                still active, is not faulted, is not in `fault` phase, has no
+                active cooling state, or another driver command is in progress.
+
+        Notes:
+            This recovery path is intentionally narrower than normal
+            `stop_cooling`: it exists only after emergency stop has already
+            stopped the session while leaving cooling active as the fail-closed
+            hardware state.
+        """
         with self._lock:
             self._assert_latest_session(session)
             if session.active:
@@ -1308,7 +1328,34 @@ class RoastSessionStore:
         fan_level_percent: int,
         cooling_on: bool,
     ) -> tuple[RoastEvent, RoastSession]:
-        """Complete cooling-stop recovery after an emergency stop."""
+        """Complete cooling-stop recovery after an emergency stop.
+
+        Args:
+            session: Latest faulted, stopped session being recovered.
+            reservation: Active recovery stop-cooling reservation returned by
+                `reserve_driver_stop_cooling_recovery`.
+            heat_level_percent: Driver-reported heat level after the recovery
+                stop-cooling command.
+            fan_level_percent: Driver-reported fan level after the recovery
+                stop-cooling command.
+            cooling_on: Driver-reported cooling state after the recovery
+                stop-cooling command.
+
+        Returns:
+            The recorded `cooling_stopped` recovery event plus an atomic session
+            snapshot.
+
+        Raises:
+            SessionLifecycleError: If the reservation is stale or belongs to a
+                different session, the session is active, the session is not a
+                stopped fault session, the driver still reports cooling active,
+                or returned heat/fan controls are invalid.
+
+        Notes:
+            Successful completion records `cooling_stopped` with
+            `recovery_after_fault: true`, updates the session controls, and
+            preserves `phase: fault` / `active: false`.
+        """
         with self._lock:
             self._assert_latest_session(session)
             if (

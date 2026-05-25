@@ -1045,6 +1045,35 @@ def test_stop_cooling_recovers_after_emergency_stop_leaves_cooling_on(
     ]
 
 
+def test_stop_cooling_recovery_keeps_fault_when_driver_reports_cooling_on(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(stop_cooling_stays_on=True)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "emergency_stop", ctx, reason="unit-test")
+
+    with pytest.raises(SessionLifecycleError, match="still reports cooling active"):
+        _call_tool(server, "stop_cooling", ctx)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=start_result.session.session_id)
+    assert state.phase == "fault"
+    assert state.active is False
+    assert state.cooling_on is True
+    assert [event.kind for event in state.events] == ["fault"]
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:unit-test",
+        "stop_cooling",
+    ]
+
+
 def test_stop_cooling_still_rejects_completed_inactive_session(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
