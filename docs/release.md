@@ -6,7 +6,7 @@ This runbook documents the operator prerequisites and CI release path for
 The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 - Manual dry run through `workflow_dispatch` with `dry_run: true`.
-- Live release through a pushed version tag such as `v0.1.2`.
+- Live release through a pushed version tag such as `v0.1.3`.
 
 ## Operator Prerequisites
 
@@ -30,7 +30,7 @@ Before enabling a live release, the release owner must confirm:
   the release owner before deployment jobs can run.
 - Protected tag rules block unapproved creation or update of `v*` tags.
 - The release tag matches the package version exactly, for example package
-  version `0.1.2` must use tag `v0.1.2`.
+  version `0.1.3` must use tag `v0.1.3`.
 - No model weights, audio files, roast logs, serial captures, `.env` files, or
   local IDE folders are included in the release artifact.
 
@@ -163,8 +163,8 @@ model cards, and dataset cards remain in `coffee-first-crack-detection`.
 4. Create and push the matching protected version tag:
 
    ```bash
-   git tag v0.1.2
-   git push origin v0.1.2
+   git tag v0.1.3
+   git push origin v0.1.3
    ```
 
 5. Approve the GitHub `release` environment deployment for `Publish PyPI`.
@@ -173,11 +173,11 @@ model cards, and dataset cards remain in `coffee-first-crack-detection`.
 7. Run a published-package smoke after the package index exposes the version:
 
    ```bash
-   uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.1.2 coffee-roaster-mcp --version
+   uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.1.3 coffee-roaster-mcp --version
    ```
 
-Use the actual candidate version in tag and smoke commands. The `0.1.2`
-commands above document the current published state.
+Use the actual candidate version in tag and smoke commands. The `0.1.3`
+commands above document the next release candidate.
 
 ### MCP Registry Publish Steps
 
