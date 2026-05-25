@@ -778,7 +778,8 @@ class RoastSessionStore:
             The created active roast session.
 
         Raises:
-            SessionLifecycleError: If an active session already exists.
+            SessionLifecycleError: If an active session already exists or a
+                faulted stopped session still has cooling active.
         """
         with self._lock:
             if self._pending_session_start_token is not None:
@@ -794,6 +795,7 @@ class RoastSessionStore:
     def reserve_session_start(self) -> SessionStartReservation:
         """Reserve session startup before preparing the configured driver."""
         with self._lock:
+            self._assert_no_pending_fault_cooling_recovery_locked()
             if self._latest_session is not None and self._latest_session.active:
                 raise SessionLifecycleError("An active roast session already exists.")
             if self._pending_session_start_token is not None:
@@ -1766,6 +1768,7 @@ class RoastSessionStore:
 
     def _start_session_locked(self) -> RoastSession:
         """Start one new active session while the store lock is already held."""
+        self._assert_no_pending_fault_cooling_recovery_locked()
         if self._latest_session is not None and self._latest_session.active:
             raise SessionLifecycleError("An active roast session already exists.")
 
@@ -1784,6 +1787,20 @@ class RoastSessionStore:
         self._session_id_order.append(session_id)
         self._prune_session_history_locked()
         return session
+
+    def _assert_no_pending_fault_cooling_recovery_locked(self) -> None:
+        """Reject new sessions while stopped fault cooling still needs recovery."""
+        session = self._latest_session
+        if (
+            session is not None
+            and not session.active
+            and session.faulted_at_utc is not None
+            and session.phase == "fault"
+            and session.cooling_on
+        ):
+            raise SessionLifecycleError(
+                "Cannot start a new roast session while post-fault cooling recovery is pending."
+            )
 
     def _assert_session_start_reservation(
         self,

@@ -891,7 +891,7 @@ def test_stale_heat_command_fails_closed_after_emergency_stop(tmp_path: Path) ->
     ]
 
 
-def test_stale_command_does_not_emergency_stop_newer_active_session(tmp_path: Path) -> None:
+def test_pending_post_fault_cooling_blocks_newer_active_session(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
     command_started = Event()
@@ -913,26 +913,27 @@ def test_stale_command_does_not_emergency_stop_newer_active_session(tmp_path: Pa
     assert command_started.wait(timeout=1.0)
 
     _call_tool(server, "emergency_stop", ctx, reason="unit-test")
-    second_start = _call_tool(server, "start_roast_session", ctx)
+    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+        _call_tool(server, "start_roast_session", ctx)
     release_command.set()
     heat_thread.join(timeout=1.0)
 
     assert not heat_thread.is_alive()
     assert isinstance(errors[0], SessionLifecycleError)
-    assert second_start.session.session_id != first_start.session.session_id
-    second_state = _call_tool(
+    state = _call_tool(
         server,
         "get_roast_state",
         ctx,
-        session_id=second_start.session.session_id,
+        session_id=first_start.session.session_id,
     )
-    assert second_state.active is True
-    assert second_state.phase == "pre_roast"
+    assert state.active is False
+    assert state.phase == "fault"
+    assert state.cooling_on is True
     assert driver.actions == [
         "connect",
         "set_heat:65",
         "emergency_stop:unit-test",
-        "connect",
+        "emergency_stop:stale driver command after session state changed",
     ]
 
 

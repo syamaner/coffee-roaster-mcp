@@ -603,6 +603,39 @@ def test_start_session_allows_new_session_after_previous_stop() -> None:
     assert store.get_latest_session() is second_session
 
 
+def test_start_session_rejects_pending_post_fault_cooling_recovery() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+    store.emergency_stop(session, reason="unit-test")
+
+    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+        store.start_session()
+
+    assert store.get_latest_session() is session
+    assert session.phase == "fault"
+    assert session.cooling_on is True
+
+
+def test_reserve_session_start_rejects_pending_post_fault_cooling_recovery() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+    store.emergency_stop(session, reason="unit-test")
+
+    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+        store.reserve_session_start()
+
+    assert store.get_latest_session() is session
+    assert store.get_active_session() is None
+
+
 def test_get_session_snapshot_supports_completed_session_after_rollover() -> None:
     clock = ClockHarness()
     issued_ids = iter(["session-001", "session-002"])

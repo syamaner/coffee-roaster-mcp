@@ -142,7 +142,10 @@ Required repo checks:
 - Second review follow-up targeted recovery tests:
   `./.venv/bin/python -m pytest tests/test_session.py::test_stop_cooling_recovery_records_new_event_after_completed_session_fault tests/test_mcp_server.py::test_stop_cooling_recovers_after_emergency_stop_leaves_cooling_on tests/test_mcp_server.py::test_stop_cooling_recovery_keeps_fault_when_driver_reports_cooling_on tests/test_mcp_server.py::test_stop_cooling_recovery_rejects_driver_heat_after_fault tests/test_mcp_server.py::test_stale_stop_cooling_recovery_fails_closed tests/test_exports.py::test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop`:
   6 passed.
-- `./.venv/bin/python -m pytest`: 363 passed.
+- CodeRabbit post-fault ownership follow-up:
+  `./.venv/bin/python -m pytest tests/test_session.py::test_start_session_rejects_pending_post_fault_cooling_recovery tests/test_session.py::test_reserve_session_start_rejects_pending_post_fault_cooling_recovery tests/test_session.py::test_start_session_allows_new_session_after_previous_stop tests/test_mcp_server.py::test_stop_cooling_recovers_after_emergency_stop_leaves_cooling_on`:
+  4 passed.
+- `./.venv/bin/python -m pytest`: 365 passed.
 - `./.venv/bin/python -m ruff check .`: passed.
 - `./.venv/bin/python -m ruff format --check .`: 31 files already formatted.
 - `./.venv/bin/python -m pyright`: 0 errors, 0 warnings, 0 informations.
@@ -237,6 +240,16 @@ Code review follow-up:
   timeline with two `cooling_stopped` events, a heat-on recovery rejection that
   preserves fault state, and a stale recovery completion that triggers the
   fail-closed emergency-stop driver safety path.
+- CodeRabbit review
+  `https://github.com/syamaner/coffee-roaster-mcp/pull/143#pullrequestreview-4356608858`
+  found that a new session could be started after emergency stop while the
+  previous faulted session still had cooling active. Because post-fault
+  `stop_cooling` recovery is latest-session-only, that could orphan the cooling
+  recovery path.
+- The follow-up fix blocks both direct `start_session` and reserved
+  `start_roast_session` startup while the latest session is inactive, faulted,
+  and `cooling_on: true`. Regression tests cover both start paths and preserve
+  normal rollover after a completed, non-faulted session.
 
 Actions deliberately not taken:
 
