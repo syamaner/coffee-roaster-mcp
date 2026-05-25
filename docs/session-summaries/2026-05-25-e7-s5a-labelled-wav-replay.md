@@ -141,7 +141,7 @@ Review notes:
 
 - `./.venv/bin/python -m pytest tests/test_config.py tests/test_audio.py tests/test_audio_fixtures.py tests/test_first_crack_runtime.py`: 49 passed
 - `./.venv/bin/python scripts/validate_first_crack_wav_replay.py`: passed
-- `./.venv/bin/python -m pytest`: 373 passed
+- `./.venv/bin/python -m pytest`: 374 passed
 - `./.venv/bin/python -m ruff check .`: passed
 - `./.venv/bin/python -m ruff format --check .`: 33 files already formatted
 - `./.venv/bin/python -m pyright`: 0 errors, 0 warnings, 0 informations
@@ -183,6 +183,17 @@ Review notes:
   than explicit backend-provided timestamps.
 - Re-ran released-model WAV replay after the Codex follow-up:
   detected `20.018711624998417` seconds after T0 against the
+  `3.82710390663442-20.0` second label interval, emitted `2` windows, processed
+  `2` windows, dropped `0` windows, and exported `roast.jsonl`, `roast.csv`,
+  and `summary.json` under the local temporary replay log directory.
+- Addressed follow-up CodeRabbit feedback on commit `1acccf3` by reusing the
+  post-first-crack monotonic/UTC ordering normalization for stopped fault and
+  post-fault cooling recovery event writers. The detector-paced explicit
+  timestamp suggestion was assessed as not valid for current behavior because
+  explicit backend timestamps remain future-bounded by design; only inferred
+  detector-paced timestamps bypass that bound.
+- Re-ran released-model WAV replay after the fault/recovery ordering follow-up:
+  detected `20.018433708999332` seconds after T0 against the
   `3.82710390663442-20.0` second label interval, emitted `2` windows, processed
   `2` windows, dropped `0` windows, and exported `roast.jsonl`, `roast.csv`,
   and `summary.json` under the local temporary replay log directory.

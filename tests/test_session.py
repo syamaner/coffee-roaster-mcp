@@ -383,6 +383,54 @@ def test_future_first_crack_detection_allows_later_events_without_inverted_metri
     assert compute_development_time_seconds(session) == 0.0
 
 
+def test_future_first_crack_detection_orders_fault_and_recovery_events() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    store.record_first_crack_detection_snapshot(
+        session,
+        detected_at_monotonic_seconds=120.0,
+        max_future_seconds=None,
+    )
+    fault = store.emergency_stop(
+        session,
+        reason="unit-test",
+        safety_payload={
+            "driver": "test-driver",
+            "driver_safety_method": "emergency_stop",
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    )
+    reservation = store.reserve_driver_stop_cooling_recovery(session)
+    recovery, snapshot = store.complete_reserved_driver_stop_cooling_recovery_snapshot(
+        session,
+        reservation=reservation,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=False,
+    )
+
+    assert session.first_crack_at_utc is not None
+    assert fault.monotonic_seconds == 20.0
+    assert recovery.monotonic_seconds == 20.0
+    assert fault.recorded_at_utc == session.first_crack_at_utc
+    assert recovery.recorded_at_utc == session.first_crack_at_utc
+    assert [event.monotonic_seconds for event in snapshot.event_timeline] == [
+        5.0,
+        20.0,
+        20.0,
+        20.0,
+    ]
+    assert [event.recorded_at_utc for event in snapshot.event_timeline] == sorted(
+        event.recorded_at_utc for event in snapshot.event_timeline
+    )
+
+
 def test_event_log_write_failure_does_not_commit_event(tmp_path: Path) -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
