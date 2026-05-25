@@ -6,7 +6,7 @@ This runbook documents the operator prerequisites and CI release path for
 The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 - Manual dry run through `workflow_dispatch` with `dry_run: true`.
-- Live release through a pushed version tag such as `v0.1.1`.
+- Live release through a pushed version tag such as `v0.1.2`.
 
 ## Operator Prerequisites
 
@@ -30,7 +30,7 @@ Before enabling a live release, the release owner must confirm:
   the release owner before deployment jobs can run.
 - Protected tag rules block unapproved creation or update of `v*` tags.
 - The release tag matches the package version exactly, for example package
-  version `0.1.1` must use tag `v0.1.1`.
+  version `0.1.2` must use tag `v0.1.2`.
 - No model weights, audio files, roast logs, serial captures, `.env` files, or
   local IDE folders are included in the release artifact.
 
@@ -69,6 +69,178 @@ The dry run:
 - Confirms both distribution artifacts exist.
 - Does not publish to PyPI or the MCP Registry.
 
+## v0.1 Release Checklist
+
+Use this checklist for the next v0.1 release candidate from updated `main`.
+The current published package and registry metadata are `0.1.2`; the latest
+E7-S5a first-crack replay evidence uses released Hugging Face INT8 artifacts
+from `syamaner/coffee-first-crack-detection` pinned to revision
+`b349a919c34b6130472da97c01817be404e4f629`.
+
+### Required Tests And Checks
+
+Run the normal local gate before tagging:
+
+```bash
+python -m pytest
+python -m ruff check .
+python -m ruff format --check .
+python -m pyright
+coffee-roaster-mcp --help
+coffee-roaster-mcp --version
+```
+
+Confirm CI passes on the release-candidate PR:
+
+- PR `Checks` job: tests with coverage, lint, format check, typecheck, and CLI
+  smoke checks.
+- PR `Build Package` job: distribution build, built-wheel install smoke, and
+  artifact upload.
+
+Run release dry-run validation before pushing a live tag when the candidate
+contains release metadata or workflow changes:
+
+```bash
+gh workflow run release.yml -f dry_run=true
+```
+
+### Package Build Validation
+
+Build and smoke-test the local distributions before tagging:
+
+```bash
+python -m build
+python .github/scripts/smoke_install_built_wheel.py
+```
+
+The smoke install must use a clean virtual environment, install the built
+wheel from `dist/`, run installed `coffee-roaster-mcp --help`, run installed
+`coffee-roaster-mcp --version`, and assert the installed default config is
+`mock disabled int8`.
+
+### Version Alignment
+
+Before tagging, confirm these values all match the release version:
+
+- `src/coffee_roaster_mcp/__init__.py` `__version__`
+- `server.json.version`
+- `server.json.packages[0].version`
+- the pushed tag name, using `v{version}`
+- installed CLI output from `coffee-roaster-mcp --version`
+
+For the current published state, all package and registry metadata are aligned
+at `0.1.2`. A later release candidate must update all three checked-in version
+fields in the same PR before tagging.
+
+### Hugging Face First-Crack Artifact Pin
+
+For the v0.1 release candidate, record the first-crack artifact pin in the
+release notes or release PR:
+
+- repo: `syamaner/coffee-first-crack-detection`
+- revision: `b349a919c34b6130472da97c01817be404e4f629`
+- precision: `int8`
+- required artifacts:
+  - `onnx/int8/model_quantized.onnx`
+  - `onnx/int8/preprocessor_config.json`
+
+Do not select a newer model revision during release unless the change is
+deliberate, documented in the release PR, and revalidated with the E7-S5a
+labelled WAV replay path. Model training, ONNX export, Hugging Face sync,
+model cards, and dataset cards remain in `coffee-first-crack-detection`.
+
+### PyPI Publish Steps
+
+1. Merge the release-candidate PR to `main`.
+2. Update and verify local `main`:
+
+   ```bash
+   git checkout main
+   git pull --ff-only origin main
+   ```
+
+3. Confirm the tag does not already exist locally or remotely.
+4. Create and push the matching protected version tag:
+
+   ```bash
+   git tag v0.1.2
+   git push origin v0.1.2
+   ```
+
+5. Approve the GitHub `release` environment deployment for `Publish PyPI`.
+6. Confirm production PyPI exposes the expected `coffee-roaster-mcp` version,
+   wheel, sdist, README, and project URLs.
+7. Run a published-package smoke after the package index exposes the version:
+
+   ```bash
+   uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.1.2 coffee-roaster-mcp --version
+   ```
+
+Use the actual candidate version in tag and smoke commands. The `0.1.2`
+commands above document the current published state.
+
+### MCP Registry Publish Steps
+
+The release workflow publishes the MCP Registry entry only after PyPI publish
+succeeds.
+
+1. Confirm `server.json` contains the expected schema URI, Registry name
+   `io.github.syamaner/coffee-roaster-mcp`, PyPI identifier
+   `coffee-roaster-mcp`, package version, runtime hint `uvx`, and stdio
+   transport.
+2. Confirm README contains exactly one verification marker:
+   `<!-- mcp-name: io.github.syamaner/coffee-roaster-mcp -->`.
+3. Confirm the workflow validates `server.json` with the pinned
+   `mcp-publisher` before authenticating.
+4. Approve the GitHub `release` environment deployment for
+   `Publish MCP Registry`.
+5. Confirm the Registry search endpoint returns
+   `io.github.syamaner/coffee-roaster-mcp` with the expected package version,
+   `runtimeHint: uvx`, `transport.type: stdio`, and `isLatest: true`.
+
+Do not run a manual live Registry publish from a laptop. The intended live path
+uses GitHub Actions OIDC from the release workflow.
+
+### GitHub Release Steps
+
+After PyPI and MCP Registry publishing pass:
+
+1. Create or update the GitHub Release for the tag.
+2. Summarize the user-visible release contents, validation status, and known
+   boundaries.
+3. Include links to the PyPI release, MCP Registry search result, release
+   workflow run, and relevant validation/session summary.
+4. Mention the pinned Hugging Face revision used for first-crack artifacts.
+5. State whether the release is mock-safe only, hardware-validated, or
+   hardware-ready according to the policy below.
+
+### Hardware-Ready Labeling Policy
+
+Do not apply a hardware-ready release label from release checklist completion
+alone.
+
+A release may be described as mock-safe when default install, package smoke,
+MCP client, and mock roast validation pass without hardware or model download.
+The current `v0.1.2` state is mock-safe by default and includes E7-S5a
+labelled WAV replay evidence for the released first-crack artifact pin.
+
+A release may be described as hardware-validated only when the release
+candidate has current evidence for:
+
+- Warp or another real MCP client connected to the Hottop-configured server.
+- Operator-approved heat, fan, drop, cooling, stop-cooling, emergency-stop,
+  telemetry, and exported-log review.
+- Explicit config, device path, model/audio settings, workflow run or local
+  command evidence, and exported log paths.
+
+A hardware-ready label additionally requires all hardware-validated evidence
+plus current real microphone or audio-path first-crack validation, full
+end-to-end agent roast validation evidence, and release-owner approval that the
+documented Hottop command-loop, drop/cooling, emergency-stop, audio, and log
+export behavior is acceptable for the target release. E7-S6 owns the full
+end-to-end agent roast validation; this checklist story does not run it and
+does not apply the label.
+
 ## Live Release
 
 After all prerequisites are confirmed:
@@ -78,8 +250,8 @@ After all prerequisites are confirmed:
 2. Push the matching version tag:
 
    ```bash
-   git tag v0.1.1
-   git push origin v0.1.1
+   git tag v0.1.2
+   git push origin v0.1.2
    ```
 
 3. Approve the `release` environment deployment in GitHub Actions.
@@ -111,8 +283,8 @@ official registry docs and schema, then repeat the non-destructive checks below:
    `https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json`.
 2. Confirm `server.json.name` is `io.github.syamaner/coffee-roaster-mcp`.
 3. Confirm the PyPI package entry uses `registryType: pypi`, identifier
-   `coffee-roaster-mcp`, package version `0.1.1`, runtime hint `uvx`, and
-   stdio transport.
+   `coffee-roaster-mcp`, the release-candidate package version, runtime hint
+   `uvx`, and stdio transport.
 4. Confirm README contains exactly one PyPI ownership verification marker:
    `<!-- mcp-name: io.github.syamaner/coffee-roaster-mcp -->`.
 5. Download the pinned `mcp-publisher` release asset and verify its SHA-256

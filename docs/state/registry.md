@@ -411,13 +411,18 @@ Warp public MCP tool calls, and exported verified `roast.jsonl`, `roast.csv`,
 and `summary.json` files under
 `/private/tmp/roastpilot-warp-mock/logs/roasts/b279284880fd4263b2cc0df5366e557f/`.
 
-E7-S4 is complete: PR #143 merged and issue #59 is closed. E7-S5a is complete
-on branch `feature/141-test-mcp-first-crack-detection-labelled-wav-replay` and
-should open a PR for issue #141. The next story after that PR merges is E7-S5:
-produce the v0.1 release checklist. Do not run live Hottop validation, real
-microphone validation, full end-to-end agent roast validation, model
-training/export/sync, live PyPI/MCP Registry publishing, or hardware-ready
-release labeling unless a later story explicitly requires it.
+E7-S4 is complete: PR #143 merged and issue #59 is closed. E7-S5a is complete:
+PR #148 merged and issue #141 is closed. E7-S5 is complete on branch
+`feature/60-v0.1-release-checklist`: `docs/release.md` now contains the v0.1
+release checklist covering required checks, package build validation, version
+alignment, the pinned E7-S5a Hugging Face first-crack artifact revision
+`b349a919c34b6130472da97c01817be404e4f629`, PyPI publishing, MCP Registry
+publishing, GitHub Release follow-up, and hardware-ready labeling
+prerequisites. The next story after the E7-S5 PR merges is E7-S6: run
+end-to-end agent roast validation with the HF ONNX audio path. Do not run live
+Hottop validation, real microphone validation, full end-to-end agent roast
+validation, model training/export/sync, live PyPI/MCP Registry publishing, or
+hardware-ready release labeling unless issue #112 explicitly requires it.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
