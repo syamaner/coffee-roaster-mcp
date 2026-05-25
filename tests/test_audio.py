@@ -444,6 +444,71 @@ def test_audio_capture_pipeline_feeds_detector_windows_from_mock_input() -> None
     assert [window.started_at_monotonic_seconds for window in windows] == [101.0, 102.0]
 
 
+def test_audio_capture_pipeline_emits_overlapping_windows_from_mock_input() -> None:
+    audio_input = FiniteAudioInput(tuple(float(value) for value in range(10)))
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device="mock-mic",
+            sample_rate=4,
+            window_seconds=1.0,
+            overlap=0.5,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+    )
+
+    pipeline.start()
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count == 4)
+    pipeline.stop()
+
+    windows = pipeline.drain_windows()
+    assert [window.sequence_number for window in windows] == [0, 1, 2, 3]
+    assert [window.samples for window in windows] == [
+        (0.0, 1.0, 2.0, 3.0),
+        (2.0, 3.0, 4.0, 5.0),
+        (4.0, 5.0, 6.0, 7.0),
+        (6.0, 7.0, 8.0, 9.0),
+    ]
+
+
+def test_detector_paced_wav_replay_emits_overlapping_source_timeline(tmp_path: Path) -> None:
+    wav_path = tmp_path / "overlap.wav"
+    _write_pcm16_wav(
+        wav_path,
+        sample_rate=4,
+        channel_count=1,
+        samples=tuple(range(10)),
+    )
+    pipeline = build_audio_capture_pipeline(
+        AudioConfig(
+            source="wav",
+            sample_rate=4,
+            wav_path=wav_path,
+            replay_mode="detector_paced",
+            window_seconds=1.0,
+            overlap=0.5,
+        ),
+        monotonic_now=lambda: 100.0,
+    )
+
+    pipeline.start()
+    windows = pipeline.drain_windows()
+
+    assert [window.sequence_number for window in windows] == [0, 1, 2, 3]
+    assert [window.started_at_monotonic_seconds for window in windows] == [
+        100.0,
+        100.5,
+        101.0,
+        101.5,
+    ]
+    assert [window.samples for window in windows] == [
+        (0.0, 1 / 32768.0, 2 / 32768.0, 3 / 32768.0),
+        (2 / 32768.0, 3 / 32768.0, 4 / 32768.0, 5 / 32768.0),
+        (4 / 32768.0, 5 / 32768.0, 6 / 32768.0, 7 / 32768.0),
+        (6 / 32768.0, 7 / 32768.0, 8 / 32768.0, 9 / 32768.0),
+    ]
+
+
 def test_audio_capture_pipeline_drops_windows_when_detector_queue_is_full() -> None:
     audio_input = FiniteAudioInput(tuple(float(value) for value in range(12)))
     pipeline = AudioCapturePipeline(

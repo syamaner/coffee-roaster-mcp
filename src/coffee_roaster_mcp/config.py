@@ -40,7 +40,22 @@ class RoasterConfig:
 
 @dataclass(frozen=True)
 class FirstCrackConfig:
-    """First-crack detector configuration."""
+    """First-crack detector configuration.
+
+    Attributes:
+        mode: First-crack mode: `disabled`, `audio`, or `manual`.
+        repo_id: Hugging Face model repository id for released detector artifacts.
+        revision: Optional Hub revision, branch, tag, or commit SHA to pin artifacts.
+        precision: ONNX model precision, either `int8` or `fp32`.
+        local_model_dir: Optional local directory containing released artifact files.
+        onnx_threads: Number of ONNX Runtime intra-op threads.
+        confidence_threshold: Detector confidence threshold in the inclusive
+            range `0.0` to `1.0`.
+        min_positive_windows: Number of recent positive windows required before
+            automatic first crack is confirmed.
+        confirmation_window_seconds: Recent-positive confirmation span in seconds.
+        allow_manual_override: Whether explicit `mark_first_crack` is allowed.
+    """
 
     mode: FirstCrackMode = "disabled"
     repo_id: str = "syamaner/coffee-first-crack-detection"
@@ -48,12 +63,28 @@ class FirstCrackConfig:
     precision: ModelPrecision = "int8"
     local_model_dir: Path | None = None
     onnx_threads: int = 2
+    confidence_threshold: float = 0.9
+    min_positive_windows: int = 1
+    confirmation_window_seconds: float = 20.0
     allow_manual_override: bool = True
 
 
 @dataclass(frozen=True)
 class AudioConfig:
-    """Audio capture configuration."""
+    """Audio capture configuration.
+
+    Attributes:
+        source: Audio source type: `microphone` or `wav`.
+        input_device: Optional PortAudio or platform-specific input device id.
+        sample_rate: Mono detector sample rate in Hz.
+        wav_path: Optional WAV path when `source` is `wav`.
+        replay_mode: WAV replay mode: `realtime` or `detector_paced`.
+        window_seconds: Detector window duration in seconds.
+        overlap: Fraction of each window shared with the next window, from `0.0`
+            inclusive to `1.0` exclusive.
+        hop_seconds: Optional explicit hop duration in seconds. When set, this
+            overrides the cadence derived from `overlap`.
+    """
 
     source: AudioSource = "microphone"
     input_device: str | None = None
@@ -61,6 +92,8 @@ class AudioConfig:
     wav_path: Path | None = None
     replay_mode: AudioReplayMode = "realtime"
     window_seconds: float = 1.0
+    overlap: float = 0.0
+    hop_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -224,6 +257,24 @@ def _first_crack_from_mapping(raw: Mapping[str, Any]) -> FirstCrackConfig:
         ),
         local_model_dir=local_model_dir,
         onnx_threads=_integer(raw, "onnx_threads", 2, label="first_crack.onnx_threads"),
+        confidence_threshold=_unit_interval_float(
+            raw,
+            "confidence_threshold",
+            0.9,
+            label="first_crack.confidence_threshold",
+        ),
+        min_positive_windows=_positive_integer(
+            raw,
+            "min_positive_windows",
+            1,
+            label="first_crack.min_positive_windows",
+        ),
+        confirmation_window_seconds=_positive_float(
+            raw,
+            "confirmation_window_seconds",
+            20.0,
+            label="first_crack.confirmation_window_seconds",
+        ),
         allow_manual_override=_boolean(
             raw,
             "allow_manual_override",
@@ -234,6 +285,19 @@ def _first_crack_from_mapping(raw: Mapping[str, Any]) -> FirstCrackConfig:
 
 
 def _audio_from_mapping(raw: Mapping[str, Any]) -> AudioConfig:
+    window_seconds = _positive_float(
+        raw,
+        "window_seconds",
+        1.0,
+        label="audio.window_seconds",
+    )
+    hop_seconds = _optional_positive_float(raw, "hop_seconds", label="audio.hop_seconds")
+    _validate_audio_hop_seconds(
+        hop_seconds,
+        window_seconds,
+        hop_label="audio.hop_seconds",
+        window_label="audio.window_seconds",
+    )
     return AudioConfig(
         source=_audio_source(
             _string(raw, "source", "microphone", label="audio.source"),
@@ -246,12 +310,14 @@ def _audio_from_mapping(raw: Mapping[str, Any]) -> AudioConfig:
             _string(raw, "replay_mode", "realtime", label="audio.replay_mode"),
             label="audio.replay_mode",
         ),
-        window_seconds=_positive_float(
+        window_seconds=window_seconds,
+        overlap=_overlap_float(
             raw,
-            "window_seconds",
-            1.0,
-            label="audio.window_seconds",
+            "overlap",
+            0.0,
+            label="audio.overlap",
         ),
+        hop_seconds=hop_seconds,
     )
 
 
@@ -362,6 +428,30 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
                 "COFFEE_FIRST_CRACK_ONNX_THREADS",
             ),
         )
+    if "COFFEE_FIRST_CRACK_CONFIDENCE_THRESHOLD" in environ:
+        first_crack = replace(
+            first_crack,
+            confidence_threshold=_parse_unit_interval_float(
+                environ["COFFEE_FIRST_CRACK_CONFIDENCE_THRESHOLD"],
+                "COFFEE_FIRST_CRACK_CONFIDENCE_THRESHOLD",
+            ),
+        )
+    if "COFFEE_FIRST_CRACK_MIN_POSITIVE_WINDOWS" in environ:
+        first_crack = replace(
+            first_crack,
+            min_positive_windows=_parse_positive_integer(
+                environ["COFFEE_FIRST_CRACK_MIN_POSITIVE_WINDOWS"],
+                "COFFEE_FIRST_CRACK_MIN_POSITIVE_WINDOWS",
+            ),
+        )
+    if "COFFEE_FIRST_CRACK_CONFIRMATION_WINDOW_SECONDS" in environ:
+        first_crack = replace(
+            first_crack,
+            confirmation_window_seconds=_parse_positive_float(
+                environ["COFFEE_FIRST_CRACK_CONFIRMATION_WINDOW_SECONDS"],
+                "COFFEE_FIRST_CRACK_CONFIRMATION_WINDOW_SECONDS",
+            ),
+        )
 
     if "COFFEE_AUDIO_SOURCE" in environ:
         audio = replace(
@@ -397,6 +487,27 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
                 "COFFEE_AUDIO_WINDOW_SECONDS",
             ),
         )
+    if "COFFEE_AUDIO_OVERLAP" in environ:
+        audio = replace(
+            audio,
+            overlap=_parse_overlap_float(environ["COFFEE_AUDIO_OVERLAP"], "COFFEE_AUDIO_OVERLAP"),
+        )
+    if "COFFEE_AUDIO_HOP_SECONDS" in environ:
+        hop_seconds = _none_if_empty(environ["COFFEE_AUDIO_HOP_SECONDS"])
+        audio = replace(
+            audio,
+            hop_seconds=(
+                None
+                if hop_seconds is None
+                else _parse_positive_float(hop_seconds, "COFFEE_AUDIO_HOP_SECONDS")
+            ),
+        )
+    _validate_audio_hop_seconds(
+        audio.hop_seconds,
+        audio.window_seconds,
+        hop_label="COFFEE_AUDIO_HOP_SECONDS",
+        window_label="COFFEE_AUDIO_WINDOW_SECONDS",
+    )
 
     if "COFFEE_ROAST_LOG_DIR" in environ:
         logging = replace(
@@ -487,6 +598,16 @@ def _integer(raw: Mapping[str, Any], key: str, default: int, label: str | None =
     return _parse_integer(value, error_key)
 
 
+def _positive_integer(
+    raw: Mapping[str, Any],
+    key: str,
+    default: int,
+    label: str | None = None,
+) -> int:
+    error_key = label or key
+    return _parse_positive_integer(raw.get(key, default), error_key)
+
+
 def _parse_integer(value: object, key: str) -> int:
     if isinstance(value, bool):
         raise ConfigError(f"{key} must be an integer.")
@@ -498,6 +619,13 @@ def _parse_integer(value: object, key: str) -> int:
         except ValueError as exc:
             raise ConfigError(f"{key} must be an integer.") from exc
     raise ConfigError(f"{key} must be an integer.")
+
+
+def _parse_positive_integer(value: object, key: str) -> int:
+    parsed = _parse_integer(value, key)
+    if parsed <= 0:
+        raise ConfigError(f"{key} must be greater than 0.")
+    return parsed
 
 
 def _float(raw: Mapping[str, Any], key: str, default: float, label: str | None = None) -> float:
@@ -530,6 +658,66 @@ def _parse_positive_float(value: object, key: str) -> float:
     if not math.isfinite(parsed) or parsed <= 0:
         raise ConfigError(f"{key} must be greater than 0.")
     return parsed
+
+
+def _optional_positive_float(
+    raw: Mapping[str, Any],
+    key: str,
+    label: str | None = None,
+) -> float | None:
+    error_key = label or key
+    value = raw.get(key)
+    if value is None:
+        return None
+    return _parse_positive_float(value, error_key)
+
+
+def _unit_interval_float(
+    raw: Mapping[str, Any],
+    key: str,
+    default: float,
+    label: str | None = None,
+) -> float:
+    error_key = label or key
+    return _parse_unit_interval_float(raw.get(key, default), error_key)
+
+
+def _parse_unit_interval_float(value: object, key: str) -> float:
+    parsed = _parse_float(value, key)
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        raise ConfigError(f"{key} must be between 0 and 1.")
+    return parsed
+
+
+def _overlap_float(
+    raw: Mapping[str, Any],
+    key: str,
+    default: float,
+    label: str | None = None,
+) -> float:
+    error_key = label or key
+    return _parse_overlap_float(raw.get(key, default), error_key)
+
+
+def _parse_overlap_float(value: object, key: str) -> float:
+    parsed = _parse_float(value, key)
+    if not math.isfinite(parsed) or not 0.0 <= parsed < 1.0:
+        raise ConfigError(f"{key} must be greater than or equal to 0 and less than 1.")
+    return parsed
+
+
+def _validate_audio_hop_seconds(
+    hop_seconds: float | None,
+    window_seconds: float,
+    *,
+    hop_label: str,
+    window_label: str,
+) -> None:
+    if hop_seconds is not None and hop_seconds > window_seconds:
+        raise ConfigError(
+            f"{hop_label} must be less than or equal to {window_label} "
+            f"({hop_seconds} > {window_seconds})."
+        )
 
 
 def _parse_float(value: object, key: str) -> float:

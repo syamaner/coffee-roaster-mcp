@@ -39,6 +39,18 @@ architecture, original prototype, Hugging Face model/dataset/demo links, and
 README wording that frames this package as the consolidated deterministic
 rebuild of the prototype.
 
+E7-S6a is complete and routes next to E7-S6 / issue #112. The MCP
+first-crack runtime now supports configurable confidence threshold, recent
+positive-window confirmation, confirmation window seconds, and audio overlap or
+hop settings. Detector-paced WAV replay with the committed E7-S5a fixture and
+pinned released INT8 Hugging Face revision
+`b349a919c34b6130472da97c01817be404e4f629` detected first crack at
+`10.017558290999885` seconds after T0 inside the `3.82710390663442-20.0`
+second label interval, with `3` emitted windows, `3` processed windows, and
+`0` dropped windows. Live Hottop validation, real microphone validation, full
+Warp manual roast validation, live publishing, and hardware-ready labeling
+remain out of scope until E7-S6.
+
 Epic 3 is complete. The Hottop driver now has validated lifecycle, command-loop,
 packet, temperature-unit, heat, fan, drop, cooling, cleanup, and emergency-stop
 behavior at the driver boundary. The full connected-Hottop E3-S9 validation run
@@ -418,16 +430,14 @@ release checklist covering required checks, package build validation, version
 alignment, the pinned E7-S5a Hugging Face first-crack artifact revision
 `b349a919c34b6130472da97c01817be404e4f629`, PyPI publishing, MCP Registry
 publishing, GitHub Release follow-up, and hardware-ready labeling
-prerequisites. E7-S6a / issue #150 is inserted before the full E7-S6 manual
-Warp roast because the current MCP first-crack runtime uses non-overlapping
-detector windows and records detection at the inferred window end; E7-S6a must
-align the runtime with sliding-window confirmation behavior and validate the
-fix using the committed labelled WAV fixture with pinned released INT8 Hugging
-Face artifacts. The next story after the E7-S5 PR merges is E7-S6a / issue
-#150. Do not run live Hottop validation, real microphone validation, full
-end-to-end agent roast validation, model training/export/sync, live PyPI/MCP
-Registry publishing, or hardware-ready release labeling until E7-S6a is
-complete and issue #112 explicitly requires the real-roast validation.
+prerequisites. E7-S6a / issue #150 is complete and aligned the MCP
+first-crack runtime with sliding-window confirmation behavior using the
+committed labelled WAV fixture with pinned released INT8 Hugging Face
+artifacts. The next story after the E7-S6a PR merges is E7-S6 / issue #112. Do
+not run live Hottop validation, real microphone validation, full end-to-end
+agent roast validation, model training/export/sync, live PyPI/MCP Registry
+publishing, or hardware-ready release labeling until issue #112 explicitly
+requires the real-roast validation.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 

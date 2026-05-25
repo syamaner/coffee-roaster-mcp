@@ -344,6 +344,56 @@ def test_audio_runtime_keeps_pending_status_when_detector_does_not_confirm() -> 
     assert [event.kind for event in session.event_timeline] == ["beans_added"]
 
 
+def test_audio_runtime_records_earliest_positive_after_confirmation() -> None:
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    clock.monotonic_value = 500.0
+    store.record_event(session, "beans_added")
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.61),
+            FirstCrackDetectorOutput(confirmed=False, confidence=0.2),
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.82),
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.91),
+        )
+    )
+    pipeline = FakeAudioPipeline(
+        (
+            _audio_window(sequence_number=1, started_at_monotonic_seconds=503.0),
+            _audio_window(sequence_number=2, started_at_monotonic_seconds=506.0),
+            _audio_window(sequence_number=3, started_at_monotonic_seconds=509.0),
+            _audio_window(sequence_number=4, started_at_monotonic_seconds=512.0),
+        )
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            first_crack=FirstCrackConfig(
+                mode="audio",
+                confidence_threshold=0.6,
+                min_positive_windows=3,
+                confirmation_window_seconds=20.0,
+            )
+        ),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+    )
+
+    runtime.start_for_session(session)
+    clock.monotonic_value = 515.0
+    detected = runtime.process_available_windows(session_store=store, session=session)
+
+    assert detected.status == "detected"
+    assert session.first_crack_monotonic_seconds == 4.0
+    assert session.event_timeline[-1].payload["window_sequence_number"] == 1
+    assert session.event_timeline[-1].payload["confirmed_by_window_sequence_number"] == 4
+    assert session.event_timeline[-1].payload["positive_window_count"] == 3
+
+
 def test_detector_paced_wav_replay_preserves_source_audio_timeline() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)

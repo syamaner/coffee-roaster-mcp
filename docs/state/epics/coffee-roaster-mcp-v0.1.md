@@ -16,9 +16,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E7-S5`
-- Current target: produce the v0.1 release checklist and route next to `E7-S6`
-  end-to-end agent roast validation
+- Active story: `E7-S6`
+- Current target: run the full E7-S6 manual Warp roast validation with
+  released Hugging Face ONNX audio inference, real microphone input, and
+  supervised Hottop hardware control
 - Latest package release: `v0.1.2` metadata-only release for related project
   links
 - Product/display name: `RoastPilot`
@@ -107,6 +108,20 @@ The first implementation milestone is a mock vertical slice that requires no roa
   sliding-window configuration and confirmation behavior, then validate the
   corrected timing against the committed labelled WAV fixture and pinned
   Hugging Face revision before any real microphone/Hottop roast validation.
+- `E7-S6a` is complete. The MCP first-crack runtime now supports configurable
+  detector confidence threshold, recent-positive confirmation count,
+  confirmation window seconds, and audio overlap/hop settings. Audio capture
+  can emit overlapping detector windows, and the session-owned detector runtime
+  records exactly one first-crack event only after the configured recent
+  positive-window rule confirms. The opt-in public-MCP WAV replay validation
+  uses the committed fixture and pinned released INT8 Hugging Face revision
+  `b349a919c34b6130472da97c01817be404e4f629`; the sliding profile detected at
+  `10.017558290999885` seconds after T0, inside the label interval
+  `3.82710390663442-20.0` and materially earlier than the old
+  non-overlapping `20.017` second result. Exported JSONL, CSV, and
+  `summary.json` preserve first-crack model, artifact, confidence, and
+  confirmation metadata. E7-S6 remains next for real microphone/Hottop Warp
+  validation.
 - `E2-S1` keeps the initial MCP tool surface bootstrap-safe with `get_server_info` and `get_runtime_config`. Roast-session lifecycle and roast-control tools remain later Epic 2 work.
 - `E2-S2` uses one in-process `RoastSessionStore` with at most one active `RoastSession` at a time. Session state now owns monotonic timing, phase, event timeline storage, telemetry retention, and log-writer references before tool wiring lands.
 - `E2-S3` keeps event writes behind `RoastSessionStore.record_event(...)`. The session timeline now records deterministic append order, authoritative UTC plus monotonic timestamps for core roast events, and idempotent singleton handling for beans added, first crack, bean drop, and cooling transitions.
@@ -906,7 +921,7 @@ Goal: prove the package works from install through mock roast, MCP client calls,
     end-to-end agent roast validation, live publishing, and hardware-ready
     labeling remain out of scope for this story.
 
-- [ ] `E7-S6a` Align MCP first-crack detector with sliding-window validation.
+- [x] `E7-S6a` Align MCP first-crack detector with sliding-window validation.
   - Issue: #150.
   - Done when the MCP first-crack runtime supports the sliding-window detector
     parameters required for release validation, emits overlapping windows when
@@ -923,6 +938,19 @@ Goal: prove the package works from install through mock roast, MCP client calls,
   - Live Hottop validation, real microphone validation, full end-to-end Warp
     manual roast validation, model training/export/sync, live publishing, and
     hardware-ready labeling remain out of scope.
+  - Implemented on
+    `feature/150-align-mcp-first-crack-sliding-window-validation` with
+    configuration fields for detector confidence threshold, min positive
+    windows, confirmation window seconds, audio overlap, and audio hop seconds.
+    The audio pipeline now advances by the configured hop, detector-paced WAV
+    replay preserves source-audio sliding-window timestamps, the detector
+    adapter confirms from recent positive windows before returning one event,
+    and summary export now carries first-crack artifact and confirmation
+    metadata alongside JSONL and CSV metadata. The committed replay fixture
+    validated through public MCP tools with pinned INT8 revision
+    `b349a919c34b6130472da97c01817be404e4f629`, detecting at
+    `10.017558290999885` seconds after T0 with `3` emitted windows, `3`
+    processed windows, and `0` dropped windows.
 
 - [ ] `E7-S6` Run end-to-end agent roast validation with HF ONNX audio path.
   - Done when a real MCP client or agent can install/connect to the package and
@@ -2263,3 +2291,44 @@ After completing a story:
     15 passed.
   - Ran `./.venv/bin/python -m ruff check .`: passed.
   - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+- Validation run for E7-S6a:
+  - Added detector configuration for confidence threshold, min positive
+    windows, confirmation window seconds, audio overlap, and audio hop seconds.
+  - Added overlapping audio window emission for realtime capture and
+    detector-paced WAV replay.
+  - Added recent-positive first-crack confirmation before the detector runtime
+    writes exactly one `first_crack_detected` event.
+  - Preserved mock-safe defaults: roaster driver `mock`, first-crack mode
+    `disabled`, and no released-artifact resolution unless
+    `first_crack.mode: audio` is configured.
+  - Preserved released Hugging Face artifact resolution and ONNX backend
+    boundaries, adding only configurable threshold behavior.
+  - Extended summary export so JSONL, CSV, and `summary.json` preserve
+    first-crack model, artifact, confidence, and confirmation metadata.
+  - Ran public MCP WAV replay validation with
+    `tests/fixtures/audio/roastpilot-fc-replay-001.wav`, labels, manifest, and
+    pinned released INT8 revision
+    `b349a919c34b6130472da97c01817be404e4f629`: detected at
+    `10.017558290999885` seconds after T0 inside the
+    `3.82710390663442-20.0` second label interval, with `3` emitted windows,
+    `3` processed windows, `0` dropped windows, confidence
+    `0.7762153826546956`, confidence threshold `0.6`, min positive windows
+    `3`, and confirmation window `20.0` seconds.
+  - Exported validation logs:
+    `/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/roastpilot-fc-replay-y04kfl8t/logs/roasts/2936bdf8a6044ac78bfeeb09714753ca/roast.jsonl`,
+    `/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/roastpilot-fc-replay-y04kfl8t/logs/roasts/2936bdf8a6044ac78bfeeb09714753ca/roast.csv`,
+    and
+    `/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/roastpilot-fc-replay-y04kfl8t/logs/roasts/2936bdf8a6044ac78bfeeb09714753ca/summary.json`.
+  - Kept live Hottop validation, real microphone validation, full end-to-end
+    Warp manual roast validation, model training/export/sync, live PyPI/MCP
+    Registry publishing, and hardware-ready release labeling out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_config.py tests/test_audio.py tests/test_detector.py tests/test_first_crack_runtime.py tests/test_first_crack_integration.py tests/test_exports.py`:
+    119 passed.
+  - Ran `./.venv/bin/python scripts/validate_first_crack_wav_replay.py --timeout-seconds 180`:
+    passed.
+  - Ran `./.venv/bin/python -m pytest`: 394 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
+  - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.2`.

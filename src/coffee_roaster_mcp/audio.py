@@ -55,6 +55,8 @@ class AudioCaptureSettings:
         replay_mode: WAV replay mode. `detector_paced` emits windows only when
             the detector drains them, without wall-clock sleeps or queue drops.
         window_seconds: Detector window duration in seconds.
+        overlap: Fraction of each detector window shared with the next window.
+        hop_seconds: Optional explicit interval between consecutive windows.
         queue_limit: Maximum detector windows retained for downstream consumers.
         idle_sleep_seconds: Sleep duration when an input read returns no samples.
     """
@@ -65,6 +67,8 @@ class AudioCaptureSettings:
     wav_path: Path | None = None
     replay_mode: str = "realtime"
     window_seconds: float = DEFAULT_AUDIO_WINDOW_SECONDS
+    overlap: float = 0.0
+    hop_seconds: float | None = None
     queue_limit: int = DEFAULT_AUDIO_WINDOW_QUEUE_LIMIT
     idle_sleep_seconds: float = DEFAULT_AUDIO_IDLE_SLEEP_SECONDS
 
@@ -72,6 +76,21 @@ class AudioCaptureSettings:
     def window_sample_count(self) -> int:
         """Return the exact number of samples required for one detector window."""
         return max(1, round(self.sample_rate * self.window_seconds))
+
+    @property
+    def hop_sample_count(self) -> int:
+        """Return the number of samples to advance between detector windows."""
+        hop_seconds = (
+            self.window_seconds * (1.0 - self.overlap)
+            if self.hop_seconds is None
+            else self.hop_seconds
+        )
+        return max(1, round(self.sample_rate * hop_seconds))
+
+    @property
+    def effective_hop_seconds(self) -> float:
+        """Return the effective interval between detector windows."""
+        return self.hop_sample_count / self.sample_rate
 
 
 @dataclass(frozen=True)
@@ -129,6 +148,8 @@ def audio_capture_settings_from_config(
         wav_path=config.wav_path,
         replay_mode=config.replay_mode,
         window_seconds=config.window_seconds if window_seconds is None else window_seconds,
+        overlap=config.overlap,
+        hop_seconds=config.hop_seconds,
         queue_limit=queue_limit,
         idle_sleep_seconds=idle_sleep_seconds,
     )
@@ -480,7 +501,7 @@ class AudioCapturePipeline:
         window_sample_count = self._settings.window_sample_count
         while len(self._sample_buffer) >= window_sample_count:
             window_samples = tuple(self._sample_buffer[:window_sample_count])
-            del self._sample_buffer[:window_sample_count]
+            del self._sample_buffer[: self._settings.hop_sample_count]
             window = AudioWindow(
                 sequence_number=self._next_sequence_number,
                 input_device=self._settings.input_device,
@@ -610,7 +631,7 @@ class DetectorPacedWavReplayPipeline(AudioCapturePipeline):
             self._sample_buffer.extend(_normalize_sample(sample) for sample in samples)
 
         window_samples = tuple(self._sample_buffer[:window_sample_count])
-        del self._sample_buffer[:window_sample_count]
+        del self._sample_buffer[: self._settings.hop_sample_count]
         with self._state_lock:
             if self._timeline_start_monotonic_seconds is None:
                 self._timeline_start_monotonic_seconds = self._monotonic_now()
@@ -619,7 +640,7 @@ class DetectorPacedWavReplayPipeline(AudioCapturePipeline):
             self._replay_emitted_window_count += 1
             started_at_monotonic_seconds = (
                 self._timeline_start_monotonic_seconds
-                + sequence_number * self._settings.window_seconds
+                + sequence_number * self._settings.effective_hop_seconds
             )
 
         return AudioWindow(
@@ -648,6 +669,15 @@ def _validate_settings(settings: AudioCaptureSettings) -> None:
         raise AudioCaptureError("audio.sample_rate must be > 0.")
     if not math.isfinite(settings.window_seconds) or settings.window_seconds <= 0:
         raise AudioCaptureError("audio window_seconds must be > 0.")
+    if not math.isfinite(settings.overlap) or not 0.0 <= settings.overlap < 1.0:
+        raise AudioCaptureError("audio overlap must be greater than or equal to 0 and less than 1.")
+    if settings.hop_seconds is not None:
+        if not math.isfinite(settings.hop_seconds) or settings.hop_seconds <= 0:
+            raise AudioCaptureError("audio hop_seconds must be > 0.")
+        if settings.hop_seconds > settings.window_seconds:
+            raise AudioCaptureError(
+                "audio hop_seconds must be less than or equal to window_seconds."
+            )
     if settings.queue_limit < 1:
         raise AudioCaptureError("audio queue_limit must be >= 1.")
     if not math.isfinite(settings.idle_sleep_seconds) or settings.idle_sleep_seconds < 0:

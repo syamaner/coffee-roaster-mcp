@@ -223,19 +223,39 @@ def _event_row(*, session: RoastSession, event: RoastEvent) -> dict[str, Any]:
     }
 
 
-def _summary_first_crack_model(session: RoastSession) -> dict[str, str | None]:
+def _summary_first_crack_model(session: RoastSession) -> dict[str, EventPayloadValue | None]:
     """Return first-crack model metadata for summary export."""
     payload = _first_crack_payload_from(session.event_timeline)
     return {
         "repo_id": _string_payload_value(payload.get("repo_id")),
         "revision": _string_payload_value(payload.get("revision")),
         "precision": _string_payload_value(payload.get("precision")),
+        "onnx_model_filename": _string_payload_value(payload.get("onnx_model_filename")),
+        "feature_extractor_filename": _string_payload_value(
+            payload.get("feature_extractor_filename")
+        ),
+        "confidence": _number_payload_value(payload.get("confidence")),
+        "confidence_threshold": _number_payload_value(payload.get("confidence_threshold")),
+        "min_positive_windows": _integer_payload_value(payload.get("min_positive_windows")),
+        "confirmation_window_seconds": _number_payload_value(
+            payload.get("confirmation_window_seconds")
+        ),
     }
 
 
 def _string_payload_value(value: EventPayloadValue | None) -> str | None:
     """Return a payload value only when it is string metadata."""
     return value if isinstance(value, str) else None
+
+
+def _number_payload_value(value: EventPayloadValue | None) -> float | int | None:
+    """Return a payload value only when it is numeric metadata."""
+    return value if isinstance(value, (float, int)) and not isinstance(value, bool) else None
+
+
+def _integer_payload_value(value: EventPayloadValue | None) -> int | None:
+    """Return a payload value only when it is integer metadata."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _csv_rows(

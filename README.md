@@ -293,6 +293,9 @@ first_crack:
   precision: int8
   local_model_dir: null
   onnx_threads: 2
+  confidence_threshold: 0.9
+  min_positive_windows: 1
+  confirmation_window_seconds: 20.0
   allow_manual_override: true
 
 audio:
@@ -302,6 +305,8 @@ audio:
   wav_path: null
   replay_mode: realtime
   window_seconds: 1.0
+  overlap: 0.0
+  hop_seconds: null
 
 logging:
   log_dir: ./logs
@@ -330,12 +335,17 @@ Supported environment overrides:
 - `COFFEE_FIRST_CRACK_PRECISION`
 - `COFFEE_FIRST_CRACK_LOCAL_MODEL_DIR`
 - `COFFEE_FIRST_CRACK_ONNX_THREADS`
+- `COFFEE_FIRST_CRACK_CONFIDENCE_THRESHOLD`
+- `COFFEE_FIRST_CRACK_MIN_POSITIVE_WINDOWS`
+- `COFFEE_FIRST_CRACK_CONFIRMATION_WINDOW_SECONDS`
 - `COFFEE_AUDIO_SOURCE`
 - `COFFEE_AUDIO_INPUT_DEVICE`
 - `COFFEE_AUDIO_SAMPLE_RATE`
 - `COFFEE_AUDIO_WAV_PATH`
 - `COFFEE_AUDIO_REPLAY_MODE`
 - `COFFEE_AUDIO_WINDOW_SECONDS`
+- `COFFEE_AUDIO_OVERLAP`
+- `COFFEE_AUDIO_HOP_SECONDS`
 - `COFFEE_ROAST_LOG_DIR`
 - `COFFEE_AUTO_T0_DROP_THRESHOLD_C`
 - `HF_HOME`
@@ -348,9 +358,9 @@ contract as microphone capture, and requires the file sample rate to match
 `audio.sample_rate`. WAV replay defaults to the background `realtime` capture
 pipeline. For local labelled-fixture validation, set
 `audio.replay_mode: detector_paced` and the detector-compatible
-`audio.window_seconds` so each complete WAV window is processed as soon as the
-detector/runtime is ready, without wall-clock sleeps and without normal queue
-drops.
+`audio.window_seconds` plus either `audio.overlap` or `audio.hop_seconds` so
+each complete WAV window is processed as soon as the detector/runtime is ready,
+without wall-clock sleeps and without normal queue drops.
 
 The repository normally does not commit audio. The only current exception is
 the small derived E7-S5a labelled replay fixture under `tests/fixtures/audio/`,
