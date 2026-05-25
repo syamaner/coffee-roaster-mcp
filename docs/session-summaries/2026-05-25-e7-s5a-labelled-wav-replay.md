@@ -157,8 +157,8 @@ Review notes:
   metrics to the serialized session id.
 - Addressed Codex review feedback by normalizing stopped capture snapshots so a
   stopped runtime cannot continue reporting `audio_running: true`, and by
-  blocking later non-fault phase events until wall-clock elapsed time catches up
-  to a detector-paced future first-crack timestamp.
+  keeping later non-fault phase events non-decreasing when they follow a
+  detector-paced future first-crack timestamp.
 - Added regression coverage for stopped audio snapshots, cross-session runtime
   metric leakage, and future first-crack timeline ordering.
 - Re-ran released-model WAV replay after the review fixes:
@@ -166,6 +166,14 @@ Review notes:
   `3.82710390663442-20.0` second label interval, emitted `2` windows, processed
   `2` windows, dropped `0` windows, and exported `roast.jsonl`, `roast.csv`,
   and `summary.json` under the local temporary replay log directory.
+- Addressed follow-up CodeRabbit feedback on commit `8503ed1` by allowing
+  detector-paced replay sessions to progress immediately after a future
+  first-crack event while normalizing later non-fault event timestamps to avoid
+  inverted metrics. Also strengthened the runtime-metric scoping test so the
+  completed session is zeroed and the active session still reports live
+  counters.
+- Follow-up review status before push: CodeRabbit completed after the local
+  follow-up fix, and no additional Codex reviews were posted.
 
 ## Next Routing
 
@@ -179,3 +187,4 @@ the next issue explicitly requires them.
 
 - Review follow-up start: current Codex goal token tracking is unavailable in
   this session (`remainingTokens: null`, `completionBudgetReport: null`).
+- Review completion/push handoff: `797K used`.

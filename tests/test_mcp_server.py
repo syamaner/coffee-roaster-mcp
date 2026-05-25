@@ -799,7 +799,7 @@ def test_get_roast_state_scopes_runtime_metrics_to_requested_session(tmp_path: P
     _call_tool(server, "drop_beans", ctx)
     _call_tool(server, "start_cooling", ctx)
     _call_tool(server, "stop_cooling", ctx)
-    _call_tool(server, "start_roast_session", ctx)
+    second_start = _call_tool(server, "start_roast_session", ctx)
     first_state = _call_tool(
         server,
         "get_roast_state",
@@ -813,6 +813,19 @@ def test_get_roast_state_scopes_runtime_metrics_to_requested_session(tmp_path: P
     assert first_state.first_crack_status.emitted_window_count == 0
     assert first_state.first_crack_status.dropped_window_count == 0
     assert first_state.first_crack_status.processed_window_count == 0
+
+    second_state = _call_tool(
+        server,
+        "get_roast_state",
+        ctx,
+        session_id=second_start.session.session_id,
+    )
+    assert second_state.first_crack_status.status == "pending"
+    assert second_state.first_crack_status.audio_running is True
+    assert second_state.first_crack_status.queued_window_count == 2
+    assert second_state.first_crack_status.emitted_window_count == 3
+    assert second_state.first_crack_status.dropped_window_count == 4
+    assert second_state.first_crack_status.processed_window_count == 5
 
 
 def test_driver_command_failure_does_not_mutate_session_state(tmp_path: Path) -> None:

@@ -352,7 +352,7 @@ def test_append_only_jsonl_log_includes_automatic_first_crack_events(tmp_path: P
     assert rows[1]["monotonic_seconds"] == 9.25
 
 
-def test_future_first_crack_detection_blocks_later_events_until_time_catches_up() -> None:
+def test_future_first_crack_detection_allows_later_events_without_inverted_metrics() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
     session = store.start_session()
@@ -365,14 +365,12 @@ def test_future_first_crack_detection_blocks_later_events_until_time_catches_up(
         max_future_seconds=None,
     )
 
-    with pytest.raises(SessionLifecycleError, match="monotonic timestamp order"):
-        store.record_event(session, "beans_dropped")
-
-    clock.monotonic_value = 121.0
     event = store.record_event(session, "beans_dropped")
 
     assert event.kind == "beans_dropped"
-    assert session.beans_dropped_monotonic_seconds == 21.0
+    assert session.first_crack_monotonic_seconds == 20.0
+    assert session.beans_dropped_monotonic_seconds == 20.0
+    assert compute_development_time_seconds(session) == 0.0
 
 
 def test_event_log_write_failure_does_not_commit_event(tmp_path: Path) -> None:

@@ -1490,6 +1490,11 @@ class RoastSessionStore:
 
             recorded_at_utc = self._utc_now()
             monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+            monotonic_seconds = _normalize_event_monotonic_seconds(
+                session,
+                kind=kind,
+                monotonic_seconds=monotonic_seconds,
+            )
             _validate_event_monotonic_order(
                 session,
                 kind=kind,
@@ -2006,6 +2011,23 @@ def _validate_event_monotonic_order(
     latest_event = session.event_timeline[-1]
     if monotonic_seconds < latest_event.monotonic_seconds:
         raise SessionLifecycleError("Roast events must be recorded in monotonic timestamp order.")
+
+
+def _normalize_event_monotonic_seconds(
+    session: RoastSession,
+    *,
+    kind: RoastEventKind,
+    monotonic_seconds: float,
+) -> float:
+    if kind == "fault" or not session.event_timeline:
+        return monotonic_seconds
+    latest_event = session.event_timeline[-1]
+    if (
+        latest_event.kind == "first_crack_detected"
+        and monotonic_seconds < latest_event.monotonic_seconds
+    ):
+        return latest_event.monotonic_seconds
+    return monotonic_seconds
 
 
 def _elapsed_since(
