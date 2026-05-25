@@ -103,6 +103,7 @@ Milestone: `v0.1`
 - #59 E7-S4: Run Warp manual Hottop MCP control validation
 - #141 E7-S5a: Test MCP first-crack detection with labelled WAV replay
 - #60 E7-S5: Produce v0.1 release checklist
+- #150 E7-S6a: Align MCP first-crack detector with sliding-window validation
 - #112 E7-S6: Run end-to-end agent roast validation with HF ONNX audio path
 
 ## Standalone Spikes

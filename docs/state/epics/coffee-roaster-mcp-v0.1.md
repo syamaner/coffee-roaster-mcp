@@ -99,6 +99,14 @@ The first implementation milestone is a mock vertical slice that requires no roa
   hardware-ready labeling policy. It does not execute live Hottop validation,
   real microphone validation, full end-to-end agent roast validation, model
   training/export/sync, live publishing, or hardware-ready labeling.
+- `E7-S6a` is inserted before the full E7-S6 manual Warp roast to align the
+  MCP first-crack runtime with the model repo's sliding-window validation
+  behavior. E7-S5a proved the released INT8 ONNX model can fire through public
+  MCP tools, but the current MCP path uses non-overlapping detector windows and
+  records first crack at the inferred window end. E7-S6a must add the needed
+  sliding-window configuration and confirmation behavior, then validate the
+  corrected timing against the committed labelled WAV fixture and pinned
+  Hugging Face revision before any real microphone/Hottop roast validation.
 - `E2-S1` keeps the initial MCP tool surface bootstrap-safe with `get_server_info` and `get_runtime_config`. Roast-session lifecycle and roast-control tools remain later Epic 2 work.
 - `E2-S2` uses one in-process `RoastSessionStore` with at most one active `RoastSession` at a time. Session state now owns monotonic timing, phase, event timeline storage, telemetry retention, and log-writer references before tool wiring lands.
 - `E2-S3` keeps event writes behind `RoastSessionStore.record_event(...)`. The session timeline now records deterministic append order, authoritative UTC plus monotonic timestamps for core roast events, and idempotent singleton handling for beans added, first crack, bean drop, and cooling transitions.
@@ -898,6 +906,24 @@ Goal: prove the package works from install through mock roast, MCP client calls,
     end-to-end agent roast validation, live publishing, and hardware-ready
     labeling remain out of scope for this story.
 
+- [ ] `E7-S6a` Align MCP first-crack detector with sliding-window validation.
+  - Issue: #150.
+  - Done when the MCP first-crack runtime supports the sliding-window detector
+    parameters required for release validation, emits overlapping windows when
+    configured, confirms first crack from recent positive windows before
+    recording exactly one event, and validates corrected timing with the
+    committed E7-S5a WAV fixture plus pinned released INT8 Hugging Face
+    artifacts.
+  - Required WAV validation uses
+    `tests/fixtures/audio/roastpilot-fc-replay-001.wav`, retimestamped labels,
+    and manifest with revision
+    `b349a919c34b6130472da97c01817be404e4f629`; the validation should fail if
+    the corrected sliding-window profile only reproduces the old
+    non-overlapping detection around `20.017` seconds after T0.
+  - Live Hottop validation, real microphone validation, full end-to-end Warp
+    manual roast validation, model training/export/sync, live publishing, and
+    hardware-ready labeling remain out of scope.
+
 - [ ] `E7-S6` Run end-to-end agent roast validation with HF ONNX audio path.
   - Done when a real MCP client or agent can install/connect to the package and
     run a full roast flow using public MCP tools, configured Hottop hardware,
@@ -919,6 +945,8 @@ Goal: prove the package works from install through mock roast, MCP client calls,
 - A real MCP client or agent can complete an end-to-end roast validation using
   configured hardware, real audio, and released Hugging Face ONNX first-crack
   artifacts, with correct state, stats, and exported logs recorded as evidence.
+- MCP first-crack detector timing is aligned with the model repo's
+  sliding-window validation behavior before the full real microphone roast.
 - Release is tagged only after package, registry, and smoke tests pass.
 
 ## Spikes
