@@ -136,7 +136,10 @@ Required repo checks:
 - Review follow-up targeted recovery tests:
   `./.venv/bin/python -m pytest tests/test_mcp_server.py::test_stop_cooling_recovers_after_emergency_stop_leaves_cooling_on tests/test_mcp_server.py::test_stop_cooling_recovery_keeps_fault_when_driver_reports_cooling_on tests/test_mcp_server.py::test_stop_cooling_still_rejects_completed_inactive_session tests/test_mcp_server.py::test_stop_cooling_uses_driver_cooling_state_before_completing`:
   4 passed.
-- `./.venv/bin/python -m pytest`: 359 passed.
+- Export recovery phase follow-up:
+  `./.venv/bin/python -m pytest tests/test_exports.py::test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop tests/test_mcp_server.py::test_stop_cooling_recovers_after_emergency_stop_leaves_cooling_on tests/test_mcp_server.py::test_stop_cooling_recovery_keeps_fault_when_driver_reports_cooling_on`:
+  3 passed.
+- `./.venv/bin/python -m pytest`: 360 passed.
 - `./.venv/bin/python -m ruff check .`: passed.
 - `./.venv/bin/python -m ruff format --check .`: 31 files already formatted.
 - `./.venv/bin/python -m pyright`: 0 errors, 0 warnings, 0 informations.
