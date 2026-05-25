@@ -418,11 +418,16 @@ release checklist covering required checks, package build validation, version
 alignment, the pinned E7-S5a Hugging Face first-crack artifact revision
 `b349a919c34b6130472da97c01817be404e4f629`, PyPI publishing, MCP Registry
 publishing, GitHub Release follow-up, and hardware-ready labeling
-prerequisites. The next story after the E7-S5 PR merges is E7-S6: run
-end-to-end agent roast validation with the HF ONNX audio path. Do not run live
-Hottop validation, real microphone validation, full end-to-end agent roast
-validation, model training/export/sync, live PyPI/MCP Registry publishing, or
-hardware-ready release labeling unless issue #112 explicitly requires it.
+prerequisites. E7-S6a / issue #150 is inserted before the full E7-S6 manual
+Warp roast because the current MCP first-crack runtime uses non-overlapping
+detector windows and records detection at the inferred window end; E7-S6a must
+align the runtime with sliding-window confirmation behavior and validate the
+fix using the committed labelled WAV fixture with pinned released INT8 Hugging
+Face artifacts. The next story after the E7-S5 PR merges is E7-S6a / issue
+#150. Do not run live Hottop validation, real microphone validation, full
+end-to-end agent roast validation, model training/export/sync, live PyPI/MCP
+Registry publishing, or hardware-ready release labeling until E7-S6a is
+complete and issue #112 explicitly requires the real-roast validation.
 
 The first implementation milestone is now complete. The mock vertical slice can start the MCP server with the mock driver, run a simulated roast through MCP tools, and export JSONL, CSV, and summary logs without roaster hardware or model download.
 
