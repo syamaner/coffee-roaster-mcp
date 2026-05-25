@@ -263,6 +263,7 @@ considered.
 ## Usage Snapshot
 
 - `792K used`.
+- `1.86M used`.
 
 ## Resume Checklist
 
