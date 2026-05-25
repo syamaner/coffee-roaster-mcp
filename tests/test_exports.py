@@ -72,6 +72,12 @@ EXPECTED_FIRST_CRACK_MODEL_KEYS = {
     "repo_id",
     "revision",
     "precision",
+    "onnx_model_filename",
+    "feature_extractor_filename",
+    "confidence",
+    "confidence_threshold",
+    "min_positive_windows",
+    "confirmation_window_seconds",
 }
 
 
@@ -111,6 +117,11 @@ def test_snapshot_export_preserves_first_crack_detector_metadata(tmp_path: Path)
         "onnx_model_filename": "onnx/int8/model_quantized.onnx",
         "feature_extractor_filename": "onnx/int8/preprocessor_config.json",
         "window_sequence_number": 9,
+        "confirmed_by_window_sequence_number": 13,
+        "positive_window_count": 5,
+        "confidence_threshold": 0.6,
+        "min_positive_windows": 5,
+        "confirmation_window_seconds": 20.0,
         "confidence": 0.93,
     }
     clock.monotonic_value = 140.0
@@ -156,6 +167,12 @@ def test_snapshot_export_preserves_first_crack_detector_metadata(tmp_path: Path)
         "repo_id": "syamaner/coffee-first-crack-detection",
         "revision": "v0.1.0",
         "precision": "int8",
+        "onnx_model_filename": "onnx/int8/model_quantized.onnx",
+        "feature_extractor_filename": "onnx/int8/preprocessor_config.json",
+        "confidence": 0.93,
+        "confidence_threshold": 0.6,
+        "min_positive_windows": 5,
+        "confirmation_window_seconds": 20.0,
     }
     assert summary["metrics"]["development_time_seconds"] == 32.75
     assert summary["metrics"]["development_percent"] == 50.385
@@ -213,6 +230,12 @@ def test_snapshot_export_summary_includes_plan_required_schema(
         "repo_id": "syamaner/coffee-first-crack-detection",
         "revision": "release-2026-05",
         "precision": "fp32",
+        "onnx_model_filename": None,
+        "feature_extractor_filename": None,
+        "confidence": 0.91,
+        "confidence_threshold": None,
+        "min_positive_windows": None,
+        "confirmation_window_seconds": None,
     }
 
 

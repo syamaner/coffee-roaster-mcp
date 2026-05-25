@@ -22,10 +22,15 @@ def test_default_config_allows_mock_run_without_file(
     assert config.first_crack.mode == "disabled"
     assert config.first_crack.repo_id == "syamaner/coffee-first-crack-detection"
     assert config.first_crack.precision == "int8"
+    assert config.first_crack.confidence_threshold == 0.9
+    assert config.first_crack.min_positive_windows == 1
+    assert config.first_crack.confirmation_window_seconds == 20.0
     assert config.audio.source == "microphone"
     assert config.audio.wav_path is None
     assert config.audio.replay_mode == "realtime"
     assert config.audio.window_seconds == 1.0
+    assert config.audio.overlap == 0.0
+    assert config.audio.hop_seconds is None
     assert config.logging.log_dir == Path("./logs")
     assert config.logging.sample_interval_seconds == 5.0
     assert config.logging.export_formats == ("jsonl", "csv", "summary")
@@ -57,11 +62,15 @@ first_crack:
   precision: " fp32 "
   local_model_dir: ./models/fp32
   onnx_threads: 4
+  confidence_threshold: 0.6
+  min_positive_windows: 5
+  confirmation_window_seconds: 20.0
   allow_manual_override: false
 audio:
   input_device: roast-mic
   sample_rate: 48000
   window_seconds: 10.0
+  overlap: 0.7
 logging:
   log_dir: ./roast-logs
   sample_interval_seconds: 0.5
@@ -91,6 +100,9 @@ session:
     assert config.first_crack.precision == "fp32"
     assert config.first_crack.local_model_dir == Path("./models/fp32")
     assert config.first_crack.onnx_threads == 4
+    assert config.first_crack.confidence_threshold == 0.6
+    assert config.first_crack.min_positive_windows == 5
+    assert config.first_crack.confirmation_window_seconds == 20.0
     assert config.first_crack.allow_manual_override is False
     assert config.audio.source == "microphone"
     assert config.audio.input_device == "roast-mic"
@@ -98,6 +110,8 @@ session:
     assert config.audio.wav_path is None
     assert config.audio.replay_mode == "realtime"
     assert config.audio.window_seconds == 10.0
+    assert config.audio.overlap == 0.7
+    assert config.audio.hop_seconds is None
     assert config.logging.log_dir == Path("./roast-logs")
     assert config.logging.sample_interval_seconds == 0.5
     assert config.logging.export_formats == ("jsonl", "summary")
@@ -155,12 +169,17 @@ logging:
             "COFFEE_FIRST_CRACK_PRECISION": "fp32 ",
             "COFFEE_FIRST_CRACK_LOCAL_MODEL_DIR": "/models/env",
             "COFFEE_FIRST_CRACK_ONNX_THREADS": "8",
+            "COFFEE_FIRST_CRACK_CONFIDENCE_THRESHOLD": "0.7",
+            "COFFEE_FIRST_CRACK_MIN_POSITIVE_WINDOWS": "3",
+            "COFFEE_FIRST_CRACK_CONFIRMATION_WINDOW_SECONDS": "30",
             "COFFEE_AUDIO_SOURCE": "microphone",
             "COFFEE_AUDIO_INPUT_DEVICE": "env-mic",
             "COFFEE_AUDIO_SAMPLE_RATE": "16000",
             "COFFEE_AUDIO_WAV_PATH": "",
             "COFFEE_AUDIO_REPLAY_MODE": "realtime",
             "COFFEE_AUDIO_WINDOW_SECONDS": "2.5",
+            "COFFEE_AUDIO_OVERLAP": "0.25",
+            "COFFEE_AUDIO_HOP_SECONDS": "1.25",
             "COFFEE_ROAST_LOG_DIR": "/tmp/roasts",
             "COFFEE_AUTO_T0_DROP_THRESHOLD_C": "30",
         },
@@ -175,12 +194,17 @@ logging:
     assert config.first_crack.precision == "fp32"
     assert config.first_crack.local_model_dir == Path("/models/env")
     assert config.first_crack.onnx_threads == 8
+    assert config.first_crack.confidence_threshold == 0.7
+    assert config.first_crack.min_positive_windows == 3
+    assert config.first_crack.confirmation_window_seconds == 30.0
     assert config.audio.source == "microphone"
     assert config.audio.input_device == "env-mic"
     assert config.audio.sample_rate == 16_000
     assert config.audio.wav_path is None
     assert config.audio.replay_mode == "realtime"
     assert config.audio.window_seconds == 2.5
+    assert config.audio.overlap == 0.25
+    assert config.audio.hop_seconds == 1.25
     assert config.logging.log_dir == Path("/tmp/roasts")
     assert config.session.auto_t0_drop_threshold_c == 30.0
 

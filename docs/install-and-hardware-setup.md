@@ -79,6 +79,9 @@ first_crack:
   precision: int8
   local_model_dir: null
   onnx_threads: 2
+  confidence_threshold: 0.9
+  min_positive_windows: 1
+  confirmation_window_seconds: 20.0
   allow_manual_override: true
 
 audio:
@@ -86,6 +89,10 @@ audio:
   input_device: null
   sample_rate: 16000
   wav_path: null
+  replay_mode: realtime
+  window_seconds: 1.0
+  overlap: 0.0
+  hop_seconds: null
 
 logging:
   log_dir: ./logs
@@ -114,12 +121,17 @@ Supported environment overrides:
 - `COFFEE_FIRST_CRACK_PRECISION`
 - `COFFEE_FIRST_CRACK_LOCAL_MODEL_DIR`
 - `COFFEE_FIRST_CRACK_ONNX_THREADS`
+- `COFFEE_FIRST_CRACK_CONFIDENCE_THRESHOLD`
+- `COFFEE_FIRST_CRACK_MIN_POSITIVE_WINDOWS`
+- `COFFEE_FIRST_CRACK_CONFIRMATION_WINDOW_SECONDS`
 - `COFFEE_AUDIO_SOURCE`
 - `COFFEE_AUDIO_INPUT_DEVICE`
 - `COFFEE_AUDIO_SAMPLE_RATE`
 - `COFFEE_AUDIO_WAV_PATH`
 - `COFFEE_AUDIO_REPLAY_MODE`
 - `COFFEE_AUDIO_WINDOW_SECONDS`
+- `COFFEE_AUDIO_OVERLAP`
+- `COFFEE_AUDIO_HOP_SECONDS`
 - `COFFEE_ROAST_LOG_DIR`
 - `COFFEE_AUTO_T0_DROP_THRESHOLD_C`
 - `HF_HOME`
@@ -196,6 +208,9 @@ first_crack:
   precision: int8
   local_model_dir: null
   onnx_threads: 2
+  confidence_threshold: 0.9
+  min_positive_windows: 1
+  confirmation_window_seconds: 20.0
   allow_manual_override: true
 ```
 
@@ -218,6 +233,8 @@ audio:
   wav_path: null
   replay_mode: realtime
   window_seconds: 1.0
+  overlap: 0.0
+  hop_seconds: null
 ```
 
 `precision: int8` selects `onnx/int8/model_quantized.onnx`.
@@ -234,6 +251,7 @@ audio:
   wav_path: /path/to/replay.wav
   replay_mode: detector_paced
   window_seconds: 10.0
+  overlap: 0.7
 ```
 
 The WAV sample rate must match `audio.sample_rate`. `replay_mode: realtime`
@@ -241,8 +259,10 @@ keeps the normal background capture behavior. `replay_mode: detector_paced` is
 for local labelled-fixture validation: it reads the next complete WAV window
 only when the detector drains it, so replay can run faster than wall-clock audio
 without normal detector queue drops. Use `audio.window_seconds` to match the
-released detector's expected window duration for the validation source. Real
-microphone validation is gated manual work and is not required for normal CI or
+released detector's expected window duration for the validation source, and use
+`audio.overlap` or `audio.hop_seconds` when validating sliding-window detector
+behavior. Real microphone validation is gated manual work and is not required
+for normal CI or
 this story.
 
 The E7-S5a labelled replay check is opt-in/local because it uses the released

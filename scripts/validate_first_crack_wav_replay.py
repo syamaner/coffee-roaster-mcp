@@ -52,6 +52,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Allowed detection tolerance after the labelled interval start.",
     )
+    parser.add_argument(
+        "--old-non-overlap-detection-seconds",
+        type=float,
+        default=20.017,
+        help="Fail when sliding-window validation only reproduces the old timing.",
+    )
     return parser
 
 
@@ -115,10 +121,21 @@ async def _run_validation(args: argparse.Namespace) -> int:
                 f"{detected_after_t0:.3f}s after T0 is outside label interval "
                 f"{label_start:.3f}-{label_end:.3f}s."
             )
+        if detected_after_t0 >= float(args.old_non_overlap_detection_seconds):
+            raise RuntimeError(
+                "sliding-window validation reproduced the old non-overlapping "
+                f"detection timing at {detected_after_t0:.3f}s after T0."
+            )
 
         export = await _call(session.call_tool("export_roast_log", {"session_id": session_id}))
         elapsed_wall_seconds = time.monotonic() - started_at
         metrics = cast(dict[str, Any], state_content["first_crack_status"])
+        summary_path = Path(cast(str, export.structuredContent["summary_path"]))
+        exported_summary = cast(
+            dict[str, Any],
+            json.loads(summary_path.read_text(encoding="utf-8")),
+        )
+        first_crack_model = cast(dict[str, Any], exported_summary["first_crack_model"])
         summary = {
             "session_id": session_id,
             "fixture": str(FIXTURE_DIR / f"{FIXTURE_STEM}.wav"),
@@ -132,6 +149,19 @@ async def _run_validation(args: argparse.Namespace) -> int:
                 "emitted_window_count": metrics["emitted_window_count"],
                 "processed_window_count": metrics["processed_window_count"],
                 "dropped_window_count": metrics["dropped_window_count"],
+            },
+            "detector_confirmation": {
+                "confidence": first_crack_model["confidence"],
+                "confidence_threshold": first_crack_model["confidence_threshold"],
+                "min_positive_windows": first_crack_model["min_positive_windows"],
+                "confirmation_window_seconds": first_crack_model["confirmation_window_seconds"],
+            },
+            "model_artifacts": {
+                "repo_id": first_crack_model["repo_id"],
+                "revision": first_crack_model["revision"],
+                "precision": first_crack_model["precision"],
+                "onnx_model_filename": first_crack_model["onnx_model_filename"],
+                "feature_extractor_filename": first_crack_model["feature_extractor_filename"],
             },
             "exports": {
                 "jsonl_path": export.structuredContent["jsonl_path"],
@@ -163,6 +193,9 @@ def _write_config(config_path: Path, *, log_dir: Path) -> None:
                 "  precision: int8",
                 "  local_model_dir: null",
                 "  onnx_threads: 2",
+                "  confidence_threshold: 0.6",
+                "  min_positive_windows: 3",
+                "  confirmation_window_seconds: 20.0",
                 "  allow_manual_override: true",
                 "audio:",
                 "  source: wav",
@@ -171,6 +204,7 @@ def _write_config(config_path: Path, *, log_dir: Path) -> None:
                 f"  wav_path: {wav_path}",
                 "  replay_mode: detector_paced",
                 "  window_seconds: 10.0",
+                "  overlap: 0.7",
                 "logging:",
                 f"  log_dir: {log_dir_path}",
                 "  sample_interval_seconds: 5.0",

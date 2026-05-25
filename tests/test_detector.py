@@ -159,6 +159,11 @@ def test_detector_adapter_maps_confirmed_output_to_first_crack_event() -> None:
     assert event.onnx_model_filename == "onnx/fp32/model.onnx"
     assert event.feature_extractor_filename == "onnx/fp32/preprocessor_config.json"
     assert event.window_sequence_number == 7
+    assert event.confirmed_by_window_sequence_number == 7
+    assert event.positive_window_count == 1
+    assert event.confidence_threshold == 0.9
+    assert event.min_positive_windows == 1
+    assert event.confirmation_window_seconds == 20.0
     assert event.detected_at_inferred is False
     assert event.payload() == {
         "source": "first_crack_detector",
@@ -169,6 +174,11 @@ def test_detector_adapter_maps_confirmed_output_to_first_crack_event() -> None:
         "onnx_model_filename": "onnx/fp32/model.onnx",
         "feature_extractor_filename": "onnx/fp32/preprocessor_config.json",
         "window_sequence_number": 7,
+        "confirmed_by_window_sequence_number": 7,
+        "positive_window_count": 1,
+        "confidence_threshold": 0.9,
+        "min_positive_windows": 1,
+        "confirmation_window_seconds": 20.0,
         "confidence": 0.87,
     }
 
@@ -189,6 +199,81 @@ def test_detector_adapter_uses_window_end_timestamp_when_output_has_no_timestamp
     assert event.confidence is None
     assert event.detected_at_inferred is True
     assert "confidence" not in event.payload()
+
+
+def test_detector_adapter_confirms_from_recent_positive_windows() -> None:
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.61),
+            FirstCrackDetectorOutput(confirmed=False, confidence=0.10),
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.82),
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.91),
+        )
+    )
+    adapter = build_first_crack_detector_adapter(
+        FirstCrackConfig(
+            confidence_threshold=0.6,
+            min_positive_windows=3,
+            confirmation_window_seconds=20.0,
+        ),
+        _resolved_detector_artifacts(),
+        backend,
+    )
+
+    first = adapter.process_window(
+        _audio_window(sequence_number=10, started_at_monotonic_seconds=100.0)
+    )
+    second = adapter.process_window(
+        _audio_window(sequence_number=11, started_at_monotonic_seconds=103.0)
+    )
+    third = adapter.process_window(
+        _audio_window(sequence_number=12, started_at_monotonic_seconds=106.0)
+    )
+    confirmed = adapter.process_window(
+        _audio_window(sequence_number=13, started_at_monotonic_seconds=109.0)
+    )
+
+    assert first is None
+    assert second is None
+    assert third is None
+    assert confirmed is not None
+    assert confirmed.detected_at_monotonic_seconds == 101.0
+    assert confirmed.window_sequence_number == 10
+    assert confirmed.confirmed_by_window_sequence_number == 13
+    assert confirmed.positive_window_count == 3
+    assert confirmed.confidence == 0.61
+
+
+def test_detector_adapter_prunes_old_positive_windows_before_confirmation() -> None:
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.91),
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.92),
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.93),
+        )
+    )
+    adapter = build_first_crack_detector_adapter(
+        FirstCrackConfig(min_positive_windows=2, confirmation_window_seconds=5.0),
+        _resolved_detector_artifacts(),
+        backend,
+    )
+
+    first = adapter.process_window(
+        _audio_window(sequence_number=1, started_at_monotonic_seconds=100.0)
+    )
+    second = adapter.process_window(
+        _audio_window(sequence_number=2, started_at_monotonic_seconds=106.0)
+    )
+    confirmed = adapter.process_window(
+        _audio_window(sequence_number=3, started_at_monotonic_seconds=109.0)
+    )
+
+    assert first is None
+    assert second is None
+    assert confirmed is not None
+    assert confirmed.detected_at_monotonic_seconds == 107.0
+    assert confirmed.window_sequence_number == 2
+    assert confirmed.confirmed_by_window_sequence_number == 3
 
 
 @pytest.mark.parametrize("confidence", (-0.01, 1.01, float("nan")))
@@ -327,6 +412,21 @@ def test_released_onnx_backend_returns_unconfirmed_below_threshold(tmp_path: Pat
     assert output.confirmed is False
     assert output.confidence is not None
     assert abs(output.confidence - 0.00033535) < 0.000001
+
+
+def test_released_onnx_backend_uses_configured_confidence_threshold(tmp_path: Path) -> None:
+    backend = build_released_onnx_first_crack_detector_backend(
+        FirstCrackConfig(mode="audio", confidence_threshold=0.6),
+        _resolved_detector_artifacts_with_files(tmp_path),
+        session_factory=lambda _path, _threads: FakeOnnxSession(((0.0, 0.5),)),
+        feature_extractor_factory=lambda _path: FakeFeatureExtractor(),
+    )
+
+    output = backend.detect(_audio_window(sample_rate=16_000))
+
+    assert output.confirmed is True
+    assert output.confidence is not None
+    assert abs(output.confidence - 0.622459) < 0.000001
 
 
 def test_released_onnx_backend_rejects_non_audio_mode(tmp_path: Path) -> None:

@@ -483,6 +483,12 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
             "repo_id": None,
             "revision": None,
             "precision": None,
+            "onnx_model_filename": None,
+            "feature_extractor_filename": None,
+            "confidence": None,
+            "confidence_threshold": None,
+            "min_positive_windows": None,
+            "confirmation_window_seconds": None,
         }
         assert export_summary["metrics"]["development_percent"] is not None
         assert export_summary["metrics"]["roast_elapsed_seconds"] is not None

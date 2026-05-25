@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 from pathlib import Path
 from types import MethodType
@@ -110,6 +110,14 @@ class FirstCrackDetectionEvent:
         onnx_model_filename: Repository-relative ONNX model artifact.
         feature_extractor_filename: Repository-relative feature extractor artifact.
         window_sequence_number: Source audio window sequence number.
+        confirmed_by_window_sequence_number: Window sequence number that met
+            the configured recent-positive confirmation rule.
+        positive_window_count: Positive detector windows currently inside the
+            confirmation window.
+        confidence_threshold: Configured detector confidence threshold.
+        min_positive_windows: Configured positive-window count required for
+            confirmation.
+        confirmation_window_seconds: Configured recent-positive window span.
         detected_at_inferred: Whether the detection timestamp was inferred from
             the source window end because the backend omitted an explicit timestamp.
     """
@@ -123,6 +131,11 @@ class FirstCrackDetectionEvent:
     onnx_model_filename: str
     feature_extractor_filename: str
     window_sequence_number: int
+    confirmed_by_window_sequence_number: int
+    positive_window_count: int
+    confidence_threshold: float
+    min_positive_windows: int
+    confirmation_window_seconds: float
     detected_at_inferred: bool
 
     def payload(self) -> dict[str, str | int | float | None]:
@@ -136,6 +149,11 @@ class FirstCrackDetectionEvent:
             "onnx_model_filename": self.onnx_model_filename,
             "feature_extractor_filename": self.feature_extractor_filename,
             "window_sequence_number": self.window_sequence_number,
+            "confirmed_by_window_sequence_number": self.confirmed_by_window_sequence_number,
+            "positive_window_count": self.positive_window_count,
+            "confidence_threshold": self.confidence_threshold,
+            "min_positive_windows": self.min_positive_windows,
+            "confirmation_window_seconds": self.confirmation_window_seconds,
         }
         if self.confidence is not None:
             payload["confidence"] = self.confidence
@@ -143,24 +161,34 @@ class FirstCrackDetectionEvent:
 
 
 @dataclass(frozen=True)
+class _PositiveWindowCandidate:
+    event: FirstCrackDetectionEvent
+
+
+@dataclass
 class FirstCrackDetectorAdapter:
     """Adapt detector backend outputs into confirmed first-crack event candidates."""
 
     config: FirstCrackConfig
     artifacts: ResolvedDetectorArtifacts
     backend: FirstCrackDetectorBackend
+    _positive_candidates: list[_PositiveWindowCandidate] = field(
+        default_factory=lambda: cast(list[_PositiveWindowCandidate], [])
+    )
 
     def process_window(self, window: AudioWindow) -> FirstCrackDetectionEvent | None:
         """Process one audio window and return a confirmed event candidate if present."""
         output = self.backend.detect(window)
         if type(output.confirmed) is not bool:
             raise FirstCrackDetectorError("detector output confirmed must be a boolean.")
+        _validate_confirmation_config(self.config)
+        self._prune_positive_candidates(window.started_at_monotonic_seconds)
         if not output.confirmed:
             return None
 
         confidence = _validate_optional_confidence(output.confidence)
         detected_at_monotonic_seconds = _detection_timestamp(window, output)
-        return FirstCrackDetectionEvent(
+        candidate = FirstCrackDetectionEvent(
             kind="first_crack_detected",
             detected_at_monotonic_seconds=detected_at_monotonic_seconds,
             precision=self.config.precision,
@@ -170,8 +198,32 @@ class FirstCrackDetectorAdapter:
             onnx_model_filename=self.artifacts.onnx_model.filename,
             feature_extractor_filename=self.artifacts.feature_extractor_config.filename,
             window_sequence_number=window.sequence_number,
+            confirmed_by_window_sequence_number=window.sequence_number,
+            positive_window_count=1,
+            confidence_threshold=self.config.confidence_threshold,
+            min_positive_windows=self.config.min_positive_windows,
+            confirmation_window_seconds=self.config.confirmation_window_seconds,
             detected_at_inferred=output.detected_at_monotonic_seconds is None,
         )
+        self._positive_candidates.append(_PositiveWindowCandidate(event=candidate))
+        self._prune_positive_candidates(detected_at_monotonic_seconds)
+        if len(self._positive_candidates) < self.config.min_positive_windows:
+            return None
+
+        earliest = self._positive_candidates[0].event
+        return replace(
+            earliest,
+            confirmed_by_window_sequence_number=window.sequence_number,
+            positive_window_count=len(self._positive_candidates),
+        )
+
+    def _prune_positive_candidates(self, current_monotonic_seconds: float) -> None:
+        cutoff = current_monotonic_seconds - self.config.confirmation_window_seconds
+        self._positive_candidates = [
+            candidate
+            for candidate in self._positive_candidates
+            if candidate.event.detected_at_monotonic_seconds >= cutoff
+        ]
 
 
 @dataclass(frozen=True)
@@ -293,6 +345,7 @@ def build_released_onnx_first_crack_detector_backend(
         session=create_session(artifacts.onnx_model.local_path, config.onnx_threads),
         feature_extractor=create_feature_extractor(artifacts.feature_extractor_config.local_path),
         preprocessor_config=preprocessor_config,
+        confidence_threshold=config.confidence_threshold,
     )
 
 
@@ -422,6 +475,25 @@ def _validate_optional_confidence(confidence: float | None) -> float | None:
     if not math.isfinite(normalized) or not 0.0 <= normalized <= 1.0:
         raise FirstCrackDetectorError("detector output confidence must be between 0 and 1.")
     return normalized
+
+
+def _validate_confirmation_config(config: FirstCrackConfig) -> None:
+    if (
+        not math.isfinite(config.confidence_threshold)
+        or not 0.0 <= config.confidence_threshold <= 1.0
+    ):
+        raise FirstCrackDetectorError(
+            "first_crack.confidence_threshold must be finite and between 0 and 1."
+        )
+    if config.min_positive_windows <= 0:
+        raise FirstCrackDetectorError("first_crack.min_positive_windows must be greater than 0.")
+    if (
+        not math.isfinite(config.confirmation_window_seconds)
+        or config.confirmation_window_seconds <= 0
+    ):
+        raise FirstCrackDetectorError(
+            "first_crack.confirmation_window_seconds must be greater than 0."
+        )
 
 
 def _load_onnx_preprocessor_config(path: Path) -> OnnxPreprocessorConfig:

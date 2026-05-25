@@ -209,6 +209,11 @@ def test_confirmed_detector_output_records_first_crack_event_once() -> None:
         "onnx_model_filename": "onnx/int8/model_quantized.onnx",
         "feature_extractor_filename": "onnx/int8/preprocessor_config.json",
         "window_sequence_number": 11,
+        "confirmed_by_window_sequence_number": 11,
+        "positive_window_count": 1,
+        "confidence_threshold": 0.9,
+        "min_positive_windows": 1,
+        "confirmation_window_seconds": 20.0,
         "confidence": 0.91,
     }
     assert len(first_result.session.event_timeline) == 2

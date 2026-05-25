@@ -39,6 +39,18 @@ architecture, original prototype, Hugging Face model/dataset/demo links, and
 README wording that frames this package as the consolidated deterministic
 rebuild of the prototype.
 
+E7-S6a is complete and routes next to E7-S6 / issue #112. The MCP
+first-crack runtime now supports configurable confidence threshold, recent
+positive-window confirmation, confirmation window seconds, and audio overlap or
+hop settings. Detector-paced WAV replay with the committed E7-S5a fixture and
+pinned released INT8 Hugging Face revision
+`b349a919c34b6130472da97c01817be404e4f629` detected first crack at
+`10.017558290999885` seconds after T0 inside the `3.82710390663442-20.0`
+second label interval, with `3` emitted windows, `3` processed windows, and
+`0` dropped windows. Live Hottop validation, real microphone validation, full
+Warp manual roast validation, live publishing, and hardware-ready labeling
+remain out of scope until E7-S6.
+
 Epic 3 is complete. The Hottop driver now has validated lifecycle, command-loop,
 packet, temperature-unit, heat, fan, drop, cooling, cleanup, and emergency-stop
 behavior at the driver boundary. The full connected-Hottop E3-S9 validation run
