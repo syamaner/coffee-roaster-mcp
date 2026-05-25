@@ -16,9 +16,9 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: Bootstrap
-- Active story: `E7-S5a`
-- Current target: open the labelled WAV replay validation PR and route next to
-  `E7-S5` release checklist work
+- Active story: `E7-S5`
+- Current target: produce the v0.1 release checklist and route next to `E7-S6`
+  end-to-end agent roast validation
 - Latest package release: `v0.1.2` metadata-only release for related project
   links
 - Product/display name: `RoastPilot`
@@ -90,6 +90,15 @@ The first implementation milestone is a mock vertical slice that requires no roa
   `b349a919c34b6130472da97c01817be404e4f629`, detector-paced WAV replay, and
   public MCP tools to start, mark T0, poll until first crack, validate the
   reported time against labels, and export logs.
+- `E7-S5` documents the v0.1 release checklist in `docs/release.md`, grounded
+  in the current `v0.1.2` package/registry metadata state and the E7-S5a pinned
+  Hugging Face first-crack revision
+  `b349a919c34b6130472da97c01817be404e4f629`. The checklist covers required
+  local/CI checks, package build and built-wheel smoke validation, version
+  alignment, PyPI publish, MCP Registry publish, GitHub release notes, and the
+  hardware-ready labeling policy. It does not execute live Hottop validation,
+  real microphone validation, full end-to-end agent roast validation, model
+  training/export/sync, live publishing, or hardware-ready labeling.
 - `E2-S1` keeps the initial MCP tool surface bootstrap-safe with `get_server_info` and `get_runtime_config`. Roast-session lifecycle and roast-control tools remain later Epic 2 work.
 - `E2-S2` uses one in-process `RoastSessionStore` with at most one active `RoastSession` at a time. Session state now owns monotonic timing, phase, event timeline storage, telemetry retention, and log-writer references before tool wiring lands.
 - `E2-S3` keeps event writes behind `RoastSessionStore.record_event(...)`. The session timeline now records deterministic append order, authoritative UTC plus monotonic timestamps for core roast events, and idempotent singleton handling for beans added, first crack, bean drop, and cooling transitions.
@@ -878,8 +887,16 @@ Goal: prove the package works from install through mock roast, MCP client calls,
     `emitted_window_count: 2`, `processed_window_count: 2`, and
     `dropped_window_count: 0`.
 
-- [ ] `E7-S5` Produce v0.1 release checklist.
+- [x] `E7-S5` Produce v0.1 release checklist.
   - Done when release steps cover tests, package build, version alignment, HF revision pin, PyPI publish, registry publish, GitHub release, and hardware-ready labeling.
+  - Implemented in `docs/release.md` with the current `v0.1.2` metadata state,
+    the E7-S5a pinned Hugging Face first-crack revision
+    `b349a919c34b6130472da97c01817be404e4f629`, release dry-run guidance,
+    package build and built-wheel smoke checks, PyPI/MCP Registry publish
+    sequencing, GitHub Release follow-up, and explicit hardware-ready labeling
+    prerequisites. Live Hottop validation, real microphone validation, full
+    end-to-end agent roast validation, live publishing, and hardware-ready
+    labeling remain out of scope for this story.
 
 - [ ] `E7-S6` Run end-to-end agent roast validation with HF ONNX audio path.
   - Done when a real MCP client or agent can install/connect to the package and
@@ -2203,3 +2220,18 @@ After completing a story:
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
   - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
   - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.0`.
+- Validation run for E7-S5:
+  - Added the v0.1 release checklist to `docs/release.md`.
+  - Confirmed the checklist covers required local/CI checks, release dry run,
+    `python -m build`, built-wheel install smoke validation, package/server
+    metadata version alignment, the pinned E7-S5a Hugging Face first-crack
+    revision `b349a919c34b6130472da97c01817be404e4f629`, PyPI publishing,
+    MCP Registry publishing, GitHub Release follow-up, and hardware-ready
+    labeling prerequisites.
+  - Kept live Hottop validation, real microphone validation, full end-to-end
+    agent roast validation, model training/export/sync, live PyPI/MCP Registry
+    publishing, and hardware-ready release labeling out of scope.
+  - Ran `./.venv/bin/python -m pytest tests/test_server_json.py tests/test_release_workflow.py tests/test_readme.py tests/test_package.py::test_version_is_defined tests/test_package.py::test_main_prints_version`:
+    15 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
