@@ -15,13 +15,15 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Active Context
 
-- Current phase: Bootstrap
-- Active story: `E7-S6`
-- Current target: run the full E7-S6 manual Warp roast validation with
-  released Hugging Face ONNX audio inference, real microphone input, and
-  supervised Hottop hardware control
-- Latest package release: `v0.1.2` metadata-only release for related project
-  links
+- Current phase: v0.1 complete and live-validated end-to-end (E7-S6 done)
+- Active story: none — all v0.1 stories complete
+- Current target: post-validation follow-ups — ship the `server.json`
+  `packageArguments: serve` fix in the next release, and extend
+  `get_runtime_config` (`RuntimeConfigSnapshot`) with detector-profile,
+  model-revision, and audio capture fields so MCP clients can verify the
+  active first-crack configuration through the tool surface
+- Latest package release: `v0.1.3` (used for the E7-S6 live validation
+  roasts)
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -952,7 +954,8 @@ Goal: prove the package works from install through mock roast, MCP client calls,
     `10.017558290999885` seconds after T0 with `3` emitted windows, `3`
     processed windows, and `0` dropped windows.
 
-- [ ] `E7-S6` Run end-to-end agent roast validation with HF ONNX audio path.
+- [x] `E7-S6` Run end-to-end agent roast validation with HF ONNX audio path.
+  - Issue: #112.
   - Done when a real MCP client or agent can install/connect to the package and
     run a full roast flow using public MCP tools, configured Hottop hardware,
     released Hugging Face ONNX first-crack artifacts, and real microphone/audio
@@ -960,6 +963,30 @@ Goal: prove the package works from install through mock roast, MCP client calls,
     status/metadata, roaster device state, Epic 5 metrics/stat fields,
     exported logs, configuration, artifact revision, hardware/audio setup, and
     operator interventions.
+  - Completed on 2026-06-07 with two supervised live roasts through Warp using
+    the published PyPI `coffee-roaster-mcp==0.1.3` package on
+    `/dev/cu.usbserial-DN016OJ3` with the `USB PnP Audio Device` microphone
+    and pinned INT8 revision `b349a919c34b6130472da97c01817be404e4f629`.
+    Roast 1 (session `c5707681...`) validated the live path with manual T0 and
+    the default detector profile (audio-detected FC at +09:01, confidence
+    0.9066 >= 0.9). Roast 2 (session `f97fc99b...`) ran the prescribed E7-S6
+    profile exactly: YAML-configured auto-T0 recorded `beans_added` from the
+    30 C charge drop (charge 186 C -> 156 C, `source: auto_t0`), and the
+    sliding-window detector (threshold 0.6, min_positive_windows 5, window
+    10.0 s, overlap 0.7) confirmed first crack at +08:56 with confidence
+    0.9074 and 5 positive windows (sequence 337 confirmed by 343). Zero manual
+    overrides, zero serial/control/telemetry errors across 14k+ status
+    packets, full drop/cooling lifecycle, and exported
+    `roast.jsonl`/`roast.csv`/`summary.json` with complete first-crack and
+    auto-T0 metadata. A same-day full guarded `hottop-validate` run (drop and
+    emergency stop included) passed 8/8 steps on the published package with
+    `hardware_ready_release_label_allowed: true`. Evidence committed under
+    `docs/validation/2026-06-07-live-roast/` and summarized in
+    `docs/session-summaries/2026-06-07-roast-day-validation.md` plus the
+    roast summaries. Findings: `server.json` needed
+    `packageArguments: serve` for purely registry-driven launches (fixed in
+    repo for the next release), and `get_runtime_config` does not yet expose
+    detector-profile/audio fields (follow-up).
 
 ### Epic Acceptance Criteria
 

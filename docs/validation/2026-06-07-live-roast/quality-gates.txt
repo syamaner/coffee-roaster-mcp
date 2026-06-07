@@ -1,0 +1,6 @@
+........................................................................ [ 91%]
+..................................                                       [100%]
+All checks passed!
+33 files already formatted
+0 errors, 0 warnings, 0 informations
+coffee-roaster-mcp 0.1.3

@@ -16,6 +16,12 @@
       "identifier": "coffee-roaster-mcp",
       "version": "0.1.3",
       "runtimeHint": "uvx",
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve"
+        }
+      ],
       "transport": {
         "type": "stdio"
       }

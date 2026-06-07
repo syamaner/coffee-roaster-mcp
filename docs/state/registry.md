@@ -8,7 +8,7 @@
 - Repository: `syamaner/coffee-roaster-mcp`
 - Package: `coffee-roaster-mcp`
 - MCP Registry name: `io.github.syamaner/coffee-roaster-mcp`
-- Current phase: Bootstrap
+- Current phase: v0.1 validated end-to-end (E7-S6 complete)
 
 ## Working Rules
 
@@ -39,7 +39,27 @@ architecture, original prototype, Hugging Face model/dataset/demo links, and
 README wording that frames this package as the consolidated deterministic
 rebuild of the prototype.
 
-E7-S6a is complete and routes next to E7-S6 / issue #112. The MCP
+E7-S6 / issue #112 is complete: on 2026-06-07 two supervised live roasts ran
+through Warp using the published PyPI `coffee-roaster-mcp==0.1.3` package on
+connected Hottop hardware (`/dev/cu.usbserial-DN016OJ3`) with the
+`USB PnP Audio Device` microphone and pinned INT8 revision
+`b349a919c34b6130472da97c01817be404e4f629`. The second roast ran the
+prescribed profile exactly: YAML-configured auto-T0 recorded `beans_added`
+from the bean-temperature drop (charge 186 C, drop 30 C over the 25 C
+threshold, `source: auto_t0`), and the sliding-window detector (threshold
+0.6, min_positive_windows 5, window 10.0 s, overlap 0.7) audio-detected
+first crack at +08:56 with confidence 0.9074 and 5 positive windows. Zero
+manual overrides and zero serial/control/telemetry errors; full
+drop/cooling lifecycle and JSONL/CSV/summary export with complete metadata.
+A same-day full guarded `hottop-validate` run (drop and emergency stop
+included) passed 8/8 on the published package. Evidence is committed under
+`docs/validation/2026-06-07-live-roast/` with summaries in
+`docs/session-summaries/`. `server.json` now carries
+`packageArguments: serve` for registry-driven launches (ships with the next
+release); extending `get_runtime_config` with detector-profile and audio
+fields is a recorded follow-up.
+
+E7-S6a is complete and routed to E7-S6 / issue #112. The MCP
 first-crack runtime now supports configurable confidence threshold, recent
 positive-window confirmation, confirmation window seconds, and audio overlap or
 hop settings. Detector-paced WAV replay with the committed E7-S5a fixture and
