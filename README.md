@@ -10,24 +10,37 @@ and listed in the MCP Registry as
 
 RoastPilot provides one local MCP runtime for roaster control, telemetry, first-crack detection integration, roast metrics, and log export.
 
-**Validation status: the v0.1 end-to-end production path is complete and
-verified on real hardware.** On 2026-06-07 the published `coffee-roaster-mcp`
-0.1.3 package, installed through the MCP Registry `uvx` path into the Warp
-agent, ran two complete supervised roasts on a connected Hottop KN-8828B-2K+:
-automatic T0 charge detection from bean-temperature drop, live audio
-first-crack detection by the released INT8 ONNX model on a real USB
-microphone (sliding-window confirmation: confidence 0.907 over a 0.6
-threshold with 5 positive windows), driver-backed heat/fan/drop/cooling
-control, and full JSONL/CSV/summary log export — with zero serial, control,
-or telemetry faults. The same-day guarded `hottop-validate` run (including
-drop and emergency stop) passed 8/8 steps on the published package. See
-`docs/session-summaries/2026-06-07-roast-day-validation.md` and
-`docs/session-summaries/2026-06-07-live-roast-test-summary.md` for the full
-evidence, with committed artifacts under
-`docs/validation/2026-06-07-live-roast/`.
+## Status
 
-See `docs/plans/coffee-roaster-mcp-v0.1-overall-plan.md` and
-`docs/state/registry.md` for the plan and state history.
+✅ **v0.1 complete — verified end-to-end on real hardware (2026-06-07).**
+
+The published `coffee-roaster-mcp` 0.1.3 package, installed through the MCP
+Registry `uvx` path into the Warp agent, ran two complete supervised roasts
+on a connected Hottop KN-8828B-2K+ with zero serial, control, or telemetry
+faults:
+
+| Validated | Result |
+| --- | --- |
+| Install path | Published PyPI 0.1.3 via `uvx` in a real MCP client (Warp) |
+| Hardware control | Live heat/fan/drop/cooling through the driver-backed MCP tools |
+| Automatic T0 | `beans_added` detected from the bean-temperature charge drop (`source: auto_t0`) |
+| First-crack detection | Audio-detected live by the released INT8 ONNX model on a real USB microphone — sliding-window confirmation, confidence 0.907 over the 0.6 threshold with 5/5 positive windows |
+| Safety actions | Same-day guarded `hottop-validate` run passed 8/8 steps, including drop and emergency stop |
+| Log export | `roast.jsonl`, `roast.csv`, and `summary.json` with full first-crack and auto-T0 metadata |
+
+Evidence:
+
+- [Roast-day validation report](docs/session-summaries/2026-06-07-roast-day-validation.md)
+  (formal pass/fail analysis, both roasts)
+- [Roast #1 test summary](docs/session-summaries/2026-06-07-live-roast-test-summary.md)
+  and [Roast #2 auto-validation summary](docs/session-summaries/2026-06-07-roast-2-auto-validation.md)
+  (timelines, metrics, screenshots)
+- [Committed artifacts](docs/validation/2026-06-07-live-roast/)
+  (roast logs, guarded-validation JSON, transcripts, screenshots, checksums)
+
+See the [v0.1 overall plan](docs/plans/coffee-roaster-mcp-v0.1-overall-plan.md)
+and the [project state registry](docs/state/registry.md) for the plan and
+state history.
 
 ## Related Project Artifacts
 
@@ -80,8 +93,8 @@ python -m pip install coffee-roaster-mcp
 ```
 
 For operator setup, including mock install, Hottop configuration, Hugging Face
-model configuration, offline model paths, and log output paths, see
-`docs/install-and-hardware-setup.md`.
+model configuration, offline model paths, and log output paths, see the
+[install and hardware setup guide](docs/install-and-hardware-setup.md).
 
 ## Local Development
 
@@ -237,8 +250,9 @@ This confirms the bootstrap defaults are still aligned with the mock vertical-sl
 
 ## Hottop Configuration And Validation
 
-The concise setup path is in `docs/install-and-hardware-setup.md`; this section
-summarizes the guarded validation workflow.
+The concise setup path is in the
+[install and hardware setup guide](docs/install-and-hardware-setup.md); this
+section summarizes the guarded validation workflow.
 
 Hottop support lives behind the `RoasterDriver` abstraction. The driver has
 lifecycle, command-loop, packet, control-state, and temperature-unit support,
@@ -300,7 +314,8 @@ be treated as a failed validation and should not be required by normal CI.
 
 RoastPilot loads configuration from `coffee-roaster-mcp.yaml` in the current directory by default. If the file is absent, mock-safe defaults are used so local development does not require roaster hardware, audio hardware, or model downloads.
 
-See `docs/install-and-hardware-setup.md` for setup-focused examples covering
+See the [install and hardware setup guide](docs/install-and-hardware-setup.md)
+for setup-focused examples covering
 mock install, Hottop configuration, Hugging Face model configuration, offline
 model paths, and log output paths.
 
