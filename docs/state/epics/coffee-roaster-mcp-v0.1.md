@@ -15,13 +15,15 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Active Context
 
-- Current phase: Bootstrap
-- Active story: `E7-S6`
-- Current target: run the full E7-S6 manual Warp roast validation with
-  released Hugging Face ONNX audio inference, real microphone input, and
-  supervised Hottop hardware control
-- Latest package release: `v0.1.2` metadata-only release for related project
-  links
+- Current phase: v0.1 complete and live-validated end-to-end (E7-S6 done)
+- Active story: none — all v0.1 stories complete
+- Current target: post-validation follow-ups — ship the `server.json`
+  `packageArguments: serve` fix in the next release, and extend
+  `get_runtime_config` (`RuntimeConfigSnapshot`) with detector-profile,
+  model-revision, and audio capture fields so MCP clients can verify the
+  active first-crack configuration through the tool surface
+- Latest package release: `v0.1.3` (used for the E7-S6 live validation
+  roasts)
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`

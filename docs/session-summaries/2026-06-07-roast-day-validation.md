@@ -145,8 +145,8 @@ recorded in `docs/state/epics/coffee-roaster-mcp-v0.1.md`.
 ## Roast #2 — E7-S6 Prescribed Auto Validation (same day)
 
 A second supervised roast (session `f97fc99b24e948e79954361364257b0e`,
-13:05–13:28 UTC) completed the E7-S6 evidence exactly as prescribed in issue
-#112, with zero manual overrides:
+13:05–13:28 UTC) completed the E7-S6 evidence exactly as prescribed in
+issue #112, with zero manual overrides:
 
 - Configuration solely from the prescribed YAML via
   `COFFEE_ROASTER_MCP_CONFIG` (confirmed by `config_source`); YAML-enabled
