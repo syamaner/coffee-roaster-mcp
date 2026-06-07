@@ -8,9 +8,26 @@ The package name is `coffee-roaster-mcp`. It is published on production PyPI
 and listed in the MCP Registry as
 `io.github.syamaner/coffee-roaster-mcp`.
 
-RoastPilot will provide one local MCP runtime for roaster control, telemetry, first-crack detection integration, roast metrics, and log export.
+RoastPilot provides one local MCP runtime for roaster control, telemetry, first-crack detection integration, roast metrics, and log export.
 
-The project is currently in bootstrap. See `docs/plans/coffee-roaster-mcp-v0.1-overall-plan.md` and `docs/state/registry.md` for the active plan and state.
+**Validation status: the v0.1 end-to-end production path is complete and
+verified on real hardware.** On 2026-06-07 the published `coffee-roaster-mcp`
+0.1.3 package, installed through the MCP Registry `uvx` path into the Warp
+agent, ran two complete supervised roasts on a connected Hottop KN-8828B-2K+:
+automatic T0 charge detection from bean-temperature drop, live audio
+first-crack detection by the released INT8 ONNX model on a real USB
+microphone (sliding-window confirmation: confidence 0.907 over a 0.6
+threshold with 5 positive windows), driver-backed heat/fan/drop/cooling
+control, and full JSONL/CSV/summary log export — with zero serial, control,
+or telemetry faults. The same-day guarded `hottop-validate` run (including
+drop and emergency stop) passed 8/8 steps on the published package. See
+`docs/session-summaries/2026-06-07-roast-day-validation.md` and
+`docs/session-summaries/2026-06-07-live-roast-test-summary.md` for the full
+evidence, with committed artifacts under
+`docs/validation/2026-06-07-live-roast/`.
+
+See `docs/plans/coffee-roaster-mcp-v0.1-overall-plan.md` and
+`docs/state/registry.md` for the plan and state history.
 
 ## Related Project Artifacts
 
@@ -29,7 +46,7 @@ server, conservative hardware boundaries, and releaseable package metadata.
 
 RoastPilot is the human-facing product name. `coffee-roaster-mcp` is the infrastructure and packaging name used for the repository, Python package, and future distribution.
 
-The v0.1 direction is one local stdio MCP server that will own:
+The v0.1 scope is one local stdio MCP server that owns:
 
 - roaster control
 - roast session timing and events
@@ -37,7 +54,13 @@ The v0.1 direction is one local stdio MCP server that will own:
 - derived roast metrics
 - roast log export
 
-The current repo state is still bootstrap. The package scaffold, config loading, local development commands, pull-request CI, stdio MCP entrypoint, mock roast-session tool surface, one-process mock vertical slice, release workflow, and MCP Registry metadata are in place.
+All v0.1 epics are complete and live-validated. The package scaffold, config
+loading, local development commands, pull-request CI, stdio MCP entrypoint,
+roast-session tool surface, Hottop driver, audio first-crack runtime,
+automatic T0 path, metrics/log export, release workflow, and MCP Registry
+metadata are in place, and the full end-to-end path has been verified on
+connected Hottop hardware with a real microphone through the published
+package (E7-S6).
 
 ## Install
 
@@ -217,7 +240,13 @@ This confirms the bootstrap defaults are still aligned with the mock vertical-sl
 The concise setup path is in `docs/install-and-hardware-setup.md`; this section
 summarizes the guarded validation workflow.
 
-Hottop support lives behind the `RoasterDriver` abstraction. The current driver has lifecycle, command-loop, packet, control-state, and temperature-unit support, but it still requires guarded manual validation before any hardware-ready release label.
+Hottop support lives behind the `RoasterDriver` abstraction. The driver has
+lifecycle, command-loop, packet, control-state, and temperature-unit support,
+and has passed the full guarded validation (including drop and emergency
+stop) on connected hardware — most recently on 2026-06-07 against the
+published 0.1.3 PyPI package, followed by two complete supervised live
+roasts through the MCP tool surface. Guarded manual validation remains the
+required procedure before operating any new hardware setup.
 
 Configuration lives in `coffee-roaster-mcp.yaml`. Keep local development on the mock driver unless you are intentionally validating connected Hottop hardware:
 
