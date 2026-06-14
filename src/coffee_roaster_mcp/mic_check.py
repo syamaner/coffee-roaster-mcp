@@ -86,8 +86,13 @@ class MicCheckReport:
         rms_mean: Mean RMS across the captured chunks.
         peak_amplitude: Largest absolute sample seen.
         audio_detected: Whether `rms_max` cleared `rms_floor` (real signal).
-        error: Capture/enumeration error message, if any.
-        passed: Device available AND opened AND real audio detected.
+        device_warning: Non-fatal note, e.g. the configured device did not match
+            an input by name (it may still be a valid index / platform id).
+        error: Capture/enumeration/configuration error message, if any.
+        passed: Real audio was captured above the floor. The capture is bound to
+            the configured device, so this implies the device opened and
+            delivered signal; name-matching is diagnostic only (a numeric/index
+            device id need not match a name).
     """
 
     source: str
@@ -100,6 +105,7 @@ class MicCheckReport:
     rms_mean: float = 0.0
     peak_amplitude: float = 0.0
     audio_detected: bool = False
+    device_warning: str | None = None
     error: str | None = None
     passed: bool = False
 
@@ -112,10 +118,15 @@ def _default_device_lister() -> Sequence[str]:
         raise AudioCaptureError(
             "Microphone enumeration requires the sounddevice package and PortAudio runtime."
         ) from exc
-    devices: Any = sounddevice.query_devices()
-    return [
-        str(device["name"]) for device in devices if int(device.get("max_input_channels", 0)) > 0
-    ]
+    try:
+        devices: Any = sounddevice.query_devices()
+        return [
+            str(device["name"])
+            for device in devices
+            if int(device.get("max_input_channels", 0)) > 0
+        ]
+    except Exception as exc:  # noqa: BLE001 - PortAudio backend errors vary by platform.
+        raise AudioCaptureError(f"Microphone enumeration failed: {exc}") from exc
 
 
 def _match_device(selector: str | None, available: Sequence[str]) -> str | None:
@@ -163,15 +174,44 @@ def run_mic_check(
     factory = audio_input_factory or build_configured_audio_input
     lister = device_lister or _default_device_lister
 
+    # Reject configurations that would make a "pass" meaningless.
+    if settings.source != "microphone":
+        return MicCheckReport(
+            source=settings.source,
+            configured_device=settings.input_device,
+            matched_device=None,
+            error=(
+                f"mic-check requires audio.source=microphone; configured source is "
+                f"{settings.source!r}. A wav source would 'pass' from a file, not the mic."
+            ),
+        )
+    if options.rms_floor <= 0:
+        return MicCheckReport(
+            source=settings.source,
+            configured_device=settings.input_device,
+            matched_device=None,
+            error=(
+                f"rms_floor must be > 0 (got {options.rms_floor}); "
+                "a non-positive floor passes silence."
+            ),
+        )
+
     available: list[str] = []
     matched: str | None = None
     device_found = False
+    device_warning: str | None = None
     try:
         available = list(lister())
         matched = _match_device(settings.input_device, available)
         device_found = (matched is not None) or (
             settings.input_device is None and len(available) > 0
         )
+        if settings.input_device is not None and matched is None and available:
+            device_warning = (
+                f"configured device {settings.input_device!r} did not match an input by name "
+                f"(available: {available}); if it is a device index or platform id this is fine, "
+                "otherwise verify the device is connected."
+            )
     except AudioCaptureError as exc:
         return MicCheckReport(
             source=settings.source,
@@ -208,6 +248,7 @@ def run_mic_check(
             available_input_devices=available,
             device_found=device_found,
             chunks_read=len(rms_values),
+            device_warning=device_warning,
             error=str(exc),
         )
 
@@ -225,7 +266,11 @@ def run_mic_check(
         rms_mean=round(rms_mean, 6),
         peak_amplitude=round(peak, 6),
         audio_detected=audio_detected,
-        passed=device_found and audio_detected,
+        device_warning=device_warning,
+        # Real audio captured above the floor. The capture is bound to the
+        # configured device, so this implies the device opened + delivered
+        # signal; name-matching (device_found) is diagnostic only.
+        passed=audio_detected,
     )
 
 

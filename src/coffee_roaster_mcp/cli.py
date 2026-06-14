@@ -164,8 +164,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
 
+        floor = args.rms_floor if args.rms_floor > 0 else DEFAULT_RMS_FLOOR
+
         def _meter(rms: float, peak: float) -> None:
-            bar = "#" * min(40, int(rms / DEFAULT_RMS_FLOOR * 4))
+            bar = "#" * min(40, int(rms / floor * 4))
             print(f"  level {rms:7.4f} peak {peak:7.4f} |{bar}", file=sys.stderr, flush=True)
 
         report = run_mic_check(

@@ -75,8 +75,9 @@ def test_mic_check_fails_on_silence(tmp_path: Path) -> None:
     assert report.rms_max == 0.0
 
 
-def test_mic_check_fails_when_device_not_found(tmp_path: Path) -> None:
-    """The configured device not being among the inputs is a FAIL."""
+def test_mic_check_name_mismatch_is_diagnostic_not_a_gate(tmp_path: Path) -> None:
+    """A configured id that doesn't match a device NAME still passes if capture
+    delivers real audio (it may be a valid index/platform id) — but it warns."""
     report = run_mic_check(
         MicCheckOptions(
             config_path=_config(tmp_path, input_device="Nonexistent"), duration_seconds=0.3
@@ -86,7 +87,37 @@ def test_mic_check_fails_when_device_not_found(tmp_path: Path) -> None:
     )
     assert report.device_found is False
     assert report.matched_device is None
+    assert report.device_warning is not None  # surfaced for the operator
+    assert report.passed is True  # real audio captured — name-match is diagnostic only
+
+
+def test_mic_check_rejects_wav_source(tmp_path: Path) -> None:
+    """A wav source would 'pass' from a file, not the mic — reject it up front."""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "audio:\n  source: wav\n  wav_path: /tmp/x.wav\n  sample_rate: 16000\n",
+        encoding="utf-8",
+    )
+    report = run_mic_check(
+        MicCheckOptions(config_path=path, duration_seconds=0.3),
+        audio_input_factory=lambda _settings: ConstantAudioInput(0.2),
+        device_lister=lambda: _DEVICES,
+    )
     assert report.passed is False
+    assert report.error is not None
+    assert "microphone" in report.error
+
+
+def test_mic_check_rejects_nonpositive_floor(tmp_path: Path) -> None:
+    """A floor of 0 would pass silence — reject it."""
+    report = run_mic_check(
+        MicCheckOptions(config_path=_config(tmp_path), duration_seconds=0.3, rms_floor=0.0),
+        audio_input_factory=lambda _settings: ConstantAudioInput(0.0),
+        device_lister=lambda: _DEVICES,
+    )
+    assert report.passed is False
+    assert report.error is not None
+    assert "rms_floor" in report.error
 
 
 def test_mic_check_records_capture_error(tmp_path: Path) -> None:
