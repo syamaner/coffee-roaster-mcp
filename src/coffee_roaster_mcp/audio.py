@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import math
 import struct
 import time
@@ -287,6 +288,16 @@ class WavAudioInput:
         self.close()
 
 
+_LOGGER = logging.getLogger(__name__)
+
+#: A PortAudio input overflow is transient (the device dropped some input because
+#: a read missed its deadline, e.g. under CPU contention); the read still returns
+#: the samples it captured. Tolerate it and continue rather than killing capture,
+#: faulting only when overflows persist for this many *consecutive* reads, which
+#: signals the device genuinely cannot keep up rather than a momentary hiccup.
+_DEFAULT_MAX_CONSECUTIVE_OVERFLOWS = 30
+
+
 class MicrophoneAudioInput:
     """Read mono float samples from the configured system microphone."""
 
@@ -295,17 +306,24 @@ class MicrophoneAudioInput:
         settings: AudioCaptureSettings,
         *,
         sounddevice_module: Any | None = None,
+        max_consecutive_overflows: int = _DEFAULT_MAX_CONSECUTIVE_OVERFLOWS,
     ) -> None:
         """Configure a microphone input that opens lazily on first read.
 
         Args:
             settings: Validated audio capture settings.
             sounddevice_module: Optional injected sounddevice-compatible module for tests.
+            max_consecutive_overflows: Consecutive input overflows tolerated before
+                capture faults. A transient overflow is logged and the captured
+                samples are still returned; only a sustained run (the device cannot
+                keep up at all) raises ``AudioCaptureError``.
         """
         _validate_settings(settings)
         self._settings = settings
         self._sounddevice = sounddevice_module or _load_sounddevice()
         self._stream: Any | None = None
+        self._max_consecutive_overflows = max_consecutive_overflows
+        self._consecutive_overflows = 0
 
     def _ensure_stream(self) -> Any:
         if self._stream is not None:
@@ -339,9 +357,26 @@ class MicrophoneAudioInput:
         try:
             raw_data, overflowed = stream.read(sample_count)
         except Exception as exc:  # noqa: BLE001 - backend exceptions vary by platform.
+            # A genuine read failure (device gone, backend error) is still fatal.
             raise AudioCaptureError(f"Could not read microphone audio source: {exc}") from exc
         if overflowed:
-            raise AudioCaptureError("Microphone audio input overflowed.")
+            # Transient: the device dropped some input but `raw_data` still holds
+            # the samples it captured. Log, count, and keep going rather than
+            # killing capture for the whole roast; only a sustained run of
+            # consecutive overflows (the device cannot keep up at all) faults.
+            self._consecutive_overflows += 1
+            _LOGGER.warning(
+                "Microphone audio input overflowed (%d consecutive); continuing.",
+                self._consecutive_overflows,
+            )
+            if self._consecutive_overflows >= self._max_consecutive_overflows:
+                raise AudioCaptureError(
+                    "Microphone audio input overflowed on "
+                    f"{self._consecutive_overflows} consecutive reads; the device "
+                    "cannot keep up with the configured sample rate."
+                )
+        else:
+            self._consecutive_overflows = 0
         return tuple(float(sample[0]) for sample in struct.iter_unpack("f", bytes(raw_data)))
 
     def close(self) -> None:
