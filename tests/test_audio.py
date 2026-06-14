@@ -315,14 +315,51 @@ def test_microphone_audio_input_uses_configured_portaudio_stream() -> None:
     assert samples == (0.25, -0.5, 0.75)
 
 
-def test_microphone_audio_input_reports_overflow() -> None:
+def test_microphone_audio_input_tolerates_transient_overflow() -> None:
+    """A transient input overflow is non-fatal (#160): the captured samples still
+    come through and capture continues. Only a sustained run of consecutive
+    overflows (the device cannot keep up at all) faults."""
     FakeRawInputStream.created.clear()
     settings = audio_capture_settings_from_config(AudioConfig(source="microphone", sample_rate=4))
-    audio_input = MicrophoneAudioInput(settings, sounddevice_module=OverflowingSoundDeviceModule())
+    audio_input = MicrophoneAudioInput(
+        settings,
+        sounddevice_module=OverflowingSoundDeviceModule(),
+        max_consecutive_overflows=3,
+    )
 
     try:
-        with pytest.raises(AudioCaptureError, match="overflowed"):
+        # The first overflows do NOT raise; the samples captured despite the
+        # overflow are returned so detection keeps running.
+        assert audio_input.read_samples(1) == (0.25,)
+        assert audio_input.read_samples(1) == (-0.5,)
+        # The third consecutive overflow trips the sustained-failure backstop.
+        with pytest.raises(AudioCaptureError, match="consecutive"):
             audio_input.read_samples(1)
+    finally:
+        audio_input.close()
+
+
+def test_microphone_audio_input_resets_overflow_streak_on_clean_read() -> None:
+    """A clean read between overflows resets the consecutive-overflow counter, so
+    intermittent overflows never accumulate into a fault (#160)."""
+    FakeRawInputStream.created.clear()
+    settings = audio_capture_settings_from_config(AudioConfig(source="microphone", sample_rate=4))
+    audio_input = MicrophoneAudioInput(
+        settings,
+        sounddevice_module=FakeSoundDeviceModule(),
+        max_consecutive_overflows=2,
+    )
+
+    try:
+        audio_input.read_samples(1)  # opens the stream; clean read
+        stream = FakeRawInputStream.created[-1]
+        stream.overflowed = True
+        audio_input.read_samples(1)  # first consecutive overflow (streak = 1)
+        stream.overflowed = False
+        audio_input.read_samples(1)  # clean read resets the streak to 0
+        stream.overflowed = True
+        # A fresh streak: this is overflow #1 again, not #2, so it must not raise.
+        audio_input.read_samples(1)
     finally:
         audio_input.close()
 
