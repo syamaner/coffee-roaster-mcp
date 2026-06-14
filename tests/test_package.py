@@ -94,7 +94,7 @@ _EXPECTED_T0_STATUS_KEYS = {
 
 
 def test_version_is_defined() -> None:
-    assert __version__ == "0.1.3"
+    assert __version__ == "0.1.4"
 
 
 def test_cli_parser_program_name() -> None:
@@ -107,7 +107,7 @@ def test_main_without_subcommand_prints_help(capsys: pytest.CaptureFixture[str])
     assert main([]) == 0
     output = capsys.readouterr().out
     assert "usage: coffee-roaster-mcp" in output
-    assert "{serve,hottop-validate}" in output
+    assert "{serve,hottop-validate,mic-check}" in output
 
 
 def test_main_prints_version(capsys: pytest.CaptureFixture[str]) -> None:

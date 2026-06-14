@@ -3,7 +3,7 @@
   "name": "io.github.syamaner/coffee-roaster-mcp",
   "title": "RoastPilot",
   "description": "RoastPilot controls coffee roasting sessions through local stdio MCP tools and exports logs.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "websiteUrl": "https://github.com/syamaner/coffee-roaster-mcp#readme",
   "repository": {
     "url": "https://github.com/syamaner/coffee-roaster-mcp",
@@ -14,7 +14,7 @@
     {
       "registryType": "pypi",
       "identifier": "coffee-roaster-mcp",
-      "version": "0.1.3",
+      "version": "0.1.4",
       "runtimeHint": "uvx",
       "packageArguments": [
         {
