@@ -188,21 +188,25 @@ def test_confirmed_detector_output_records_first_crack_event_once() -> None:
         "first_crack_detected",
     ]
     assert session.phase == "development"
+    # FC is backdated to the confirming-window onset (seq 11 starts at 536.5,
+    # elapsed 36.5), not the detector timestamp 537.25 (#168). The raw
+    # confirmation timestamp stays in the payload.
     assert session.first_crack_at_utc == datetime(
         2026,
         5,
         17,
         14,
         0,
-        37,
-        250000,
+        36,
+        500000,
         tzinfo=UTC,
     )
-    assert session.first_crack_monotonic_seconds == 37.25
-    assert first_result.event.monotonic_seconds == 37.25
+    assert session.first_crack_monotonic_seconds == 36.5
+    assert first_result.event.monotonic_seconds == 36.5
     assert first_result.event.payload == {
         "source": "first_crack_detector",
-        "detected_at_monotonic_seconds": 537.25,
+        "detected_at_monotonic_seconds": 536.5,
+        "confirmed_at_monotonic_seconds": 537.25,
         "precision": "int8",
         "revision": "v0.1.0",
         "repo_id": "syamaner/coffee-first-crack-detection",
@@ -219,7 +223,8 @@ def test_confirmed_detector_output_records_first_crack_event_once() -> None:
     assert len(first_result.session.event_timeline) == 2
     assert [window.sequence_number for window in backend.windows] == [11]
     metrics = compute_roast_metrics(session, monotonic_now=clock.monotonic_now)
-    assert metrics.development_time_seconds == 2.75
+    # Development time grows because FC is backdated earlier (#168).
+    assert metrics.development_time_seconds == 3.5
 
 
 def test_automatic_detection_does_not_require_manual_override_permission() -> None:
@@ -274,9 +279,13 @@ def test_adapter_default_timestamp_records_when_window_end_is_slightly_ahead() -
 
     assert result is not None
     assert result.event.kind == "first_crack_detected"
-    assert result.event.monotonic_seconds == 1.25
-    assert result.event.payload["detected_at_monotonic_seconds"] == 502.0
-    assert session.first_crack_monotonic_seconds == 1.25
+    # FC backdates to the window onset (501.0, elapsed 1.0), which is no longer
+    # ahead of the integration clock; the inferred window end (502.0) is kept
+    # as the raw confirmation timestamp (#168).
+    assert result.event.monotonic_seconds == 1.0
+    assert result.event.payload["detected_at_monotonic_seconds"] == 501.0
+    assert result.event.payload["confirmed_at_monotonic_seconds"] == 502.0
+    assert session.first_crack_monotonic_seconds == 1.0
 
 
 def test_explicit_future_detector_timestamp_is_rejected() -> None:

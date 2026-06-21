@@ -120,6 +120,10 @@ class FirstCrackDetectionEvent:
         confirmation_window_seconds: Configured recent-positive window span.
         detected_at_inferred: Whether the detection timestamp was inferred from
             the source window end because the backend omitted an explicit timestamp.
+        confirmed_at_monotonic_seconds: Raw confirmation timestamp — the
+            detection timestamp of the window that satisfied the recent-positive
+            rule. `detected_at_monotonic_seconds` is backdated to the crack
+            onset (#168); this preserves the original audio-confirmation moment.
     """
 
     kind: FirstCrackDetectorEventKind
@@ -137,12 +141,14 @@ class FirstCrackDetectionEvent:
     min_positive_windows: int
     confirmation_window_seconds: float
     detected_at_inferred: bool
+    confirmed_at_monotonic_seconds: float
 
     def payload(self) -> dict[str, str | int | float | None]:
         """Return session-event payload metadata for this confirmed detection."""
         payload: dict[str, str | int | float | None] = {
             "source": "first_crack_detector",
             "detected_at_monotonic_seconds": self.detected_at_monotonic_seconds,
+            "confirmed_at_monotonic_seconds": self.confirmed_at_monotonic_seconds,
             "precision": self.precision,
             "revision": self.revision,
             "repo_id": self.repo_id,
@@ -163,6 +169,8 @@ class FirstCrackDetectionEvent:
 @dataclass(frozen=True)
 class _PositiveWindowCandidate:
     event: FirstCrackDetectionEvent
+    window_onset_monotonic_seconds: float
+    detected_at_monotonic_seconds: float
 
 
 @dataclass
@@ -188,6 +196,7 @@ class FirstCrackDetectorAdapter:
 
         confidence = _validate_optional_confidence(output.confidence)
         detected_at_monotonic_seconds = _detection_timestamp(window, output)
+        window_onset_monotonic_seconds = round(window.started_at_monotonic_seconds, 6)
         candidate = FirstCrackDetectionEvent(
             kind="first_crack_detected",
             detected_at_monotonic_seconds=detected_at_monotonic_seconds,
@@ -204,17 +213,32 @@ class FirstCrackDetectorAdapter:
             min_positive_windows=self.config.min_positive_windows,
             confirmation_window_seconds=self.config.confirmation_window_seconds,
             detected_at_inferred=output.detected_at_monotonic_seconds is None,
+            confirmed_at_monotonic_seconds=detected_at_monotonic_seconds,
         )
-        self._positive_candidates.append(_PositiveWindowCandidate(event=candidate))
+        self._positive_candidates.append(
+            _PositiveWindowCandidate(
+                event=candidate,
+                window_onset_monotonic_seconds=window_onset_monotonic_seconds,
+                detected_at_monotonic_seconds=detected_at_monotonic_seconds,
+            )
+        )
         self._prune_positive_candidates(detected_at_monotonic_seconds)
         if len(self._positive_candidates) < self.config.min_positive_windows:
             return None
 
-        earliest = self._positive_candidates[0].event
+        # Backdate the reported first crack to the ONSET of the confirming crack
+        # window — the start of the earliest positive window still inside the
+        # confirmation span — rather than the audio-confirmation tick (#168).
+        # The confirming window's detection timestamp is preserved as the raw
+        # confirmation moment, which the agent prompt is told lags the true
+        # crack (memory fc-detector-lag).
+        earliest = self._positive_candidates[0]
         return replace(
-            earliest,
+            earliest.event,
+            detected_at_monotonic_seconds=earliest.window_onset_monotonic_seconds,
             confirmed_by_window_sequence_number=window.sequence_number,
             positive_window_count=len(self._positive_candidates),
+            confirmed_at_monotonic_seconds=detected_at_monotonic_seconds,
         )
 
     def _prune_positive_candidates(self, current_monotonic_seconds: float) -> None:
@@ -222,7 +246,7 @@ class FirstCrackDetectorAdapter:
         self._positive_candidates = [
             candidate
             for candidate in self._positive_candidates
-            if candidate.event.detected_at_monotonic_seconds >= cutoff
+            if candidate.detected_at_monotonic_seconds >= cutoff
         ]
 
 
@@ -432,6 +456,7 @@ def integrate_first_crack_window_with_session(
         session,
         detected_at_monotonic_seconds=detection_event.detected_at_monotonic_seconds,
         max_future_seconds=future_tolerance,
+        confirmed_at_monotonic_seconds=detection_event.confirmed_at_monotonic_seconds,
         payload=detection_event.payload(),
     )
     return FirstCrackTimelineIntegrationResult(event=event, session=snapshot)

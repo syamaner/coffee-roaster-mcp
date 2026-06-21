@@ -151,7 +151,11 @@ def test_detector_adapter_maps_confirmed_output_to_first_crack_event() -> None:
 
     assert event is not None
     assert event.kind == "first_crack_detected"
-    assert event.detected_at_monotonic_seconds == 120.42
+    # FC is backdated to the confirming-window onset (window start 120.0),
+    # not the audio-detection timestamp 120.42 (#168). The raw confirmation
+    # timestamp stays available as confirmed_at_monotonic_seconds.
+    assert event.detected_at_monotonic_seconds == 120.0
+    assert event.confirmed_at_monotonic_seconds == 120.42
     assert event.precision == "fp32"
     assert event.revision == "v0.2.0"
     assert event.confidence == 0.87
@@ -167,7 +171,8 @@ def test_detector_adapter_maps_confirmed_output_to_first_crack_event() -> None:
     assert event.detected_at_inferred is False
     assert event.payload() == {
         "source": "first_crack_detector",
-        "detected_at_monotonic_seconds": 120.42,
+        "detected_at_monotonic_seconds": 120.0,
+        "confirmed_at_monotonic_seconds": 120.42,
         "precision": "fp32",
         "revision": "v0.2.0",
         "repo_id": "syamaner/custom-first-crack",
@@ -183,7 +188,7 @@ def test_detector_adapter_maps_confirmed_output_to_first_crack_event() -> None:
     }
 
 
-def test_detector_adapter_uses_window_end_timestamp_when_output_has_no_timestamp() -> None:
+def test_detector_adapter_backdates_inferred_timestamp_to_window_onset() -> None:
     window = _audio_window(started_at_monotonic_seconds=55.25, duration_seconds=1.0)
     backend = MockDetectorBackend((FirstCrackDetectorOutput(confirmed=True),))
     adapter = build_first_crack_detector_adapter(
@@ -195,7 +200,12 @@ def test_detector_adapter_uses_window_end_timestamp_when_output_has_no_timestamp
     event = adapter.process_window(window)
 
     assert event is not None
-    assert event.detected_at_monotonic_seconds == 56.25
+    # With no explicit detector timestamp, FC is backdated to the window onset
+    # (55.25) rather than the inferred window end (56.25) — recovering the
+    # window-duration slice of detector lag (#168). The window-end stays
+    # available as the raw confirmation timestamp.
+    assert event.detected_at_monotonic_seconds == 55.25
+    assert event.confirmed_at_monotonic_seconds == 56.25
     assert event.confidence is None
     assert event.detected_at_inferred is True
     assert "confidence" not in event.payload()
@@ -237,7 +247,11 @@ def test_detector_adapter_confirms_from_recent_positive_windows() -> None:
     assert second is None
     assert third is None
     assert confirmed is not None
-    assert confirmed.detected_at_monotonic_seconds == 101.0
+    # Backdated to the onset of the earliest positive window (seq 10 starts at
+    # 100.0), not its window end (101.0) and not the confirming window (#168).
+    assert confirmed.detected_at_monotonic_seconds == 100.0
+    # Raw confirmation = the confirming window's (seq 13) end timestamp.
+    assert confirmed.confirmed_at_monotonic_seconds == 110.0
     assert confirmed.window_sequence_number == 10
     assert confirmed.confirmed_by_window_sequence_number == 13
     assert confirmed.positive_window_count == 3
@@ -271,9 +285,61 @@ def test_detector_adapter_prunes_old_positive_windows_before_confirmation() -> N
     assert first is None
     assert second is None
     assert confirmed is not None
-    assert confirmed.detected_at_monotonic_seconds == 107.0
+    # Window 1 (end 101.0) is pruned outside the 5.0s confirmation span; the
+    # earliest surviving positive is window 2, backdated to its onset 106.0
+    # (not its end 107.0). Raw confirmation = window 3 end 110.0 (#168).
+    assert confirmed.detected_at_monotonic_seconds == 106.0
+    assert confirmed.confirmed_at_monotonic_seconds == 110.0
     assert confirmed.window_sequence_number == 2
     assert confirmed.confirmed_by_window_sequence_number == 3
+
+
+def test_detector_adapter_backdates_to_first_confirming_crack_window() -> None:
+    """FC reports the onset of the FIRST confirming crack window, recovering lag.
+
+    Mirrors the roast-3 finding (#168, memory fc-detector-lag): the detector
+    needs a window of cracks before it fires, so the confirmation tick lags the
+    first audible crack. Backdating to the earliest positive window's onset
+    recovers that gap deterministically. Here three positive windows span
+    200.0 -> 208.0; the reported FC is the first window's onset (200.0), while
+    the raw confirmation lands at the third window's end (209.0) — a ~9 s lag.
+    """
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.95),
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.96),
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.97),
+        )
+    )
+    adapter = build_first_crack_detector_adapter(
+        FirstCrackConfig(min_positive_windows=3, confirmation_window_seconds=20.0),
+        _resolved_detector_artifacts(),
+        backend,
+    )
+
+    assert (
+        adapter.process_window(_audio_window(sequence_number=1, started_at_monotonic_seconds=200.0))
+        is None
+    )
+    assert (
+        adapter.process_window(_audio_window(sequence_number=2, started_at_monotonic_seconds=204.0))
+        is None
+    )
+    confirmed = adapter.process_window(
+        _audio_window(sequence_number=3, started_at_monotonic_seconds=208.0)
+    )
+
+    assert confirmed is not None
+    # Reported FC = onset of the first confirming crack window (seq 1).
+    assert confirmed.detected_at_monotonic_seconds == 200.0
+    assert confirmed.window_sequence_number == 1
+    # Raw confirmation = the third window's (inferred) end timestamp.
+    assert confirmed.confirmed_at_monotonic_seconds == 209.0
+    assert confirmed.confirmed_by_window_sequence_number == 3
+    # The backdating recovers the full detector-confirmation lag.
+    assert confirmed.confirmed_at_monotonic_seconds - confirmed.detected_at_monotonic_seconds == 9.0
+    assert confirmed.payload()["detected_at_monotonic_seconds"] == 200.0
+    assert confirmed.payload()["confirmed_at_monotonic_seconds"] == 209.0
 
 
 @pytest.mark.parametrize("confidence", (-0.01, 1.01, float("nan")))
