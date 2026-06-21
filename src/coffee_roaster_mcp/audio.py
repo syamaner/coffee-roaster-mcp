@@ -324,6 +324,7 @@ class MicrophoneAudioInput:
         self._stream: Any | None = None
         self._max_consecutive_overflows = max_consecutive_overflows
         self._consecutive_overflows = 0
+        self._close_lock = Lock()
 
     def _ensure_stream(self) -> Any:
         if self._stream is not None:
@@ -380,15 +381,23 @@ class MicrophoneAudioInput:
         return tuple(float(sample[0]) for sample in struct.iter_unpack("f", bytes(raw_data)))
 
     def close(self) -> None:
-        """Stop and close the microphone stream."""
-        stream = self._stream
-        if stream is None:
-            return
-        try:
-            stream.stop()
-        finally:
-            stream.close()
-            self._stream = None
+        """Stop and close the microphone stream.
+
+        Idempotent and thread-safe: closing the underlying PortAudio stream frees
+        its native ring buffer, so a repeated close (capture worker plus stop
+        caller) must never race into a double free. Callers must ensure no read is
+        in flight on another thread before closing; the capture pipeline
+        guarantees this by closing only from the worker thread that owns reads.
+        """
+        with self._close_lock:
+            stream = self._stream
+            if stream is None:
+                return
+            try:
+                stream.stop()
+            finally:
+                stream.close()
+                self._stream = None
 
     def __enter__(self) -> Self:
         """Return this microphone input as a context manager."""
@@ -462,7 +471,25 @@ class AudioCapturePipeline:
         return self.snapshot()
 
     def stop(self, *, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
-        """Request capture stop and wait briefly for the worker to finish."""
+        """Request capture stop and wait briefly for the worker to finish.
+
+        The audio input is closed by the worker thread itself once its read loop
+        exits, so its native (PortAudio) stream is never freed while a read is in
+        flight on the worker. This method only closes the input directly as a
+        fallback when no worker thread is (still) running — for example, when
+        ``start`` failed or the worker already finished without closing. Closing
+        from this caller thread while the worker is still alive would free the
+        ring buffer under an in-flight ``read`` and crash the process.
+
+        Args:
+            timeout_seconds: Maximum time to wait for the worker thread to exit.
+
+        Returns:
+            The capture status snapshot taken after the stop request.
+
+        Raises:
+            AudioCaptureError: If ``timeout_seconds`` is negative.
+        """
         if timeout_seconds < 0:
             raise AudioCaptureError("timeout_seconds must be >= 0.")
         self._stop_requested.set()
@@ -470,7 +497,15 @@ class AudioCapturePipeline:
         if thread is not None:
             thread.join(timeout=timeout_seconds)
         snapshot = self.snapshot()
-        _close_audio_input_if_supported(self._audio_input)
+        if thread is None:
+            # No worker thread ever ran (e.g. start() failed before spawning the
+            # worker): close the input here as a fallback. Whenever a worker DID
+            # run it closes the input itself in its loop finally — on the thread
+            # that owns reads — whether it has already exited or is still draining
+            # a blocking read. So stop() must not also close it: that would double
+            # free / free under an in-flight read. (close() is idempotent anyway,
+            # but correctness here does not depend on that.)
+            _close_audio_input_if_supported(self._audio_input)
         return snapshot
 
     def close(self) -> None:
@@ -526,6 +561,12 @@ class AudioCapturePipeline:
             with self._state_lock:
                 self._latest_error = str(exc)
             self._stop_requested.set()
+        finally:
+            # Close the audio input on the same thread that owns its reads. This
+            # guarantees the underlying PortAudio stream's ring buffer is never
+            # freed while a read is in flight, which would otherwise segfault the
+            # process at end of roast (worker mid-read while the caller closes).
+            _close_audio_input_if_supported(self._audio_input)
 
     def _read_next_samples(self) -> tuple[float, ...]:
         needed_samples = self._settings.window_sample_count - len(self._sample_buffer)
