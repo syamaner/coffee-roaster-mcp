@@ -114,7 +114,8 @@ class FakeValidationDriver:
         self.cooling_on = True
         self.fan_level_percent = 100
         self.heat_level_percent = 0
-        self.drum_motor_on = False
+        # Drop keeps the drum running so beans eject through the open chute (#163).
+        self.drum_motor_on = True
         self.solenoid_open = True
         return self.read_state()
 
@@ -131,6 +132,8 @@ class FakeValidationDriver:
         self.cooling_on = False
         self.fan_level_percent = 0
         self.solenoid_open = False
+        # End-of-roast: stop the drum that drop_beans left running (#163).
+        self.drum_motor_on = False
         return self.read_state()
 
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:

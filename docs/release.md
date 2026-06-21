@@ -8,6 +8,17 @@ The release workflow is `.github/workflows/release.yml`. It supports two paths:
 - Manual dry run through `workflow_dispatch` with `dry_run: true`.
 - Live release through a pushed version tag such as `v0.1.3`.
 
+## Changelog
+
+### 0.1.6
+
+- fix(#163): `drop_beans` keeps the drum running so beans eject; `stop_cooling`
+  stops the drum. On a real Hottop the previous drop stopped the drum the instant
+  the chute opened, trapping roughly half the charge. The rotating drum now
+  tumbles beans out through the open chute, and `stop_cooling` (the end-of-roast
+  action) is what finally stops the drum. `emergency_stop` is unchanged: it keeps
+  the drum stopped and the solenoid closed to cool the beans in place.
+
 ## Operator Prerequisites
 
 Before enabling a live release, the release owner must confirm:
@@ -128,8 +139,8 @@ Before tagging, confirm these values all match the release version:
 - the pushed tag name, using `v{version}`
 - installed CLI output from `coffee-roaster-mcp --version`
 
-For the current published state, all package and registry metadata are aligned
-at `0.1.2`. A later release candidate must update all three checked-in version
+The current release candidate aligns all package and registry metadata at
+`0.1.6`. A later release candidate must update all three checked-in version
 fields in the same PR before tagging.
 
 ### Hugging Face First-Crack Artifact Pin

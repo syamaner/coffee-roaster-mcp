@@ -1043,6 +1043,8 @@ def test_hottop_driver_drop_and_cooling_commands_stream_safe_compound_states() -
     try:
         driver.set_heat(heat_level_percent=80)
         drop_state = driver.drop_beans()
+        # write[17] is the drum-motor command byte (_HOTTOP_COMMAND_DRUM_MOTOR_INDEX):
+        # the drop must keep the drum RUNNING (==1) so beans eject (#163).
         drop_packet = _wait_for_hottop_write(
             serial_factory.transport,
             lambda write: (
@@ -1051,13 +1053,19 @@ def test_hottop_driver_drop_and_cooling_commands_stream_safe_compound_states() -
                 and write[10] == 0
                 and write[12] == 10
                 and write[16] == 1
-                and write[17] == 0
+                and write[17] == 1
                 and write[18] == 1
             ),
         )
 
+        # start_cooling leaves the drum bit untouched (#163), so the drum keeps
+        # running after the drop while the operator runs the cooling cycle.
+        cooling_state = driver.start_cooling()
+
         stop_cooling_start_index = len(serial_factory.transport.writes_snapshot())
         stopped_state = driver.stop_cooling()
+        # stop_cooling is the end-of-roast action: it must stop the drum
+        # (write[17] == 0) now that drop_beans leaves it running (#163).
         stopped_packet = _wait_for_hottop_write(
             serial_factory.transport,
             lambda write: (
@@ -1066,6 +1074,7 @@ def test_hottop_driver_drop_and_cooling_commands_stream_safe_compound_states() -
                 and write[10] == 0
                 and write[12] == 0
                 and write[16] == 0
+                and write[17] == 0
                 and write[18] == 0
             ),
             start_index=stop_cooling_start_index,
@@ -1075,10 +1084,14 @@ def test_hottop_driver_drop_and_cooling_commands_stream_safe_compound_states() -
         assert drop_state.fan_level_percent == 100
         assert drop_state.cooling_on is True
         assert drop_state.raw_vendor_data["solenoid_open"] is True
-        assert drop_state.raw_vendor_data["drum_motor_on"] is False
+        assert drop_state.raw_vendor_data["drum_motor_on"] is True
+        assert cooling_state.cooling_on is True
+        assert cooling_state.fan_level_percent == 100
+        assert cooling_state.raw_vendor_data["drum_motor_on"] is True
         assert stopped_state.cooling_on is False
         assert stopped_state.fan_level_percent == 0
         assert stopped_state.raw_vendor_data["solenoid_open"] is False
+        assert stopped_state.raw_vendor_data["drum_motor_on"] is False
         assert drop_packet[35] == sum(drop_packet[:35]) & 0xFF
         assert stopped_packet[35] == sum(stopped_packet[:35]) & 0xFF
     finally:
