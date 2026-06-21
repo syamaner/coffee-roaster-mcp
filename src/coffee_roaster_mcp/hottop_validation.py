@@ -412,7 +412,9 @@ def _drop_step_status(
         state.heat_level_percent != 0
         or not state.cooling_on
         or state.fan_level_percent != 100
-        or _raw_bool(state, "drum_motor_on")
+        # The drop must keep the drum RUNNING so beans eject through the open
+        # chute; a stopped drum traps ~half the charge (#163).
+        or not _raw_bool(state, "drum_motor_on")
         or not _raw_bool(state, "solenoid_open")
     ):
         return "failed"
@@ -450,7 +452,14 @@ def _cooling_stop_status(
         == "failed"
     ):
         return "failed"
-    if state.cooling_on or state.fan_level_percent != 0 or _raw_bool(state, "solenoid_open"):
+    if (
+        state.cooling_on
+        or state.fan_level_percent != 0
+        or _raw_bool(state, "solenoid_open")
+        # stop_cooling is the end-of-roast action and must stop the drum that
+        # drop_beans left running through cooling (#163).
+        or _raw_bool(state, "drum_motor_on")
+    ):
         return "failed"
     return "passed"
 

@@ -941,7 +941,11 @@ class HottopRoasterDriver:
         """Apply Hottop compound bean-drop command state."""
         with self._state_lock:
             self._heat_level_percent = 0
-            self._drum_motor_on = False
+            # Keep the drum motor RUNNING through the drop so the rotating drum
+            # tumbles beans out the open chute. A stopped drum traps ~half the
+            # charge below the chute (coffee-roaster-mcp#163). stop_cooling is
+            # the end-of-roast action that stops the drum once beans are clear.
+            self._drum_motor_on = True
             self._solenoid_open = True
             self._cooling_motor_on = True
             self._main_fan_level_percent = 100
@@ -955,10 +959,15 @@ class HottopRoasterDriver:
         return self.read_state()
 
     def stop_cooling(self) -> RoasterState:
-        """Stop Hottop cooling, close drop path, and clear main fan."""
+        """Stop Hottop cooling, close drop path, stop the drum, and clear main fan."""
         with self._state_lock:
             self._cooling_motor_on = False
             self._solenoid_open = False
+            # drop_beans now leaves the drum running through cooling to fully
+            # clear the beans (coffee-roaster-mcp#163). stop_cooling is the
+            # end-of-roast action, so it must stop the drum here; otherwise the
+            # drum would spin indefinitely after cooling ends.
+            self._drum_motor_on = False
             self._main_fan_level_percent = 0
         return self.read_state()
 
