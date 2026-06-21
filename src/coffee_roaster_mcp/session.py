@@ -1575,10 +1575,12 @@ class RoastSessionStore:
             confirmation_at_utc = self._utc_now()
 
             previous_max = session.auto_t0_charge_temperature_c
-            if previous_max is None or current_temp > previous_max:
-                # A new local max — this sample is the current candidate
-                # turning point. Remember when it occurred so T0 can be
-                # backdated to here once the decline is confirmed (#167).
+            if previous_max is None or current_temp >= previous_max:
+                # A new local max — OR a repeat of the running max (a plateau of
+                # quantized/equal sensor readings). Either way this sample is the
+                # current candidate turning point: #167 wants the MOST RECENT
+                # local max before the decline, so advance the timestamp to the
+                # latest sample at the running max, not the first plateau sample.
                 session.auto_t0_charge_temperature_c = current_temp
                 session.auto_t0_charge_temperature_monotonic_seconds = confirmation_elapsed_seconds
                 previous_max = current_temp

@@ -10,6 +10,7 @@ import pytest
 import coffee_roaster_mcp.session as session_module
 from coffee_roaster_mcp.session import (
     RoastEventKind,
+    RoastSession,
     RoastSessionStore,
     SessionLifecycleError,
     TelemetrySample,
@@ -969,6 +970,66 @@ def test_auto_t0_backdates_to_turning_point_not_confirmation_tick() -> None:
     assert event.payload["confirmed_at_utc"] == clock.utc_value.isoformat()
     assert snapshot.beans_added_monotonic_seconds == 5.0
     assert snapshot.beans_added_at_utc == session.created_at_utc + timedelta(seconds=5.0)
+
+
+def test_auto_t0_backdates_to_last_sample_of_max_temperature_plateau() -> None:
+    """On a plateau of equal max readings, T0 lands at the LAST plateau sample.
+
+    Quantized/repeated sensor readings can hold the bean at its peak for
+    several ticks. #167 wants the most recent local max before the decline,
+    which is the LAST sample of that plateau, not the first — so the
+    turning-point candidate advances on equality, not only on a strict
+    increase.
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    # Climb to 181 then hold flat at 181 across a three-tick plateau
+    # (elapsed 3.0 -> 5.0) before declining.
+    readings = [
+        (101.0, 170.0),  # elapsed 1.0
+        (102.0, 178.0),  # elapsed 2.0
+        (103.0, 181.0),  # elapsed 3.0 — plateau begins
+        (104.0, 181.0),  # elapsed 4.0 — plateau (equal max)
+        (105.0, 181.0),  # elapsed 5.0 — last plateau sample / most recent max
+        (106.0, 176.0),  # elapsed 6.0 — decline begins
+        (107.0, 168.0),  # elapsed 7.0
+    ]
+    plateau_snapshot: RoastSession | None = None
+    for monotonic_value, bean_temp_c in readings:
+        clock.monotonic_value = monotonic_value
+        event, plateau_snapshot = store.process_auto_t0_reading_snapshot(
+            session,
+            bean_temp_c=bean_temp_c,
+            drop_threshold_c=25.0,
+        )
+        assert event is None
+    assert plateau_snapshot is not None
+    # The candidate tracks the LAST sample at the running max (elapsed 5.0),
+    # not the first plateau sample (elapsed 3.0).
+    assert plateau_snapshot.auto_t0_charge_temperature_c == 181.0
+    assert plateau_snapshot.auto_t0_charge_temperature_monotonic_seconds == 5.0
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 0, 8, tzinfo=UTC)
+    clock.monotonic_value = 108.0  # elapsed 8.0 — drop of 181-155=26 confirms
+    event, snapshot = store.process_auto_t0_reading_snapshot(
+        session,
+        bean_temp_c=155.0,
+        drop_threshold_c=25.0,
+    )
+
+    assert event is not None
+    assert event.kind == "beans_added"
+    # Backdated to the LAST plateau sample (elapsed 5.0), not the first (3.0)
+    # and not the elapsed-8.0 confirmation tick.
+    assert event.monotonic_seconds == 5.0
+    assert event.payload["turning_point_monotonic_seconds"] == 5.0
+    assert event.payload["confirmed_at_monotonic_seconds"] == 8.0
+    assert snapshot.beans_added_monotonic_seconds == 5.0
 
 
 def test_auto_t0_debounce_rejects_transient_dip_below_threshold() -> None:
