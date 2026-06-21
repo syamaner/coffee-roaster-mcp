@@ -497,9 +497,14 @@ class AudioCapturePipeline:
         if thread is not None:
             thread.join(timeout=timeout_seconds)
         snapshot = self.snapshot()
-        if thread is None or not thread.is_alive():
-            # No worker owns the input (or it already exited): safe to close here.
-            # A still-alive worker closes the input itself in its loop finally.
+        if thread is None:
+            # No worker thread ever ran (e.g. start() failed before spawning the
+            # worker): close the input here as a fallback. Whenever a worker DID
+            # run it closes the input itself in its loop finally — on the thread
+            # that owns reads — whether it has already exited or is still draining
+            # a blocking read. So stop() must not also close it: that would double
+            # free / free under an in-flight read. (close() is idempotent anyway,
+            # but correctness here does not depend on that.)
             _close_audio_input_if_supported(self._audio_input)
         return snapshot
 
