@@ -323,6 +323,10 @@ class RoastSession:
         fan_level_percent: Latest in-memory fan setting for the active mock path.
         cooling_on: Whether cooling is currently active in the session state.
         auto_t0_charge_temperature_c: Max preheat/charge bean temperature before T0.
+        auto_t0_charge_temperature_monotonic_seconds: Monotonic elapsed seconds
+            of the candidate turning point — the most recent local-max
+            bean-temperature sample before the sustained decline. Automatic T0
+            is backdated to this timestamp on confirmation (#167).
         auto_t0_current_drop_c: Current drop from the tracked charge temperature.
         auto_t0_preheat_sample_count: Number of valid pre-T0 bean-temperature samples.
         event_timeline: Shared ordered event timeline for future runtime stories.
@@ -354,6 +358,7 @@ class RoastSession:
     fan_level_percent: int = 0
     cooling_on: bool = False
     auto_t0_charge_temperature_c: float | None = None
+    auto_t0_charge_temperature_monotonic_seconds: float | None = None
     auto_t0_current_drop_c: float | None = None
     auto_t0_preheat_sample_count: int = 0
     event_timeline: list[RoastEvent] = field(default_factory=_event_timeline_default)
@@ -1542,7 +1547,11 @@ class RoastSessionStore:
 
         Returns:
             The recorded beans-added event when this reading crosses the
-            threshold, otherwise `None`, plus an atomic session snapshot.
+            threshold, otherwise `None`, plus an atomic session snapshot. On
+            confirmation the event is backdated to the candidate turning
+            point — the most recent local-max bean-temperature sample before
+            the sustained decline — not the confirmation tick (#167). The raw
+            confirmation timestamp stays available in the event payload.
 
         Raises:
             SessionLifecycleError: If called outside the pre-T0 active phase or
@@ -1562,9 +1571,16 @@ class RoastSessionStore:
             if not math.isfinite(threshold) or threshold <= 0:
                 raise SessionLifecycleError("Automatic T0 threshold must be greater than 0.")
 
+            confirmation_elapsed_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+            confirmation_at_utc = self._utc_now()
+
             previous_max = session.auto_t0_charge_temperature_c
             if previous_max is None or current_temp > previous_max:
+                # A new local max — this sample is the current candidate
+                # turning point. Remember when it occurred so T0 can be
+                # backdated to here once the decline is confirmed (#167).
                 session.auto_t0_charge_temperature_c = current_temp
+                session.auto_t0_charge_temperature_monotonic_seconds = confirmation_elapsed_seconds
                 previous_max = current_temp
 
             session.auto_t0_preheat_sample_count += 1
@@ -1573,18 +1589,91 @@ class RoastSessionStore:
             if session.auto_t0_preheat_sample_count < 2 or drop_c < threshold:
                 return None, _copy_session_for_read(session)
 
-            event = self.record_event(
+            turning_point_elapsed_seconds = session.auto_t0_charge_temperature_monotonic_seconds
+            if turning_point_elapsed_seconds is None:  # pragma: no cover - defensive
+                # The candidate is always set with the first local max above,
+                # so reaching confirmation without one is unreachable; fall
+                # back to the confirmation tick rather than crash.
+                turning_point_elapsed_seconds = confirmation_elapsed_seconds
+
+            event = self._record_backdated_beans_added(
                 session,
-                "beans_added",
+                turning_point_elapsed_seconds=turning_point_elapsed_seconds,
+                confirmation_elapsed_seconds=confirmation_elapsed_seconds,
+                confirmation_at_utc=confirmation_at_utc,
                 payload={
                     "source": "auto_t0",
                     "charge_temperature_c": round(previous_max, 3),
                     "detected_bean_temperature_c": round(current_temp, 3),
                     "drop_c": round(drop_c, 3),
                     "drop_threshold_c": round(threshold, 3),
+                    "turning_point_monotonic_seconds": round(turning_point_elapsed_seconds, 3),
+                    "confirmed_at_monotonic_seconds": round(confirmation_elapsed_seconds, 3),
+                    "confirmed_at_utc": confirmation_at_utc.isoformat(),
                 },
             )
             return event, _copy_session_for_read(session)
+
+    def _record_backdated_beans_added(
+        self,
+        session: RoastSession,
+        *,
+        turning_point_elapsed_seconds: float,
+        confirmation_elapsed_seconds: float,
+        confirmation_at_utc: datetime,
+        payload: dict[str, EventPayloadValue],
+    ) -> RoastEvent:
+        """Record automatic T0 backdated to the candidate turning point.
+
+        The reported `beans_added` timestamp is the local-max bean-temperature
+        sample (#167), never the confirmation tick. The raw confirmation
+        timestamp is preserved in ``payload`` so existing consumers keep the
+        confirmation moment available.
+
+        Args:
+            session: Session to mutate. Caller holds the store lock.
+            turning_point_elapsed_seconds: Backdated T0 elapsed seconds — the
+                monotonic elapsed time of the most recent local max.
+            confirmation_elapsed_seconds: Elapsed seconds at the confirmation
+                tick, used to clamp the backdated value into the valid range.
+            confirmation_at_utc: Wall-clock confirmation timestamp.
+            payload: Structured event details including the raw confirmation
+                timestamp.
+
+        Returns:
+            The recorded, backdated ``beans_added`` event.
+        """
+        backdated_elapsed_seconds = round(turning_point_elapsed_seconds, 6)
+        # The turning point can never be after the confirmation tick or before
+        # the session start; clamp defensively so the timeline stays ordered.
+        backdated_elapsed_seconds = max(
+            0.0,
+            min(backdated_elapsed_seconds, confirmation_elapsed_seconds),
+        )
+        monotonic_seconds = _normalize_event_monotonic_seconds(
+            session,
+            monotonic_seconds=backdated_elapsed_seconds,
+        )
+        recorded_at_utc = session.created_at_utc + timedelta(seconds=monotonic_seconds)
+        recorded_at_utc = _normalize_event_recorded_at_utc(
+            session,
+            recorded_at_utc=recorded_at_utc,
+        )
+        _validate_event_monotonic_order(
+            session,
+            kind="beans_added",
+            monotonic_seconds=monotonic_seconds,
+        )
+        event = RoastEvent(
+            kind="beans_added",
+            recorded_at_utc=recorded_at_utc,
+            monotonic_seconds=monotonic_seconds,
+            payload=dict(payload),
+        )
+        _append_event_log_row(session, event)
+        session.event_timeline.append(event)
+        _apply_event_timestamp(session, event)
+        return event
 
     def record_first_crack_detection_snapshot(
         self,
@@ -2200,6 +2289,9 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         fan_level_percent=session.fan_level_percent,
         cooling_on=session.cooling_on,
         auto_t0_charge_temperature_c=session.auto_t0_charge_temperature_c,
+        auto_t0_charge_temperature_monotonic_seconds=(
+            session.auto_t0_charge_temperature_monotonic_seconds
+        ),
         auto_t0_current_drop_c=session.auto_t0_current_drop_c,
         auto_t0_preheat_sample_count=session.auto_t0_preheat_sample_count,
         event_timeline=deepcopy(session.event_timeline),

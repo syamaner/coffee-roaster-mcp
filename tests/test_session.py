@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -834,6 +834,8 @@ def test_auto_t0_records_beans_added_from_drop_against_preheat_max() -> None:
     )
     session = store.start_session()
 
+    # The 170 °C local max is captured at session start (elapsed 0.0); this is
+    # the candidate turning point T0 is backdated to on confirmation (#167).
     event, first_snapshot = store.process_auto_t0_reading_snapshot(
         session,
         bean_temp_c=170.0,
@@ -842,8 +844,10 @@ def test_auto_t0_records_beans_added_from_drop_against_preheat_max() -> None:
     assert event is None
     assert first_snapshot.phase == "pre_roast"
     assert first_snapshot.auto_t0_charge_temperature_c == 170.0
+    assert first_snapshot.auto_t0_charge_temperature_monotonic_seconds == 0.0
 
-    clock.utc_value = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    confirmation_utc = datetime(2026, 5, 4, 12, 1, tzinfo=UTC)
+    clock.utc_value = confirmation_utc
     clock.monotonic_value = 105.0
     event, snapshot = store.process_auto_t0_reading_snapshot(
         session,
@@ -853,17 +857,26 @@ def test_auto_t0_records_beans_added_from_drop_against_preheat_max() -> None:
 
     assert event is not None
     assert event.kind == "beans_added"
-    assert event.recorded_at_utc == clock.utc_value
-    assert event.monotonic_seconds == 5.0
+    # T0 is backdated to the turning point (elapsed 0.0 / session start),
+    # NOT the confirmation tick at elapsed 5.0.
+    assert event.monotonic_seconds == 0.0
+    assert event.recorded_at_utc == session.created_at_utc
+    assert event.recorded_at_utc != confirmation_utc
     assert event.payload == {
         "source": "auto_t0",
         "charge_temperature_c": 170.0,
         "detected_bean_temperature_c": 143.5,
         "drop_c": 26.5,
         "drop_threshold_c": 25.0,
+        "turning_point_monotonic_seconds": 0.0,
+        # The raw confirmation timestamp stays available alongside the
+        # backdated T0.
+        "confirmed_at_monotonic_seconds": 5.0,
+        "confirmed_at_utc": confirmation_utc.isoformat(),
     }
     assert snapshot.phase == "roasting"
-    assert snapshot.beans_added_at_utc == clock.utc_value
+    assert snapshot.beans_added_at_utc == session.created_at_utc
+    assert snapshot.beans_added_monotonic_seconds == 0.0
     assert snapshot.auto_t0_charge_temperature_c == 170.0
     assert snapshot.auto_t0_current_drop_c == 26.5
 
@@ -896,6 +909,118 @@ def test_auto_t0_uses_max_preheat_for_gradual_drop() -> None:
     assert event.kind == "beans_added"
     assert event.payload["charge_temperature_c"] == 170.0
     assert event.payload["drop_c"] == 25.1
+    assert snapshot.phase == "roasting"
+
+
+def test_auto_t0_backdates_to_turning_point_not_confirmation_tick() -> None:
+    """T0 is reported at the local max, not where the X-degree drop confirms.
+
+    Mirrors roast 3 (21 Jun): the bean peaks well before the sustained
+    decline is confirmed, so a confirmation-tick T0 lands ~15-20 s late and
+    mis-origins every downstream metric (#167). The debounce still waits for
+    the confirmed drop, but the reported timestamp is backdated.
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    # Climb to a peak (the charge turning point) at elapsed 5.0s, then decline
+    # over several ticks before the drop is confirmed at elapsed 9.0s.
+    readings = [
+        (101.0, 150.0),  # elapsed 1.0
+        (102.0, 165.0),  # elapsed 2.0
+        (103.0, 178.0),  # elapsed 3.0
+        (104.0, 180.0),  # elapsed 4.0
+        (105.0, 181.0),  # elapsed 5.0 — the local max / turning point
+        (106.0, 178.0),  # elapsed 6.0 — decline begins, still under threshold
+        (107.0, 172.0),  # elapsed 7.0
+        (108.0, 165.0),  # elapsed 8.0
+    ]
+    for monotonic_value, bean_temp_c in readings:
+        clock.monotonic_value = monotonic_value
+        event, _ = store.process_auto_t0_reading_snapshot(
+            session,
+            bean_temp_c=bean_temp_c,
+            drop_threshold_c=25.0,
+        )
+        # The debounce holds: no false-positive T0 before the drop confirms.
+        assert event is None
+
+    clock.utc_value = datetime(2026, 5, 4, 12, 0, 9, tzinfo=UTC)
+    clock.monotonic_value = 109.0  # elapsed 9.0 — drop of 181-155=26 confirms
+    event, snapshot = store.process_auto_t0_reading_snapshot(
+        session,
+        bean_temp_c=155.0,
+        drop_threshold_c=25.0,
+    )
+
+    assert event is not None
+    assert event.kind == "beans_added"
+    # Backdated to the 181 °C peak at elapsed 5.0s, NOT the elapsed-9.0s
+    # confirmation tick.
+    assert event.monotonic_seconds == 5.0
+    assert event.payload["charge_temperature_c"] == 181.0
+    assert event.payload["turning_point_monotonic_seconds"] == 5.0
+    # The raw confirmation moment stays available for consumers told the lag.
+    assert event.payload["confirmed_at_monotonic_seconds"] == 9.0
+    assert event.payload["confirmed_at_utc"] == clock.utc_value.isoformat()
+    assert snapshot.beans_added_monotonic_seconds == 5.0
+    assert snapshot.beans_added_at_utc == session.created_at_utc + timedelta(seconds=5.0)
+
+
+def test_auto_t0_debounce_rejects_transient_dip_below_threshold() -> None:
+    """A brief dip that does not reach the threshold never fires T0.
+
+    Backdating must not weaken the false-positive guard: a transient drop
+    under the confirmation threshold leaves the session pre-roast and keeps
+    the turning-point candidate tracking the running local max.
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+    )
+    session = store.start_session()
+
+    clock.monotonic_value = 101.0
+    store.process_auto_t0_reading_snapshot(session, bean_temp_c=180.0, drop_threshold_c=25.0)
+    # A 10 °C transient dip — below the 25 °C confirmation threshold.
+    clock.monotonic_value = 102.0
+    event, snapshot = store.process_auto_t0_reading_snapshot(
+        session,
+        bean_temp_c=170.0,
+        drop_threshold_c=25.0,
+    )
+
+    assert event is None
+    assert snapshot.phase == "pre_roast"
+    assert snapshot.beans_added_at_utc is None
+    assert snapshot.auto_t0_charge_temperature_c == 180.0
+    assert snapshot.auto_t0_charge_temperature_monotonic_seconds == 1.0
+
+    # Temperature recovers to a new local max — the candidate moves forward.
+    clock.monotonic_value = 103.0
+    _, recovered = store.process_auto_t0_reading_snapshot(
+        session,
+        bean_temp_c=185.0,
+        drop_threshold_c=25.0,
+    )
+    assert recovered.auto_t0_charge_temperature_c == 185.0
+    assert recovered.auto_t0_charge_temperature_monotonic_seconds == 3.0
+
+    # Now a confirmed drop fires T0 backdated to the elapsed-3.0s new max.
+    clock.utc_value = datetime(2026, 5, 4, 12, 0, 6, tzinfo=UTC)
+    clock.monotonic_value = 106.0
+    event, snapshot = store.process_auto_t0_reading_snapshot(
+        session,
+        bean_temp_c=158.0,
+        drop_threshold_c=25.0,
+    )
+    assert event is not None
+    assert event.monotonic_seconds == 3.0
     assert snapshot.phase == "roasting"
 
 
