@@ -118,12 +118,19 @@ class FirstCrackDetectionEvent:
         min_positive_windows: Configured positive-window count required for
             confirmation.
         confirmation_window_seconds: Configured recent-positive window span.
-        detected_at_inferred: Whether the detection timestamp was inferred from
-            the source window end because the backend omitted an explicit timestamp.
+        detected_at_inferred: Whether the BACKDATED detection timestamp was
+            inferred from a source window end because the backend omitted an
+            explicit timestamp (the earliest positive window's flag).
         confirmed_at_monotonic_seconds: Raw confirmation timestamp — the
             detection timestamp of the window that satisfied the recent-positive
             rule. `detected_at_monotonic_seconds` is backdated to the crack
             onset (#168); this preserves the original audio-confirmation moment.
+        confirmed_at_inferred: Whether the CONFIRMING window's timestamp was
+            inferred from its window end. The future-timeline tolerance is
+            validated against `confirmed_at_monotonic_seconds`, so it must key
+            off this flag (the confirming window's basis), not the earliest
+            window's — they can differ when explicit/inferred timestamps mix
+            across windows.
     """
 
     kind: FirstCrackDetectorEventKind
@@ -142,6 +149,7 @@ class FirstCrackDetectionEvent:
     confirmation_window_seconds: float
     detected_at_inferred: bool
     confirmed_at_monotonic_seconds: float
+    confirmed_at_inferred: bool
 
     def payload(self) -> dict[str, str | int | float | None]:
         """Return session-event payload metadata for this confirmed detection."""
@@ -214,6 +222,7 @@ class FirstCrackDetectorAdapter:
             confirmation_window_seconds=self.config.confirmation_window_seconds,
             detected_at_inferred=output.detected_at_monotonic_seconds is None,
             confirmed_at_monotonic_seconds=detected_at_monotonic_seconds,
+            confirmed_at_inferred=output.detected_at_monotonic_seconds is None,
         )
         self._positive_candidates.append(
             _PositiveWindowCandidate(
@@ -232,6 +241,12 @@ class FirstCrackDetectorAdapter:
         # The confirming window's detection timestamp is preserved as the raw
         # confirmation moment, which the agent prompt is told lags the true
         # crack (memory fc-detector-lag).
+        #
+        # `detected_at_inferred` carries the EARLIEST window's flag (it describes
+        # the backdated onset), while `confirmed_at_inferred` carries THIS
+        # (confirming) window's flag — they can differ when explicit/inferred
+        # timestamps mix across windows, and the future-timeline tolerance keys
+        # off the confirming one.
         earliest = self._positive_candidates[0]
         return replace(
             earliest.event,
@@ -239,6 +254,7 @@ class FirstCrackDetectorAdapter:
             confirmed_by_window_sequence_number=window.sequence_number,
             positive_window_count=len(self._positive_candidates),
             confirmed_at_monotonic_seconds=detected_at_monotonic_seconds,
+            confirmed_at_inferred=output.detected_at_monotonic_seconds is None,
         )
 
     def _prune_positive_candidates(self, current_monotonic_seconds: float) -> None:
@@ -469,11 +485,17 @@ def _future_tolerance_for_detection(
     max_future_seconds: float | None,
     allow_future_timeline: bool,
 ) -> float | None:
-    if allow_future_timeline and detection_event.detected_at_inferred:
+    # The future-timeline bound is validated against the CONFIRMING window's
+    # timestamp (`confirmed_at_monotonic_seconds`), so the tolerance must key
+    # off the confirming window's inferred flag — not the earliest (backdated)
+    # window's, which can differ when explicit/inferred timestamps mix across
+    # windows. `window` here is always the confirming window, so its duration is
+    # the correct inferred allowance.
+    if allow_future_timeline and detection_event.confirmed_at_inferred:
         return None
     if max_future_seconds is not None:
         return max_future_seconds
-    if detection_event.detected_at_inferred:
+    if detection_event.confirmed_at_inferred:
         return window.duration_seconds
     return 0.0
 

@@ -361,6 +361,73 @@ def test_explicit_future_detector_timestamp_is_rejected_with_future_timeline_ena
     assert session.phase == "roasting"
 
 
+def test_mixed_explicit_then_inferred_windows_use_confirming_window_tolerance() -> None:
+    """Future tolerance keys off the CONFIRMING window, not the backdated one.
+
+    When the earliest positive window has an EXPLICIT timestamp but the
+    confirming window's timestamp is INFERRED (its window end, which can sit
+    slightly ahead of the integration clock), the future-timeline bound must be
+    the confirming window's inferred allowance. Keying it off the earliest
+    (explicit) window's flag would pick a 0.0 tolerance and wrongly reject a
+    valid backdated FC. Mirrors the cross-window mismatch in the #168 review.
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    config = FirstCrackConfig(mode="audio", min_positive_windows=2)
+    backend = MockDetectorBackend(
+        (
+            # Earliest positive: EXPLICIT detector timestamp.
+            FirstCrackDetectorOutput(
+                confirmed=True,
+                confidence=0.95,
+                detected_at_monotonic_seconds=510.3,
+            ),
+            # Confirming window: INFERRED (no timestamp) — its window end (512.0)
+            # is 0.5s ahead of the integration clock (511.5).
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.96),
+        )
+    )
+    adapter = build_first_crack_detector_adapter(config, _resolved_detector_artifacts(), backend)
+
+    clock.monotonic_value = 511.0
+    first_result = integrate_first_crack_window_with_session(
+        config=config,
+        adapter=adapter,
+        session_store=store,
+        session=session,
+        window=_audio_window(
+            sequence_number=1,
+            started_at_monotonic_seconds=510.0,
+            duration_seconds=1.0,
+        ),
+    )
+    clock.monotonic_value = 511.5
+    second_result = integrate_first_crack_window_with_session(
+        config=config,
+        adapter=adapter,
+        session_store=store,
+        session=session,
+        window=_audio_window(
+            sequence_number=2,
+            started_at_monotonic_seconds=511.0,
+            duration_seconds=1.0,
+        ),
+    )
+
+    # The confirming window's inferred end (512.0) is ahead of the clock but
+    # within the confirming-window tolerance, so FC records — backdated to the
+    # earliest window's onset (510.0, elapsed 10.0).
+    assert first_result is None
+    assert second_result is not None
+    assert second_result.event.kind == "first_crack_detected"
+    assert second_result.event.monotonic_seconds == 10.0
+    assert second_result.event.payload["detected_at_monotonic_seconds"] == 510.0
+    assert second_result.event.payload["confirmed_at_monotonic_seconds"] == 512.0
+    assert session.phase == "development"
+
+
 def test_manual_first_crack_event_takes_precedence_over_later_detector_confirmation() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
