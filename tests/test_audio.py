@@ -6,7 +6,7 @@ import wave
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from queue import Queue
-from threading import Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 
 import pytest
 
@@ -685,6 +685,77 @@ def test_audio_capture_pipeline_validates_finite_samples() -> None:
     snapshot = pipeline.stop()
 
     assert snapshot.latest_error == "audio samples must be finite numbers."
+
+
+class BlockingClosableAudioInput:
+    """Audio input whose reads block, recording which thread closes it.
+
+    Models the real microphone path: a worker thread is parked inside a blocking
+    ``read`` when ``stop`` is requested. Closing the underlying stream from any
+    thread other than the one reading it frees the native ring buffer under an
+    in-flight read and crashes the process, so this records the closing thread
+    and whether the worker was still alive at close time.
+    """
+
+    def __init__(self) -> None:
+        self._release = Event()
+        self.closed = False
+        self.closed_by_worker: bool | None = None
+        self.worker_alive_at_close: bool | None = None
+        self.worker_thread: Thread | None = None
+        self.read_started = Event()
+
+    def read_samples(self, sample_count: int) -> Sequence[float]:
+        self.worker_thread = current_thread()
+        self.read_started.set()
+        # Block until released, mimicking a microphone read that outlasts the
+        # stop join timeout.
+        self._release.wait(timeout=2.0)
+        return (0.1,) * sample_count
+
+    def release(self) -> None:
+        self._release.set()
+
+    def close(self) -> None:
+        self.closed = True
+        self.closed_by_worker = current_thread() is self.worker_thread
+        self.worker_alive_at_close = (
+            self.worker_thread is not None and self.worker_thread.is_alive()
+        )
+
+
+def test_audio_capture_stop_does_not_close_input_while_worker_reads() -> None:
+    """A worker blocked mid-read must close its own input, never the stop caller.
+
+    Regression for the end-of-roast SIGSEGV: ``stop`` closed the PortAudio stream
+    after a join timeout even though the worker was still inside ``read``, freeing
+    the ring buffer under the in-flight read and crashing the process.
+    """
+    audio_input = BlockingClosableAudioInput()
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device="mock-mic",
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+    )
+
+    pipeline.start()
+    assert audio_input.read_started.wait(timeout=1.0)
+    # Worker is parked inside read(); a zero-timeout join must not close the input.
+    pipeline.stop(timeout_seconds=0.0)
+    assert audio_input.closed is False
+
+    # Releasing the read lets the worker observe the stop request, exit, and close.
+    audio_input.release()
+    _wait_for(lambda: audio_input.closed)
+    assert audio_input.closed_by_worker is True
+    worker = audio_input.worker_thread
+    assert worker is not None
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
 
 
 def _wait_for(predicate: Callable[[], bool], *, timeout_seconds: float = 1.0) -> None:
