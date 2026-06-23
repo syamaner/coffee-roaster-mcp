@@ -341,13 +341,20 @@ def test_get_roast_state_records_automatic_t0_after_configured_drop(
     assert threshold_state.t0_status.drop_threshold_c == 25.0
     assert threshold_state.t0_status.detected_bean_temperature_c == 145.0
     assert [event.kind for event in threshold_state.events] == ["beans_added"]
-    assert threshold_state.events[0].payload == {
-        "source": "auto_t0",
-        "charge_temperature_c": 170.0,
-        "detected_bean_temperature_c": 145.0,
-        "drop_c": 25.0,
-        "drop_threshold_c": 25.0,
-    }
+    t0_payload = threshold_state.events[0].payload
+    assert t0_payload["source"] == "auto_t0"
+    assert t0_payload["charge_temperature_c"] == 170.0
+    assert t0_payload["detected_bean_temperature_c"] == 145.0
+    assert t0_payload["drop_c"] == 25.0
+    assert t0_payload["drop_threshold_c"] == 25.0
+    # T0 is backdated to the candidate turning point (the 170 °C local max),
+    # while the raw confirmation timestamp stays available (#167).
+    assert "turning_point_monotonic_seconds" in t0_payload
+    assert "confirmed_at_monotonic_seconds" in t0_payload
+    assert "confirmed_at_utc" in t0_payload
+    assert cast(float, t0_payload["turning_point_monotonic_seconds"]) <= cast(
+        float, t0_payload["confirmed_at_monotonic_seconds"]
+    )
 
 
 def test_get_roast_state_discards_queued_first_crack_windows_after_auto_t0(
