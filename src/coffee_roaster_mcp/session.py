@@ -1683,6 +1683,7 @@ class RoastSessionStore:
         *,
         detected_at_monotonic_seconds: float,
         max_future_seconds: float | None = 0.0,
+        confirmed_at_monotonic_seconds: float | None = None,
         payload: dict[str, EventPayloadValue] | None = None,
     ) -> tuple[RoastEvent, RoastSession]:
         """Record automatic first crack at the detector-provided monotonic time.
@@ -1690,13 +1691,22 @@ class RoastSessionStore:
         Args:
             session: Session to mutate.
             detected_at_monotonic_seconds: Absolute monotonic timestamp reported
-                by the detector for the first-crack event.
+                by the detector for the first-crack event. With #168 this is the
+                backdated crack onset (the confirming-window onset), not the
+                audio-confirmation tick.
             max_future_seconds: Allowed future timestamp tolerance. This lets
                 adapter-inferred window-end defaults record when the capture
                 window has just been emitted but its inferred end timestamp is
                 slightly ahead of the integration clock. Use `None` for
                 detector-paced replay where source-audio time can intentionally
                 advance faster than wall-clock time.
+            confirmed_at_monotonic_seconds: Raw audio-confirmation timestamp when
+                the recorded timestamp is backdated (#168). The future-timeline
+                bound is validated against this confirmation timestamp — the
+                actual detector signal that could be ahead of the integration
+                clock — so an implausible-future detector signal is still
+                rejected even though the recorded event is backdated to an
+                earlier onset. Defaults to ``detected_at_monotonic_seconds``.
             payload: Optional structured event details.
 
         Returns:
@@ -1720,10 +1730,25 @@ class RoastSessionStore:
                 return existing_event, _copy_session_for_read(session)
             _validate_event_transition(session, "first_crack_detected")
 
+            current_elapsed_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+            # Validate the future-timeline bound against the raw confirmation
+            # timestamp (the actual detector signal), not the backdated onset:
+            # a wildly-future detector signal must still be rejected (#168).
+            confirmation_seconds = (
+                detected_at_monotonic_seconds
+                if confirmed_at_monotonic_seconds is None
+                else confirmed_at_monotonic_seconds
+            )
+            _detected_elapsed_seconds(
+                session,
+                detected_at_monotonic_seconds=confirmation_seconds,
+                current_elapsed_seconds=current_elapsed_seconds,
+                max_future_seconds=max_future_seconds,
+            )
             detected_elapsed_seconds = _detected_elapsed_seconds(
                 session,
                 detected_at_monotonic_seconds=detected_at_monotonic_seconds,
-                current_elapsed_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
+                current_elapsed_seconds=current_elapsed_seconds,
                 max_future_seconds=max_future_seconds,
             )
             event = RoastEvent(

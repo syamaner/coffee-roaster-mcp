@@ -175,7 +175,9 @@ def test_audio_runtime_processes_after_beans_added_and_records_once() -> None:
         "beans_added",
         "first_crack_detected",
     ]
-    assert session.first_crack_monotonic_seconds == 6.0
+    # FC is backdated to the confirming-window onset (seq 1 starts at 505.0,
+    # elapsed 5.0), not the detector timestamp 506.0 (#168).
+    assert session.first_crack_monotonic_seconds == 5.0
 
 
 def test_detector_paced_audio_runtime_drains_one_window_per_processing_tick() -> None:
@@ -225,7 +227,9 @@ def test_detector_paced_audio_runtime_drains_one_window_per_processing_tick() ->
     assert detected.status == "detected"
     assert pipeline.drain_limits == [1, 1]
     assert [window.sequence_number for window in backend.windows] == [1, 2]
-    assert session.first_crack_monotonic_seconds == 7.0
+    # Inferred timestamp backdates to the confirming-window onset (seq 2 starts
+    # at 506.0, elapsed 6.0), not its window end 507.0 (#168).
+    assert session.first_crack_monotonic_seconds == 6.0
 
 
 def test_audio_runtime_reports_stopped_after_pipeline_stop_returns_running_snapshot() -> None:
@@ -388,7 +392,9 @@ def test_audio_runtime_records_earliest_positive_after_confirmation() -> None:
     detected = runtime.process_available_windows(session_store=store, session=session)
 
     assert detected.status == "detected"
-    assert session.first_crack_monotonic_seconds == 4.0
+    # Backdated to the onset of the earliest positive window (seq 1 starts at
+    # 503.0, elapsed 3.0), not its window end 504.0 (#168).
+    assert session.first_crack_monotonic_seconds == 3.0
     assert session.event_timeline[-1].payload["window_sequence_number"] == 1
     assert session.event_timeline[-1].payload["confirmed_by_window_sequence_number"] == 4
     assert session.event_timeline[-1].payload["positive_window_count"] == 3
@@ -420,7 +426,9 @@ def test_detector_paced_wav_replay_preserves_source_audio_timeline() -> None:
     detected = runtime.process_available_windows(session_store=store, session=session)
 
     assert detected.status == "detected"
-    assert session.first_crack_monotonic_seconds == 5.0
+    # Backdated to the confirming-window onset (504.0, elapsed 4.0), not the
+    # inferred window end 505.0 (#168).
+    assert session.first_crack_monotonic_seconds == 4.0
 
 
 def test_audio_runtime_reports_unavailable_artifact_errors_without_crashing() -> None:
