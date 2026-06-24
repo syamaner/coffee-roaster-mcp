@@ -55,6 +55,19 @@ def test_quiet_sdk_per_request_log_suppresses_info_keeps_warning() -> None:
         project_logger.setLevel(original_project_level)
 
 
+def test_quiet_sdk_per_request_log_only_raises_never_lowers() -> None:
+    """A stricter user/config level (e.g. ERROR) is preserved, not trampled to WARNING."""
+    sdk_logger = logging.getLogger(SDK_REQUEST_LOGGER_NAME)
+    original_sdk_level = sdk_logger.level
+    sdk_logger.setLevel(logging.ERROR)
+    try:
+        quiet_sdk_per_request_log()
+
+        assert sdk_logger.level == logging.ERROR
+    finally:
+        sdk_logger.setLevel(original_sdk_level)
+
+
 def test_in_process_mcp_tools_cover_mock_roast_and_export(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")

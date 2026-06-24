@@ -793,15 +793,21 @@ SDK_REQUEST_LOGGER_NAME = "mcp.server.lowlevel.server"
 
 
 def quiet_sdk_per_request_log() -> None:
-    """Raise the MCP SDK's per-request logger above INFO.
+    """Raise the MCP SDK's per-request logger to WARNING if it is more verbose.
 
     Suppresses the routine per-request ``Processing request of type
     CallToolRequest`` INFO line that the SDK emits once per dispatched request,
     while leaving ``WARNING`` and above visible so faults, mic-overflow recovery,
     and real errors still surface. This is observability-only and touches no other
     logger (the project's own ``coffee_roaster_mcp.*`` INFO lines are unaffected).
+
+    Only raises the level: if a user or config has already set the logger to a
+    stricter level (``ERROR``/``CRITICAL``), that setting is preserved rather than
+    trampled down to ``WARNING``.
     """
-    logging.getLogger(SDK_REQUEST_LOGGER_NAME).setLevel(logging.WARNING)
+    sdk_logger = logging.getLogger(SDK_REQUEST_LOGGER_NAME)
+    if sdk_logger.getEffectiveLevel() < logging.WARNING:
+        sdk_logger.setLevel(logging.WARNING)
 
 
 def run_stdio_server(config_path: str | Path | None = None) -> None:
