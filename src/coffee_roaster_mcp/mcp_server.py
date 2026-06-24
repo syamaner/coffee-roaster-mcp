@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
@@ -780,12 +781,36 @@ def create_mcp_server(
     return mcp
 
 
+# Logger of the MCP SDK's low-level server, which logs one INFO line
+# ("Processing request of type ...") for every request it dispatches. During a
+# live roast the agent polls ``get_roast_state`` once per controller tick (~1 Hz),
+# so at INFO this single logger floods the console for the whole roast and buries
+# the operator-relevant output (phase changes, advisor recs, safety verdicts,
+# audio mic-overflow recovery). The name is stable across the SDK versions we pin;
+# it is asserted in the tests so a rename surfaces loudly rather than silently
+# re-flooding.
+SDK_REQUEST_LOGGER_NAME = "mcp.server.lowlevel.server"
+
+
+def quiet_sdk_per_request_log() -> None:
+    """Raise the MCP SDK's per-request logger above INFO.
+
+    Suppresses the routine per-request ``Processing request of type
+    CallToolRequest`` INFO line that the SDK emits once per dispatched request,
+    while leaving ``WARNING`` and above visible so faults, mic-overflow recovery,
+    and real errors still surface. This is observability-only and touches no other
+    logger (the project's own ``coffee_roaster_mcp.*`` INFO lines are unaffected).
+    """
+    logging.getLogger(SDK_REQUEST_LOGGER_NAME).setLevel(logging.WARNING)
+
+
 def run_stdio_server(config_path: str | Path | None = None) -> None:
     """Run RoastPilot over stdio transport.
 
     Args:
         config_path: Optional explicit config path.
     """
+    quiet_sdk_per_request_log()
     create_mcp_server(config_path=config_path, transport="stdio").run(transport="stdio")
 
 
