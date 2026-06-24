@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -17,11 +18,54 @@ from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackRuntimeState,
 )
 from coffee_roaster_mcp.mcp_server import (
+    SDK_REQUEST_LOGGER_NAME,
     ServerContext,
     build_server_context,
     create_mcp_server,
+    quiet_sdk_per_request_log,
 )
 from coffee_roaster_mcp.session import RoastSession, RoastSessionStore, SessionLifecycleError
+
+
+def test_sdk_request_logger_name_matches_installed_sdk() -> None:
+    """The pinned SDK logger name must match the SDK we suppress, or the guard misses."""
+    import mcp.server.lowlevel.server as sdk_server
+
+    assert sdk_server.logger.name == SDK_REQUEST_LOGGER_NAME
+
+
+def test_quiet_sdk_per_request_log_suppresses_info_keeps_warning() -> None:
+    """Quieting raises the SDK per-request logger to WARNING without touching others."""
+    sdk_logger = logging.getLogger(SDK_REQUEST_LOGGER_NAME)
+    project_logger = logging.getLogger("coffee_roaster_mcp.audio")
+    original_sdk_level = sdk_logger.level
+    original_project_level = project_logger.level
+    sdk_logger.setLevel(logging.INFO)
+    project_logger.setLevel(logging.INFO)
+    try:
+        quiet_sdk_per_request_log()
+
+        assert sdk_logger.level == logging.WARNING
+        assert sdk_logger.isEnabledFor(logging.WARNING)
+        assert not sdk_logger.isEnabledFor(logging.INFO)
+        # The project's own INFO logging (e.g. mic-overflow recovery) is untouched.
+        assert project_logger.level == logging.INFO
+    finally:
+        sdk_logger.setLevel(original_sdk_level)
+        project_logger.setLevel(original_project_level)
+
+
+def test_quiet_sdk_per_request_log_only_raises_never_lowers() -> None:
+    """A stricter user/config level (e.g. ERROR) is preserved, not trampled to WARNING."""
+    sdk_logger = logging.getLogger(SDK_REQUEST_LOGGER_NAME)
+    original_sdk_level = sdk_logger.level
+    sdk_logger.setLevel(logging.ERROR)
+    try:
+        quiet_sdk_per_request_log()
+
+        assert sdk_logger.level == logging.ERROR
+    finally:
+        sdk_logger.setLevel(original_sdk_level)
 
 
 def test_in_process_mcp_tools_cover_mock_roast_and_export(tmp_path: Path) -> None:
