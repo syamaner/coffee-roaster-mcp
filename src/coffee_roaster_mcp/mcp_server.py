@@ -393,6 +393,19 @@ class EventCommandResult:
 
 
 @dataclass(frozen=True)
+class SetRecordingMetadataResult:
+    """Result for storing annotation-pipeline recording metadata (#176).
+
+    Attributes:
+        origin: Stored bean origin slug used to name the captured WAVs.
+        roast_num: Stored 1-based roast number used to name the captured WAVs.
+    """
+
+    origin: str
+    roast_num: int
+
+
+@dataclass(frozen=True)
 class ExportRoastLogResult:
     """Result for one snapshot roast-log export."""
 
@@ -521,6 +534,7 @@ def create_mcp_server(
                 "stop_cooling",
                 "export_roast_log",
                 "emergency_stop",
+                "set_recording_metadata",
             ),
             started_at_utc=server_context.started_at_utc.isoformat(),
         )
@@ -777,6 +791,38 @@ def create_mcp_server(
             reason="emergency stop",
         )
         return _serialize_event_result(snapshot=snapshot, event=event)
+
+    @mcp.tool()
+    def set_recording_metadata(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+        origin: str,
+        roast_num: int,
+    ) -> SetRecordingMetadataResult:
+        """Store bean origin + roast number for the next roast's audio recording.
+
+        Call this BEFORE starting the roast. The recorder reads it when it creates
+        the WAVs, naming them ``mic{N}-{origin}-roast{N}.wav`` and writing a
+        ``{origin}-roast{N}-session.json`` so the captured audio plugs straight
+        into the coffee-first-crack-detection annotation pipeline. This is purely
+        additive metadata: it sends no hardware command. If never called,
+        recording falls back to the session id as origin and roast number 0.
+
+        Args:
+            origin: Bean origin slug (e.g. ``"brazil"``).
+            roast_num: 1-based roast number.
+
+        Returns:
+            The stored origin and roast number.
+
+        Raises:
+            ValueError: If origin is blank or roast_num is negative.
+        """
+        server_context = ctx.request_context.lifespan_context
+        stored = server_context.first_crack_runtime.set_recording_metadata(
+            origin=origin,
+            roast_num=roast_num,
+        )
+        return SetRecordingMetadataResult(origin=stored.origin, roast_num=stored.roast_num)
 
     return mcp
 

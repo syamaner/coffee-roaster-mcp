@@ -94,7 +94,7 @@ _EXPECTED_T0_STATUS_KEYS = {
 
 
 def test_version_is_defined() -> None:
-    assert __version__ == "0.1.8"
+    assert __version__ == "0.1.9"
 
 
 def test_cli_parser_program_name() -> None:
@@ -107,7 +107,7 @@ def test_main_without_subcommand_prints_help(capsys: pytest.CaptureFixture[str])
     assert main([]) == 0
     output = capsys.readouterr().out
     assert "usage: coffee-roaster-mcp" in output
-    assert "{serve,hottop-validate,mic-check}" in output
+    assert "{serve,hottop-validate,mic-check,record-check}" in output
 
 
 def test_main_prints_version(capsys: pytest.CaptureFixture[str]) -> None:
@@ -149,6 +149,39 @@ def test_hottop_validate_returns_nonzero_for_unsuccessful_report(
     assert capsys.readouterr().out == "{}\n"
 
 
+def test_record_check_cli_reports_and_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    stream = SimpleNamespace(
+        device="USB PnP",
+        wav_filename="record-check.usb-pnp.wav",
+        peak_dbfs=-6.0,
+        rms_dbfs=-12.0,
+        has_signal=False,
+        error=None,
+    )
+    report = SimpleNamespace(streams=[stream], passed=False, output_dir=tmp_path)
+
+    def fake_run_record_check(options: Any) -> Any:
+        _ = options
+        return report
+
+    def fake_record_report_to_json(record_report: Any) -> str:
+        _ = record_report
+        return "{}"
+
+    monkeypatch.setattr(cli, "run_record_check", fake_run_record_check)
+    monkeypatch.setattr(cli, "record_report_to_json", fake_record_report_to_json)
+
+    assert main(["record-check", "--seconds", "1"]) == 1
+    captured = capsys.readouterr()
+    assert "{}" in captured.out
+    assert "USB PnP" in captured.err
+    assert "FAIL" in captured.err
+
+
 def test_stdio_server_starts_and_exposes_bootstrap_tools(tmp_path: Path) -> None:
     asyncio.run(_assert_stdio_server_tools(tmp_path))
 
@@ -177,6 +210,7 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
             "mark_first_crack",
             "set_fan",
             "set_heat",
+            "set_recording_metadata",
             "start_cooling",
             "start_roast_session",
             "stop_cooling",

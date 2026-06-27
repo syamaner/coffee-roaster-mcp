@@ -106,6 +106,55 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class RecordingConfig:
+    """Roast audio recording configuration (#176, v1: capture-only).
+
+    Records the detector's existing mono capture stream to a per-roast WAV plus
+    a session sidecar JSON, so the first-crack model can be diagnosed offline and
+    the audio feeds the FC training corpus. The recorder tees the same samples
+    the detector consumes (no second contending stream on the audio device).
+
+    Single-stream (default): the recorder tees the detector's mono stream into
+    ONE WAV. Multi-device (option A): set `devices` to capture several
+    independent USB-mic streams at once, one WAV per device — the FIRST device is
+    the FC detector's device (teed, no second open), and each ADDITIONAL device
+    is opened as its own independent capture stream. The additional streams are
+    independent (NOT sample-locked) clocks; drift is acceptable for FC training
+    data (operator decision, research-confirmed: no aggregate, no JACK).
+
+    Attributes:
+        enabled: Whether roast audio recording is active at all. When false, no
+            WAV or sidecar is written and the detector stream is untouched.
+        autocapture: Whether capture starts automatically with each roast,
+            requiring no MCP command. Only meaningful when `enabled` is true.
+        export_location: Base directory for per-session capture output. Each
+            session writes to `export_location/<session_id>/`. Defaults to a
+            gitignored captures directory when unset.
+        sample_rate: Optional WAV sample rate in Hz. Defaults to the detector
+            `audio.sample_rate` when unset. Applies to every recorded stream.
+        devices: Optional list of capture device-name substrings (matched the
+            same way as `audio.input_device`). The FIRST entry is the detector's
+            device and is TEED from the existing detector stream (no second open,
+            no contention); each ADDITIONAL entry is opened as its own
+            independent capture stream into its own WAV. When unset, the recorder
+            falls back to single-stream behaviour (tee the detector only).
+        device: Deprecated single-device hint retained for forward-compat. Use
+            `devices`; this field is no longer read by the recorder.
+        channels: Optional channel-to-mic map reserved for a future true
+            multi-channel (single-device, 2-channel) follow-on; not read in
+            option A, which uses independent per-device streams.
+    """
+
+    enabled: bool = False
+    autocapture: bool = False
+    export_location: Path | None = None
+    sample_rate: int | None = None
+    devices: tuple[str, ...] | None = None
+    device: str | None = None
+    channels: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True)
 class SessionConfig:
     """Roast session metric configuration."""
 
@@ -124,6 +173,7 @@ class AppConfig:
     first_crack: FirstCrackConfig = field(default_factory=FirstCrackConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    recording: RecordingConfig = field(default_factory=RecordingConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
     source_path: Path | None = None
 
@@ -200,6 +250,7 @@ def _config_from_mapping(raw_config: Mapping[str, Any], source_path: Path | None
         first_crack=_first_crack_from_mapping(_section(raw_config, "first_crack")),
         audio=_audio_from_mapping(_section(raw_config, "audio")),
         logging=_logging_from_mapping(_section(raw_config, "logging")),
+        recording=_recording_from_mapping(_section(raw_config, "recording")),
         session=_session_from_mapping(_section(raw_config, "session")),
         source_path=source_path,
     )
@@ -334,6 +385,26 @@ def _logging_from_mapping(raw: Mapping[str, Any]) -> LoggingConfig:
     )
 
 
+def _recording_from_mapping(raw: Mapping[str, Any]) -> RecordingConfig:
+    return RecordingConfig(
+        enabled=_boolean(raw, "enabled", False, label="recording.enabled"),
+        autocapture=_boolean(raw, "autocapture", False, label="recording.autocapture"),
+        export_location=_optional_path(
+            raw,
+            "export_location",
+            label="recording.export_location",
+        ),
+        sample_rate=_optional_positive_integer(
+            raw,
+            "sample_rate",
+            label="recording.sample_rate",
+        ),
+        devices=_optional_string_list(raw.get("devices"), label="recording.devices"),
+        device=_optional_string(raw, "device", label="recording.device"),
+        channels=_optional_channels(raw.get("channels"), label="recording.channels"),
+    )
+
+
 def _session_from_mapping(raw: Mapping[str, Any]) -> SessionConfig:
     return SessionConfig(
         auto_t0_detection_enabled=_boolean(
@@ -368,6 +439,7 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
     first_crack = config.first_crack
     audio = config.audio
     logging = config.logging
+    recording = config.recording
 
     if "COFFEE_ROASTER_DRIVER" in environ:
         roaster = replace(
@@ -514,6 +586,41 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
             logging,
             log_dir=Path(_required_string(environ["COFFEE_ROAST_LOG_DIR"], "COFFEE_ROAST_LOG_DIR")),
         )
+
+    if "COFFEE_RECORDING_ENABLED" in environ:
+        recording = replace(
+            recording,
+            enabled=_parse_boolean(environ["COFFEE_RECORDING_ENABLED"], "COFFEE_RECORDING_ENABLED"),
+        )
+    if "COFFEE_RECORDING_AUTOCAPTURE" in environ:
+        recording = replace(
+            recording,
+            autocapture=_parse_boolean(
+                environ["COFFEE_RECORDING_AUTOCAPTURE"],
+                "COFFEE_RECORDING_AUTOCAPTURE",
+            ),
+        )
+    if "COFFEE_RECORDING_EXPORT_LOCATION" in environ:
+        export_location = _none_if_empty(environ["COFFEE_RECORDING_EXPORT_LOCATION"])
+        recording = replace(
+            recording,
+            export_location=Path(export_location) if export_location is not None else None,
+        )
+    if "COFFEE_RECORDING_SAMPLE_RATE" in environ:
+        sample_rate = _none_if_empty(environ["COFFEE_RECORDING_SAMPLE_RATE"])
+        recording = replace(
+            recording,
+            sample_rate=(
+                None
+                if sample_rate is None
+                else _parse_positive_integer(sample_rate, "COFFEE_RECORDING_SAMPLE_RATE")
+            ),
+        )
+    if "COFFEE_RECORDING_DEVICES" in environ:
+        recording = replace(
+            recording,
+            devices=_parse_devices_csv(environ["COFFEE_RECORDING_DEVICES"]),
+        )
     if "COFFEE_AUTO_T0_DROP_THRESHOLD_C" in environ:
         session = replace(
             config.session,
@@ -531,6 +638,7 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
         first_crack=first_crack,
         audio=audio,
         logging=logging,
+        recording=recording,
         session=session,
     )
 
@@ -592,6 +700,20 @@ def _boolean(
     raise ConfigError(f"{error_key} must be a boolean.")
 
 
+def _parse_devices_csv(value: str) -> tuple[str, ...] | None:
+    items = tuple(part.strip() for part in value.split(",") if part.strip())
+    return items or None
+
+
+def _parse_boolean(value: str, key: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{key} must be a boolean.")
+
+
 def _integer(raw: Mapping[str, Any], key: str, default: int, label: str | None = None) -> int:
     error_key = label or key
     value = raw.get(key, default)
@@ -606,6 +728,47 @@ def _positive_integer(
 ) -> int:
     error_key = label or key
     return _parse_positive_integer(raw.get(key, default), error_key)
+
+
+def _optional_positive_integer(
+    raw: Mapping[str, Any],
+    key: str,
+    label: str | None = None,
+) -> int | None:
+    error_key = label or key
+    value = raw.get(key)
+    if value is None:
+        return None
+    return _parse_positive_integer(value, error_key)
+
+
+def _optional_string_list(value: object, *, label: str) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(f"{label} must be a list of strings or null.")
+    raw_items = cast(list[object] | tuple[object, ...], value)
+    items: list[str] = []
+    for item in raw_items:
+        if not isinstance(item, str):
+            raise ConfigError(f"{label} values must be strings.")
+        normalized = item.strip()
+        if not normalized:
+            raise ConfigError(f"{label} values must not be empty.")
+        items.append(normalized)
+    return tuple(items)
+
+
+def _optional_channels(value: object, *, label: str) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(f"{label} must be a list of integers or null.")
+    raw_channels = cast(list[object] | tuple[object, ...], value)
+    channels = tuple(_parse_integer(item, label) for item in raw_channels)
+    if any(channel < 0 for channel in channels):
+        raise ConfigError(f"{label} values must be non-negative integers.")
+    return channels
 
 
 def _parse_integer(value: object, key: str) -> int:

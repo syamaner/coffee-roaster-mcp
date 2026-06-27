@@ -4,6 +4,8 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from coffee_roaster_mcp.artifacts import (
     ArtifactResolutionError,
     ResolvedArtifact,
@@ -555,3 +557,572 @@ def _resolved_detector_artifacts() -> ResolvedDetectorArtifacts:
             local_path=Path("/tmp/preprocessor_config.json"),
         ),
     )
+
+
+def test_build_session_recorder_disabled_returns_none() -> None:
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+
+    # Disabled entirely.
+    assert (
+        build_session_recorder(AppConfig(recording=RecordingConfig(enabled=False)), session) is None
+    )
+    # Enabled but not autocapture (v1 only wires autocapture).
+    assert (
+        build_session_recorder(
+            AppConfig(recording=RecordingConfig(enabled=True, autocapture=False)),
+            session,
+        )
+        is None
+    )
+
+
+def test_build_session_recorder_uses_export_location_and_session_id(tmp_path: Path) -> None:
+    from coffee_roaster_mcp.audio import RoastAudioRecorder
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    config = AppConfig(
+        audio=AudioConfig(sample_rate=22_050),
+        recording=RecordingConfig(
+            enabled=True,
+            autocapture=True,
+            export_location=tmp_path / "captures",
+        ),
+    )
+
+    recorder = build_session_recorder(config, session)
+
+    assert isinstance(recorder, RoastAudioRecorder)
+    # No metadata → fallback origin=session.id, roast_num=0; mic1 WAV name.
+    assert recorder.wav_path == tmp_path / "captures" / session.id / f"mic1-{session.id}-roast0.wav"
+    assert recorder.sidecar_path == tmp_path / "captures" / session.id / "roast.recording.json"
+    # sample_rate falls back to the detector audio.sample_rate.
+    assert recorder.sample_rate == 22_050
+
+
+def test_build_session_recorder_defaults_export_under_log_dir(tmp_path: Path) -> None:
+    from coffee_roaster_mcp.audio import RoastAudioRecorder
+    from coffee_roaster_mcp.config import LoggingConfig, RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    config = AppConfig(
+        logging=LoggingConfig(log_dir=tmp_path / "logs"),
+        recording=RecordingConfig(enabled=True, autocapture=True),
+    )
+
+    recorder = build_session_recorder(config, session)
+
+    assert isinstance(recorder, RoastAudioRecorder)
+    # With no export_location, captures land under the gitignored log dir.
+    assert (
+        recorder.wav_path
+        == tmp_path / "logs" / "captures" / session.id / f"mic1-{session.id}-roast0.wav"
+    )
+
+
+def test_default_pipeline_factory_passes_recorder(monkeypatch: pytest.MonkeyPatch) -> None:
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+    from coffee_roaster_mcp.config import RecordingConfig
+
+    captured: dict[str, object] = {}
+
+    def fake_build_pipeline(config: AudioConfig, *, recorder: object = None) -> FakeAudioPipeline:
+        captured["recorder"] = recorder
+        return FakeAudioPipeline()
+
+    monkeypatch.setattr(runtime_module, "build_audio_capture_pipeline", fake_build_pipeline)
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+            recording=RecordingConfig(enabled=True, autocapture=True),
+        ),
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            MockDetectorBackend(()),
+        ),
+    )
+
+    snapshot = runtime.start_for_session(session)
+
+    # The default factory built the pipeline with the session recorder teed in.
+    assert snapshot.status == "pending"
+    assert captured["recorder"] is not None
+
+
+def test_build_session_recorder_milestones_track_session(tmp_path: Path) -> None:
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import (
+        build_session_recorder,
+        recording_relative_milestones,
+    )
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    config = AppConfig(
+        recording=RecordingConfig(
+            enabled=True,
+            autocapture=True,
+            export_location=tmp_path,
+            sample_rate=16_000,
+        ),
+    )
+
+    recorder = build_session_recorder(config, session)
+    assert recorder is not None
+
+    # Before any milestone, both are None (recording start unknown → raw values).
+    assert recording_relative_milestones(session, recording_started_monotonic_seconds=None) == {
+        "beans_added": None,
+        "first_crack": None,
+    }
+
+    # The provider reads the LIVE session, so later milestones surface.
+    session.beans_added_monotonic_seconds = 12.0
+    session.first_crack_monotonic_seconds = 95.5
+    assert recording_relative_milestones(session, recording_started_monotonic_seconds=None) == {
+        "beans_added": 12.0,
+        "first_crack": 95.5,
+    }
+
+
+def test_recording_relative_milestones_are_rebased_to_recording_start() -> None:
+    """A milestone's sidecar value equals (milestone_session_elapsed - rec_start)."""
+    from coffee_roaster_mcp.first_crack_runtime import recording_relative_milestones
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+
+    # Session started at monotonic 500.0 (ClockHarness). Recording began 3.5 s
+    # later, at absolute monotonic 503.5 — i.e. 3.5 s into the session.
+    assert session.monotonic_start == 500.0
+    recording_started = 503.5
+    recording_start_session_elapsed = recording_started - session.monotonic_start
+
+    # Milestones in SESSION-elapsed seconds (as the session stores them).
+    session.beans_added_monotonic_seconds = 12.0
+    session.first_crack_monotonic_seconds = 95.5
+
+    milestones = recording_relative_milestones(
+        session, recording_started_monotonic_seconds=recording_started
+    )
+
+    # Each is genuinely recording-relative: session-elapsed minus the recording
+    # start (in the same session-elapsed domain).
+    assert milestones["beans_added"] == round(12.0 - recording_start_session_elapsed, 6)
+    assert milestones["first_crack"] == round(95.5 - recording_start_session_elapsed, 6)
+    assert milestones["beans_added"] == 8.5
+    assert milestones["first_crack"] == 92.0
+
+
+def test_built_recorder_writes_recording_relative_milestones(tmp_path: Path) -> None:
+    """End to end: the sidecar from build_session_recorder carries rebased milestones."""
+    import json
+
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    recorder = build_session_recorder(
+        AppConfig(
+            recording=RecordingConfig(
+                enabled=True,
+                autocapture=True,
+                export_location=tmp_path,
+                sample_rate=8,
+            ),
+        ),
+        session,
+    )
+    assert recorder is not None
+
+    recorder.begin()
+    recording_started = recorder.started_monotonic_seconds
+    assert recording_started is not None
+    recording_start_session_elapsed = recording_started - session.monotonic_start
+
+    # Milestones recorded (in session-elapsed seconds) after recording started.
+    session.beans_added_monotonic_seconds = 12.0
+    session.first_crack_monotonic_seconds = 95.5
+    recorder.write_samples((0.1,) * 8)
+    recorder.close()
+
+    sidecar = json.loads(
+        (tmp_path / session.id / "roast.recording.json").read_text(encoding="utf-8")
+    )
+    # The closure rebased both milestones onto the recording clock.
+    assert sidecar["milestones"]["beans_added"] == round(12.0 - recording_start_session_elapsed, 6)
+    assert sidecar["milestones"]["first_crack"] == round(95.5 - recording_start_session_elapsed, 6)
+
+
+def test_build_session_recorder_multi_device(tmp_path: Path) -> None:
+    from coffee_roaster_mcp.audio import MultiDeviceRoastRecorder
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import RecordingMetadata, build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    config = AppConfig(
+        recording=RecordingConfig(
+            enabled=True,
+            autocapture=True,
+            export_location=tmp_path,
+            devices=("USB PnP", "ATR2100x"),
+        ),
+    )
+
+    recorder = build_session_recorder(
+        config, session, metadata=RecordingMetadata(origin="brazil", roast_num=7)
+    )
+
+    assert isinstance(recorder, MultiDeviceRoastRecorder)
+    # mic1 = the teed detector device; mic2 = the first additional device. WAVs
+    # are named for the annotation pipeline: mic{N}-{origin}-roast{N}.wav.
+    assert recorder.wav_path == tmp_path / session.id / "mic1-brazil-roast7.wav"
+    assert recorder.additional_wav_paths == (tmp_path / session.id / "mic2-brazil-roast7.wav",)
+
+
+def test_build_session_recorder_single_device_labels_wav(tmp_path: Path) -> None:
+    from coffee_roaster_mcp.audio import RoastAudioRecorder
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import RecordingMetadata, build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    config = AppConfig(
+        recording=RecordingConfig(
+            enabled=True,
+            autocapture=True,
+            export_location=tmp_path,
+            devices=("USB PnP",),
+        ),
+    )
+
+    recorder = build_session_recorder(
+        config, session, metadata=RecordingMetadata(origin="ethiopia", roast_num=3)
+    )
+
+    # A single configured device uses the single-stream recorder, mic1-named.
+    assert isinstance(recorder, RoastAudioRecorder)
+    assert recorder.wav_path == tmp_path / session.id / "mic1-ethiopia-roast3.wav"
+
+
+def test_build_session_recorder_no_devices_is_v1_single(tmp_path: Path) -> None:
+    from coffee_roaster_mcp.audio import RoastAudioRecorder
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    config = AppConfig(
+        recording=RecordingConfig(enabled=True, autocapture=True, export_location=tmp_path),
+    )
+
+    recorder = build_session_recorder(config, session)
+
+    # No devices + no metadata → single stream, fallback origin=session.id/roast0.
+    assert isinstance(recorder, RoastAudioRecorder)
+    assert recorder.wav_path == tmp_path / session.id / f"mic1-{session.id}-roast0.wav"
+
+
+def test_runtime_set_recording_metadata_flows_into_built_recorder(tmp_path: Path) -> None:
+    from coffee_roaster_mcp.audio import RoastAudioRecorder
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    config = AppConfig(
+        recording=RecordingConfig(enabled=True, autocapture=True, export_location=tmp_path),
+    )
+    runtime = FirstCrackSessionRuntime(config=config)
+
+    # The tool stores the metadata and echoes it back.
+    stored = runtime.set_recording_metadata(origin="Brazil Cerrado", roast_num=12)
+    assert stored.origin == "Brazil Cerrado"
+    assert stored.roast_num == 12
+
+    # The recorder consumes that exact metadata object to name the WAVs.
+    recorder = build_session_recorder(config, session, metadata=stored)
+    assert isinstance(recorder, RoastAudioRecorder)
+    # Origin is slugified to [a-z0-9-]+ for the FC pipeline.
+    assert recorder.wav_path.name == "mic1-brazil-cerrado-roast12.wav"
+
+
+def test_set_recording_metadata_validates_input() -> None:
+    runtime = FirstCrackSessionRuntime(config=AppConfig())
+    with pytest.raises(ValueError, match="origin must not be blank"):
+        runtime.set_recording_metadata(origin="  ", roast_num=1)
+    with pytest.raises(ValueError, match="roast_num must be >= 0"):
+        runtime.set_recording_metadata(origin="brazil", roast_num=-1)
+
+
+def test_built_recorder_no_metadata_fallback_writes_valid_files(tmp_path: Path) -> None:
+    """Finding: the no-metadata fallback (session_id / 0) still produces valid files."""
+    import json
+
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    recorder = build_session_recorder(
+        AppConfig(
+            recording=RecordingConfig(
+                enabled=True, autocapture=True, export_location=tmp_path, sample_rate=8
+            ),
+        ),
+        session,
+        metadata=None,
+    )
+    assert recorder is not None
+
+    recorder.begin()
+    recorder.write_samples((0.2,) * 8)
+    recorder.close()
+
+    session_dir = tmp_path / session.id
+    annotation_path = session_dir / f"{session.id}-roast0-session.json"
+    assert annotation_path.exists()
+    payload = json.loads(annotation_path.read_text(encoding="utf-8"))
+    assert payload["origin"] == session.id  # fallback origin
+    assert payload["roast_num"] == 0  # fallback roast number
+    assert payload["mics"][0]["file"] == f"mic1-{session.id}-roast0.wav"
+    # The WAV and recording sidecar are valid too.
+    assert (session_dir / f"mic1-{session.id}-roast0.wav").exists()
+    assert (session_dir / "roast.recording.json").exists()
+
+
+def test_normalize_origin_slug_edge_cases() -> None:
+    from coffee_roaster_mcp.first_crack_runtime import (
+        _normalize_origin_slug,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    assert _normalize_origin_slug("Brazil Cerrado") == "brazil-cerrado"
+    assert _normalize_origin_slug("ETHIOPIA__yirgacheffe") == "ethiopia-yirgacheffe"
+    assert _normalize_origin_slug("  !!  ") == "roast"  # empty after stripping → fallback
+    assert _normalize_origin_slug("kenya-aa") == "kenya-aa"
+
+
+def test_teed_stream_wav_uses_detector_sample_rate_not_recording_rate(tmp_path: Path) -> None:
+    """Bug 1: the teed mic1 WAV header must use audio.sample_rate (the detector's
+    real capture rate), NOT recording.sample_rate."""
+    import wave
+
+    from coffee_roaster_mcp.audio import RoastAudioRecorder
+    from coffee_roaster_mcp.config import AudioConfig, RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    config = AppConfig(
+        audio=AudioConfig(sample_rate=16_000),
+        recording=RecordingConfig(
+            enabled=True,
+            autocapture=True,
+            export_location=tmp_path,
+            sample_rate=44_100,  # the WRONG rate for the teed detector stream
+        ),
+    )
+
+    recorder = build_session_recorder(config, session)
+    assert isinstance(recorder, RoastAudioRecorder)
+    # The recorder's nominal rate is the detector rate, not recording.sample_rate.
+    assert recorder.sample_rate == 16_000
+
+    recorder.begin()
+    recorder.write_samples((0.1,) * 16_000)  # 1.0 s of 16 kHz audio
+    recorder.close()
+
+    with wave.open(str(recorder.wav_path), "rb") as wav_file:
+        assert wav_file.getframerate() == 16_000  # NOT 44_100
+        frame_count = wav_file.getnframes()
+    assert frame_count == 16_000
+    # frame_count / rate gives the TRUE wall-clock duration (1.0 s), not 0.36 s.
+    assert round(frame_count / wav_file.getframerate(), 3) == 1.0
+
+
+def test_multi_device_teed_and_additional_rates_differ(tmp_path: Path) -> None:
+    """Bug 1: mic1 (teed) uses audio.sample_rate; additional streams use
+    recording.sample_rate."""
+    import time
+    import wave
+
+    from coffee_roaster_mcp.audio import (
+        AdditionalRecordingDevice,
+        AudioInput,
+        MultiDeviceRoastRecorder,
+    )
+    from coffee_roaster_mcp.config import AudioConfig, RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import RecordingMetadata, build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    config = AppConfig(
+        audio=AudioConfig(sample_rate=16_000),
+        recording=RecordingConfig(
+            enabled=True,
+            autocapture=True,
+            export_location=tmp_path,
+            sample_rate=44_100,
+            devices=("USB PnP", "ATR2100x"),
+        ),
+    )
+
+    captured_rates: dict[str, int] = {}
+
+    def factory(device: AdditionalRecordingDevice) -> AudioInput:
+        # Record the rate the additional stream was configured with, then no-op
+        # the capture (no hardware in tests).
+        captured_rates[device.device_label] = device.sample_rate
+        raise RuntimeError("not opening hardware in this test")
+
+    recorder = build_session_recorder(
+        config,
+        session,
+        metadata=RecordingMetadata(origin="brazil", roast_num=7),
+    )
+    assert isinstance(recorder, MultiDeviceRoastRecorder)
+
+    # We cannot reach the private additional specs through build_session_recorder,
+    # so re-create an equivalent recorder with a capturing factory to observe the
+    # rate threaded into the additional device.
+    observed = MultiDeviceRoastRecorder(
+        detector_wav_path=tmp_path / "x" / "mic1-brazil-roast7.wav",
+        detector_device_label="USB PnP",
+        sidecar_path=tmp_path / "x" / "roast.recording.json",
+        sample_rate=16_000,  # detector rate
+        session_id="s",
+        additional_devices=[
+            AdditionalRecordingDevice(
+                "ATR2100x", tmp_path / "x" / "mic2-brazil-roast7.wav", 44_100
+            ),
+        ],
+        additional_input_factory=factory,
+        stop_timeout_seconds=2.0,
+    )
+    observed.begin()
+    time.sleep(0.05)
+    observed.close()
+
+    # The teed mic1 WAV header is the detector rate; the additional stream is the
+    # recording rate.
+    with wave.open(str(observed.wav_path), "rb") as wav_file:
+        assert wav_file.getframerate() == 16_000
+    assert captured_rates["ATR2100x"] == 44_100
+
+
+def test_zero_frame_teed_stream_still_finalises_wav_and_both_sidecars(tmp_path: Path) -> None:
+    """Bug 2: a teed stream that captures NO frames before close still produces a
+    valid finalised mic1 WAV plus both JSON sidecars."""
+    import json
+    import wave
+
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    recorder = build_session_recorder(
+        AppConfig(
+            recording=RecordingConfig(
+                enabled=True, autocapture=True, export_location=tmp_path, sample_rate=16_000
+            ),
+        ),
+        session,
+        metadata=None,
+    )
+    assert recorder is not None
+
+    # begin() then close() with NO write_samples in between (zero frames).
+    recorder.begin()
+    recorder.close()
+
+    session_dir = tmp_path / session.id
+    wav_path = session_dir / f"mic1-{session.id}-roast0.wav"
+    # Valid, finalised WAV (not 0 bytes) with a correct header and 0 frames.
+    assert wav_path.exists()
+    assert wav_path.stat().st_size >= 44  # WAV header is 44 bytes
+    with wave.open(str(wav_path), "rb") as wav_file:
+        assert wav_file.getnframes() == 0
+        assert wav_file.getframerate() == 16_000
+    # BOTH sidecars written.
+    annotation_path = session_dir / f"{session.id}-roast0-session.json"
+    recording_sidecar = session_dir / "roast.recording.json"
+    assert annotation_path.exists()
+    assert recording_sidecar.exists()
+    annotation = json.loads(annotation_path.read_text(encoding="utf-8"))
+    assert annotation["mics"][0]["file"] == f"mic1-{session.id}-roast0.wav"
+
+
+def test_set_recording_metadata_after_build_warns_and_is_not_applied(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Hardening: metadata set AFTER the recorder is built logs a warning and the
+    WAV names stay fixed (it is not silently applied)."""
+    import logging
+
+    from coffee_roaster_mcp.config import RecordingConfig
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+            recording=RecordingConfig(enabled=True, autocapture=True, export_location=tmp_path),
+        ),
+        audio_pipeline_factory=lambda _config: FakeAudioPipeline(),
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+
+    # Metadata BEFORE start: applied with no warning.
+    with caplog.at_level(logging.WARNING, logger="coffee_roaster_mcp.first_crack_runtime"):
+        runtime.set_recording_metadata(origin="early", roast_num=1)
+    assert not any("arrived AFTER" in record.message for record in caplog.records)
+
+    # Starting the roast builds the recorder for the active session.
+    runtime.start_for_session(session)
+
+    # Metadata AFTER the recorder was built now warns (non-silent).
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="coffee_roaster_mcp.first_crack_runtime"):
+        runtime.set_recording_metadata(origin="late", roast_num=99)
+    assert any("arrived AFTER" in record.message for record in caplog.records)
+
+    # A new session resets the gate: metadata is accepted again without warning.
+    runtime.stop_for_session(session.id, reason="done")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="coffee_roaster_mcp.first_crack_runtime"):
+        runtime.set_recording_metadata(origin="next", roast_num=2)
+    assert not any("arrived AFTER" in record.message for record in caplog.records)

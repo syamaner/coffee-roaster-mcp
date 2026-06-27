@@ -16,6 +16,12 @@ from coffee_roaster_mcp.hottop_validation import (
 from coffee_roaster_mcp.mcp_server import run_stdio_server
 from coffee_roaster_mcp.mic_check import DEFAULT_RMS_FLOOR, MicCheckOptions, run_mic_check
 from coffee_roaster_mcp.mic_check import report_to_json as mic_report_to_json
+from coffee_roaster_mcp.record_check import (
+    DEFAULT_RECORD_SECONDS,
+    RecordCheckOptions,
+    run_record_check,
+)
+from coffee_roaster_mcp.record_check import report_to_json as record_report_to_json
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -127,6 +133,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional JSON evidence file to write.",
     )
+
+    record_parser = subparsers.add_parser(
+        "record-check",
+        help="Smoke-test multi-device roast audio capture WITHOUT a roast (#176).",
+    )
+    record_parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="coffee-roaster-mcp YAML config selecting recording.devices + sample rate.",
+    )
+    record_parser.add_argument(
+        "--seconds",
+        type=float,
+        default=DEFAULT_RECORD_SECONDS,
+        help="Capture duration per device; make noise during this window.",
+    )
+    record_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Where to write the WAVs + sidecar (a temp dir is used when unset).",
+    )
     return parser
 
 
@@ -184,6 +213,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         verdict = "PASS — microphone is capturing real audio" if report.passed else "FAIL"
         print(f"\n{verdict}", file=sys.stderr)
         if not report.passed:
+            return 1
+    if args.command == "record-check":
+        print(
+            f"Recording {args.seconds:.0f}s from the configured devices — "
+            "make noise (snap / speak / tap)…",
+            file=sys.stderr,
+            flush=True,
+        )
+        record_report = run_record_check(
+            RecordCheckOptions(
+                config_path=args.config,
+                record_seconds=args.seconds,
+                output_dir=args.output_dir,
+            )
+        )
+        print(record_report_to_json(record_report))
+        for stream in record_report.streams:
+            note = stream.error or ("signal OK" if stream.has_signal else "SILENT/low")
+            print(
+                f"  {stream.device}: {stream.wav_filename} "
+                f"peak {stream.peak_dbfs} dBFS rms {stream.rms_dbfs} dBFS — {note}",
+                file=sys.stderr,
+            )
+        verdict = "PASS — every device captured real audio" if record_report.passed else "FAIL"
+        print(f"\n{verdict} (files in {record_report.output_dir})", file=sys.stderr)
+        if not record_report.passed:
             return 1
     return 0
 

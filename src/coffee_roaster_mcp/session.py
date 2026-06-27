@@ -334,6 +334,15 @@ class RoastSession:
         log_writer: Append-only log writer reference when available.
         last_logged_telemetry_monotonic_seconds: Latest telemetry timestamp
             written to the append-only JSONL log.
+        fc_window_count: Number of audio windows the first-crack detector
+            processed during this session (#175 observability).
+        fc_max_confidence: Highest per-window first-crack confidence seen so
+            far, or `None` when no window reported a confidence.
+        fc_max_positive_window_count: Highest rolling positive-window count the
+            detector reached, even when confirmation was never met.
+        fc_model_confirmed: Whether the audio model confirmed first crack for
+            this session (false when first crack was operator-marked or never
+            fired).
         stopped_at_utc: Wall-clock UTC stop time once the session is stopped.
         monotonic_stop: Monotonic clock value captured when the session stops.
     """
@@ -365,6 +374,10 @@ class RoastSession:
     telemetry_buffer: deque[TelemetrySample] = field(default_factory=_telemetry_buffer_default)
     log_writer: LogWriterReference | None = None
     last_logged_telemetry_monotonic_seconds: float | None = None
+    fc_window_count: int = 0
+    fc_max_confidence: float | None = None
+    fc_max_positive_window_count: int = 0
+    fc_model_confirmed: bool = False
     stopped_at_utc: datetime | None = None
     monotonic_stop: float | None = None
     pending_driver_command_token: str | None = None
@@ -1677,6 +1690,65 @@ class RoastSessionStore:
         _apply_event_timestamp(session, event)
         return event
 
+    def record_first_crack_window_observation(
+        self,
+        session: RoastSession,
+        *,
+        window_sequence_number: int,
+        confidence: float | None,
+        positive_window_count: int,
+        confirmed: bool,
+        fc_status: Literal["listening", "candidate", "confirmed"],
+    ) -> None:
+        """Record one per-window first-crack inference observation (#175).
+
+        This is observability-only: it appends an `fc_window` row to the durable
+        roast log and updates the session's first-crack inference aggregates. It
+        never records a timeline event or changes control behavior. The
+        confirmed first-crack timeline event is still recorded separately by
+        `record_first_crack_detection_snapshot`.
+
+        Args:
+            session: Latest active session that owns the observation.
+            window_sequence_number: Source audio window sequence number.
+            confidence: Per-window model confidence, or `None` when the backend
+                reported no confidence.
+            positive_window_count: Rolling positive-window count inside the
+                confirmation span after this window was processed.
+            confirmed: Whether this window confirmed first crack.
+            fc_status: Per-window status (`listening`, `candidate`, `confirmed`).
+
+        Raises:
+            SessionLifecycleError: If the session is not the latest active session.
+        """
+        with self._lock:
+            self._assert_latest_active_session(session)
+            recorded_at_utc = self._utc_now()
+            monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+            session.fc_window_count += 1
+            if confidence is not None and (
+                session.fc_max_confidence is None or confidence > session.fc_max_confidence
+            ):
+                session.fc_max_confidence = confidence
+            if positive_window_count > session.fc_max_positive_window_count:
+                session.fc_max_positive_window_count = positive_window_count
+            if confirmed:
+                session.fc_model_confirmed = True
+            _append_jsonl_log_row(
+                session,
+                {
+                    "session_id": session.id,
+                    "type": "fc_window",
+                    "recorded_at_utc": recorded_at_utc.isoformat(),
+                    "monotonic_seconds": monotonic_seconds,
+                    "window_sequence_number": window_sequence_number,
+                    "confidence": confidence,
+                    "positive_window_count": positive_window_count,
+                    "confirmed": confirmed,
+                    "fc_status": fc_status,
+                },
+            )
+
     def record_first_crack_detection_snapshot(
         self,
         session: RoastSession,
@@ -2325,6 +2397,10 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         telemetry_buffer=deque(session.telemetry_buffer),
         log_writer=session.log_writer,
         last_logged_telemetry_monotonic_seconds=(session.last_logged_telemetry_monotonic_seconds),
+        fc_window_count=session.fc_window_count,
+        fc_max_confidence=session.fc_max_confidence,
+        fc_max_positive_window_count=session.fc_max_positive_window_count,
+        fc_model_confirmed=session.fc_model_confirmed,
         stopped_at_utc=session.stopped_at_utc,
         monotonic_stop=session.monotonic_stop,
         pending_driver_command_token=session.pending_driver_command_token,

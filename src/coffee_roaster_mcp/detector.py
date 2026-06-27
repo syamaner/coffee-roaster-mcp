@@ -174,6 +174,40 @@ class FirstCrackDetectionEvent:
         return payload
 
 
+FirstCrackWindowStatus = Literal["listening", "candidate", "confirmed"]
+
+
+@dataclass(frozen=True)
+class FirstCrackWindowObservation:
+    """Per-window first-crack inference observability for one processed window.
+
+    This is observability-only metadata recorded for every audio window the
+    detector processes during a roast (#175). It never changes detection
+    thresholds, the confirmation rule, or control behavior.
+
+    Attributes:
+        window_sequence_number: Source audio window sequence number.
+        confidence: Model confidence for this window, or `None` when the backend
+            reported no confidence.
+        positive_window_count: Positive detector windows currently inside the
+            confirmation span after this window was processed.
+        confirmed: Whether this window completed the confirmation rule.
+        fc_status: Per-window status — `listening` when the window was not
+            positive, `candidate` when it was positive but confirmation has not
+            yet been reached, and `confirmed` when this window confirmed first
+            crack.
+        event: Confirmed first-crack event when this window confirmed, else
+            `None`.
+    """
+
+    window_sequence_number: int
+    confidence: float | None
+    positive_window_count: int
+    confirmed: bool
+    fc_status: FirstCrackWindowStatus
+    event: FirstCrackDetectionEvent | None
+
+
 @dataclass(frozen=True)
 class _PositiveWindowCandidate:
     event: FirstCrackDetectionEvent
@@ -193,16 +227,68 @@ class FirstCrackDetectorAdapter:
     )
 
     def process_window(self, window: AudioWindow) -> FirstCrackDetectionEvent | None:
-        """Process one audio window and return a confirmed event candidate if present."""
+        """Process one audio window and return a confirmed event candidate if present.
+
+        Args:
+            window: Audio window to run detection for.
+
+        Returns:
+            The confirmed first-crack event candidate when this window completes
+            the confirmation rule, otherwise `None`.
+        """
+        return self.process_window_observed(window).event
+
+    def process_window_observed(self, window: AudioWindow) -> FirstCrackWindowObservation:
+        """Process one audio window and return per-window observability metadata.
+
+        This is the observability-aware entry point (#175): it always reports the
+        window's confidence, rolling positive-window count, status, and the
+        confirmed event when this window confirms. `process_window` delegates to
+        it, so detection thresholds and the confirmation rule are unchanged.
+
+        Args:
+            window: Audio window to run detection for.
+
+        Returns:
+            Per-window observation including the confirmed event when present.
+
+        Raises:
+            FirstCrackDetectorError: If the backend output or confidence is invalid.
+        """
         output = self.backend.detect(window)
         if type(output.confirmed) is not bool:
             raise FirstCrackDetectorError("detector output confirmed must be a boolean.")
         _validate_confirmation_config(self.config)
+        confidence = _validate_optional_confidence(output.confidence)
         self._prune_positive_candidates(window.started_at_monotonic_seconds)
         if not output.confirmed:
-            return None
+            return FirstCrackWindowObservation(
+                window_sequence_number=window.sequence_number,
+                confidence=confidence,
+                positive_window_count=len(self._positive_candidates),
+                confirmed=False,
+                fc_status="listening",
+                event=None,
+            )
 
-        confidence = _validate_optional_confidence(output.confidence)
+        event = self._record_positive_window(window, output, confidence)
+        confirmed = event is not None
+        return FirstCrackWindowObservation(
+            window_sequence_number=window.sequence_number,
+            confidence=confidence,
+            positive_window_count=len(self._positive_candidates),
+            confirmed=confirmed,
+            fc_status="confirmed" if confirmed else "candidate",
+            event=event,
+        )
+
+    def _record_positive_window(
+        self,
+        window: AudioWindow,
+        output: FirstCrackDetectorOutput,
+        confidence: float | None,
+    ) -> FirstCrackDetectionEvent | None:
+        """Accumulate one positive window and return a confirmed event if reached."""
         detected_at_monotonic_seconds = _detection_timestamp(window, output)
         window_onset_monotonic_seconds = round(window.started_at_monotonic_seconds, 6)
         candidate = FirstCrackDetectionEvent(
@@ -458,7 +544,16 @@ def integrate_first_crack_window_with_session(
     if not session.active or session.phase != "roasting":
         return None
 
-    detection_event = adapter.process_window(window)
+    observation = adapter.process_window_observed(window)
+    session_store.record_first_crack_window_observation(
+        session,
+        window_sequence_number=observation.window_sequence_number,
+        confidence=observation.confidence,
+        positive_window_count=observation.positive_window_count,
+        confirmed=observation.confirmed,
+        fc_status=observation.fc_status,
+    )
+    detection_event = observation.event
     if detection_event is None:
         return None
 
