@@ -9,8 +9,65 @@ from pathlib import Path
 
 import pytest
 
+from coffee_roaster_mcp.artifacts import ResolvedArtifact, ResolvedDetectorArtifacts
+from coffee_roaster_mcp.audio import AudioWindow
+from coffee_roaster_mcp.config import FirstCrackConfig
+from coffee_roaster_mcp.detector import (
+    FirstCrackDetectorOutput,
+    build_first_crack_detector_adapter,
+    integrate_first_crack_window_with_session,
+)
 from coffee_roaster_mcp.exports import export_roast_snapshot
 from coffee_roaster_mcp.session import EventPayloadValue, RoastSessionStore, TelemetrySample
+
+
+class MockDetectorBackend:
+    """Detector backend with deterministic queued outputs for export tests."""
+
+    def __init__(self, outputs: tuple[FirstCrackDetectorOutput, ...]) -> None:
+        self._outputs = list(outputs)
+        self.windows: list[AudioWindow] = []
+
+    def detect(self, window: AudioWindow) -> FirstCrackDetectorOutput:
+        """Return the next queued detector output for one window."""
+        self.windows.append(window)
+        return self._outputs.pop(0)
+
+
+def _audio_window(
+    *,
+    sequence_number: int,
+    started_at_monotonic_seconds: float,
+    duration_seconds: float = 1.0,
+) -> AudioWindow:
+    """Return a deterministic audio window for export observability tests."""
+    return AudioWindow(
+        sequence_number=sequence_number,
+        input_device="mock-audio",
+        sample_rate=4,
+        started_at_monotonic_seconds=started_at_monotonic_seconds,
+        duration_seconds=duration_seconds,
+        samples=(0.1, 0.2, 0.3, 0.4),
+    )
+
+
+def _resolved_detector_artifacts() -> ResolvedDetectorArtifacts:
+    """Return resolved detector artifacts for export observability tests."""
+    return ResolvedDetectorArtifacts(
+        onnx_model=ResolvedArtifact(
+            repo_id="syamaner/coffee-first-crack-detection",
+            revision=None,
+            filename="onnx/int8/model_quantized.onnx",
+            local_path=Path("/tmp/model.onnx"),
+        ),
+        feature_extractor_config=ResolvedArtifact(
+            repo_id="syamaner/coffee-first-crack-detection",
+            revision=None,
+            filename="onnx/int8/preprocessor_config.json",
+            local_path=Path("/tmp/preprocessor_config.json"),
+        ),
+    )
+
 
 EXPECTED_CSV_FIELDNAMES = [
     "timestamp_utc",
@@ -56,7 +113,14 @@ EXPECTED_SUMMARY_KEYS = {
     "development_time_percent",
     "roaster_driver",
     "first_crack_model",
+    "first_crack_detection",
     "metrics",
+}
+EXPECTED_FIRST_CRACK_DETECTION_KEYS = {
+    "model_confirmed",
+    "max_confidence",
+    "window_count",
+    "max_positive_window_count",
 }
 EXPECTED_SUMMARY_METRICS_KEYS = {
     "roast_elapsed_seconds",
@@ -269,6 +333,132 @@ def test_snapshot_export_summary_schema_completeness(tmp_path: Path) -> None:
     assert set(summary) == EXPECTED_SUMMARY_KEYS
     assert set(summary["metrics"]) == EXPECTED_SUMMARY_METRICS_KEYS
     assert set(summary["first_crack_model"]) == EXPECTED_FIRST_CRACK_MODEL_KEYS
+    assert set(summary["first_crack_detection"]) == EXPECTED_FIRST_CRACK_DETECTION_KEYS
+
+
+def test_per_window_fc_inference_rows_are_appended_to_roast_jsonl(tmp_path: Path) -> None:
+    """Append one fc_window row per processed window during a roast (#175)."""
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    config = FirstCrackConfig(
+        mode="audio",
+        confidence_threshold=0.6,
+        min_positive_windows=2,
+        confirmation_window_seconds=20.0,
+    )
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(confirmed=False, confidence=0.40),
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.72),
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.91),
+        )
+    )
+    adapter = build_first_crack_detector_adapter(config, _resolved_detector_artifacts(), backend)
+
+    clock.monotonic_value = 110.0
+    for sequence_number, started_at in ((1, 105.0), (2, 108.0), (3, 111.0)):
+        clock.monotonic_value = started_at + 1.0
+        integrate_first_crack_window_with_session(
+            config=config,
+            adapter=adapter,
+            session_store=store,
+            session=session,
+            window=_audio_window(
+                sequence_number=sequence_number,
+                started_at_monotonic_seconds=started_at,
+            ),
+        )
+
+    export = export_roast_snapshot(session)
+    jsonl_rows = [
+        json.loads(line) for line in export.jsonl_path.read_text(encoding="utf-8").splitlines()
+    ]
+    fc_window_rows = [row for row in jsonl_rows if row["type"] == "fc_window"]
+    assert len(fc_window_rows) == 3
+    assert [row["window_sequence_number"] for row in fc_window_rows] == [1, 2, 3]
+    assert [row["confidence"] for row in fc_window_rows] == [0.40, 0.72, 0.91]
+    assert [row["fc_status"] for row in fc_window_rows] == [
+        "listening",
+        "candidate",
+        "confirmed",
+    ]
+    assert [row["positive_window_count"] for row in fc_window_rows] == [0, 1, 2]
+    assert [row["confirmed"] for row in fc_window_rows] == [False, False, True]
+    assert all(row["session_id"] == session.id for row in fc_window_rows)
+
+    summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
+    assert summary["first_crack_detection"] == {
+        "model_confirmed": True,
+        "max_confidence": 0.91,
+        "window_count": 3,
+        "max_positive_window_count": 2,
+    }
+
+
+def test_summary_records_fc_picture_on_a_no_fire_roast(tmp_path: Path) -> None:
+    """A no-fire roast still records max confidence + model_confirmed=false (#175)."""
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
+    session = store.start_session()
+    clock.monotonic_value = 105.0
+    store.record_event(session, "beans_added")
+    config = FirstCrackConfig(
+        mode="audio",
+        confidence_threshold=0.6,
+        min_positive_windows=2,
+        confirmation_window_seconds=20.0,
+    )
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(confirmed=False, confidence=0.31),
+            FirstCrackDetectorOutput(confirmed=False, confidence=0.55),
+            FirstCrackDetectorOutput(confirmed=False, confidence=0.48),
+        )
+    )
+    adapter = build_first_crack_detector_adapter(config, _resolved_detector_artifacts(), backend)
+
+    for sequence_number, started_at in ((1, 105.0), (2, 108.0), (3, 111.0)):
+        clock.monotonic_value = started_at + 1.0
+        integrate_first_crack_window_with_session(
+            config=config,
+            adapter=adapter,
+            session_store=store,
+            session=session,
+            window=_audio_window(
+                sequence_number=sequence_number,
+                started_at_monotonic_seconds=started_at,
+            ),
+        )
+
+    # First crack is operator-marked because the model never confirmed.
+    clock.monotonic_value = 150.0
+    store.record_event(session, "first_crack_detected", payload={"source": "operator"})
+    clock.monotonic_value = 180.0
+    store.record_event(session, "beans_dropped")
+
+    export = export_roast_snapshot(session)
+    summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
+    assert summary["first_crack_detection"] == {
+        "model_confirmed": False,
+        "max_confidence": 0.55,
+        "window_count": 3,
+        "max_positive_window_count": 0,
+    }
+    # The model-metadata block stays empty on a miss; the detection picture
+    # carries the diagnosable aggregates instead.
+    assert summary["first_crack_model"]["confidence"] is None
+    assert summary["first_crack_model"]["confidence_threshold"] is None
 
 
 def test_snapshot_export_uses_configured_ror_parameters(tmp_path: Path) -> None:

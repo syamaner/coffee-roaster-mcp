@@ -13,6 +13,7 @@ from coffee_roaster_mcp.detector import (
     FirstCrackDetectorAdapter,
     FirstCrackDetectorError,
     FirstCrackDetectorOutput,
+    FirstCrackWindowObservation,
     OnnxFeatureExtractor,
     OnnxInferenceSession,
     OnnxInputInfo,
@@ -256,6 +257,84 @@ def test_detector_adapter_confirms_from_recent_positive_windows() -> None:
     assert confirmed.confirmed_by_window_sequence_number == 13
     assert confirmed.positive_window_count == 3
     assert confirmed.confidence == 0.61
+
+
+def test_process_window_observed_captures_confidence_for_non_confirming_window() -> None:
+    backend = MockDetectorBackend((FirstCrackDetectorOutput(confirmed=False, confidence=0.55),))
+    adapter = build_first_crack_detector_adapter(
+        FirstCrackConfig(confidence_threshold=0.6),
+        _resolved_detector_artifacts(),
+        backend,
+    )
+
+    observation = adapter.process_window_observed(
+        _audio_window(sequence_number=21, started_at_monotonic_seconds=100.0)
+    )
+
+    assert isinstance(observation, FirstCrackWindowObservation)
+    assert observation.window_sequence_number == 21
+    # Confidence is captured even though the window never crossed the threshold,
+    # so a miss is diagnosable (#175).
+    assert observation.confidence == 0.55
+    assert observation.positive_window_count == 0
+    assert observation.confirmed is False
+    assert observation.fc_status == "listening"
+    assert observation.event is None
+
+
+def test_process_window_observed_reports_candidate_before_confirmation() -> None:
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.71),
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.83),
+        )
+    )
+    adapter = build_first_crack_detector_adapter(
+        FirstCrackConfig(
+            confidence_threshold=0.6,
+            min_positive_windows=2,
+            confirmation_window_seconds=20.0,
+        ),
+        _resolved_detector_artifacts(),
+        backend,
+    )
+
+    candidate = adapter.process_window_observed(
+        _audio_window(sequence_number=30, started_at_monotonic_seconds=100.0)
+    )
+    confirmed = adapter.process_window_observed(
+        _audio_window(sequence_number=31, started_at_monotonic_seconds=103.0)
+    )
+
+    assert candidate.confidence == 0.71
+    assert candidate.positive_window_count == 1
+    assert candidate.confirmed is False
+    assert candidate.fc_status == "candidate"
+    assert candidate.event is None
+
+    assert confirmed.confidence == 0.83
+    assert confirmed.positive_window_count == 2
+    assert confirmed.confirmed is True
+    assert confirmed.fc_status == "confirmed"
+    assert confirmed.event is not None
+    assert confirmed.event.kind == "first_crack_detected"
+
+
+def test_process_window_delegates_to_observed() -> None:
+    backend = MockDetectorBackend((FirstCrackDetectorOutput(confirmed=True, confidence=0.95),))
+    adapter = build_first_crack_detector_adapter(
+        FirstCrackConfig(confidence_threshold=0.6, min_positive_windows=1),
+        _resolved_detector_artifacts(),
+        backend,
+    )
+
+    event = adapter.process_window(
+        _audio_window(sequence_number=40, started_at_monotonic_seconds=100.0)
+    )
+
+    assert event is not None
+    assert event.kind == "first_crack_detected"
+    assert event.confidence == 0.95
 
 
 def test_detector_adapter_prunes_old_positive_windows_before_confirmation() -> None:

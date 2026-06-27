@@ -175,6 +175,7 @@ def _write_summary_json(
         ror_min_sample_seconds=ror_min_sample_seconds,
     )
     first_crack_model = _summary_first_crack_model(session)
+    first_crack_detection = _summary_first_crack_detection(session)
     payload: dict[str, Any] = {
         "session_id": session.id,
         "active": session.active,
@@ -197,6 +198,7 @@ def _write_summary_json(
         "development_time_percent": metrics.development_percent,
         "roaster_driver": roaster_driver,
         "first_crack_model": first_crack_model,
+        "first_crack_detection": first_crack_detection,
         "metrics": {
             "roast_elapsed_seconds": metrics.roast_elapsed_seconds,
             "development_time_seconds": metrics.development_time_seconds,
@@ -240,6 +242,29 @@ def _summary_first_crack_model(session: RoastSession) -> dict[str, EventPayloadV
         "confirmation_window_seconds": _number_payload_value(
             payload.get("confirmation_window_seconds")
         ),
+    }
+
+
+def _summary_first_crack_detection(session: RoastSession) -> dict[str, EventPayloadValue]:
+    """Return the first-crack inference picture for the summary export (#175).
+
+    Unlike `first_crack_model` (which is empty when the model never confirmed),
+    these aggregates are always present, so a miss is diagnosable: it records the
+    max confidence ever seen, the total window count, the highest positive-window
+    count reached, and whether the audio model confirmed first crack. A no-fire
+    roast then reads as "peaked at 0.55, never reached the threshold."
+
+    Args:
+        session: Session snapshot to summarize.
+
+    Returns:
+        First-crack detection aggregates for the summary export.
+    """
+    return {
+        "model_confirmed": session.fc_model_confirmed,
+        "max_confidence": session.fc_max_confidence,
+        "window_count": session.fc_window_count,
+        "max_positive_window_count": session.fc_max_positive_window_count,
     }
 
 
