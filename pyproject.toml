@@ -42,6 +42,7 @@ classifiers = [
 dependencies = [
   "huggingface_hub>=0.23,<1",
   "mcp>=1.0.0,<2",
+  "numpy>=1.24,<3",
   "onnxruntime>=1.18,<2",
   "pyserial>=3.5",
   "PyYAML>=6.0.2",

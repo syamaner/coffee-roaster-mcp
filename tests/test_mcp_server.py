@@ -68,6 +68,50 @@ def test_quiet_sdk_per_request_log_only_raises_never_lowers() -> None:
         sdk_logger.setLevel(original_sdk_level)
 
 
+def test_quiet_sdk_per_request_log_pins_warning_before_logging_configured() -> None:
+    """Regression (#162): the production order is quiet() THEN the SDK's .run() configures
+    INFO. At the quiet call the effective level is the inherited default WARNING; the guard
+    (`<= WARNING`, vs the old `<`) pins an EXPLICIT WARNING so it survives the later root INFO
+    config — fixing the flood."""
+    sdk_logger = logging.getLogger(SDK_REQUEST_LOGGER_NAME)
+    root = logging.getLogger()
+    original_sdk_level = sdk_logger.level
+    original_root_level = root.level
+    sdk_logger.setLevel(logging.NOTSET)  # the real startup state — no explicit level
+    root.setLevel(logging.WARNING)  # nothing has configured INFO yet
+    try:
+        quiet_sdk_per_request_log()
+
+        assert sdk_logger.level == logging.WARNING  # explicit, set despite inherited WARNING
+        # the SDK's .run() configures INFO on the root afterwards; the explicit WARNING wins.
+        root.setLevel(logging.INFO)
+        assert sdk_logger.getEffectiveLevel() == logging.WARNING
+        assert not sdk_logger.isEnabledFor(logging.INFO)
+    finally:
+        sdk_logger.setLevel(original_sdk_level)
+        root.setLevel(original_root_level)
+
+
+def test_quiet_sdk_per_request_log_preserves_inherited_stricter_level() -> None:
+    """Augment #182: a NOTSET SDK logger under a STRICTER root (e.g. ERROR) must be left
+    alone — pinning WARNING there would LOWER the effective threshold, breaking "only raises".
+    Keying off getEffectiveLevel() (not .level) preserves the inherited ERROR."""
+    sdk_logger = logging.getLogger(SDK_REQUEST_LOGGER_NAME)
+    root = logging.getLogger()
+    original_sdk_level = sdk_logger.level
+    original_root_level = root.level
+    sdk_logger.setLevel(logging.NOTSET)
+    root.setLevel(logging.ERROR)
+    try:
+        quiet_sdk_per_request_log()
+
+        assert sdk_logger.level == logging.NOTSET  # untouched
+        assert sdk_logger.getEffectiveLevel() == logging.ERROR  # inherited ERROR preserved
+    finally:
+        sdk_logger.setLevel(original_sdk_level)
+        root.setLevel(original_root_level)
+
+
 def test_in_process_mcp_tools_cover_mock_roast_and_export(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
