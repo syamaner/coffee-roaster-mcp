@@ -76,6 +76,8 @@ _EXPECTED_FIRST_CRACK_STATUS_KEYS = {
     "detected_monotonic_seconds",
     "dropped_window_count",
     "emitted_window_count",
+    "mic_peak_dbfs",
+    "mic_rms_dbfs",
     "mode",
     "processed_window_count",
     "queued_window_count",
@@ -94,7 +96,7 @@ _EXPECTED_T0_STATUS_KEYS = {
 
 
 def test_version_is_defined() -> None:
-    assert __version__ == "0.1.10"
+    assert __version__ == "0.1.11"
 
 
 def test_cli_parser_program_name() -> None:

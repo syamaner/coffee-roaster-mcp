@@ -923,6 +923,8 @@ def test_get_roast_state_scopes_runtime_metrics_to_requested_session(tmp_path: P
             emitted_window_count=3,
             dropped_window_count=4,
             processed_window_count=5,
+            mic_peak_dbfs=-6.02,
+            mic_rms_dbfs=-9.03,
         ),
     )
     server = create_mcp_server(config_path=config_path)
@@ -948,6 +950,9 @@ def test_get_roast_state_scopes_runtime_metrics_to_requested_session(tmp_path: P
     assert first_state.first_crack_status.emitted_window_count == 0
     assert first_state.first_crack_status.dropped_window_count == 0
     assert first_state.first_crack_status.processed_window_count == 0
+    # The inactive session reports no live mic levels (#178).
+    assert first_state.first_crack_status.mic_peak_dbfs is None
+    assert first_state.first_crack_status.mic_rms_dbfs is None
 
     second_state = _call_tool(
         server,
@@ -961,6 +966,10 @@ def test_get_roast_state_scopes_runtime_metrics_to_requested_session(tmp_path: P
     assert second_state.first_crack_status.emitted_window_count == 3
     assert second_state.first_crack_status.dropped_window_count == 4
     assert second_state.first_crack_status.processed_window_count == 5
+    # The live mic levels surface in the runtime readout (#178) so a mis-gained
+    # or dead mic is visible under real conditions.
+    assert second_state.first_crack_status.mic_peak_dbfs == -6.02
+    assert second_state.first_crack_status.mic_rms_dbfs == -9.03
 
 
 def test_driver_command_failure_does_not_mutate_session_state(tmp_path: Path) -> None:
@@ -1518,6 +1527,8 @@ class FakeFirstCrackRuntime:
         emitted_window_count: int = 0,
         dropped_window_count: int = 0,
         processed_window_count: int = 0,
+        mic_peak_dbfs: float | None = None,
+        mic_rms_dbfs: float | None = None,
     ) -> None:
         self.status = status
         self.reason = reason
@@ -1527,6 +1538,8 @@ class FakeFirstCrackRuntime:
         self.emitted_window_count = emitted_window_count
         self.dropped_window_count = dropped_window_count
         self.processed_window_count = processed_window_count
+        self.mic_peak_dbfs = mic_peak_dbfs
+        self.mic_rms_dbfs = mic_rms_dbfs
         self.active_session_id: str | None = None
         self.started_sessions: list[str] = []
         self.processed_sessions: list[str] = []
@@ -1583,6 +1596,8 @@ class FakeFirstCrackRuntime:
             emitted_window_count=self.emitted_window_count,
             dropped_window_count=self.dropped_window_count,
             processed_window_count=self.processed_window_count,
+            mic_peak_dbfs=self.mic_peak_dbfs,
+            mic_rms_dbfs=self.mic_rms_dbfs,
         )
 
 

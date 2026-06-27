@@ -128,6 +128,13 @@ class AudioCaptureSnapshot:
         emitted_window_count: Windows successfully queued for detector consumption.
         dropped_window_count: Windows dropped because the detector queue was full.
         latest_error: Last capture error message, if the worker stopped on error.
+        peak_dbfs: Rolling peak level of the captured stream in dBFS over the most
+            recent measurement window, or ``None`` before any samples are read
+            (#178). ``-inf`` for pure silence. A live in-session mic-levels signal
+            so a mis-gained or dead mic is visible under real roasting conditions.
+        rms_dbfs: Rolling RMS level of the captured stream in dBFS over the most
+            recent measurement window, or ``None`` before any samples are read
+            (#178). ``-inf`` for pure silence.
     """
 
     running: bool
@@ -135,6 +142,84 @@ class AudioCaptureSnapshot:
     emitted_window_count: int
     dropped_window_count: int
     latest_error: str | None
+    peak_dbfs: float | None = None
+    rms_dbfs: float | None = None
+
+
+def amplitude_to_dbfs(amplitude: float) -> float:
+    """Convert a 0..1 normalized amplitude to dBFS.
+
+    Returns ``-inf`` for an amplitude at or below zero (pure silence) so a dead
+    or muted mic is unambiguous in the levels readout (#178). Amplitudes above
+    1.0 are clamped to 0 dBFS.
+
+    Args:
+        amplitude: Absolute sample amplitude in the normalized [0, 1] range.
+
+    Returns:
+        The level in dBFS, ``-inf`` at silence.
+    """
+    if amplitude <= 0.0:
+        return -math.inf
+    return round(20.0 * math.log10(min(1.0, amplitude)), 2)
+
+
+class _RollingLevelMeter:
+    """Track peak / RMS of the captured stream over a recent sample window (#178).
+
+    Fed the same float blocks the detector consumes, it keeps a bounded ring of
+    the most recent samples and reports the peak and RMS of that ring in dBFS.
+    The bound keeps the meter responsive (it reflects the live signal, not the
+    whole-roast average) and the work is vectorised in C via numpy so it never
+    stalls the capture worker on the Pi CPU budget (D27). The meter is owned and
+    driven by the single capture worker thread; reads come from the snapshot
+    under the pipeline's state lock, which sees a consistent ``(peak, rms)`` pair.
+    """
+
+    def __init__(self, *, window_sample_count: int) -> None:
+        """Configure the rolling meter.
+
+        Args:
+            window_sample_count: Maximum recent samples retained for the level
+                measurement. At least one sample is always kept.
+        """
+        self._window_sample_count = max(1, window_sample_count)
+        self._samples: np.ndarray = np.empty(0, dtype=np.float64)
+        self._has_samples = False
+        self._peak_dbfs: float | None = None
+        self._rms_dbfs: float | None = None
+
+    def observe(self, samples: Sequence[float]) -> None:
+        """Append captured samples and recompute the rolling peak / RMS."""
+        if not samples:
+            return
+        block = np.abs(np.asarray(samples, dtype=np.float64))
+        combined = np.concatenate((self._samples, block))
+        if combined.shape[0] > self._window_sample_count:
+            combined = combined[-self._window_sample_count :]
+        self._samples = combined
+        self._has_samples = True
+        peak = float(combined.max()) if combined.shape[0] else 0.0
+        rms = float(np.sqrt(np.mean(np.square(combined)))) if combined.shape[0] else 0.0
+        self._peak_dbfs = amplitude_to_dbfs(peak)
+        self._rms_dbfs = amplitude_to_dbfs(rms)
+
+    @property
+    def peak_dbfs(self) -> float | None:
+        """Return the rolling peak in dBFS, or ``None`` before any samples."""
+        return self._peak_dbfs if self._has_samples else None
+
+    @property
+    def rms_dbfs(self) -> float | None:
+        """Return the rolling RMS in dBFS, or ``None`` before any samples."""
+        return self._rms_dbfs if self._has_samples else None
+
+    def reset(self) -> None:
+        """Clear the retained samples and reported levels for a fresh run."""
+        self._samples = np.empty(0, dtype=np.float64)
+        self._has_samples = False
+        self._peak_dbfs = None
+        self._rms_dbfs = None
 
 
 def audio_capture_settings_from_config(
@@ -1355,6 +1440,12 @@ class AudioCapturePipeline:
         self._emitted_window_count = 0
         self._dropped_window_count = 0
         self._latest_error: str | None = None
+        # Live mic-levels meter (#178): a rolling peak/RMS over roughly the most
+        # recent measurement window of captured samples, fed the same blocks the
+        # detector consumes. Surfaced in the snapshot so a mis-gained / dead mic
+        # is visible under real roasting conditions, where the quiet pre-roast
+        # floor differs from the in-roast level.
+        self._level_meter = _RollingLevelMeter(window_sample_count=settings.window_sample_count)
 
     @property
     def settings(self) -> AudioCaptureSettings:
@@ -1478,6 +1569,8 @@ class AudioCapturePipeline:
                 emitted_window_count=self._emitted_window_count,
                 dropped_window_count=self._dropped_window_count,
                 latest_error=self._latest_error,
+                peak_dbfs=self._level_meter.peak_dbfs,
+                rms_dbfs=self._level_meter.rms_dbfs,
             )
 
     def _run_capture_loop(self) -> None:
@@ -1498,6 +1591,10 @@ class AudioCapturePipeline:
                     time.sleep(self._settings.idle_sleep_seconds)
                     continue
                 self._sample_buffer.extend(samples)
+                # Update the live mic-levels meter from the SAME samples the
+                # detector consumes (#178). Cheap, vectorised, and never raises;
+                # purely observational so it cannot affect detection.
+                self._level_meter.observe(samples)
                 # Tee the SAME samples the detector consumes into the recording
                 # WAV right after the buffer extend (#176). This is the verified
                 # non-disturbing tee point: the detector still windows the buffer
@@ -1583,6 +1680,7 @@ class AudioCapturePipeline:
         self._emitted_window_count = 0
         self._dropped_window_count = 0
         self._latest_error = None
+        self._level_meter.reset()
 
 
 class DetectorPacedWavReplayPipeline(AudioCapturePipeline):

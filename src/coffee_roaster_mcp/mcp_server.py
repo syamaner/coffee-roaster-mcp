@@ -284,6 +284,11 @@ class FirstCrackStatus:
         emitted_window_count: Windows emitted by the audio runtime.
         dropped_window_count: Windows dropped by the audio runtime.
         processed_window_count: Windows processed by the detector runtime.
+        mic_peak_dbfs: Live rolling peak mic level in dBFS while audio capture
+            runs (#178), or ``None`` when no capture is running. ``-inf`` for
+            silence — surfaces a mis-gained / dead mic under real conditions.
+        mic_rms_dbfs: Live rolling RMS mic level in dBFS while audio capture runs
+            (#178), or ``None`` when no capture is running.
     """
 
     mode: FirstCrackMode
@@ -297,6 +302,8 @@ class FirstCrackStatus:
     emitted_window_count: int = 0
     dropped_window_count: int = 0
     processed_window_count: int = 0
+    mic_peak_dbfs: float | None = None
+    mic_rms_dbfs: float | None = None
 
 
 T0RuntimeStatus = Literal["disabled", "pending", "detected", "unavailable"]
@@ -1377,6 +1384,8 @@ def _serialize_first_crack_status(
             emitted_window_count=runtime.emitted_window_count,
             dropped_window_count=runtime.dropped_window_count,
             processed_window_count=runtime.processed_window_count,
+            mic_peak_dbfs=runtime.mic_peak_dbfs,
+            mic_rms_dbfs=runtime.mic_rms_dbfs,
         )
     if session.faulted_at_utc is not None:
         runtime = _runtime_metrics(
@@ -1395,6 +1404,8 @@ def _serialize_first_crack_status(
             emitted_window_count=runtime.emitted_window_count,
             dropped_window_count=runtime.dropped_window_count,
             processed_window_count=runtime.processed_window_count,
+            mic_peak_dbfs=runtime.mic_peak_dbfs,
+            mic_rms_dbfs=runtime.mic_rms_dbfs,
         )
     if config.first_crack.mode == "disabled":
         return FirstCrackStatus(
@@ -1445,6 +1456,8 @@ def _serialize_first_crack_status(
             emitted_window_count=runtime.emitted_window_count,
             dropped_window_count=runtime.dropped_window_count,
             processed_window_count=runtime.processed_window_count,
+            mic_peak_dbfs=runtime.mic_peak_dbfs,
+            mic_rms_dbfs=runtime.mic_rms_dbfs,
         )
     reason = "Audio first-crack detection has not recorded first crack for this session."
     if (
@@ -1470,6 +1483,8 @@ def _serialize_first_crack_status(
         emitted_window_count=runtime.emitted_window_count,
         dropped_window_count=runtime.dropped_window_count,
         processed_window_count=runtime.processed_window_count,
+        mic_peak_dbfs=runtime.mic_peak_dbfs,
+        mic_rms_dbfs=runtime.mic_rms_dbfs,
     )
 
 

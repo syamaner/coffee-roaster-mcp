@@ -171,7 +171,12 @@ def test_audio_runtime_processes_after_beans_added_and_records_once() -> None:
     assert pre_t0.queued_window_count == 2
     assert detected.status == "detected"
     assert duplicate.status == "detected"
-    assert pipeline.stopped is True
+    # #181: detection stops INFERENCE only — the capture pipeline keeps running
+    # (and the recorder keeps teeing) so the recording spans charge→session stop,
+    # not charge→FC. The pipeline is finalised only at stop_for_session.
+    assert pipeline.stopped is False
+    assert detected.active is True
+    assert detected.audio_running is True
     assert [window.sequence_number for window in backend.windows] == [1]
     assert [event.kind for event in session.event_timeline] == [
         "beans_added",
@@ -180,6 +185,12 @@ def test_audio_runtime_processes_after_beans_added_and_records_once() -> None:
     # FC is backdated to the confirming-window onset (seq 1 starts at 505.0,
     # elapsed 5.0), not the detector timestamp 506.0 (#168).
     assert session.first_crack_monotonic_seconds == 5.0
+
+    # The real roast end finalises capture + the recorder (#181).
+    stopped = runtime.stop_for_session(session.id, reason="roast complete")
+    assert pipeline.stopped is True
+    assert stopped.active is False
+    assert stopped.audio_running is False
 
 
 def test_detector_paced_audio_runtime_drains_one_window_per_processing_tick() -> None:
@@ -268,10 +279,21 @@ def test_audio_runtime_reports_stopped_after_pipeline_stop_returns_running_snaps
     detected = runtime.process_available_windows(session_store=store, session=session)
     snapshot = runtime.snapshot()
 
-    assert detected.active is False
-    assert detected.audio_running is False
-    assert snapshot.active is False
-    assert snapshot.audio_running is False
+    # #181: at first crack the capture pipeline keeps running, so the runtime
+    # still reports active + audio_running. The recording spans charge→stop.
+    assert detected.status == "detected"
+    assert detected.active is True
+    assert detected.audio_running is True
+    assert snapshot.active is True
+    assert snapshot.audio_running is True
+
+    # stop_for_session finalises capture. Even though this pipeline's snapshot
+    # keeps claiming running after stop() (running_after_stop=True), the runtime
+    # forces the stopped snapshot once it has torn the pipeline down.
+    stopped = runtime.stop_for_session(session.id, reason="roast complete")
+    assert pipeline.stopped is True
+    assert stopped.active is False
+    assert stopped.audio_running is False
 
 
 def test_audio_runtime_can_discard_queued_pre_t0_windows() -> None:
@@ -1126,3 +1148,192 @@ def test_set_recording_metadata_after_build_warns_and_is_not_applied(
     with caplog.at_level(logging.WARNING, logger="coffee_roaster_mcp.first_crack_runtime"):
         runtime.set_recording_metadata(origin="next", roast_num=2)
     assert not any("arrived AFTER" in record.message for record in caplog.records)
+
+
+# --- #181: recording must span charge→session stop, not charge→first crack ---
+
+
+class _StreamingToneInput:
+    """An ``AudioInput`` that delivers a continuous tone in fixed-size reads.
+
+    Models a live microphone for the soak test: it never runs dry (always
+    returns the requested sample count), so the capture worker keeps reading,
+    teeing, and updating levels for the full session — before AND after first
+    crack — exactly as a real mic would.
+    """
+
+    def __init__(self, *, amplitude: float = 0.5) -> None:
+        self._amplitude = amplitude
+        self._phase = 0
+        self.total_read = 0
+        self.closed = False
+
+    def read_samples(self, sample_count: int) -> Sequence[float]:
+        if sample_count <= 0:
+            return ()
+        out: list[float] = []
+        for _ in range(sample_count):
+            # Alternate sign so peak and RMS are non-trivial and stable.
+            out.append(self._amplitude if self._phase % 2 == 0 else -self._amplitude)
+            self._phase += 1
+        self.total_read += sample_count
+        return tuple(out)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _confirmed_outputs(count: int) -> tuple[FirstCrackDetectorOutput, ...]:
+    return tuple(FirstCrackDetectorOutput(confirmed=True, confidence=0.95) for _ in range(count))
+
+
+def test_recording_spans_charge_to_session_stop_not_to_first_crack(tmp_path: Path) -> None:
+    """#181 soak: a sustained MCP-driven session records charge→stop, FC inside.
+
+    Drives the runtime API with a REAL capture pipeline teeing a REAL recorder:
+    charge, run a while, fire first crack via the detector, run MORE, then stop
+    the session. Asserts the WAV spans charge→stop (its duration exceeds the
+    first-crack offset by a clear margin — the post-FC tail is captured, not
+    truncated at FC), that first crack sits INSIDE the recording, and that
+    finalisation wrote both the recording sidecar and the annotation session
+    JSON. Run sustained: many capture cycles before and after FC.
+    """
+    import time
+
+    from coffee_roaster_mcp.audio import RoastAudioRecorder, build_audio_capture_pipeline
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    # Drive this soak on the REAL monotonic clock so the capture pipeline, the
+    # recorder, and the first-crack integrator all agree on time (the integrator
+    # rejects window timestamps that are future relative to its own clock). This
+    # is a genuine sustained run, not a stepped fixture.
+    store = RoastSessionStore()
+    session = store.start_session()
+
+    sample_rate = 4_000
+    config = AppConfig(
+        audio=AudioConfig(sample_rate=sample_rate, source="microphone"),
+        first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+        recording=RecordingConfig(
+            enabled=True,
+            autocapture=True,
+            export_location=tmp_path / "captures",
+        ),
+    )
+
+    audio_input = _StreamingToneInput(amplitude=0.5)
+    # The detector confirms on the first window it sees once roasting; many
+    # confirmations queued so the post-FC ticks (which never reach the detector
+    # again) cannot exhaust it.
+    backend = MockDetectorBackend(_confirmed_outputs(50))
+
+    captured: dict[str, RoastAudioRecorder] = {}
+
+    def pipeline_factory(audio_config: AudioConfig) -> object:
+        # Tee the session recorder the runtime built into a REAL capture
+        # pipeline driven by the streaming tone input (the recorder is exposed
+        # to the runtime via build_session_recorder + the default factory; here
+        # we build the pipeline explicitly so the test owns the input).
+        recorder = build_session_recorder(config, session)
+        assert isinstance(recorder, RoastAudioRecorder)
+        captured["recorder"] = recorder
+        return build_audio_capture_pipeline(
+            audio_config,
+            input_factory=lambda settings: audio_input,  # noqa: ARG005 - fixed test input
+            window_seconds=0.05,
+            recorder=recorder,
+        )
+
+    runtime = FirstCrackSessionRuntime(
+        config=config,
+        audio_pipeline_factory=pipeline_factory,  # type: ignore[arg-type]
+        detector_adapter_factory=lambda fc_config: build_first_crack_detector_adapter(
+            fc_config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+    )
+
+    runtime.start_for_session(session)
+    recorder = captured["recorder"]
+
+    # --- Phase 1: pre-charge / pre-FC — capture runs, no detection. ---
+    deadline = time.monotonic() + 2.0
+    while recorder.frames_written < sample_rate // 4 and time.monotonic() < deadline:
+        runtime.process_available_windows(session_store=store, session=session)
+        time.sleep(0.01)
+    frames_before_charge = recorder.frames_written
+    assert frames_before_charge > 0, "capture worker should be teeing before charge"
+
+    # --- Phase 2: charge, then let the detector confirm first crack. ---
+    store.record_event(session, "beans_added")
+    # Drop the pre-charge windows so first crack backdates to a post-charge
+    # window onset (a window captured before charge would be rejected as
+    # pre-beans by the integrator). Mirrors the auto-T0 boundary discard.
+    runtime.discard_queued_windows_for_session(session.id, reason="charge boundary")
+    # Let fresh post-charge windows accumulate before detecting.
+    time.sleep(0.2)
+    detected = None
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        snap = runtime.process_available_windows(session_store=store, session=session)
+        if snap.status == "detected":
+            detected = snap
+            break
+        time.sleep(0.01)
+    assert detected is not None, "first crack should be detected during roasting"
+    assert detected.status == "detected"
+    # Capture is STILL running after FC — the #181 invariant.
+    assert detected.active is True
+    assert detected.audio_running is True
+    frames_at_fc = recorder.frames_written
+
+    # --- Phase 3: run MORE after FC — capture must keep growing the WAV. ---
+    deadline = time.monotonic() + 2.0
+    target = frames_at_fc + sample_rate // 2  # at least ~0.5s more audio
+    while recorder.frames_written < target and time.monotonic() < deadline:
+        # Post-FC ticks must NOT drain/detect again (inference stopped, #181).
+        runtime.process_available_windows(session_store=store, session=session)
+        time.sleep(0.01)
+    frames_after_fc = recorder.frames_written
+    assert frames_after_fc > frames_at_fc, "the WAV must keep growing after first crack"
+    # The detector saw windows only up to the confirming one — post-FC windows
+    # are dropped from the bounded queue, never re-detected.
+    detector_windows_after = len(backend.windows)
+
+    # --- Stop the session: finalises capture + recorder at the REAL roast end. ---
+    stopped = runtime.stop_for_session(session.id, reason="roast complete")
+    assert stopped.active is False
+    assert stopped.audio_running is False
+    # No further detection happened during the post-FC tail.
+    runtime.process_available_windows(session_store=store, session=session)
+    assert len(backend.windows) == detector_windows_after
+
+    # --- Assert the on-disk recording spans charge→stop, FC inside it. ---
+    import json
+    import wave
+
+    wav_path = recorder.wav_path
+    assert wav_path.exists()
+    with wave.open(str(wav_path), "rb") as wav_file:
+        wav_frames = wav_file.getnframes()
+        wav_rate = wav_file.getframerate()
+    recorded_seconds = wav_frames / wav_rate
+    # The WAV holds the full pre-FC + post-FC audio, not a charge→FC slice.
+    assert wav_frames >= frames_after_fc
+    assert wav_frames > frames_at_fc
+
+    sidecar = json.loads(recorder.sidecar_path.read_text())
+    fc_offset = sidecar["milestones"]["first_crack"]
+    assert fc_offset is not None, "first crack milestone must be written"
+    # First crack sits INSIDE the recording, with a real post-FC tail after it.
+    assert 0.0 <= fc_offset < recorded_seconds
+    assert recorded_seconds - fc_offset > 0.1, "a post-FC tail must follow first crack in the WAV"
+
+    # Finalisation wrote BOTH JSONs: the recording sidecar and the annotation
+    # session JSON for the coffee-first-crack-detection pipeline.
+    annotation_path = recorder.sidecar_path.parent / f"{session.id}-roast0-session.json"
+    assert annotation_path.exists(), "annotation session JSON must be written at finalisation"
+    annotation = json.loads(annotation_path.read_text())
+    assert annotation["mics"][0]["file"] == wav_path.name
