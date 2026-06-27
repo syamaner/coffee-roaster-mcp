@@ -455,6 +455,11 @@ class RoastRecorder(Protocol):
     stop or fault. Single-device and multi-device recorders both satisfy it.
     """
 
+    @property
+    def started_monotonic_seconds(self) -> float | None:
+        """Return the absolute monotonic instant captured at recording start."""
+        ...
+
     def begin(self) -> None:
         """Open writers and capture the recording-start time."""
         ...
@@ -1338,8 +1343,16 @@ class AudioCapturePipeline:
             )
 
     def _run_capture_loop(self) -> None:
+        # Recording is strictly best-effort: a recorder error (including a
+        # recording-START failure here) must NEVER kill detection. begin() runs
+        # outside the main try below, so it gets its own fail-soft guard: on
+        # failure the recorder is dropped and capture/detection continue.
         if self._recorder is not None:
-            self._recorder.begin()
+            try:
+                self._recorder.begin()
+            except Exception as exc:  # noqa: BLE001 - recording is best effort.
+                _LOGGER.warning("Roast audio recording start failed; continuing: %s", exc)
+                self._disable_recorder()
         try:
             while not self._stop_requested.is_set():
                 samples = self._read_next_samples()
@@ -1357,7 +1370,10 @@ class AudioCapturePipeline:
                         self._recorder.write_samples(samples)
                     except Exception as exc:  # noqa: BLE001 - recording is best effort.
                         _LOGGER.warning("Roast audio recording write failed; continuing: %s", exc)
-                        self._recorder = None
+                        # Finalize what was captured (flush the WAV + write the
+                        # sidecar) BEFORE dropping the recorder, so the partial
+                        # recording is not leaked or lost.
+                        self._disable_recorder()
                 self._emit_complete_windows()
         except Exception as exc:  # noqa: BLE001 - worker stores error for caller inspection.
             with self._state_lock:
@@ -1372,6 +1388,20 @@ class AudioCapturePipeline:
             if self._recorder is not None:
                 with suppress(Exception):
                     self._recorder.close()
+
+    def _disable_recorder(self) -> None:
+        """Finalize and drop the recorder after a best-effort recording failure.
+
+        Closes the recorder first so a partial recording is flushed and its
+        sidecar written, then clears the reference so the capture worker performs
+        no further recording work. Closing is itself suppressed: the recorder is
+        already in a failure path and must not propagate into detection.
+        """
+        recorder = self._recorder
+        self._recorder = None
+        if recorder is not None:
+            with suppress(Exception):
+                recorder.close()
 
     def _read_next_samples(self) -> tuple[float, ...]:
         needed_samples = self._settings.window_sample_count - len(self._sample_buffer)

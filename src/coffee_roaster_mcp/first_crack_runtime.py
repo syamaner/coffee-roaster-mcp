@@ -395,9 +395,22 @@ def build_session_recorder(
     sample_rate = recording.sample_rate or config.audio.sample_rate
     devices = recording.devices or ()
 
-    def milestones() -> dict[str, float | None]:
-        return recording_relative_milestones(session)
+    # The milestones closure needs the recorder's start instant to rebase the
+    # session-elapsed milestone times onto the recording clock, but the recorder
+    # is built below. Capture it in a one-slot holder the closure reads at close.
+    recorder_holder: list[RoastRecorder] = []
 
+    def milestones() -> dict[str, float | None]:
+        recorder = recorder_holder[0] if recorder_holder else None
+        recording_started_monotonic = (
+            recorder.started_monotonic_seconds if recorder is not None else None
+        )
+        return recording_relative_milestones(
+            session,
+            recording_started_monotonic_seconds=recording_started_monotonic,
+        )
+
+    recorder: RoastRecorder
     if len(devices) >= 2:
         detector_label = devices[0]
         detector_wav = session_dir / f"roast.{device_label_to_filename(detector_label)}.wav"
@@ -409,7 +422,7 @@ def build_session_recorder(
             )
             for label in devices[1:]
         ]
-        return MultiDeviceRoastRecorder(
+        recorder = MultiDeviceRoastRecorder(
             detector_wav_path=detector_wav,
             detector_device_label=detector_label,
             sidecar_path=sidecar_path,
@@ -418,42 +431,68 @@ def build_session_recorder(
             additional_devices=additional,
             milestones_provider=milestones,
         )
+    else:
+        # Single-stream: tee the detector only. A lone configured device labels
+        # the WAV; otherwise the default roast.wav name is kept.
+        detector_label = devices[0] if devices else None
+        recorder = RoastAudioRecorder(
+            wav_path=session_dir / "roast.wav",
+            sidecar_path=sidecar_path,
+            sample_rate=sample_rate,
+            session_id=session.id,
+            device_label=detector_label,
+            milestones_provider=milestones,
+        )
+    recorder_holder.append(recorder)
+    return recorder
 
-    # Single-stream: tee the detector only. A lone configured device labels the
-    # WAV; otherwise the default roast.wav name is kept.
-    detector_label = devices[0] if devices else None
-    return RoastAudioRecorder(
-        wav_path=session_dir / "roast.wav",
-        sidecar_path=sidecar_path,
-        sample_rate=sample_rate,
-        session_id=session.id,
-        device_label=detector_label,
-        milestones_provider=milestones,
-    )
 
+def recording_relative_milestones(
+    session: RoastSession,
+    *,
+    recording_started_monotonic_seconds: float | None,
+) -> dict[str, float | None]:
+    """Return roast milestones in RECORDING-relative seconds for the sidecar.
 
-def recording_relative_milestones(session: RoastSession) -> dict[str, float | None]:
-    """Return roast milestones in recording-relative seconds for the sidecar.
+    The session stores each milestone as elapsed seconds from the SESSION start
+    (`session.monotonic_start`). The recorder starts slightly later, at its own
+    `started_monotonic_seconds` (an absolute monotonic instant). To express a
+    milestone relative to the RECORDING start — what the operator needs to align
+    the WAV to T0 / first crack for offline annotation — subtract the recording
+    start, converted into the same session-elapsed domain:
 
-    The session stores milestones as elapsed seconds from its own start, while
-    the recorder's clock starts when capture begins. Both share the process
-    monotonic clock, so a milestone's recording-relative offset is its absolute
-    monotonic time (`session.monotonic_start + elapsed`) minus the recording
-    start. Recording starts very slightly after the session, so the offset is
-    effectively the session-elapsed value; it is returned verbatim because the
-    sub-tick skew is below the detector window and the recorder owns the
-    absolute recording-start timestamp separately in the sidecar.
+        recording_start_session_elapsed =
+            recording_started_monotonic_seconds - session.monotonic_start
+        milestone_recording_relative =
+            milestone_session_elapsed - recording_start_session_elapsed
+
+    Both the milestone and the recording start are exact in the shared monotonic
+    clock, so the subtraction is exact (no sub-tick fudge). When the recording
+    start is unknown (recorder never began), the raw session-elapsed value is
+    returned unchanged.
 
     Args:
         session: Live roast session.
+        recording_started_monotonic_seconds: The recorder's absolute monotonic
+            start instant, or `None` if recording never started.
 
     Returns:
         Mapping of milestone name to recording-relative seconds, or `None` when
         the milestone has not fired.
     """
+    if recording_started_monotonic_seconds is None:
+        offset = 0.0
+    else:
+        offset = recording_started_monotonic_seconds - session.monotonic_start
+
+    def _rebase(value: float | None) -> float | None:
+        if value is None:
+            return None
+        return round(value - offset, 6)
+
     return {
-        "beans_added": session.beans_added_monotonic_seconds,
-        "first_crack": session.first_crack_monotonic_seconds,
+        "beans_added": _rebase(session.beans_added_monotonic_seconds),
+        "first_crack": _rebase(session.first_crack_monotonic_seconds),
     }
 
 

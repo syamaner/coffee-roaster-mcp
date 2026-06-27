@@ -34,6 +34,7 @@ from typing import cast
 from coffee_roaster_mcp.audio import (
     AdditionalAudioInputFactory,
     AdditionalRecordingDevice,
+    AudioCaptureError,
     capture_devices_independently,
     device_label_to_filename,
 )
@@ -198,15 +199,27 @@ def run_record_check(
         )
         for label in devices
     ]
-    captures = capture_devices_independently(
-        specs,
-        record_seconds=options.record_seconds,
-        sidecar_path=sidecar_path,
-        session_id="record-check",
-        input_factory=additional_input_factory,
-        sleep=sleep,
-        read_seconds=_READ_SECONDS,
-    )
+    try:
+        captures = capture_devices_independently(
+            specs,
+            record_seconds=options.record_seconds,
+            sidecar_path=sidecar_path,
+            session_id="record-check",
+            input_factory=additional_input_factory,
+            sleep=sleep,
+            read_seconds=_READ_SECONDS,
+        )
+    except (AudioCaptureError, OSError, wave.Error) as exc:
+        # The docstring promises never to raise for capture problems: a WAV
+        # open/write or sidecar I/O error becomes a report so the CLI exits
+        # cleanly (non-zero) with diagnostics instead of crashing.
+        return RecordCheckReport(
+            output_dir=output_dir,
+            sidecar_filename=sidecar_path.name,
+            record_seconds=options.record_seconds,
+            signal_floor_dbfs=options.signal_floor_dbfs,
+            error=f"Recording failed: {exc}",
+        )
 
     results: list[RecordCheckStreamResult] = []
     for capture in captures:

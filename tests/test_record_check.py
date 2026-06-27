@@ -4,6 +4,8 @@ import math
 from collections.abc import Sequence
 from pathlib import Path
 
+import pytest
+
 from coffee_roaster_mcp.audio import AdditionalRecordingDevice
 from coffee_roaster_mcp.record_check import (
     RecordCheckOptions,
@@ -188,3 +190,42 @@ audio:
     assert stream.frame_count == 0
     assert stream.error is not None
     assert report.passed is False
+
+
+def test_record_check_catches_capture_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding #3: a capture-layer error becomes a report, never a raised crash."""
+    import coffee_roaster_mcp.record_check as record_check_module
+    from coffee_roaster_mcp.audio import AudioCaptureError
+
+    config_path = _write_config(
+        tmp_path,
+        """
+recording:
+  enabled: true
+  autocapture: true
+  sample_rate: 8
+  devices:
+    - USB PnP
+audio:
+  sample_rate: 8
+""",
+    )
+
+    def boom(*_args: object, **_kwargs: object) -> object:
+        raise AudioCaptureError("WAV open failed")
+
+    monkeypatch.setattr(record_check_module, "capture_devices_independently", boom)
+
+    report = run_record_check(
+        RecordCheckOptions(config_path=config_path, record_seconds=0.0, output_dir=tmp_path / "o"),
+        additional_input_factory=lambda _device: _BoundedInput(0.5, 1),
+        sleep=lambda _: None,
+    )
+
+    assert report.error is not None
+    assert "Recording failed" in report.error
+    assert report.passed is False
+    assert report.streams == []

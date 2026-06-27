@@ -960,6 +960,92 @@ def test_pipeline_recorder_write_failure_does_not_kill_detection(tmp_path: Path)
     assert pipeline.drain_windows()[0].samples == (0.0, 1.0, 2.0, 3.0)
 
 
+def test_pipeline_recorder_begin_failure_does_not_kill_detection(tmp_path: Path) -> None:
+    """Finding #1: a recording-START failure must not stop capture/detection."""
+
+    class BeginFailingRecorder(RoastAudioRecorder):
+        def begin(self) -> None:
+            raise RuntimeError("could not open WAV")
+
+    recorder = BeginFailingRecorder(
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.json",
+        sample_rate=4,
+        session_id="s",
+    )
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=FiniteAudioInput((0.0, 1.0, 2.0, 3.0)),
+        recorder=recorder,
+    )
+
+    pipeline.start()
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count == 1)
+    snapshot = pipeline.stop()
+
+    # The begin() failure dropped the recorder but detection ran to completion.
+    assert snapshot.emitted_window_count == 1
+    assert snapshot.latest_error is None
+    assert pipeline.drain_windows()[0].samples == (0.0, 1.0, 2.0, 3.0)
+    # No sidecar: recording never started.
+    assert not (tmp_path / "roast.json").exists()
+
+
+def test_pipeline_recorder_write_failure_finalizes_partial_recording(tmp_path: Path) -> None:
+    """Finding #2: a write failure flushes the WAV + writes the sidecar before drop."""
+    import json
+
+    class FailOnSecondWriteRecorder(RoastAudioRecorder):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)  # type: ignore[arg-type]
+            self._writes = 0
+
+        def write_samples(self, samples: Sequence[float]) -> None:
+            self._writes += 1
+            if self._writes >= 2:
+                raise RuntimeError("disk full mid-roast")
+            super().write_samples(samples)
+
+    recorder = FailOnSecondWriteRecorder(
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.recording.json",
+        sample_rate=4,
+        session_id="s",
+        flush_sample_threshold=1,
+    )
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        # Two windows: the first write succeeds and is captured; the second
+        # write raises, finalizing the partial recording.
+        audio_input=FiniteAudioInput((0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0)),
+        recorder=recorder,
+    )
+
+    pipeline.start()
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count == 2)
+    snapshot = pipeline.stop()
+
+    # Detection unaffected.
+    assert snapshot.latest_error is None
+    # The partial recording was finalized: the first window's samples are in the
+    # WAV (not leaked) and the sidecar was written.
+    values, _, _ = _read_wav_samples(tmp_path / "roast.wav")
+    assert len(values) >= 4
+    sidecar = json.loads((tmp_path / "roast.recording.json").read_text(encoding="utf-8"))
+    assert sidecar["frame_count"] >= 4
+    assert sidecar["wav_filename"] == "roast.wav"
+
+
 def test_device_label_to_filename_slug() -> None:
     from coffee_roaster_mcp.audio import device_label_to_filename
 

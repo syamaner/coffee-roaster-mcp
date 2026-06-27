@@ -683,8 +683,8 @@ def test_build_session_recorder_milestones_track_session(tmp_path: Path) -> None
     recorder = build_session_recorder(config, session)
     assert recorder is not None
 
-    # Before any milestone, both are None.
-    assert recording_relative_milestones(session) == {
+    # Before any milestone, both are None (recording start unknown → raw values).
+    assert recording_relative_milestones(session, recording_started_monotonic_seconds=None) == {
         "beans_added": None,
         "first_crack": None,
     }
@@ -692,10 +692,82 @@ def test_build_session_recorder_milestones_track_session(tmp_path: Path) -> None
     # The provider reads the LIVE session, so later milestones surface.
     session.beans_added_monotonic_seconds = 12.0
     session.first_crack_monotonic_seconds = 95.5
-    assert recording_relative_milestones(session) == {
+    assert recording_relative_milestones(session, recording_started_monotonic_seconds=None) == {
         "beans_added": 12.0,
         "first_crack": 95.5,
     }
+
+
+def test_recording_relative_milestones_are_rebased_to_recording_start() -> None:
+    """A milestone's sidecar value equals (milestone_session_elapsed - rec_start)."""
+    from coffee_roaster_mcp.first_crack_runtime import recording_relative_milestones
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+
+    # Session started at monotonic 500.0 (ClockHarness). Recording began 3.5 s
+    # later, at absolute monotonic 503.5 — i.e. 3.5 s into the session.
+    assert session.monotonic_start == 500.0
+    recording_started = 503.5
+    recording_start_session_elapsed = recording_started - session.monotonic_start
+
+    # Milestones in SESSION-elapsed seconds (as the session stores them).
+    session.beans_added_monotonic_seconds = 12.0
+    session.first_crack_monotonic_seconds = 95.5
+
+    milestones = recording_relative_milestones(
+        session, recording_started_monotonic_seconds=recording_started
+    )
+
+    # Each is genuinely recording-relative: session-elapsed minus the recording
+    # start (in the same session-elapsed domain).
+    assert milestones["beans_added"] == round(12.0 - recording_start_session_elapsed, 6)
+    assert milestones["first_crack"] == round(95.5 - recording_start_session_elapsed, 6)
+    assert milestones["beans_added"] == 8.5
+    assert milestones["first_crack"] == 92.0
+
+
+def test_built_recorder_writes_recording_relative_milestones(tmp_path: Path) -> None:
+    """End to end: the sidecar from build_session_recorder carries rebased milestones."""
+    import json
+
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    recorder = build_session_recorder(
+        AppConfig(
+            recording=RecordingConfig(
+                enabled=True,
+                autocapture=True,
+                export_location=tmp_path,
+                sample_rate=8,
+            ),
+        ),
+        session,
+    )
+    assert recorder is not None
+
+    recorder.begin()
+    recording_started = recorder.started_monotonic_seconds
+    assert recording_started is not None
+    recording_start_session_elapsed = recording_started - session.monotonic_start
+
+    # Milestones recorded (in session-elapsed seconds) after recording started.
+    session.beans_added_monotonic_seconds = 12.0
+    session.first_crack_monotonic_seconds = 95.5
+    recorder.write_samples((0.1,) * 8)
+    recorder.close()
+
+    sidecar = json.loads(
+        (tmp_path / session.id / "roast.recording.json").read_text(encoding="utf-8")
+    )
+    # The closure rebased both milestones onto the recording clock.
+    assert sidecar["milestones"]["beans_added"] == round(12.0 - recording_start_session_elapsed, 6)
+    assert sidecar["milestones"]["first_crack"] == round(95.5 - recording_start_session_elapsed, 6)
 
 
 def test_build_session_recorder_multi_device(tmp_path: Path) -> None:
