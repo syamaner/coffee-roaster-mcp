@@ -918,7 +918,9 @@ def test_built_recorder_no_metadata_fallback_writes_valid_files(tmp_path: Path) 
 
 
 def test_normalize_origin_slug_edge_cases() -> None:
-    from coffee_roaster_mcp.first_crack_runtime import _normalize_origin_slug
+    from coffee_roaster_mcp.first_crack_runtime import (
+        _normalize_origin_slug,  # pyright: ignore[reportPrivateUsage]
+    )
 
     assert _normalize_origin_slug("Brazil Cerrado") == "brazil-cerrado"
     assert _normalize_origin_slug("ETHIOPIA__yirgacheffe") == "ethiopia-yirgacheffe"

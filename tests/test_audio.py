@@ -1375,7 +1375,7 @@ def test_stop_finalises_recorder_when_worker_blocked(tmp_path: Path) -> None:
 def test_wav_writer_zero_frames_finalises_valid_header(tmp_path: Path) -> None:
     """Bug 2(a): a writer that opens but never receives frames still finalises a
     valid WAV (correct header, 0 frames), not a 0-byte file."""
-    from coffee_roaster_mcp.audio import _WavStreamWriter
+    from coffee_roaster_mcp.audio import _WavStreamWriter  # pyright: ignore[reportPrivateUsage]
 
     writer = _WavStreamWriter(
         wav_path=tmp_path / "empty.wav",
