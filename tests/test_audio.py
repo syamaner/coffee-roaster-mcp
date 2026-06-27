@@ -1217,3 +1217,96 @@ def test_capture_devices_independently_writes_all(tmp_path: Path) -> None:
     assert (tmp_path / "c.usb-pnp.wav").exists()
     assert (tmp_path / "c.atr2100x.wav").exists()
     assert (tmp_path / "c.json").exists()
+
+
+def test_multi_device_recorder_writes_annotation_session_json(tmp_path: Path) -> None:
+    """Finding: the {origin}-roast{N}-session.json matches the record_mics.py shape."""
+    import json
+    import time
+
+    from coffee_roaster_mcp.audio import (
+        AdditionalRecordingDevice,
+        AnnotationSessionSpec,
+        MultiDeviceRoastRecorder,
+    )
+
+    def factory(device: AdditionalRecordingDevice) -> _BoundedInput:
+        return _BoundedInput(amplitude=0.5, reads=4)
+
+    annotation_path = tmp_path / "brazil-roast7-session.json"
+    recorder = MultiDeviceRoastRecorder(
+        detector_wav_path=tmp_path / "mic1-brazil-roast7.wav",
+        detector_device_label="USB PnP",
+        sidecar_path=tmp_path / "roast.recording.json",
+        sample_rate=8,
+        session_id="s",
+        additional_devices=[
+            AdditionalRecordingDevice("ATR2100x", tmp_path / "mic2-brazil-roast7.wav", 8),
+        ],
+        annotation_session=AnnotationSessionSpec(
+            path=annotation_path,
+            origin="brazil",
+            roast_num=7,
+            mic_labels=("USB PnP", "ATR2100x"),
+        ),
+        additional_input_factory=factory,
+        additional_read_seconds=0.25,
+        idle_sleep_seconds=0.001,
+        stop_timeout_seconds=2.0,
+    )
+
+    recorder.begin()
+    recorder.write_samples((0.25,) * 8)
+    time.sleep(0.1)
+    recorder.close()
+
+    assert annotation_path.exists()
+    payload = json.loads(annotation_path.read_text(encoding="utf-8"))
+    # Exact record_mics.py session-JSON shape.
+    assert payload["origin"] == "brazil"
+    assert isinstance(payload["origin"], str)
+    assert payload["roast_num"] == 7
+    assert isinstance(payload["roast_num"], int)
+    assert payload["sample_rate"] == 8
+    assert payload["mics"] == [
+        {"mic_num": 1, "label": "USB PnP", "file": "mic1-brazil-roast7.wav"},
+        {"mic_num": 2, "label": "ATR2100x", "file": "mic2-brazil-roast7.wav"},
+    ]
+    for mic in payload["mics"]:
+        assert isinstance(mic["mic_num"], int)
+        assert isinstance(mic["label"], str)
+        assert isinstance(mic["file"], str)
+    # The recording sidecar (milestones / recording-relative alignment) is NOT lost.
+    assert (tmp_path / "roast.recording.json").exists()
+
+
+def test_single_recorder_writes_annotation_session_json(tmp_path: Path) -> None:
+    from coffee_roaster_mcp.audio import AnnotationSessionSpec, RoastAudioRecorder
+
+    annotation_path = tmp_path / "ethiopia-roast3-session.json"
+    recorder = RoastAudioRecorder(
+        wav_path=tmp_path / "mic1-ethiopia-roast3.wav",
+        sidecar_path=tmp_path / "roast.recording.json",
+        sample_rate=4,
+        session_id="s",
+        device_label="USB PnP",
+        annotation_session=AnnotationSessionSpec(
+            path=annotation_path,
+            origin="ethiopia",
+            roast_num=3,
+            mic_labels=("USB PnP",),
+        ),
+    )
+
+    import json
+
+    recorder.begin()
+    recorder.write_samples((0.25,) * 4)
+    recorder.close()
+
+    payload = json.loads(annotation_path.read_text(encoding="utf-8"))
+    assert payload["origin"] == "ethiopia"
+    assert payload["roast_num"] == 3
+    assert payload["mics"] == [
+        {"mic_num": 1, "label": "USB PnP", "file": "mic1-ethiopia-roast3.wav"},
+    ]

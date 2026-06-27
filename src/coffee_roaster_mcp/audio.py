@@ -666,6 +666,63 @@ def _write_recording_sidecar(
         output.write("\n")
 
 
+@dataclass(frozen=True)
+class AnnotationSessionSpec:
+    """Annotation-pipeline session descriptor for the captured WAVs (#176).
+
+    Drives the ``{origin}-roast{N}-session.json`` written alongside the recording
+    sidecar so the WAVs plug straight into the coffee-first-crack-detection
+    pipeline (``record_mics.py`` → ``propagate_annotations.py`` → ``chunk_audio``),
+    which keys on ``origin`` / ``roast_num`` and a ``mics`` list of
+    ``{mic_num, label, file}``.
+
+    Attributes:
+        path: Destination ``{origin}-roast{N}-session.json`` path.
+        origin: Bean origin slug (e.g. ``"brazil"``). Falls back to the session
+            id when ``set_recording_metadata`` was never called.
+        roast_num: 1-based roast number, or ``0`` for the no-metadata fallback.
+        mic_labels: Per-stream label in device order (index 0 = detector / mic1).
+    """
+
+    path: Path
+    origin: str
+    roast_num: int
+    mic_labels: tuple[str, ...]
+
+
+def _write_annotation_session(
+    spec: AnnotationSessionSpec,
+    streams: Sequence[_WavStreamWriter],
+) -> None:
+    """Write the ``{origin}-roast{N}-session.json`` for the annotation pipeline.
+
+    The shape matches ``record_mics.py``: ``origin`` / ``roast_num`` /
+    ``sample_rate`` / ``mics`` where each mic entry carries ``mic_num`` (1-based,
+    in device order), ``label``, and ``file`` (the WAV filename). ``mic1`` is the
+    detector/teed stream by convention.
+    """
+    mics: list[dict[str, object]] = []
+    for index, stream in enumerate(streams):
+        label = spec.mic_labels[index] if index < len(spec.mic_labels) else f"mic{index + 1}"
+        mics.append(
+            {
+                "mic_num": index + 1,
+                "label": label,
+                "file": stream.wav_path.name,
+            }
+        )
+    payload: dict[str, object] = {
+        "origin": spec.origin,
+        "roast_num": spec.roast_num,
+        "sample_rate": streams[0].sample_rate if streams else 0,
+        "mics": mics,
+    }
+    spec.path.parent.mkdir(parents=True, exist_ok=True)
+    with spec.path.open("w", encoding="utf-8") as output:
+        json.dump(payload, output, indent=2)
+        output.write("\n")
+
+
 class _IndependentCaptureStream:
     """Capture one additional device on its own thread into its own WAV.
 
@@ -777,6 +834,7 @@ class RoastAudioRecorder:
         session_id: str,
         device_label: str | None = None,
         milestones_provider: RecorderMilestonesProvider | None = None,
+        annotation_session: AnnotationSessionSpec | None = None,
         monotonic_now: Callable[[], float] | None = None,
         flush_sample_threshold: int = 16_000,
     ) -> None:
@@ -791,6 +849,10 @@ class RoastAudioRecorder:
                 sidecar stream descriptor.
             milestones_provider: Optional callable returning roast milestone
                 offsets in recording-relative seconds, evaluated at close.
+            annotation_session: Optional annotation-pipeline session descriptor
+                (#176). When set, a ``{origin}-roast{N}-session.json`` is written
+                alongside the sidecar so the WAV plugs into the FC annotation
+                pipeline.
             monotonic_now: Optional monotonic clock supplier for tests.
             flush_sample_threshold: Buffered sample count that triggers a disk
                 flush. Larger values reduce syscalls at the cost of memory.
@@ -801,6 +863,7 @@ class RoastAudioRecorder:
         self._sidecar_path = Path(sidecar_path)
         self._session_id = session_id
         self._milestones_provider = milestones_provider
+        self._annotation_session = annotation_session
         self._monotonic_now = monotonic_now or time.monotonic
         self._writer = _WavStreamWriter(
             wav_path=wav_path,
@@ -863,6 +926,9 @@ class RoastAudioRecorder:
             streams=(self._writer,),
             milestones_provider=self._milestones_provider,
         )
+        if self._annotation_session is not None:
+            with suppress(Exception):
+                _write_annotation_session(self._annotation_session, (self._writer,))
 
 
 @dataclass(frozen=True)
@@ -932,6 +998,7 @@ class MultiDeviceRoastRecorder:
         session_id: str,
         additional_devices: Sequence[AdditionalRecordingDevice] = (),
         milestones_provider: RecorderMilestonesProvider | None = None,
+        annotation_session: AnnotationSessionSpec | None = None,
         monotonic_now: Callable[[], float] | None = None,
         flush_sample_threshold: int = 16_000,
         additional_input_factory: AdditionalAudioInputFactory | None = None,
@@ -949,6 +1016,9 @@ class MultiDeviceRoastRecorder:
             session_id: Roast session identifier recorded in the sidecar.
             additional_devices: Independently-captured devices (one WAV each).
             milestones_provider: Optional roast-milestone offsets supplier.
+            annotation_session: Optional annotation-pipeline session descriptor
+                (#176). When set, a ``{origin}-roast{N}-session.json`` listing
+                every device (mic1 = detector) is written alongside the sidecar.
             monotonic_now: Optional monotonic clock supplier for tests.
             flush_sample_threshold: Buffered sample count that triggers a flush.
             additional_input_factory: Opens a fresh input per additional device;
@@ -963,6 +1033,7 @@ class MultiDeviceRoastRecorder:
         self._sidecar_path = Path(sidecar_path)
         self._session_id = session_id
         self._milestones_provider = milestones_provider
+        self._annotation_session = annotation_session
         self._monotonic_now = monotonic_now or time.monotonic
         self._stop_timeout_seconds = stop_timeout_seconds
         self._started_monotonic_seconds: float | None = None
@@ -1057,6 +1128,9 @@ class MultiDeviceRoastRecorder:
             streams=streams,
             milestones_provider=self._milestones_provider,
         )
+        if self._annotation_session is not None:
+            with suppress(Exception):
+                _write_annotation_session(self._annotation_session, streams)
 
 
 @dataclass(frozen=True)

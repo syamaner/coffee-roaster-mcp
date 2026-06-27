@@ -210,6 +210,7 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
             "mark_first_crack",
             "set_fan",
             "set_heat",
+            "set_recording_metadata",
             "start_cooling",
             "start_roast_session",
             "stop_cooling",

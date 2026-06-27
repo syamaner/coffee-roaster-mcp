@@ -136,6 +136,46 @@ def test_in_process_mcp_tools_cover_mock_roast_and_export(tmp_path: Path) -> Non
     ]
 
 
+def test_set_recording_metadata_tool_stores_and_echoes(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    # The tool is registered and listed as a bootstrap-safe tool.
+    server_info = _call_tool(server, "get_server_info", ctx)
+    assert "set_recording_metadata" in server_info.available_bootstrap_tools
+
+    result = _call_tool(server, "set_recording_metadata", ctx, origin="brazil", roast_num=7)
+    assert result.origin == "brazil"
+    assert result.roast_num == 7
+
+    # The metadata reached the runtime, so the recorder it builds for a roast
+    # names the WAV for the annotation pipeline.
+    from dataclasses import replace
+
+    from coffee_roaster_mcp.audio import RoastAudioRecorder
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    recording_config = replace(
+        server_context.config,
+        recording=RecordingConfig(enabled=True, autocapture=True, export_location=tmp_path),
+    )
+    session = server_context.session_store.start_session()
+    metadata = server_context.first_crack_runtime.set_recording_metadata(
+        origin="brazil", roast_num=7
+    )
+    recorder = build_session_recorder(recording_config, session, metadata=metadata)
+    assert isinstance(recorder, RoastAudioRecorder)
+    assert recorder.wav_path.name == "mic1-brazil-roast7.wav"
+
+    # Invalid input is rejected.
+    with pytest.raises(ValueError, match="origin must not be blank"):
+        _call_tool(server, "set_recording_metadata", ctx, origin="  ", roast_num=1)
+
+
 def test_in_process_mcp_tools_surface_errors_and_audio_bootstrap_state(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(

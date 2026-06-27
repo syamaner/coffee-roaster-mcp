@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from threading import RLock
 from typing import Literal, Protocol
 
 from coffee_roaster_mcp.artifacts import ArtifactResolutionError
 from coffee_roaster_mcp.audio import (
     AdditionalRecordingDevice,
+    AnnotationSessionSpec,
     AudioCaptureError,
     AudioCapturePipeline,
     AudioCaptureSnapshot,
@@ -18,7 +20,6 @@ from coffee_roaster_mcp.audio import (
     RoastAudioRecorder,
     RoastRecorder,
     build_audio_capture_pipeline,
-    device_label_to_filename,
 )
 from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig
 from coffee_roaster_mcp.detector import (
@@ -127,6 +128,41 @@ class FirstCrackSessionRuntime:
         #: default pipeline factory runs so the teed WAV is wired into the real
         #: capture pipeline; injected test factories ignore it.
         self._pending_recorder: RoastRecorder | None = None
+        #: Annotation-pipeline metadata for the next/current recording (#176). Set
+        #: by ``set_recording_metadata`` before the roast; consumed when the
+        #: recorder is built at session start. None falls back to session_id / 0.
+        self._recording_metadata: RecordingMetadata | None = None
+
+    def set_recording_metadata(self, *, origin: str, roast_num: int) -> RecordingMetadata:
+        """Store annotation-pipeline metadata for the next/current recording.
+
+        Called before a roast so the captured WAVs are named
+        ``mic{N}-{origin}-roast{N}.wav`` and a ``{origin}-roast{N}-session.json``
+        is written for the coffee-first-crack-detection annotation pipeline. If
+        never called, recording falls back to the session id as origin and roast
+        number ``0`` so capture never breaks.
+
+        Args:
+            origin: Bean origin slug (e.g. ``"brazil"``).
+            roast_num: 1-based roast number.
+
+        Returns:
+            The stored :class:`RecordingMetadata`.
+
+        Raises:
+            ValueError: If origin is blank or roast_num is negative.
+        """
+        normalized_origin = origin.strip()
+        if not normalized_origin:
+            raise ValueError("origin must not be blank.")
+        if roast_num < 0:
+            raise ValueError("roast_num must be >= 0.")
+        with self._lock:
+            self._recording_metadata = RecordingMetadata(
+                origin=normalized_origin,
+                roast_num=roast_num,
+            )
+            return self._recording_metadata
 
     def _build_default_audio_pipeline(self, config: AudioConfig) -> AudioCapturePipeline:
         """Build the real capture pipeline, teeing the pending session recorder."""
@@ -147,7 +183,11 @@ class FirstCrackSessionRuntime:
 
             self._status = "pending"
             self._reason = "Audio first-crack detection is prepared for this session."
-            recorder = build_session_recorder(self._config, session)
+            recorder = build_session_recorder(
+                self._config,
+                session,
+                metadata=self._recording_metadata,
+            )
             self._pending_recorder = recorder
             try:
                 adapter = self._detector_adapter_factory(self._config.first_crack)
@@ -355,9 +395,42 @@ def build_first_crack_session_runtime(
 _DEFAULT_RECORDING_SUBDIR = "captures"
 
 
+@dataclass(frozen=True)
+class RecordingMetadata:
+    """Annotation-pipeline metadata for a recording session (#176).
+
+    Set by the ``set_recording_metadata`` MCP tool before a roast so the captured
+    WAVs are named and described for the coffee-first-crack-detection annotation
+    pipeline.
+
+    Attributes:
+        origin: Bean origin slug (e.g. ``"brazil"``).
+        roast_num: 1-based roast number.
+    """
+
+    origin: str
+    roast_num: int
+
+
+def _normalize_origin_slug(origin: str) -> str:
+    """Coerce an origin into the ``[a-z0-9-]+`` slug the FC pipeline expects.
+
+    Lower-cases, replaces every run of disallowed characters with a hyphen, and
+    trims leading/trailing hyphens. An empty result falls back to ``"roast"`` so
+    a filename is always producible.
+    """
+    chars = [char.lower() if char.isalnum() else "-" for char in origin]
+    slug = "".join(chars).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug or "roast"
+
+
 def build_session_recorder(
     config: AppConfig,
     session: RoastSession,
+    *,
+    metadata: RecordingMetadata | None = None,
 ) -> RoastRecorder | None:
     """Build a per-roast audio recorder for one session, or `None` when disabled.
 
@@ -365,20 +438,30 @@ def build_session_recorder(
     are true, so capture begins with the roast and needs no MCP command. Output
     lands under `export_location/<session_id>/`.
 
+    Annotation-pipeline naming (#176): WAVs are named
+    ``mic{N}-{origin}-roast{N}.wav`` (N = 1-based device order, mic1 = the
+    detector/teed device) and a ``{origin}-roast{N}-session.json`` is written
+    alongside the recording sidecar, so the output plugs straight into
+    coffee-first-crack-detection's ``propagate_annotations`` / ``chunk_audio``.
+    When `metadata` is omitted the fallback origin is the session id and the
+    roast number is ``0``, so capture never breaks.
+
     Dispatch on `recording.devices`:
 
     - Unset, empty, or a single device: a single-stream
       :class:`RoastAudioRecorder` that tees the detector's existing mono stream
-      into one WAV (the original behaviour).
+      into one WAV (mic1).
     - Two or more devices: a :class:`MultiDeviceRoastRecorder` — the FIRST device
-      is the detector's device (teed, no second open) and each ADDITIONAL device
-      is captured as its own independent stream into its own WAV (option A). WAV
-      filenames are derived from the device labels.
+      is the detector's device (teed, no second open, mic1) and each ADDITIONAL
+      device is captured as its own independent stream into its own WAV (option
+      A, mic2..N).
 
     Args:
         config: Application configuration.
         session: Live roast session that owns the recording. Its milestone
             timestamps are read at close to compute recording-relative offsets.
+        metadata: Optional annotation-pipeline metadata (origin + roast number).
+            Falls back to ``origin=session.id`` and ``roast_num=0`` when omitted.
 
     Returns:
         A configured recorder, or `None` when recording is disabled or capture
@@ -395,6 +478,13 @@ def build_session_recorder(
     sample_rate = recording.sample_rate or config.audio.sample_rate
     devices = recording.devices or ()
 
+    origin = _normalize_origin_slug(metadata.origin if metadata is not None else session.id)
+    roast_num = metadata.roast_num if metadata is not None else 0
+    annotation_path = session_dir / f"{origin}-roast{roast_num}-session.json"
+
+    def _mic_wav(mic_num: int) -> Path:
+        return session_dir / f"mic{mic_num}-{origin}-roast{roast_num}.wav"
+
     # The milestones closure needs the recorder's start instant to rebase the
     # session-elapsed milestone times onto the recording clock, but the recorder
     # is built below. Capture it in a one-slot holder the closure reads at close.
@@ -410,38 +500,58 @@ def build_session_recorder(
             recording_started_monotonic_seconds=recording_started_monotonic,
         )
 
+    # Per-device labels for the annotation session JSON, in device order. The
+    # detector is mic1; additional devices use their configured label, else mic{N}.
+    mic_labels = tuple(
+        devices[index] if index < len(devices) else f"mic{index + 1}"
+        for index in range(max(1, len(devices)))
+    )
+
     recorder: RoastRecorder
     if len(devices) >= 2:
         detector_label = devices[0]
-        detector_wav = session_dir / f"roast.{device_label_to_filename(detector_label)}.wav"
+        annotation_session = AnnotationSessionSpec(
+            path=annotation_path,
+            origin=origin,
+            roast_num=roast_num,
+            mic_labels=mic_labels,
+        )
         additional = [
             AdditionalRecordingDevice(
                 device_label=label,
-                wav_path=session_dir / f"roast.{device_label_to_filename(label)}.wav",
+                wav_path=_mic_wav(index + 2),
                 sample_rate=sample_rate,
             )
-            for label in devices[1:]
+            for index, label in enumerate(devices[1:])
         ]
         recorder = MultiDeviceRoastRecorder(
-            detector_wav_path=detector_wav,
+            detector_wav_path=_mic_wav(1),
             detector_device_label=detector_label,
             sidecar_path=sidecar_path,
             sample_rate=sample_rate,
             session_id=session.id,
             additional_devices=additional,
             milestones_provider=milestones,
+            annotation_session=annotation_session,
         )
     else:
-        # Single-stream: tee the detector only. A lone configured device labels
-        # the WAV; otherwise the default roast.wav name is kept.
+        # Single-stream: tee the detector only (mic1). A lone configured device
+        # supplies the mic1 label; otherwise the default mic1 label is used.
         detector_label = devices[0] if devices else None
+        annotation_session = AnnotationSessionSpec(
+            path=annotation_path,
+            origin=origin,
+            roast_num=roast_num,
+            mic_labels=(mic_labels[0],),
+        )
         recorder = RoastAudioRecorder(
-            wav_path=session_dir / "roast.wav",
+            wav_path=_mic_wav(1),
             sidecar_path=sidecar_path,
             sample_rate=sample_rate,
             session_id=session.id,
             device_label=detector_label,
             milestones_provider=milestones,
+            annotation_session=annotation_session,
         )
     recorder_holder.append(recorder)
     return recorder
