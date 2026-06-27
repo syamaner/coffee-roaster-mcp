@@ -18,6 +18,7 @@ from coffee_roaster_mcp.audio import (
     AudioInput,
     DetectorPacedWavReplayPipeline,
     MicrophoneAudioInput,
+    RoastAudioRecorder,
     WavAudioInput,
     audio_capture_settings_from_config,
     build_audio_capture_pipeline,
@@ -779,3 +780,181 @@ def _write_pcm16_wav(
         wav_file.setsampwidth(2)
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+
+
+def _read_wav_samples(path: Path) -> tuple[tuple[int, ...], int, int]:
+    with wave.open(str(path), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_rate = wav_file.getframerate()
+        frame_count = wav_file.getnframes()
+        raw = wav_file.readframes(frame_count)
+    values = tuple(value[0] for value in struct.iter_unpack("<h", raw))
+    return values, channels, sample_rate
+
+
+def test_roast_recorder_writes_wav_and_sidecar(tmp_path: Path) -> None:
+    wav_path = tmp_path / "session-1" / "roast.wav"
+    sidecar_path = tmp_path / "session-1" / "roast.recording.json"
+    recorder = RoastAudioRecorder(
+        wav_path=wav_path,
+        sidecar_path=sidecar_path,
+        sample_rate=8,
+        session_id="session-1",
+        milestones_provider=lambda: {"beans_added": 1.5, "first_crack": None},
+        monotonic_now=lambda: 123.0,
+        flush_sample_threshold=2,
+    )
+
+    recorder.begin()
+    recorder.write_samples((0.0, 1.0, -1.0))
+    recorder.write_samples((0.5,))
+    recorder.close()
+
+    assert recorder.frames_written == 4
+    assert recorder.started_monotonic_seconds == 123.0
+    values, channels, sample_rate = _read_wav_samples(wav_path)
+    assert channels == 1
+    assert sample_rate == 8
+    assert values == (0, 32767, -32767, round(0.5 * 32767))
+
+    import json
+
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar["session_id"] == "session-1"
+    assert sidecar["sample_rate"] == 8
+    assert sidecar["channels"] == 1
+    assert sidecar["frame_count"] == 4
+    assert sidecar["recording_started_monotonic_seconds"] == 123.0
+    assert sidecar["milestones"] == {"beans_added": 1.5, "first_crack": None}
+    assert sidecar["wav_filename"] == "roast.wav"
+
+
+def test_roast_recorder_clamps_out_of_range_samples(tmp_path: Path) -> None:
+    recorder = RoastAudioRecorder(
+        wav_path=tmp_path / "r.wav",
+        sidecar_path=tmp_path / "r.json",
+        sample_rate=4,
+        session_id="s",
+    )
+    recorder.begin()
+    recorder.write_samples((2.0, -2.0))
+    recorder.close()
+
+    values, _, _ = _read_wav_samples(tmp_path / "r.wav")
+    assert values == (32767, -32767)
+
+
+def test_roast_recorder_rejects_invalid_sample_rate(tmp_path: Path) -> None:
+    with pytest.raises(AudioCaptureError, match="sample_rate"):
+        RoastAudioRecorder(
+            wav_path=tmp_path / "r.wav",
+            sidecar_path=tmp_path / "r.json",
+            sample_rate=0,
+            session_id="s",
+        )
+
+
+def test_roast_recorder_close_is_idempotent_and_write_after_close_noops(
+    tmp_path: Path,
+) -> None:
+    recorder = RoastAudioRecorder(
+        wav_path=tmp_path / "r.wav",
+        sidecar_path=tmp_path / "r.json",
+        sample_rate=4,
+        session_id="s",
+    )
+    recorder.begin()
+    recorder.write_samples((0.25,))
+    recorder.close()
+    recorder.close()
+    recorder.write_samples((0.5,))
+
+    assert recorder.frames_written == 1
+
+
+def test_pipeline_tees_detector_stream_into_wav(tmp_path: Path) -> None:
+    samples = tuple(float(value) / 8.0 for value in range(8))
+    recorder = RoastAudioRecorder(
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.json",
+        sample_rate=4,
+        session_id="s",
+        flush_sample_threshold=1,
+    )
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=FiniteAudioInput(samples),
+        recorder=recorder,
+    )
+
+    pipeline.start()
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count == 2)
+    pipeline.stop()
+
+    windows = pipeline.drain_windows()
+    # The detector still sees the unmodified float windows: teeing did not change
+    # detector behavior.
+    assert windows[0].samples == samples[:4]
+    assert windows[1].samples == samples[4:]
+    # The recorder captured the SAME samples (as 16-bit PCM).
+    values, channels, sample_rate = _read_wav_samples(tmp_path / "roast.wav")
+    assert channels == 1
+    assert sample_rate == 4
+    assert values == tuple(round(sample * 32767) for sample in samples)
+
+
+def test_pipeline_without_recorder_writes_no_wav(tmp_path: Path) -> None:
+    wav_path = tmp_path / "roast.wav"
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=FiniteAudioInput((0.0, 1.0, 2.0, 3.0)),
+    )
+
+    pipeline.start()
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count == 1)
+    pipeline.stop()
+
+    assert not wav_path.exists()
+
+
+def test_pipeline_recorder_write_failure_does_not_kill_detection(tmp_path: Path) -> None:
+    class FailingRecorder(RoastAudioRecorder):
+        def write_samples(self, samples: Sequence[float]) -> None:
+            raise RuntimeError("disk full")
+
+    recorder = FailingRecorder(
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.json",
+        sample_rate=4,
+        session_id="s",
+    )
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=FiniteAudioInput((0.0, 1.0, 2.0, 3.0)),
+        recorder=recorder,
+    )
+
+    pipeline.start()
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count == 1)
+    snapshot = pipeline.stop()
+
+    # Detection survived the recorder failure: the window was still emitted and
+    # the capture worker reported no fatal error.
+    assert snapshot.emitted_window_count == 1
+    assert snapshot.latest_error is None
+    assert pipeline.drain_windows()[0].samples == (0.0, 1.0, 2.0, 3.0)

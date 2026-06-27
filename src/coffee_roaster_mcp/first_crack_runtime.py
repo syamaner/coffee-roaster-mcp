@@ -13,6 +13,7 @@ from coffee_roaster_mcp.audio import (
     AudioCapturePipeline,
     AudioCaptureSnapshot,
     AudioWindow,
+    RoastAudioRecorder,
     build_audio_capture_pipeline,
 )
 from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig
@@ -105,7 +106,7 @@ class FirstCrackSessionRuntime:
             stop_timeout_seconds: Maximum seconds to wait for capture shutdown.
         """
         self._config = config
-        self._audio_pipeline_factory = audio_pipeline_factory or _build_audio_pipeline
+        self._audio_pipeline_factory = audio_pipeline_factory or self._build_default_audio_pipeline
         self._detector_adapter_factory = (
             detector_adapter_factory or _build_released_detector_adapter
         )
@@ -118,6 +119,14 @@ class FirstCrackSessionRuntime:
         self._reason: str | None = _initial_reason(config.first_crack)
         self._processed_window_count = 0
         self._last_capture_snapshot: AudioCaptureSnapshot | None = None
+        #: Recorder for the session currently being started (#176). Set while the
+        #: default pipeline factory runs so the teed WAV is wired into the real
+        #: capture pipeline; injected test factories ignore it.
+        self._pending_recorder: RoastAudioRecorder | None = None
+
+    def _build_default_audio_pipeline(self, config: AudioConfig) -> AudioCapturePipeline:
+        """Build the real capture pipeline, teeing the pending session recorder."""
+        return build_audio_capture_pipeline(config, recorder=self._pending_recorder)
 
     def start_for_session(self, session: RoastSession) -> FirstCrackRuntimeSnapshot:
         """Start or prepare first-crack detection for a roast session."""
@@ -134,6 +143,8 @@ class FirstCrackSessionRuntime:
 
             self._status = "pending"
             self._reason = "Audio first-crack detection is prepared for this session."
+            recorder = build_session_recorder(self._config, session)
+            self._pending_recorder = recorder
             try:
                 adapter = self._detector_adapter_factory(self._config.first_crack)
                 pipeline = self._audio_pipeline_factory(self._config.audio)
@@ -159,6 +170,10 @@ class FirstCrackSessionRuntime:
                 self._adapter = None
                 self._pipeline = None
                 return self.snapshot()
+            finally:
+                # The recorder is consumed by the pipeline factory; clear the
+                # session-scoped handle so it never leaks into the next start.
+                self._pending_recorder = None
 
             self._adapter = adapter
             self._pipeline = pipeline
@@ -330,8 +345,72 @@ def build_first_crack_session_runtime(
     )
 
 
-def _build_audio_pipeline(config: AudioConfig) -> AudioCapturePipeline:
-    return build_audio_capture_pipeline(config)
+#: Default per-roast capture root when `recording.export_location` is unset.
+#: This lives under the configured log dir, which is gitignored, so large WAVs
+#: are never committed (#176 privacy/storage).
+_DEFAULT_RECORDING_SUBDIR = "captures"
+
+
+def build_session_recorder(
+    config: AppConfig,
+    session: RoastSession,
+) -> RoastAudioRecorder | None:
+    """Build a per-roast audio recorder for one session, or `None` when disabled.
+
+    v1 only autocaptures: recording is wired when both `recording.enabled` and
+    `recording.autocapture` are true, so capture begins with the roast and needs
+    no MCP command. The recorder tees the detector's existing mono stream into a
+    single WAV plus a sidecar JSON under `export_location/<session_id>/`.
+
+    Args:
+        config: Application configuration.
+        session: Live roast session that owns the recording. Its milestone
+            timestamps are read at close to compute recording-relative offsets.
+
+    Returns:
+        A configured recorder, or `None` when recording is disabled or capture
+        is not autostarted for this roast.
+    """
+    recording = config.recording
+    if not recording.enabled or not recording.autocapture:
+        return None
+    export_location = recording.export_location or (
+        config.logging.log_dir / _DEFAULT_RECORDING_SUBDIR
+    )
+    session_dir = export_location / session.id
+    sample_rate = recording.sample_rate or config.audio.sample_rate
+    return RoastAudioRecorder(
+        wav_path=session_dir / "roast.wav",
+        sidecar_path=session_dir / "roast.recording.json",
+        sample_rate=sample_rate,
+        session_id=session.id,
+        milestones_provider=lambda: recording_relative_milestones(session),
+    )
+
+
+def recording_relative_milestones(session: RoastSession) -> dict[str, float | None]:
+    """Return roast milestones in recording-relative seconds for the sidecar.
+
+    The session stores milestones as elapsed seconds from its own start, while
+    the recorder's clock starts when capture begins. Both share the process
+    monotonic clock, so a milestone's recording-relative offset is its absolute
+    monotonic time (`session.monotonic_start + elapsed`) minus the recording
+    start. Recording starts very slightly after the session, so the offset is
+    effectively the session-elapsed value; it is returned verbatim because the
+    sub-tick skew is below the detector window and the recorder owns the
+    absolute recording-start timestamp separately in the sidecar.
+
+    Args:
+        session: Live roast session.
+
+    Returns:
+        Mapping of milestone name to recording-relative seconds, or `None` when
+        the milestone has not fired.
+    """
+    return {
+        "beans_added": session.beans_added_monotonic_seconds,
+        "first_crack": session.first_crack_monotonic_seconds,
+    }
 
 
 def _build_released_detector_adapter(config: FirstCrackConfig) -> FirstCrackDetectorAdapter:

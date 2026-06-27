@@ -391,3 +391,109 @@ def test_temperature_unit_error_reports_context(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="roaster.temperature_unit"):
         load_config(config_path, environ={})
+
+
+def test_recording_defaults_are_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    config = load_config(environ={})
+
+    assert config.recording.enabled is False
+    assert config.recording.autocapture is False
+    assert config.recording.export_location is None
+    assert config.recording.sample_rate is None
+    assert config.recording.device is None
+    assert config.recording.channels is None
+
+
+def test_recording_yaml_config_is_parsed(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        """
+recording:
+  enabled: true
+  autocapture: "yes"
+  export_location: ~/roasts/captures
+  sample_rate: 44100
+  device: aggregate-2ch
+  channels:
+    - 0
+    - 1
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path, environ={})
+
+    assert config.recording.enabled is True
+    assert config.recording.autocapture is True
+    assert config.recording.export_location == Path("~/roasts/captures")
+    assert config.recording.sample_rate == 44_100
+    assert config.recording.device == "aggregate-2ch"
+    assert config.recording.channels == (0, 1)
+
+
+def test_recording_environment_overrides(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("recording:\n  enabled: false\n", encoding="utf-8")
+
+    config = load_config(
+        config_path,
+        environ={
+            "COFFEE_RECORDING_ENABLED": "true",
+            "COFFEE_RECORDING_AUTOCAPTURE": "1",
+            "COFFEE_RECORDING_EXPORT_LOCATION": "  /tmp/captures \n",
+            "COFFEE_RECORDING_SAMPLE_RATE": "48000",
+        },
+    )
+
+    assert config.recording.enabled is True
+    assert config.recording.autocapture is True
+    assert config.recording.export_location == Path("/tmp/captures")
+    assert config.recording.sample_rate == 48_000
+
+
+def test_recording_empty_environment_clears_optionals(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "recording:\n  export_location: ~/x\n  sample_rate: 44100\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(
+        config_path,
+        environ={
+            "COFFEE_RECORDING_EXPORT_LOCATION": "   ",
+            "COFFEE_RECORDING_SAMPLE_RATE": "  ",
+        },
+    )
+
+    assert config.recording.export_location is None
+    assert config.recording.sample_rate is None
+
+
+def test_recording_invalid_sample_rate_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("recording:\n  sample_rate: 0\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="recording.sample_rate"):
+        load_config(config_path, environ={})
+
+
+def test_recording_invalid_channels_fail(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("recording:\n  channels:\n    - -1\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="recording.channels"):
+        load_config(config_path, environ={})
+
+
+def test_recording_invalid_enabled_environment_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("recording:\n  enabled: false\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="COFFEE_RECORDING_ENABLED"):
+        load_config(config_path, environ={"COFFEE_RECORDING_ENABLED": "maybe"})

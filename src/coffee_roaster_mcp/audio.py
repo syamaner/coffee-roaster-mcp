@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import math
 import struct
 import time
 import wave
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -166,8 +167,24 @@ def build_audio_capture_pipeline(
     queue_limit: int = DEFAULT_AUDIO_WINDOW_QUEUE_LIMIT,
     idle_sleep_seconds: float = DEFAULT_AUDIO_IDLE_SLEEP_SECONDS,
     monotonic_now: Callable[[], float] | None = None,
+    recorder: RoastAudioRecorder | None = None,
 ) -> AudioCapturePipeline:
-    """Create an audio capture pipeline from configured audio input settings."""
+    """Create an audio capture pipeline from configured audio input settings.
+
+    Args:
+        config: Audio capture configuration.
+        input_factory: Optional configured-input factory override.
+        window_seconds: Optional detector window override.
+        queue_limit: Detector window queue limit.
+        idle_sleep_seconds: Idle sleep when no samples are available.
+        monotonic_now: Optional monotonic clock supplier for tests.
+        recorder: Optional roast audio recorder teed onto the detector stream
+            (#176). Detector-paced WAV replay never records, since it has no live
+            capture stream to tee.
+
+    Returns:
+        A configured capture pipeline.
+    """
     resolved_input_factory = input_factory or build_configured_audio_input
     settings = audio_capture_settings_from_config(
         config,
@@ -187,6 +204,7 @@ def build_audio_capture_pipeline(
         settings=settings,
         audio_input=resolved_input_factory(settings),
         monotonic_now=monotonic_now,
+        recorder=recorder,
     )
 
 
@@ -413,6 +431,191 @@ class MicrophoneAudioInput:
         self.close()
 
 
+#: 16-bit signed PCM is the recorder's on-disk format: it is the Label-Studio /
+#: training-corpus convention reused from coffee-first-crack-detection, keeps the
+#: WAV roughly half the size of 32-bit float, and the detector samples are already
+#: in the [-1, 1] float range so the conversion is a single multiply per sample.
+_RECORDER_SAMPLE_WIDTH_BYTES = 2
+_RECORDER_PCM16_MAX = 32767
+
+
+class RecorderMilestonesProvider(Protocol):
+    """Supplies roast milestone offsets for the recording sidecar at close."""
+
+    def __call__(self) -> Mapping[str, float | None]:
+        """Return milestone name to recording-relative seconds (or `None`)."""
+        ...
+
+
+class RoastAudioRecorder:
+    """Tee the detector's mono capture stream into one per-roast WAV (#176, v1).
+
+    This recorder is owned by the MCP audio pipeline, which already owns the
+    audio device for detection. It does NOT open a second stream: the capture
+    loop hands it the same float samples the detector consumes (the verified
+    non-disturbing tee point), so there is no extra device contention.
+
+    v1 captures the detector's single mono stream into ONE WAV plus a session
+    sidecar JSON. True multi-channel / 2-mic capture (open the device at 2
+    channels into 2 WAVs) is a documented follow-on and is intentionally not
+    built here.
+
+    Writes are buffered in memory and flushed to disk in blocks so the capture
+    worker is not stalled by a per-sample syscall; the actual disk write still
+    happens on the capture thread, which is acceptable for the v1 mono stream on
+    the Pi-CPU budget (D27) but is the first thing to move to a dedicated writer
+    thread if multi-channel capture is added later.
+
+    The recorder is not internally locked: the capture pipeline drives all of
+    ``begin``, ``write_samples``, and ``close`` from its single worker thread, so
+    no two of them run concurrently.
+    """
+
+    def __init__(
+        self,
+        *,
+        wav_path: Path,
+        sidecar_path: Path,
+        sample_rate: int,
+        session_id: str,
+        milestones_provider: RecorderMilestonesProvider | None = None,
+        monotonic_now: Callable[[], float] | None = None,
+        flush_sample_threshold: int = 16_000,
+    ) -> None:
+        """Configure a per-roast audio recorder.
+
+        Args:
+            wav_path: Destination WAV path. Parent directories are created.
+            sidecar_path: Destination sidecar JSON path written at close.
+            sample_rate: WAV sample rate in Hz.
+            session_id: Roast session identifier recorded in the sidecar.
+            milestones_provider: Optional callable returning roast milestone
+                offsets in recording-relative seconds, evaluated at close.
+            monotonic_now: Optional monotonic clock supplier for tests.
+            flush_sample_threshold: Buffered sample count that triggers a disk
+                flush. Larger values reduce syscalls at the cost of memory.
+
+        Raises:
+            AudioCaptureError: If sample_rate or the flush threshold is invalid.
+        """
+        if sample_rate <= 0:
+            raise AudioCaptureError("recording sample_rate must be > 0.")
+        if flush_sample_threshold < 1:
+            raise AudioCaptureError("recording flush_sample_threshold must be >= 1.")
+        self._wav_path = Path(wav_path)
+        self._sidecar_path = Path(sidecar_path)
+        self._sample_rate = sample_rate
+        self._session_id = session_id
+        self._milestones_provider = milestones_provider
+        self._monotonic_now = monotonic_now or time.monotonic
+        self._flush_sample_threshold = flush_sample_threshold
+        self._wav: wave.Wave_write | None = None
+        self._pending: list[float] = []
+        self._frames_written = 0
+        self._started_monotonic_seconds: float | None = None
+        self._closed = False
+
+    @property
+    def wav_path(self) -> Path:
+        """Return the destination WAV path."""
+        return self._wav_path
+
+    @property
+    def sidecar_path(self) -> Path:
+        """Return the destination sidecar JSON path."""
+        return self._sidecar_path
+
+    @property
+    def sample_rate(self) -> int:
+        """Return the WAV sample rate in Hz."""
+        return self._sample_rate
+
+    @property
+    def frames_written(self) -> int:
+        """Return the number of audio frames written to the WAV so far."""
+        return self._frames_written
+
+    @property
+    def started_monotonic_seconds(self) -> float | None:
+        """Return the absolute monotonic timestamp captured at recording start."""
+        return self._started_monotonic_seconds
+
+    def begin(self) -> None:
+        """Open the WAV writer and capture the recording-start monotonic time."""
+        if self._wav is not None or self._closed:
+            return
+        self._started_monotonic_seconds = self._monotonic_now()
+        self._wav_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            wav_file = wave.open(  # noqa: SIM115 - recorder owns the handle until close().
+                str(self._wav_path), "wb"
+            )
+        except (OSError, wave.Error) as exc:
+            raise AudioCaptureError(
+                f"Could not open roast recording WAV {self._wav_path}: {exc}"
+            ) from exc
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(_RECORDER_SAMPLE_WIDTH_BYTES)
+        wav_file.setframerate(self._sample_rate)
+        self._wav = wav_file
+
+    def write_samples(self, samples: Sequence[float]) -> None:
+        """Append the detector's mono float samples to the recording buffer."""
+        if self._wav is None or self._closed or not samples:
+            return
+        self._pending.extend(float(sample) for sample in samples)
+        if len(self._pending) >= self._flush_sample_threshold:
+            self._flush_locked()
+
+    def close(self) -> None:
+        """Flush remaining samples, finalize the WAV, and write the sidecar JSON."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._wav is None:
+            return
+        try:
+            self._flush_locked()
+        finally:
+            with suppress(Exception):
+                self._wav.close()
+            self._wav = None
+        self._write_sidecar()
+
+    def _flush_locked(self) -> None:
+        if self._wav is None or not self._pending:
+            return
+        frames = bytearray()
+        for sample in self._pending:
+            clamped = -1.0 if sample < -1.0 else (1.0 if sample > 1.0 else sample)
+            frames += struct.pack("<h", int(round(clamped * _RECORDER_PCM16_MAX)))
+        self._wav.writeframes(bytes(frames))
+        self._frames_written += len(self._pending)
+        self._pending.clear()
+
+    def _write_sidecar(self) -> None:
+        milestones: Mapping[str, float | None] = {}
+        if self._milestones_provider is not None:
+            with suppress(Exception):
+                milestones = self._milestones_provider()
+        sidecar: dict[str, object] = {
+            "schema_version": 1,
+            "session_id": self._session_id,
+            "wav_filename": self._wav_path.name,
+            "sample_rate": self._sample_rate,
+            "channels": 1,
+            "sample_width_bytes": _RECORDER_SAMPLE_WIDTH_BYTES,
+            "frame_count": self._frames_written,
+            "duration_seconds": round(self._frames_written / self._sample_rate, 6),
+            "recording_started_monotonic_seconds": self._started_monotonic_seconds,
+            "milestones": {key: milestones.get(key) for key in milestones},
+        }
+        self._sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._sidecar_path.open("w", encoding="utf-8") as output:
+            json.dump(sidecar, output, sort_keys=True, indent=2)
+            output.write("\n")
+
+
 class AudioCapturePipeline:
     """Background audio capture pipeline that emits detector windows.
 
@@ -428,6 +631,7 @@ class AudioCapturePipeline:
         settings: AudioCaptureSettings,
         audio_input: AudioInput,
         monotonic_now: Callable[[], float] | None = None,
+        recorder: RoastAudioRecorder | None = None,
     ) -> None:
         """Initialize an audio capture pipeline.
 
@@ -435,11 +639,15 @@ class AudioCapturePipeline:
             settings: Validated audio capture settings.
             audio_input: Configured readable audio source.
             monotonic_now: Optional monotonic clock supplier for tests.
+            recorder: Optional roast audio recorder (#176). When supplied, the
+                capture worker tees the same float samples the detector consumes
+                into a per-roast WAV without opening a second device stream.
         """
         _validate_settings(settings)
         self._settings = settings
         self._audio_input = audio_input
         self._monotonic_now = monotonic_now or time.monotonic
+        self._recorder = recorder
         self._windows: Queue[AudioWindow] = Queue(maxsize=settings.queue_limit)
         self._sample_buffer: list[float] = []
         self._stop_requested = Event()
@@ -549,6 +757,8 @@ class AudioCapturePipeline:
             )
 
     def _run_capture_loop(self) -> None:
+        if self._recorder is not None:
+            self._recorder.begin()
         try:
             while not self._stop_requested.is_set():
                 samples = self._read_next_samples()
@@ -556,6 +766,17 @@ class AudioCapturePipeline:
                     time.sleep(self._settings.idle_sleep_seconds)
                     continue
                 self._sample_buffer.extend(samples)
+                # Tee the SAME samples the detector consumes into the recording
+                # WAV right after the buffer extend (#176). This is the verified
+                # non-disturbing tee point: the detector still windows the buffer
+                # below, untouched. Recording failures must never kill detection,
+                # so a recorder error is logged and capture continues.
+                if self._recorder is not None:
+                    try:
+                        self._recorder.write_samples(samples)
+                    except Exception as exc:  # noqa: BLE001 - recording is best effort.
+                        _LOGGER.warning("Roast audio recording write failed; continuing: %s", exc)
+                        self._recorder = None
                 self._emit_complete_windows()
         except Exception as exc:  # noqa: BLE001 - worker stores error for caller inspection.
             with self._state_lock:
@@ -567,6 +788,9 @@ class AudioCapturePipeline:
             # freed while a read is in flight, which would otherwise segfault the
             # process at end of roast (worker mid-read while the caller closes).
             _close_audio_input_if_supported(self._audio_input)
+            if self._recorder is not None:
+                with suppress(Exception):
+                    self._recorder.close()
 
     def _read_next_samples(self) -> tuple[float, ...]:
         needed_samples = self._settings.window_sample_count - len(self._sample_buffer)
