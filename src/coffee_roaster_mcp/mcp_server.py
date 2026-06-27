@@ -852,7 +852,14 @@ def quiet_sdk_per_request_log() -> None:
     trampled down to ``WARNING``.
     """
     sdk_logger = logging.getLogger(SDK_REQUEST_LOGGER_NAME)
-    if sdk_logger.getEffectiveLevel() < logging.WARNING:
+    # Guard on the logger's OWN level, not getEffectiveLevel() (#162): this runs at
+    # run_stdio_server startup BEFORE the SDK's .run() configures INFO logging, so
+    # getEffectiveLevel() returns the inherited default WARNING and the old
+    # `< WARNING` guard skipped — then .run() set INFO and the still-NOTSET logger
+    # inherited it and flooded the console at 1 Hz. .level is NOTSET (0) at startup,
+    # so `< WARNING` pins an explicit WARNING (which .run()'s root INFO can't override),
+    # while an explicit ERROR/CRITICAL (>= WARNING) is preserved.
+    if sdk_logger.level < logging.WARNING:
         sdk_logger.setLevel(logging.WARNING)
 
 

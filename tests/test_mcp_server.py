@@ -68,6 +68,30 @@ def test_quiet_sdk_per_request_log_only_raises_never_lowers() -> None:
         sdk_logger.setLevel(original_sdk_level)
 
 
+def test_quiet_sdk_per_request_log_pins_warning_before_logging_configured() -> None:
+    """Regression (#162): the production order is quiet() THEN the SDK's .run() configures
+    INFO. At the quiet call the SDK logger is NOTSET (no explicit level), so the guard must
+    key off .level (NOTSET → pin WARNING), not getEffectiveLevel() (the inherited default
+    WARNING, which made the old guard skip — then INFO was configured and it flooded)."""
+    sdk_logger = logging.getLogger(SDK_REQUEST_LOGGER_NAME)
+    root = logging.getLogger()
+    original_sdk_level = sdk_logger.level
+    original_root_level = root.level
+    sdk_logger.setLevel(logging.NOTSET)  # the real startup state — no explicit level
+    root.setLevel(logging.WARNING)  # nothing has configured INFO yet
+    try:
+        quiet_sdk_per_request_log()
+
+        assert sdk_logger.level == logging.WARNING  # explicit, set despite inherited WARNING
+        # the SDK's .run() configures INFO on the root afterwards; the explicit WARNING wins.
+        root.setLevel(logging.INFO)
+        assert sdk_logger.getEffectiveLevel() == logging.WARNING
+        assert not sdk_logger.isEnabledFor(logging.INFO)
+    finally:
+        sdk_logger.setLevel(original_sdk_level)
+        root.setLevel(original_root_level)
+
+
 def test_in_process_mcp_tools_cover_mock_roast_and_export(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
