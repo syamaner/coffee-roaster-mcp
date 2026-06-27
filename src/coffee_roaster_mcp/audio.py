@@ -18,6 +18,8 @@ from threading import Event, Lock, Thread
 from types import TracebackType
 from typing import Any, Protocol, Self, cast
 
+import numpy as np
+
 from coffee_roaster_mcp.config import AudioConfig
 
 DEFAULT_AUDIO_WINDOW_SECONDS = 1.0
@@ -632,11 +634,17 @@ class _WavStreamWriter:
     def _flush_locked(self) -> None:
         if self._wav is None or not self._pending:
             return
-        frames = bytearray()
-        for sample in self._pending:
-            clamped = -1.0 if sample < -1.0 else (1.0 if sample > 1.0 else sample)
-            frames += struct.pack("<h", int(round(clamped * _RECORDER_PCM16_MAX)))
-        self._wav.writeframes(bytes(frames))
+        # Vectorised PCM16 conversion (coffee-roaster-mcp#180): the previous
+        # per-sample Python struct.pack loop packed the full flush block (default
+        # 16k samples) one sample at a time while holding the GIL, stalling the
+        # detector capture worker (and the ATR2100x thread) long enough to
+        # overflow the mic input on a live roast (roast 5). numpy does the
+        # clamp/scale/round in C and releases the GIL, so the flush no longer
+        # starves detection.
+        samples = np.asarray(self._pending, dtype=np.float64)
+        np.clip(samples, -1.0, 1.0, out=samples)
+        pcm16 = np.rint(samples * _RECORDER_PCM16_MAX).astype("<i2")
+        self._wav.writeframes(pcm16.tobytes())
         self._frames_written += len(self._pending)
         self._pending.clear()
 
