@@ -20,6 +20,7 @@ from coffee_roaster_mcp.audio import (
     MicrophoneAudioInput,
     RoastAudioRecorder,
     WavAudioInput,
+    amplitude_to_dbfs,
     audio_capture_settings_from_config,
     build_audio_capture_pipeline,
     build_configured_audio_input,
@@ -1393,3 +1394,153 @@ def test_wav_writer_zero_frames_finalises_valid_header(tmp_path: Path) -> None:
         assert wav_file.getnframes() == 0
         assert wav_file.getframerate() == 16_000
         assert wav_file.getnchannels() == 1
+
+
+# --- #178: live in-session mic-levels readout -----------------------------
+
+
+def test_amplitude_to_dbfs_maps_levels_and_silence() -> None:
+    """`amplitude_to_dbfs` maps full-scale to 0, half-scale to ~-6, silence to -inf."""
+    import math
+
+    assert amplitude_to_dbfs(1.0) == 0.0
+    assert amplitude_to_dbfs(2.0) == 0.0  # clamped to full scale
+    # Rounded to 2 dp, half-scale is exactly -6.02 dBFS.
+    assert amplitude_to_dbfs(0.5) == -6.02
+    assert amplitude_to_dbfs(0.0) == -math.inf
+    assert amplitude_to_dbfs(-0.1) == -math.inf
+
+
+def test_capture_snapshot_reports_none_levels_before_any_samples() -> None:
+    """Before the worker reads a sample, the levels are `None` (not yet measured)."""
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device="mock-mic",
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=FiniteAudioInput(()),
+    )
+    snapshot = pipeline.snapshot()
+    assert snapshot.peak_dbfs is None
+    assert snapshot.rms_dbfs is None
+
+
+def test_capture_snapshot_reports_live_peak_and_rms_levels() -> None:
+    """The capture worker surfaces a non-trivial peak/RMS for a real signal (#178)."""
+    audio_input = MutableAudioInput((0.5, -0.5, 0.5, -0.5))
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device="mock-mic",
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+    )
+
+    pipeline.start()
+    try:
+        _wait_for(lambda: pipeline.snapshot().peak_dbfs is not None)
+        snapshot = pipeline.snapshot()
+    finally:
+        pipeline.stop()
+
+    # A constant 0.5 amplitude block is exactly -6.02 dBFS peak AND RMS
+    # (the helper rounds to 2 dp).
+    assert snapshot.peak_dbfs == -6.02
+    assert snapshot.rms_dbfs == -6.02
+
+
+def test_capture_snapshot_reports_silence_floor_for_a_dead_mic() -> None:
+    """A device that opens but delivers zeros reports -inf dBFS, not None (#178)."""
+    import math
+
+    audio_input = MutableAudioInput((0.0, 0.0, 0.0, 0.0))
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device="mock-mic",
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+    )
+
+    pipeline.start()
+    try:
+        _wait_for(lambda: pipeline.snapshot().peak_dbfs is not None)
+        snapshot = pipeline.snapshot()
+    finally:
+        pipeline.stop()
+
+    assert snapshot.peak_dbfs == -math.inf
+    assert snapshot.rms_dbfs == -math.inf
+
+
+def test_capture_levels_reset_on_pipeline_restart() -> None:
+    """The level meter clears on restart so a new run does not show stale levels."""
+    audio_input = MutableAudioInput((0.5, 0.5, 0.5, 0.5))
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device="mock-mic",
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+    )
+
+    pipeline.start()
+    _wait_for(lambda: pipeline.snapshot().peak_dbfs is not None)
+    pipeline.stop()
+
+    pipeline.start()
+    try:
+        # Immediately after restart, before the worker has read, levels are reset.
+        assert pipeline.snapshot().peak_dbfs is None
+    finally:
+        pipeline.stop()
+
+
+def test_rolling_level_meter_tracks_recent_window_only() -> None:
+    """The meter reflects the recent window, dropping older quieter samples."""
+    from coffee_roaster_mcp.audio import _RollingLevelMeter  # pyright: ignore[reportPrivateUsage]
+
+    meter = _RollingLevelMeter(window_sample_count=4)
+    assert meter.peak_dbfs is None
+    # An empty observe is a no-op: levels stay unmeasured.
+    meter.observe(())
+    assert meter.peak_dbfs is None
+    meter.observe((0.0, 0.0))
+    assert meter.peak_dbfs == float("-inf")
+    # A later loud block displaces the early silence within the 4-sample window.
+    meter.observe((1.0, 1.0, 1.0, 1.0))
+    assert meter.peak_dbfs == 0.0
+    assert meter.rms_dbfs == 0.0
+    meter.reset()
+    assert meter.peak_dbfs is None
+    assert meter.rms_dbfs is None
+
+
+def test_rolling_level_meter_levels_is_a_coherent_pair() -> None:
+    """`levels` returns the (peak, rms) pair as ONE reference (#178).
+
+    The meter is written by the capture worker outside the pipeline state lock,
+    so the snapshot reads the pair via this single accessor to avoid a torn
+    (peak-from-one-update, rms-from-another) read. The peak/rms scalar
+    properties derive from the same tuple.
+    """
+    from coffee_roaster_mcp.audio import _RollingLevelMeter  # pyright: ignore[reportPrivateUsage]
+
+    meter = _RollingLevelMeter(window_sample_count=4)
+    assert meter.levels is None
+    meter.observe((0.5, -0.5, 0.5, -0.5))
+    levels = meter.levels
+    assert levels is not None
+    assert levels == (meter.peak_dbfs, meter.rms_dbfs)
+    # A constant half-scale block: peak == rms == -6.02 dBFS (2 dp).
+    assert levels == (-6.02, -6.02)
+    meter.reset()
+    assert meter.levels is None

@@ -81,6 +81,11 @@ class FirstCrackRuntimeSnapshot:
         emitted_window_count: Windows emitted by the capture pipeline.
         dropped_window_count: Windows dropped by the capture queue.
         processed_window_count: Windows processed by this runtime.
+        mic_peak_dbfs: Live rolling peak level of the captured mic stream in dBFS
+            (#178), or ``None`` when no audio capture is running. ``-inf`` for
+            silence. Lets a mis-gained / dead mic be caught under real conditions.
+        mic_rms_dbfs: Live rolling RMS level of the captured mic stream in dBFS
+            (#178), or ``None`` when no audio capture is running.
     """
 
     status: FirstCrackRuntimeState
@@ -92,6 +97,8 @@ class FirstCrackRuntimeSnapshot:
     emitted_window_count: int = 0
     dropped_window_count: int = 0
     processed_window_count: int = 0
+    mic_peak_dbfs: float | None = None
+    mic_rms_dbfs: float | None = None
 
 
 class FirstCrackSessionRuntime:
@@ -127,6 +134,12 @@ class FirstCrackSessionRuntime:
         self._reason: str | None = _initial_reason(config.first_crack)
         self._processed_window_count = 0
         self._last_capture_snapshot: AudioCaptureSnapshot | None = None
+        #: Whether inference/draining has been stopped for this session while the
+        #: capture worker + recorder keep running (#181). Set at first-crack
+        #: detection so the runtime stops draining/detecting but the recording
+        #: spans charge→session stop (not charge→FC). The pipeline is finalised
+        #: only at ``stop_for_session`` (the real roast end).
+        self._inference_stopped = False
         #: Recorder for the session currently being started (#176). Set while the
         #: default pipeline factory runs so the teed WAV is wired into the real
         #: capture pipeline; injected test factories ignore it.
@@ -197,6 +210,7 @@ class FirstCrackSessionRuntime:
             self._stop_locked(reason="new roast session")
             self._active_session_id = session.id
             self._processed_window_count = 0
+            self._inference_stopped = False
             self._last_capture_snapshot = None
 
             if self._config.first_crack.mode != "audio":
@@ -286,7 +300,13 @@ class FirstCrackSessionRuntime:
                     if result is not None:
                         self._status = "detected"
                         self._reason = "First crack was recorded by audio detection."
-                        self._stop_locked(reason="first crack detected")
+                        # #181: stop ONLY inference/draining at first crack — keep
+                        # the capture worker + recorder running so the recording
+                        # spans charge→session stop (not charge→FC). Nothing drains
+                        # the bounded window queue after this, so it fills and drops
+                        # harmlessly while the capture worker keeps teeing to the
+                        # WAVs. The pipeline finalises at stop_for_session.
+                        self._inference_stopped = True
                         break
             except (AudioCaptureError, FirstCrackDetectorError, SessionLifecycleError) as exc:
                 self._mark_faulted_locked(f"First-crack detection failed: {exc}")
@@ -352,12 +372,22 @@ class FirstCrackSessionRuntime:
                 status = "faulted"
                 reason = f"Audio capture failed: {capture_snapshot.latest_error}"
 
+            audio_running = capture_snapshot is not None and capture_snapshot.running
+            # The mic levels are a LIVE signal: report them only while audio
+            # capture is running. After stop_for_session the stopped capture
+            # snapshot still carries the last-measured levels, but they are stale,
+            # so gate on ``audio_running`` — ``None`` reliably means "no live
+            # signal", matching the field's documented semantics (#178).
+            mic_peak_dbfs = (
+                capture_snapshot.peak_dbfs if audio_running and capture_snapshot else None
+            )
+            mic_rms_dbfs = capture_snapshot.rms_dbfs if audio_running and capture_snapshot else None
             return FirstCrackRuntimeSnapshot(
                 status=status,
                 active_session_id=self._active_session_id,
                 active=self._pipeline is not None,
                 reason=reason,
-                audio_running=False if capture_snapshot is None else capture_snapshot.running,
+                audio_running=audio_running,
                 queued_window_count=0
                 if capture_snapshot is None
                 else capture_snapshot.queued_window_count,
@@ -368,12 +398,18 @@ class FirstCrackSessionRuntime:
                 if capture_snapshot is None
                 else capture_snapshot.dropped_window_count,
                 processed_window_count=self._processed_window_count,
+                mic_peak_dbfs=mic_peak_dbfs,
+                mic_rms_dbfs=mic_rms_dbfs,
             )
 
     def _can_process_locked(self, session: RoastSession) -> bool:
         if self._config.first_crack.mode != "audio":
             return False
         if self._active_session_id != session.id:
+            return False
+        # Inference is stopped at first crack (#181) while capture keeps running;
+        # never drain/detect again until a fresh session resets the flag.
+        if self._inference_stopped:
             return False
         if self._status != "pending":
             return False
@@ -397,8 +433,10 @@ class FirstCrackSessionRuntime:
             finally:
                 self._pipeline = None
                 self._adapter = None
-        # The session is over: the next roast may set fresh recording metadata.
+        # The session is over: the next roast may set fresh recording metadata,
+        # and inference may run again from scratch (#181).
         self._recorder_built_for_session = False
+        self._inference_stopped = False
         if self._status == "pending":
             self._reason = f"Audio first-crack detection stopped before confirmation: {reason}."
 
@@ -659,12 +697,17 @@ def _initial_status(config: FirstCrackConfig) -> FirstCrackRuntimeState:
 
 
 def _stopped_capture_snapshot(snapshot: AudioCaptureSnapshot) -> AudioCaptureSnapshot:
+    # A stopped capture carries no LIVE mic levels: the meter's last values are
+    # stale once capture stops, so drop them (the runtime snapshot also gates the
+    # levels on ``audio_running``, so a stale value would never surface anyway).
     return AudioCaptureSnapshot(
         running=False,
         queued_window_count=snapshot.queued_window_count,
         emitted_window_count=snapshot.emitted_window_count,
         dropped_window_count=snapshot.dropped_window_count,
         latest_error=snapshot.latest_error,
+        peak_dbfs=None,
+        rms_dbfs=None,
     )
 
 
