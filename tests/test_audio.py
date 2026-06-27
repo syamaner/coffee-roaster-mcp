@@ -1310,3 +1310,86 @@ def test_single_recorder_writes_annotation_session_json(tmp_path: Path) -> None:
     assert payload["mics"] == [
         {"mic_num": 1, "label": "USB PnP", "file": "mic1-ethiopia-roast3.wav"},
     ]
+
+
+def test_stop_finalises_recorder_when_worker_blocked(tmp_path: Path) -> None:
+    """Bug 2(b): if the capture worker is blocked in a read when stop() is called
+    (e.g. the detector's first samples are pending during AST model load), stop()
+    finalises the recorder itself so the WAV + sidecars are written, not lost."""
+    from threading import Event
+
+    released = Event()
+    closed = Event()
+
+    class BlockingInput:
+        """read_samples blocks until stop() releases it."""
+
+        def read_samples(self, sample_count: int) -> Sequence[float]:
+            released.wait(timeout=2.0)
+            return ()
+
+        def close(self) -> None:
+            return None
+
+    class CloseTrackingRecorder(RoastAudioRecorder):
+        def close(self) -> None:
+            closed.set()
+            super().close()
+
+    recorder = CloseTrackingRecorder(
+        wav_path=tmp_path / "mic1.wav",
+        sidecar_path=tmp_path / "roast.recording.json",
+        sample_rate=16,
+        session_id="s",
+    )
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=16,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=BlockingInput(),
+        recorder=recorder,
+    )
+
+    pipeline.start()
+    # Give the worker a moment to call begin() and block in read_samples.
+    _wait_for(lambda: recorder.started_monotonic_seconds is not None)
+    # Stop with a short join timeout while the worker is still blocked → the stop
+    # caller must finalise the recorder as a fallback.
+    pipeline.stop(timeout_seconds=0.05)
+
+    assert closed.is_set()
+    # The mic1 WAV exists and is a valid (0-frame) finalised file, not 0 bytes.
+    assert (tmp_path / "mic1.wav").exists()
+    assert (tmp_path / "mic1.wav").stat().st_size >= 44
+    # The recording sidecar was written despite zero frames.
+    assert (tmp_path / "roast.recording.json").exists()
+
+    # Release the still-blocked worker so it exits cleanly; its later close() is a
+    # no-op (idempotent), proving no double-write.
+    released.set()
+
+
+def test_wav_writer_zero_frames_finalises_valid_header(tmp_path: Path) -> None:
+    """Bug 2(a): a writer that opens but never receives frames still finalises a
+    valid WAV (correct header, 0 frames), not a 0-byte file."""
+    from coffee_roaster_mcp.audio import _WavStreamWriter
+
+    writer = _WavStreamWriter(
+        wav_path=tmp_path / "empty.wav",
+        device_label="USB PnP",
+        sample_rate=16_000,
+        flush_sample_threshold=1,
+    )
+    writer.begin()
+    writer.close()
+
+    # After close the WAV is a valid, finalised file (>=44-byte header, 0 frames),
+    # not a 0-byte file — even though no samples were ever written.
+    assert (tmp_path / "empty.wav").stat().st_size >= 44
+    with wave.open(str(tmp_path / "empty.wav"), "rb") as wav_file:
+        assert wav_file.getnframes() == 0
+        assert wav_file.getframerate() == 16_000
+        assert wav_file.getnchannels() == 1

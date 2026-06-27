@@ -534,6 +534,10 @@ class _WavStreamWriter:
         self._pending: list[float] = []
         self._frames_written = 0
         self._closed = False
+        # Serialises write_samples / close so the capture worker and a stop-caller
+        # fallback finalisation (#176 hardware bug 2) never touch the wave handle
+        # concurrently.
+        self._lock = Lock()
 
     @property
     def wav_path(self) -> Path:
@@ -563,46 +567,55 @@ class _WavStreamWriter:
     def begin(self) -> None:
         """Open the WAV writer.
 
+        The WAV header (sample rate / channels / width) is committed by the
+        stdlib ``wave`` module at ``close()``, so a stream that captures no frames
+        — e.g. the teed detector stream while the AST model loads (#176 hardware
+        bug 2) — still finalises as a valid 0-frame WAV as long as close() runs
+        (which the capture worker and stop-caller fallback both guarantee).
+
         Raises:
             AudioCaptureError: If the WAV file cannot be opened.
         """
-        if self._wav is not None or self._closed:
-            return
-        self._wav_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            wav_file = wave.open(  # noqa: SIM115 - writer owns the handle until close().
-                str(self._wav_path), "wb"
-            )
-        except (OSError, wave.Error) as exc:
-            raise AudioCaptureError(
-                f"Could not open roast recording WAV {self._wav_path}: {exc}"
-            ) from exc
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(_RECORDER_SAMPLE_WIDTH_BYTES)
-        wav_file.setframerate(self._sample_rate)
-        self._wav = wav_file
+        with self._lock:
+            if self._wav is not None or self._closed:
+                return
+            self._wav_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                wav_file = wave.open(  # noqa: SIM115 - writer owns the handle until close().
+                    str(self._wav_path), "wb"
+                )
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(_RECORDER_SAMPLE_WIDTH_BYTES)
+                wav_file.setframerate(self._sample_rate)
+            except (OSError, wave.Error) as exc:
+                raise AudioCaptureError(
+                    f"Could not open roast recording WAV {self._wav_path}: {exc}"
+                ) from exc
+            self._wav = wav_file
 
     def write_samples(self, samples: Sequence[float]) -> None:
         """Append mono float samples to the buffer, flushing on threshold."""
-        if self._wav is None or self._closed or not samples:
-            return
-        self._pending.extend(float(sample) for sample in samples)
-        if len(self._pending) >= self._flush_sample_threshold:
-            self._flush()
+        with self._lock:
+            if self._wav is None or self._closed or not samples:
+                return
+            self._pending.extend(float(sample) for sample in samples)
+            if len(self._pending) >= self._flush_sample_threshold:
+                self._flush_locked()
 
     def close(self) -> None:
-        """Flush remaining samples and finalize the WAV. Idempotent."""
-        if self._closed:
-            return
-        self._closed = True
-        if self._wav is None:
-            return
-        try:
-            self._flush()
-        finally:
-            with suppress(Exception):
-                self._wav.close()
-            self._wav = None
+        """Flush remaining samples and finalize the WAV. Idempotent + thread-safe."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._wav is None:
+                return
+            try:
+                self._flush_locked()
+            finally:
+                with suppress(Exception):
+                    self._wav.close()
+                self._wav = None
 
     def sidecar_entry(self) -> dict[str, object]:
         """Return this stream's descriptor for the recording sidecar JSON."""
@@ -616,7 +629,7 @@ class _WavStreamWriter:
             "duration_seconds": round(self._frames_written / self._sample_rate, 6),
         }
 
-    def _flush(self) -> None:
+    def _flush_locked(self) -> None:
         if self._wav is None or not self._pending:
             return
         frames = bytearray()
@@ -873,6 +886,9 @@ class RoastAudioRecorder:
         )
         self._started_monotonic_seconds: float | None = None
         self._closed = False
+        # Guards the one-shot close so a worker finally-close and a stop-caller
+        # fallback close (#176 hardware bug 2) can't both finalise/write sidecars.
+        self._close_lock = Lock()
 
     @property
     def wav_path(self) -> Path:
@@ -911,24 +927,30 @@ class RoastAudioRecorder:
         self._writer.write_samples(samples)
 
     def close(self) -> None:
-        """Flush remaining samples, finalize the WAV, and write the sidecar JSON."""
-        if self._closed:
-            return
-        self._closed = True
-        if self._started_monotonic_seconds is None:
-            # begin() was never called: nothing to finalize and no sidecar.
-            return
-        self._writer.close()
-        _write_recording_sidecar(
-            sidecar_path=self._sidecar_path,
-            session_id=self._session_id,
-            started_monotonic_seconds=self._started_monotonic_seconds,
-            streams=(self._writer,),
-            milestones_provider=self._milestones_provider,
-        )
-        if self._annotation_session is not None:
-            with suppress(Exception):
-                _write_annotation_session(self._annotation_session, (self._writer,))
+        """Flush remaining samples, finalize the WAV, and write the sidecar JSON.
+
+        Idempotent and thread-safe: a worker finally-close and a stop-caller
+        fallback close (#176 hardware bug 2) race here, and only the first
+        finalises and writes the sidecars.
+        """
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._started_monotonic_seconds is None:
+                # begin() was never called: nothing to finalize and no sidecar.
+                return
+            self._writer.close()
+            _write_recording_sidecar(
+                sidecar_path=self._sidecar_path,
+                session_id=self._session_id,
+                started_monotonic_seconds=self._started_monotonic_seconds,
+                streams=(self._writer,),
+                milestones_provider=self._milestones_provider,
+            )
+            if self._annotation_session is not None:
+                with suppress(Exception):
+                    _write_annotation_session(self._annotation_session, (self._writer,))
 
 
 @dataclass(frozen=True)
@@ -1038,6 +1060,9 @@ class MultiDeviceRoastRecorder:
         self._stop_timeout_seconds = stop_timeout_seconds
         self._started_monotonic_seconds: float | None = None
         self._closed = False
+        # Guards the one-shot close (#176 hardware bug 2): a worker finally-close
+        # and a stop-caller fallback close must not both finalise/write sidecars.
+        self._close_lock = Lock()
         self._detector_writer = _WavStreamWriter(
             wav_path=detector_wav_path,
             device_label=detector_device_label,
@@ -1107,30 +1132,35 @@ class MultiDeviceRoastRecorder:
         self._detector_writer.write_samples(samples)
 
     def close(self) -> None:
-        """Stop additional streams, finalize every WAV, and write the sidecar."""
-        if self._closed:
-            return
-        self._closed = True
-        if self._started_monotonic_seconds is None:
-            return
-        for stream in self._additional_streams:
-            with suppress(Exception):
-                stream.stop(timeout_seconds=self._stop_timeout_seconds)
-        self._detector_writer.close()
-        for stream in self._additional_streams:
-            with suppress(Exception):
-                stream.writer.close()
-        streams = [self._detector_writer, *(s.writer for s in self._additional_streams)]
-        _write_recording_sidecar(
-            sidecar_path=self._sidecar_path,
-            session_id=self._session_id,
-            started_monotonic_seconds=self._started_monotonic_seconds,
-            streams=streams,
-            milestones_provider=self._milestones_provider,
-        )
-        if self._annotation_session is not None:
-            with suppress(Exception):
-                _write_annotation_session(self._annotation_session, streams)
+        """Stop additional streams, finalize every WAV, and write the sidecars.
+
+        Idempotent and thread-safe: a worker finally-close and a stop-caller
+        fallback close (#176 hardware bug 2) race here, and only the first wins.
+        """
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._started_monotonic_seconds is None:
+                return
+            for stream in self._additional_streams:
+                with suppress(Exception):
+                    stream.stop(timeout_seconds=self._stop_timeout_seconds)
+            self._detector_writer.close()
+            for stream in self._additional_streams:
+                with suppress(Exception):
+                    stream.writer.close()
+            streams = [self._detector_writer, *(s.writer for s in self._additional_streams)]
+            _write_recording_sidecar(
+                sidecar_path=self._sidecar_path,
+                session_id=self._session_id,
+                started_monotonic_seconds=self._started_monotonic_seconds,
+                streams=streams,
+                milestones_provider=self._milestones_provider,
+            )
+            if self._annotation_session is not None:
+                with suppress(Exception):
+                    _write_annotation_session(self._annotation_session, streams)
 
 
 @dataclass(frozen=True)
@@ -1374,7 +1404,33 @@ class AudioCapturePipeline:
             # free / free under an in-flight read. (close() is idempotent anyway,
             # but correctness here does not depend on that.)
             _close_audio_input_if_supported(self._audio_input)
+        elif thread.is_alive():
+            # The worker did not exit within the join timeout — typically blocked
+            # in a read while the detector's first samples are still pending (AST
+            # model load). Its `finally` (which closes the recorder) will not run
+            # before this caller returns, and on process/lifespan shutdown the
+            # daemon worker can be killed before it ever does, leaving the WAV at
+            # 0 bytes and no sidecars (#176 hardware bug 2). Finalise the recorder
+            # HERE as a fallback: the recorder is thread-safe (its writer lock
+            # serialises this close against any in-flight worker write), and
+            # close() is idempotent, so the worker's later close() is a no-op. We
+            # do NOT touch the audio input — only the worker may free its native
+            # ring buffer.
+            self._finalize_recorder()
         return snapshot
+
+    def _finalize_recorder(self) -> None:
+        """Finalise the recorder (flush WAV + write sidecars), idempotent + safe.
+
+        Safe to call from the stop caller as a fallback when the worker thread is
+        still alive: the recorder's writer lock serialises this close against any
+        in-flight worker write, and close() is idempotent so the worker's own
+        finally-close becomes a no-op.
+        """
+        recorder = self._recorder
+        if recorder is not None:
+            with suppress(Exception):
+                recorder.close()
 
     def close(self) -> None:
         """Stop capture and close the underlying audio input when supported."""

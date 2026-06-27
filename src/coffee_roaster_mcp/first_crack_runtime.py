@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,8 @@ from coffee_roaster_mcp.detector import (
     integrate_first_crack_window_with_session,
 )
 from coffee_roaster_mcp.session import RoastSession, RoastSessionStore, SessionLifecycleError
+
+_LOGGER = logging.getLogger(__name__)
 
 FirstCrackRuntimeState = Literal[
     "disabled",
@@ -132,15 +135,26 @@ class FirstCrackSessionRuntime:
         #: by ``set_recording_metadata`` before the roast; consumed when the
         #: recorder is built at session start. None falls back to session_id / 0.
         self._recording_metadata: RecordingMetadata | None = None
+        #: Whether the recorder for the active session was already built (#176). If
+        #: ``set_recording_metadata`` arrives after this, the WAV names are already
+        #: fixed and the late metadata is rejected with a clear warning.
+        self._recorder_built_for_session = False
 
     def set_recording_metadata(self, *, origin: str, roast_num: int) -> RecordingMetadata:
-        """Store annotation-pipeline metadata for the next/current recording.
+        """Store annotation-pipeline metadata for the next roast's recording.
 
-        Called before a roast so the captured WAVs are named
-        ``mic{N}-{origin}-roast{N}.wav`` and a ``{origin}-roast{N}-session.json``
-        is written for the coffee-first-crack-detection annotation pipeline. If
-        never called, recording falls back to the session id as origin and roast
-        number ``0`` so capture never breaks.
+        Call this BEFORE ``start_roast_session``. The recorder reads it when it
+        creates the WAVs, naming them ``mic{N}-{origin}-roast{N}.wav`` and writing
+        a ``{origin}-roast{N}-session.json`` for the coffee-first-crack-detection
+        annotation pipeline. If never called, recording falls back to the session
+        id as origin and roast number ``0`` so capture never breaks.
+
+        Ordering matters: the recorder is built at session start, so metadata set
+        AFTER the roast has started cannot rename the already-open WAVs. Calling
+        it late is therefore non-silent — it logs a clear warning and the late
+        metadata is NOT applied (renaming nothing while relabelling the session
+        JSON would point the JSON at the wrong WAV files). The stored value is
+        still returned so the agent can detect the mismatch.
 
         Args:
             origin: Bean origin slug (e.g. ``"brazil"``).
@@ -158,6 +172,15 @@ class FirstCrackSessionRuntime:
         if roast_num < 0:
             raise ValueError("roast_num must be >= 0.")
         with self._lock:
+            if self._recorder_built_for_session:
+                _LOGGER.warning(
+                    "set_recording_metadata(origin=%r, roast_num=%d) arrived AFTER the "
+                    "roast recorder was built; the WAV names are already fixed for the "
+                    "active session and this metadata will NOT be applied. Call "
+                    "set_recording_metadata BEFORE start_roast_session.",
+                    normalized_origin,
+                    roast_num,
+                )
             self._recording_metadata = RecordingMetadata(
                 origin=normalized_origin,
                 roast_num=roast_num,
@@ -189,6 +212,9 @@ class FirstCrackSessionRuntime:
                 metadata=self._recording_metadata,
             )
             self._pending_recorder = recorder
+            # Once the recorder exists the WAV names are fixed; a later
+            # set_recording_metadata for this session is rejected with a warning.
+            self._recorder_built_for_session = recorder is not None
             try:
                 adapter = self._detector_adapter_factory(self._config.first_crack)
                 pipeline = self._audio_pipeline_factory(self._config.audio)
@@ -371,6 +397,8 @@ class FirstCrackSessionRuntime:
             finally:
                 self._pipeline = None
                 self._adapter = None
+        # The session is over: the next roast may set fresh recording metadata.
+        self._recorder_built_for_session = False
         if self._status == "pending":
             self._reason = f"Audio first-crack detection stopped before confirmation: {reason}."
 
@@ -475,7 +503,13 @@ def build_session_recorder(
     )
     session_dir = export_location / session.id
     sidecar_path = session_dir / "roast.recording.json"
-    sample_rate = recording.sample_rate or config.audio.sample_rate
+    # The teed mic1 stream IS the FC detector's stream, so its WAV header must use
+    # the detector's TRUE capture rate (audio.sample_rate), not recording.sample_rate
+    # (#176 hardware bug 1: a 16 kHz teed stream mislabelled at 44.1 kHz played
+    # ~2.75x too fast). Only the independently-opened additional streams use
+    # recording.sample_rate (defaulting to the detector rate when unset).
+    detector_sample_rate = config.audio.sample_rate
+    additional_sample_rate = recording.sample_rate or config.audio.sample_rate
     devices = recording.devices or ()
 
     origin = _normalize_origin_slug(metadata.origin if metadata is not None else session.id)
@@ -520,7 +554,7 @@ def build_session_recorder(
             AdditionalRecordingDevice(
                 device_label=label,
                 wav_path=_mic_wav(index + 2),
-                sample_rate=sample_rate,
+                sample_rate=additional_sample_rate,
             )
             for index, label in enumerate(devices[1:])
         ]
@@ -528,7 +562,7 @@ def build_session_recorder(
             detector_wav_path=_mic_wav(1),
             detector_device_label=detector_label,
             sidecar_path=sidecar_path,
-            sample_rate=sample_rate,
+            sample_rate=detector_sample_rate,
             session_id=session.id,
             additional_devices=additional,
             milestones_provider=milestones,
@@ -547,7 +581,7 @@ def build_session_recorder(
         recorder = RoastAudioRecorder(
             wav_path=_mic_wav(1),
             sidecar_path=sidecar_path,
-            sample_rate=sample_rate,
+            sample_rate=detector_sample_rate,
             session_id=session.id,
             device_label=detector_label,
             milestones_provider=milestones,
