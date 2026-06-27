@@ -171,9 +171,13 @@ class _RollingLevelMeter:
     the most recent samples and reports the peak and RMS of that ring in dBFS.
     The bound keeps the meter responsive (it reflects the live signal, not the
     whole-roast average) and the work is vectorised in C via numpy so it never
-    stalls the capture worker on the Pi CPU budget (D27). The meter is owned and
-    driven by the single capture worker thread; reads come from the snapshot
-    under the pipeline's state lock, which sees a consistent ``(peak, rms)`` pair.
+    stalls the capture worker on the Pi CPU budget (D27). The meter is written
+    only by the single capture worker thread, but a snapshot reader runs on
+    another thread WITHOUT holding the writer (``observe`` is outside the
+    pipeline's state lock). To keep the reader from seeing a torn pair (a peak
+    from one update with an RMS from another), the two dBFS levels are stored as
+    one ``(peak, rms)`` tuple assigned atomically; ``levels`` reads that single
+    reference, so a reader always sees a coherent pair.
     """
 
     def __init__(self, *, window_sample_count: int) -> None:
@@ -185,9 +189,10 @@ class _RollingLevelMeter:
         """
         self._window_sample_count = max(1, window_sample_count)
         self._samples: np.ndarray = np.empty(0, dtype=np.float64)
-        self._has_samples = False
-        self._peak_dbfs: float | None = None
-        self._rms_dbfs: float | None = None
+        #: The coherent ``(peak_dbfs, rms_dbfs)`` pair, or ``None`` before any
+        #: samples. Assigned as one reference so a cross-thread reader never sees
+        #: a peak and RMS from different updates.
+        self._levels: tuple[float, float] | None = None
 
     def observe(self, samples: Sequence[float]) -> None:
         """Append captured samples and recompute the rolling peak / RMS."""
@@ -198,28 +203,38 @@ class _RollingLevelMeter:
         if combined.shape[0] > self._window_sample_count:
             combined = combined[-self._window_sample_count :]
         self._samples = combined
-        self._has_samples = True
         peak = float(combined.max()) if combined.shape[0] else 0.0
         rms = float(np.sqrt(np.mean(np.square(combined)))) if combined.shape[0] else 0.0
-        self._peak_dbfs = amplitude_to_dbfs(peak)
-        self._rms_dbfs = amplitude_to_dbfs(rms)
+        # Single atomic assignment of the coherent pair (see class docstring):
+        # the reader sees both new values or both old, never a mix.
+        self._levels = (amplitude_to_dbfs(peak), amplitude_to_dbfs(rms))
+
+    @property
+    def levels(self) -> tuple[float, float] | None:
+        """Return the coherent ``(peak_dbfs, rms_dbfs)`` pair, or ``None``.
+
+        A single read of the atomically-assigned tuple, so a cross-thread reader
+        never sees a peak and RMS drawn from different updates. ``None`` before
+        any samples have been observed.
+        """
+        return self._levels
 
     @property
     def peak_dbfs(self) -> float | None:
         """Return the rolling peak in dBFS, or ``None`` before any samples."""
-        return self._peak_dbfs if self._has_samples else None
+        levels = self._levels
+        return None if levels is None else levels[0]
 
     @property
     def rms_dbfs(self) -> float | None:
         """Return the rolling RMS in dBFS, or ``None`` before any samples."""
-        return self._rms_dbfs if self._has_samples else None
+        levels = self._levels
+        return None if levels is None else levels[1]
 
     def reset(self) -> None:
         """Clear the retained samples and reported levels for a fresh run."""
         self._samples = np.empty(0, dtype=np.float64)
-        self._has_samples = False
-        self._peak_dbfs = None
-        self._rms_dbfs = None
+        self._levels = None
 
 
 def audio_capture_settings_from_config(
@@ -1562,6 +1577,11 @@ class AudioCapturePipeline:
     def snapshot(self) -> AudioCaptureSnapshot:
         """Return a thread-safe capture status snapshot."""
         thread = self._thread
+        # Read the coherent (peak, rms) pair in a single access so the snapshot
+        # never mixes a peak and RMS from different meter updates (#178). The
+        # meter is written outside _state_lock by the capture worker, so two
+        # separate property reads could tear; one tuple read cannot.
+        levels = self._level_meter.levels
         with self._state_lock:
             return AudioCaptureSnapshot(
                 running=thread is not None and thread.is_alive(),
@@ -1569,8 +1589,8 @@ class AudioCapturePipeline:
                 emitted_window_count=self._emitted_window_count,
                 dropped_window_count=self._dropped_window_count,
                 latest_error=self._latest_error,
-                peak_dbfs=self._level_meter.peak_dbfs,
-                rms_dbfs=self._level_meter.rms_dbfs,
+                peak_dbfs=None if levels is None else levels[0],
+                rms_dbfs=None if levels is None else levels[1],
             )
 
     def _run_capture_loop(self) -> None:

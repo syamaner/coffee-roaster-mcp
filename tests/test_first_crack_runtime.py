@@ -51,10 +51,14 @@ class FakeAudioPipeline:
         *,
         latest_error: str | None = None,
         running_after_stop: bool = False,
+        peak_dbfs: float | None = None,
+        rms_dbfs: float | None = None,
     ) -> None:
         self._windows = list(windows)
         self.latest_error = latest_error
         self.running_after_stop = running_after_stop
+        self.peak_dbfs = peak_dbfs
+        self.rms_dbfs = rms_dbfs
         self.started = False
         self.stopped = False
         self.stop_reasons: list[float] = []
@@ -89,6 +93,8 @@ class FakeAudioPipeline:
             emitted_window_count=len(self._windows),
             dropped_window_count=0,
             latest_error=self.latest_error,
+            peak_dbfs=self.peak_dbfs,
+            rms_dbfs=self.rms_dbfs,
         )
 
 
@@ -294,6 +300,41 @@ def test_audio_runtime_reports_stopped_after_pipeline_stop_returns_running_snaps
     assert pipeline.stopped is True
     assert stopped.active is False
     assert stopped.audio_running is False
+
+
+def test_runtime_mic_levels_are_live_only_and_none_after_stop() -> None:
+    """mic_*_dbfs report the LIVE signal, and are None once capture stops (#178).
+
+    While audio capture runs, the runtime surfaces the meter's peak/RMS. After
+    stop_for_session — even though the runtime keeps the last capture snapshot —
+    the levels go None so a caller never reads a stale post-stop value (None
+    means "no live signal", per the field's documented semantics).
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    pipeline = FakeAudioPipeline(peak_dbfs=-6.02, rms_dbfs=-9.03)
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            MockDetectorBackend(()),
+        ),
+    )
+
+    runtime.start_for_session(session)
+    live = runtime.snapshot()
+    assert live.audio_running is True
+    assert live.mic_peak_dbfs == -6.02
+    assert live.mic_rms_dbfs == -9.03
+
+    stopped = runtime.stop_for_session(session.id, reason="roast complete")
+    assert stopped.audio_running is False
+    # The last capture snapshot is retained, but the stale levels are not surfaced.
+    assert stopped.mic_peak_dbfs is None
+    assert stopped.mic_rms_dbfs is None
 
 
 def test_audio_runtime_can_discard_queued_pre_t0_windows() -> None:

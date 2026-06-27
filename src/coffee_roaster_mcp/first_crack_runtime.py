@@ -372,12 +372,22 @@ class FirstCrackSessionRuntime:
                 status = "faulted"
                 reason = f"Audio capture failed: {capture_snapshot.latest_error}"
 
+            audio_running = capture_snapshot is not None and capture_snapshot.running
+            # The mic levels are a LIVE signal: report them only while audio
+            # capture is running. After stop_for_session the stopped capture
+            # snapshot still carries the last-measured levels, but they are stale,
+            # so gate on ``audio_running`` — ``None`` reliably means "no live
+            # signal", matching the field's documented semantics (#178).
+            mic_peak_dbfs = (
+                capture_snapshot.peak_dbfs if audio_running and capture_snapshot else None
+            )
+            mic_rms_dbfs = capture_snapshot.rms_dbfs if audio_running and capture_snapshot else None
             return FirstCrackRuntimeSnapshot(
                 status=status,
                 active_session_id=self._active_session_id,
                 active=self._pipeline is not None,
                 reason=reason,
-                audio_running=False if capture_snapshot is None else capture_snapshot.running,
+                audio_running=audio_running,
                 queued_window_count=0
                 if capture_snapshot is None
                 else capture_snapshot.queued_window_count,
@@ -388,8 +398,8 @@ class FirstCrackSessionRuntime:
                 if capture_snapshot is None
                 else capture_snapshot.dropped_window_count,
                 processed_window_count=self._processed_window_count,
-                mic_peak_dbfs=None if capture_snapshot is None else capture_snapshot.peak_dbfs,
-                mic_rms_dbfs=None if capture_snapshot is None else capture_snapshot.rms_dbfs,
+                mic_peak_dbfs=mic_peak_dbfs,
+                mic_rms_dbfs=mic_rms_dbfs,
             )
 
     def _can_process_locked(self, session: RoastSession) -> bool:
@@ -687,14 +697,17 @@ def _initial_status(config: FirstCrackConfig) -> FirstCrackRuntimeState:
 
 
 def _stopped_capture_snapshot(snapshot: AudioCaptureSnapshot) -> AudioCaptureSnapshot:
+    # A stopped capture carries no LIVE mic levels: the meter's last values are
+    # stale once capture stops, so drop them (the runtime snapshot also gates the
+    # levels on ``audio_running``, so a stale value would never surface anyway).
     return AudioCaptureSnapshot(
         running=False,
         queued_window_count=snapshot.queued_window_count,
         emitted_window_count=snapshot.emitted_window_count,
         dropped_window_count=snapshot.dropped_window_count,
         latest_error=snapshot.latest_error,
-        peak_dbfs=snapshot.peak_dbfs,
-        rms_dbfs=snapshot.rms_dbfs,
+        peak_dbfs=None,
+        rms_dbfs=None,
     )
 
 

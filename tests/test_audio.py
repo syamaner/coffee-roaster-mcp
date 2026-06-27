@@ -1522,3 +1522,25 @@ def test_rolling_level_meter_tracks_recent_window_only() -> None:
     meter.reset()
     assert meter.peak_dbfs is None
     assert meter.rms_dbfs is None
+
+
+def test_rolling_level_meter_levels_is_a_coherent_pair() -> None:
+    """`levels` returns the (peak, rms) pair as ONE reference (#178).
+
+    The meter is written by the capture worker outside the pipeline state lock,
+    so the snapshot reads the pair via this single accessor to avoid a torn
+    (peak-from-one-update, rms-from-another) read. The peak/rms scalar
+    properties derive from the same tuple.
+    """
+    from coffee_roaster_mcp.audio import _RollingLevelMeter  # pyright: ignore[reportPrivateUsage]
+
+    meter = _RollingLevelMeter(window_sample_count=4)
+    assert meter.levels is None
+    meter.observe((0.5, -0.5, 0.5, -0.5))
+    levels = meter.levels
+    assert levels is not None
+    assert levels == (meter.peak_dbfs, meter.rms_dbfs)
+    # A constant half-scale block: peak == rms == -6.02 dBFS (2 dp).
+    assert levels == (-6.02, -6.02)
+    meter.reset()
+    assert meter.levels is None
