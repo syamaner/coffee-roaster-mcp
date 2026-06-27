@@ -958,3 +958,176 @@ def test_pipeline_recorder_write_failure_does_not_kill_detection(tmp_path: Path)
     assert snapshot.emitted_window_count == 1
     assert snapshot.latest_error is None
     assert pipeline.drain_windows()[0].samples == (0.0, 1.0, 2.0, 3.0)
+
+
+def test_device_label_to_filename_slug() -> None:
+    from coffee_roaster_mcp.audio import device_label_to_filename
+
+    assert device_label_to_filename("USB PnP") == "usb-pnp"
+    assert device_label_to_filename("ATR2100x-USB") == "atr2100x-usb"
+    assert device_label_to_filename("  !!  ") == "device"
+    assert device_label_to_filename("A  B__C") == "a-b-c"
+
+
+class _BoundedInput:
+    """Yields a fixed number of constant-amplitude reads, then end-of-stream."""
+
+    def __init__(self, amplitude: float, reads: int) -> None:
+        self._amplitude = amplitude
+        self._reads = reads
+        self.closed = False
+
+    def read_samples(self, sample_count: int) -> Sequence[float]:
+        if self._reads <= 0:
+            return ()
+        self._reads -= 1
+        return (self._amplitude,) * sample_count
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_multi_device_recorder_writes_two_wavs(tmp_path: Path) -> None:
+    import json
+    import time
+
+    from coffee_roaster_mcp.audio import AdditionalRecordingDevice, MultiDeviceRoastRecorder
+
+    inputs: dict[str, _BoundedInput] = {}
+
+    def factory(device: AdditionalRecordingDevice) -> _BoundedInput:
+        created = _BoundedInput(amplitude=0.5, reads=4)
+        inputs[device.device_label] = created
+        return created
+
+    recorder = MultiDeviceRoastRecorder(
+        detector_wav_path=tmp_path / "roast.usb-pnp.wav",
+        detector_device_label="USB PnP",
+        sidecar_path=tmp_path / "roast.recording.json",
+        sample_rate=4,
+        session_id="s",
+        additional_devices=[
+            AdditionalRecordingDevice("ATR2100x", tmp_path / "roast.atr2100x.wav", 4),
+        ],
+        milestones_provider=lambda: {"beans_added": 1.0, "first_crack": 9.0},
+        additional_input_factory=factory,
+        additional_read_seconds=0.25,
+        idle_sleep_seconds=0.001,
+        stop_timeout_seconds=2.0,
+    )
+
+    recorder.begin()
+    recorder.write_samples((0.25,) * 8)  # teed detector samples → detector WAV only
+    # Let the independent ATR2100x stream drain its bounded input, then close
+    # (close() joins the capture thread and finalizes every WAV).
+    time.sleep(0.1)
+    recorder.close()
+
+    # Two WAVs: the teed detector stream + the independent additional stream.
+    detector_values, _, _ = _read_wav_samples(tmp_path / "roast.usb-pnp.wav")
+    additional_values, _, _ = _read_wav_samples(tmp_path / "roast.atr2100x.wav")
+    assert detector_values == (round(0.25 * 32767),) * 8  # teed samples only
+    assert len(additional_values) > 0
+    assert all(value == round(0.5 * 32767) for value in additional_values)  # independent capture
+    # The additional device was opened fresh and closed on its own thread.
+    assert inputs["ATR2100x"].closed is True
+
+    sidecar = json.loads((tmp_path / "roast.recording.json").read_text(encoding="utf-8"))
+    assert sidecar["schema_version"] == 2
+    devices = [stream["device"] for stream in sidecar["streams"]]
+    assert devices == ["USB PnP", "ATR2100x"]
+    # Per-stream sample rate + the detector stream surfaced at top level (back-compat).
+    assert all(stream["sample_rate"] == 4 for stream in sidecar["streams"])
+    assert sidecar["wav_filename"] == "roast.usb-pnp.wav"
+    assert sidecar["milestones"] == {"beans_added": 1.0, "first_crack": 9.0}
+    assert recorder.additional_wav_paths == (tmp_path / "roast.atr2100x.wav",)
+
+
+def test_multi_device_recorder_drops_only_failing_stream(tmp_path: Path) -> None:
+    import json
+    import time
+
+    from coffee_roaster_mcp.audio import AdditionalRecordingDevice, MultiDeviceRoastRecorder
+
+    class FailingInput:
+        def read_samples(self, sample_count: int) -> Sequence[float]:
+            raise RuntimeError("device unplugged")
+
+        def close(self) -> None:
+            return None
+
+    good = _BoundedInput(amplitude=0.5, reads=4)
+
+    def factory(device: AdditionalRecordingDevice) -> AudioInput:
+        return FailingInput() if device.device_label == "BAD" else good
+
+    recorder = MultiDeviceRoastRecorder(
+        detector_wav_path=tmp_path / "roast.usb-pnp.wav",
+        detector_device_label="USB PnP",
+        sidecar_path=tmp_path / "roast.recording.json",
+        sample_rate=4,
+        session_id="s",
+        additional_devices=[
+            AdditionalRecordingDevice("BAD", tmp_path / "roast.bad.wav", 4),
+            AdditionalRecordingDevice("GOOD", tmp_path / "roast.good.wav", 4),
+        ],
+        additional_input_factory=factory,
+        additional_read_seconds=0.25,
+        idle_sleep_seconds=0.001,
+        stop_timeout_seconds=2.0,
+    )
+
+    recorder.begin()
+    recorder.write_samples((0.25,) * 8)
+    # Let both independent streams run (one fails immediately, one captures),
+    # then close — which joins every thread and finalizes the surviving WAVs.
+    time.sleep(0.1)
+    recorder.close()
+
+    # The detector (teed) WAV and the good additional WAV survived the failing one.
+    detector_values, _, _ = _read_wav_samples(tmp_path / "roast.usb-pnp.wav")
+    good_values, _, _ = _read_wav_samples(tmp_path / "roast.good.wav")
+    assert detector_values == (round(0.25 * 32767),) * 8
+    assert len(good_values) > 0
+
+    sidecar = json.loads((tmp_path / "roast.recording.json").read_text(encoding="utf-8"))
+    # All three streams are listed; the failing one captured zero frames.
+    by_device = {stream["device"]: stream for stream in sidecar["streams"]}
+    assert by_device["BAD"]["frame_count"] == 0
+    assert by_device["GOOD"]["frame_count"] > 0
+    assert by_device["USB PnP"]["frame_count"] == 8
+
+
+def test_capture_devices_independently_writes_all(tmp_path: Path) -> None:
+    import time
+
+    from coffee_roaster_mcp.audio import (
+        AdditionalRecordingDevice,
+        capture_devices_independently,
+    )
+
+    def factory(device: AdditionalRecordingDevice) -> _BoundedInput:
+        return _BoundedInput(amplitude=0.5, reads=3)
+
+    devices = [
+        AdditionalRecordingDevice("USB PnP", tmp_path / "c.usb-pnp.wav", 4),
+        AdditionalRecordingDevice("ATR2100x", tmp_path / "c.atr2100x.wav", 4),
+    ]
+
+    results = capture_devices_independently(
+        devices,
+        record_seconds=0.05,
+        sidecar_path=tmp_path / "c.json",
+        session_id="record-check",
+        input_factory=factory,
+        sleep=time.sleep,
+        read_seconds=0.01,
+        idle_sleep_seconds=0.001,
+        stop_timeout_seconds=2.0,
+    )
+
+    assert [r.device_label for r in results] == ["USB PnP", "ATR2100x"]
+    assert all(r.frame_count > 0 for r in results)
+    assert (tmp_path / "c.usb-pnp.wav").exists()
+    assert (tmp_path / "c.atr2100x.wav").exists()
+    assert (tmp_path / "c.json").exists()

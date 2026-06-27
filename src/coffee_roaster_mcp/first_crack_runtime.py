@@ -9,12 +9,16 @@ from typing import Literal, Protocol
 
 from coffee_roaster_mcp.artifacts import ArtifactResolutionError
 from coffee_roaster_mcp.audio import (
+    AdditionalRecordingDevice,
     AudioCaptureError,
     AudioCapturePipeline,
     AudioCaptureSnapshot,
     AudioWindow,
+    MultiDeviceRoastRecorder,
     RoastAudioRecorder,
+    RoastRecorder,
     build_audio_capture_pipeline,
+    device_label_to_filename,
 )
 from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig
 from coffee_roaster_mcp.detector import (
@@ -122,7 +126,7 @@ class FirstCrackSessionRuntime:
         #: Recorder for the session currently being started (#176). Set while the
         #: default pipeline factory runs so the teed WAV is wired into the real
         #: capture pipeline; injected test factories ignore it.
-        self._pending_recorder: RoastAudioRecorder | None = None
+        self._pending_recorder: RoastRecorder | None = None
 
     def _build_default_audio_pipeline(self, config: AudioConfig) -> AudioCapturePipeline:
         """Build the real capture pipeline, teeing the pending session recorder."""
@@ -354,13 +358,22 @@ _DEFAULT_RECORDING_SUBDIR = "captures"
 def build_session_recorder(
     config: AppConfig,
     session: RoastSession,
-) -> RoastAudioRecorder | None:
+) -> RoastRecorder | None:
     """Build a per-roast audio recorder for one session, or `None` when disabled.
 
-    v1 only autocaptures: recording is wired when both `recording.enabled` and
-    `recording.autocapture` are true, so capture begins with the roast and needs
-    no MCP command. The recorder tees the detector's existing mono stream into a
-    single WAV plus a sidecar JSON under `export_location/<session_id>/`.
+    Recording is wired when both `recording.enabled` and `recording.autocapture`
+    are true, so capture begins with the roast and needs no MCP command. Output
+    lands under `export_location/<session_id>/`.
+
+    Dispatch on `recording.devices`:
+
+    - Unset, empty, or a single device: a single-stream
+      :class:`RoastAudioRecorder` that tees the detector's existing mono stream
+      into one WAV (the original behaviour).
+    - Two or more devices: a :class:`MultiDeviceRoastRecorder` — the FIRST device
+      is the detector's device (teed, no second open) and each ADDITIONAL device
+      is captured as its own independent stream into its own WAV (option A). WAV
+      filenames are derived from the device labels.
 
     Args:
         config: Application configuration.
@@ -378,13 +391,44 @@ def build_session_recorder(
         config.logging.log_dir / _DEFAULT_RECORDING_SUBDIR
     )
     session_dir = export_location / session.id
+    sidecar_path = session_dir / "roast.recording.json"
     sample_rate = recording.sample_rate or config.audio.sample_rate
+    devices = recording.devices or ()
+
+    def milestones() -> dict[str, float | None]:
+        return recording_relative_milestones(session)
+
+    if len(devices) >= 2:
+        detector_label = devices[0]
+        detector_wav = session_dir / f"roast.{device_label_to_filename(detector_label)}.wav"
+        additional = [
+            AdditionalRecordingDevice(
+                device_label=label,
+                wav_path=session_dir / f"roast.{device_label_to_filename(label)}.wav",
+                sample_rate=sample_rate,
+            )
+            for label in devices[1:]
+        ]
+        return MultiDeviceRoastRecorder(
+            detector_wav_path=detector_wav,
+            detector_device_label=detector_label,
+            sidecar_path=sidecar_path,
+            sample_rate=sample_rate,
+            session_id=session.id,
+            additional_devices=additional,
+            milestones_provider=milestones,
+        )
+
+    # Single-stream: tee the detector only. A lone configured device labels the
+    # WAV; otherwise the default roast.wav name is kept.
+    detector_label = devices[0] if devices else None
     return RoastAudioRecorder(
         wav_path=session_dir / "roast.wav",
-        sidecar_path=session_dir / "roast.recording.json",
+        sidecar_path=sidecar_path,
         sample_rate=sample_rate,
         session_id=session.id,
-        milestones_provider=lambda: recording_relative_milestones(session),
+        device_label=detector_label,
+        milestones_provider=milestones,
     )
 
 

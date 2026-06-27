@@ -114,10 +114,13 @@ class RecordingConfig:
     the audio feeds the FC training corpus. The recorder tees the same samples
     the detector consumes (no second contending stream on the audio device).
 
-    v1 captures the detector's single mono stream into ONE WAV. True
-    multi-channel / 2-mic capture (open the device at 2 channels into 2 WAVs) is
-    a documented follow-on and is intentionally not built here; the current
-    microphone input is mono and the 2-channel hardware is not connected.
+    Single-stream (default): the recorder tees the detector's mono stream into
+    ONE WAV. Multi-device (option A): set `devices` to capture several
+    independent USB-mic streams at once, one WAV per device — the FIRST device is
+    the FC detector's device (teed, no second open), and each ADDITIONAL device
+    is opened as its own independent capture stream. The additional streams are
+    independent (NOT sample-locked) clocks; drift is acceptable for FC training
+    data (operator decision, research-confirmed: no aggregate, no JACK).
 
     Attributes:
         enabled: Whether roast audio recording is active at all. When false, no
@@ -128,19 +131,25 @@ class RecordingConfig:
             session writes to `export_location/<session_id>/`. Defaults to a
             gitignored captures directory when unset.
         sample_rate: Optional WAV sample rate in Hz. Defaults to the detector
-            `audio.sample_rate` when unset, since v1 tees the detector stream.
-        device: Optional capture device identifier reserved for the
-            multi-channel follow-on. v1 captures the detector's existing mono
-            stream and does not open this device, so it is forward-compat only.
-        channels: Optional channel-to-mic map reserved for the multi-channel
-            follow-on. v1 captures one mono channel, so this is forward-compat
-            only.
+            `audio.sample_rate` when unset. Applies to every recorded stream.
+        devices: Optional list of capture device-name substrings (matched the
+            same way as `audio.input_device`). The FIRST entry is the detector's
+            device and is TEED from the existing detector stream (no second open,
+            no contention); each ADDITIONAL entry is opened as its own
+            independent capture stream into its own WAV. When unset, the recorder
+            falls back to single-stream behaviour (tee the detector only).
+        device: Deprecated single-device hint retained for forward-compat. Use
+            `devices`; this field is no longer read by the recorder.
+        channels: Optional channel-to-mic map reserved for a future true
+            multi-channel (single-device, 2-channel) follow-on; not read in
+            option A, which uses independent per-device streams.
     """
 
     enabled: bool = False
     autocapture: bool = False
     export_location: Path | None = None
     sample_rate: int | None = None
+    devices: tuple[str, ...] | None = None
     device: str | None = None
     channels: tuple[int, ...] | None = None
 
@@ -390,6 +399,7 @@ def _recording_from_mapping(raw: Mapping[str, Any]) -> RecordingConfig:
             "sample_rate",
             label="recording.sample_rate",
         ),
+        devices=_optional_string_list(raw.get("devices"), label="recording.devices"),
         device=_optional_string(raw, "device", label="recording.device"),
         channels=_optional_channels(raw.get("channels"), label="recording.channels"),
     )
@@ -606,6 +616,11 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
                 else _parse_positive_integer(sample_rate, "COFFEE_RECORDING_SAMPLE_RATE")
             ),
         )
+    if "COFFEE_RECORDING_DEVICES" in environ:
+        recording = replace(
+            recording,
+            devices=_parse_devices_csv(environ["COFFEE_RECORDING_DEVICES"]),
+        )
     if "COFFEE_AUTO_T0_DROP_THRESHOLD_C" in environ:
         session = replace(
             config.session,
@@ -685,6 +700,11 @@ def _boolean(
     raise ConfigError(f"{error_key} must be a boolean.")
 
 
+def _parse_devices_csv(value: str) -> tuple[str, ...] | None:
+    items = tuple(part.strip() for part in value.split(",") if part.strip())
+    return items or None
+
+
 def _parse_boolean(value: str, key: str) -> bool:
     lowered = value.strip().lower()
     if lowered in {"1", "true", "yes", "on"}:
@@ -720,6 +740,23 @@ def _optional_positive_integer(
     if value is None:
         return None
     return _parse_positive_integer(value, error_key)
+
+
+def _optional_string_list(value: object, *, label: str) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(f"{label} must be a list of strings or null.")
+    raw_items = cast(list[object] | tuple[object, ...], value)
+    items: list[str] = []
+    for item in raw_items:
+        if not isinstance(item, str):
+            raise ConfigError(f"{label} values must be strings.")
+        normalized = item.strip()
+        if not normalized:
+            raise ConfigError(f"{label} values must not be empty.")
+        items.append(normalized)
+    return tuple(items)
 
 
 def _optional_channels(value: object, *, label: str) -> tuple[int, ...] | None:

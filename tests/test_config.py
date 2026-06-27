@@ -497,3 +497,46 @@ def test_recording_invalid_enabled_environment_fails(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="COFFEE_RECORDING_ENABLED"):
         load_config(config_path, environ={"COFFEE_RECORDING_ENABLED": "maybe"})
+
+
+def test_recording_devices_yaml_and_env(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        """
+recording:
+  enabled: true
+  autocapture: true
+  devices:
+    - USB PnP
+    - ATR2100x
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path, environ={})
+    assert config.recording.devices == ("USB PnP", "ATR2100x")
+
+    overridden = load_config(
+        config_path,
+        environ={"COFFEE_RECORDING_DEVICES": " USB PnP , ATR2100x , "},
+    )
+    assert overridden.recording.devices == ("USB PnP", "ATR2100x")
+
+    # An all-empty CSV clears the list back to None.
+    cleared = load_config(config_path, environ={"COFFEE_RECORDING_DEVICES": " , "})
+    assert cleared.recording.devices is None
+
+
+def test_recording_devices_invalid_entries_fail(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("recording:\n  devices:\n    - 5\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="recording.devices"):
+        load_config(config_path, environ={})
+
+    config_path.write_text("recording:\n  devices:\n    - '   '\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="recording.devices"):
+        load_config(config_path, environ={})
+
+    config_path.write_text("recording:\n  devices: USB PnP\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="recording.devices"):
+        load_config(config_path, environ={})
