@@ -14,6 +14,16 @@ Project rules and context for coding agents working in this repository.
 - This repository consumes released Hugging Face artifacts only.
 - Do not commit model weights, audio files, roast logs, serial captures, `.env` files, or local IDE folders, except for the single small derived E7-S5a replay fixture under `tests/fixtures/audio/`.
 - One PR per story, branch: `feature/{issue-number}-{slug}`.
+- **PR size — the pre-open logic-churn check (#187).** Before opening a PR, measure its
+  **src-logic** churn (additions+deletions under `src/`, EXCLUDING `tests/`, fixtures, `*.json`
+  snapshots, and docs). If it exceeds ~400 lines, **split into thin vertical slices at kickoff**,
+  not at review (a story may be several stacked PRs). Decompose total churn into
+  **logic / tests / data** before trusting any "large PR" signal: tests inflating the count is
+  healthy, not a miss; only the logic figure gates. Keep **data separated from logic** (fixtures,
+  regenerated snapshots, and the version-bump/changelog in their own commit or PR). This mirrors
+  the agent repo's `pr-preflight` discipline so a cross-repo feature's component half gets the same
+  size gate as its agent half — the gap that let #186 (the ambient sensor) ship 663 logic lines in
+  one PR.
 - Before starting a task: read `docs/state/registry.md`, open the active epic file, then check the GitHub issue.
 
 ## Quick Commands
