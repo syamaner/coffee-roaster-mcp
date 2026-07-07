@@ -36,6 +36,9 @@ def test_default_config_allows_mock_run_without_file(
     assert config.logging.export_formats == ("jsonl", "csv", "summary")
     assert config.session.auto_t0_detection_enabled is False
     assert config.session.auto_t0_drop_threshold_c == 25.0
+    assert config.ambient.mode == "disabled"
+    assert config.ambient.device is None
+    assert config.ambient.poll_interval_seconds == 30.0
 
 
 def test_missing_explicit_config_file_fails(tmp_path: Path) -> None:
@@ -82,6 +85,10 @@ session:
   auto_t0_drop_threshold_c: 20.5
   ror_window_seconds: 45
   ror_min_sample_seconds: 12
+ambient:
+  mode: " yoctopuce "
+  device: METEOMK2-98765
+  poll_interval_seconds: 15.0
 """,
         encoding="utf-8",
     )
@@ -119,6 +126,9 @@ session:
     assert config.session.auto_t0_drop_threshold_c == 20.5
     assert config.session.ror_window_seconds == 45
     assert config.session.ror_min_sample_seconds == 12
+    assert config.ambient.mode == "yoctopuce"
+    assert config.ambient.device == "METEOMK2-98765"
+    assert config.ambient.poll_interval_seconds == 15.0
 
 
 def test_logging_sample_interval_must_be_positive(tmp_path: Path) -> None:
@@ -182,6 +192,9 @@ logging:
             "COFFEE_AUDIO_HOP_SECONDS": "1.25",
             "COFFEE_ROAST_LOG_DIR": "/tmp/roasts",
             "COFFEE_AUTO_T0_DROP_THRESHOLD_C": "30",
+            "COFFEE_AMBIENT_MODE": "yoctopuce\n",
+            "COFFEE_AMBIENT_DEVICE": "METEOMK2-12345",
+            "COFFEE_AMBIENT_POLL_INTERVAL_SECONDS": "45",
         },
     )
 
@@ -207,6 +220,9 @@ logging:
     assert config.audio.hop_seconds == 1.25
     assert config.logging.log_dir == Path("/tmp/roasts")
     assert config.session.auto_t0_drop_threshold_c == 30.0
+    assert config.ambient.mode == "yoctopuce"
+    assert config.ambient.device == "METEOMK2-12345"
+    assert config.ambient.poll_interval_seconds == 45.0
 
 
 def test_environment_config_path_is_supported(tmp_path: Path) -> None:
@@ -238,6 +254,56 @@ def test_invalid_audio_source_fails(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="audio.source"):
         load_config(config_path, environ={})
+
+
+def test_invalid_ambient_mode_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("ambient:\n  mode: bluetooth\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="ambient.mode"):
+        load_config(config_path, environ={})
+
+
+def test_invalid_ambient_poll_interval_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "ambient:\n  mode: yoctopuce\n  poll_interval_seconds: 0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="ambient.poll_interval_seconds"):
+        load_config(config_path, environ={})
+
+
+def test_invalid_ambient_mode_environment_override_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("roaster:\n  driver: mock\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="COFFEE_AMBIENT_MODE"):
+        load_config(config_path, environ={"COFFEE_AMBIENT_MODE": "bluetooth"})
+
+
+def test_invalid_ambient_poll_interval_environment_override_fails(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("roaster:\n  driver: mock\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="COFFEE_AMBIENT_POLL_INTERVAL_SECONDS"):
+        load_config(
+            config_path,
+            environ={"COFFEE_AMBIENT_POLL_INTERVAL_SECONDS": "-1"},
+        )
+
+
+def test_empty_ambient_device_environment_override_clears_selector(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "ambient:\n  mode: yoctopuce\n  device: METEOMK2-11111\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path, environ={"COFFEE_AMBIENT_DEVICE": "  "})
+
+    assert config.ambient.device is None
 
 
 @pytest.mark.parametrize(

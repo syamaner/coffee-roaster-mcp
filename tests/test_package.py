@@ -50,6 +50,7 @@ _EXPECTED_ROAST_STATE_KEYS = {
     "faulted_monotonic_seconds",
     "first_crack_at_utc",
     "first_crack_monotonic_seconds",
+    "ambient_status",
     "first_crack_status",
     "heat_level_percent",
     "log_dir",
@@ -93,10 +94,20 @@ _EXPECTED_T0_STATUS_KEYS = {
     "reason",
     "status",
 }
+_EXPECTED_AMBIENT_STATUS_KEYS = {
+    "ambient_running",
+    "humidity_percent",
+    "last_reading_monotonic_seconds",
+    "mode",
+    "pressure_hpa",
+    "reason",
+    "status",
+    "temperature_c",
+}
 
 
 def test_version_is_defined() -> None:
-    assert __version__ == "0.1.11"
+    assert __version__ == "0.1.12"
 
 
 def test_cli_parser_program_name() -> None:
@@ -431,6 +442,16 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert t0_status["auto_detection_enabled"] is False
         assert t0_status["status"] == "detected"
         assert t0_status["drop_threshold_c"] == 25.0
+
+        ambient_status = state_content["ambient_status"]
+        assert set(ambient_status) == _EXPECTED_AMBIENT_STATUS_KEYS
+        assert ambient_status["mode"] == "disabled"
+        assert ambient_status["status"] == "disabled"
+        assert ambient_status["ambient_running"] is False
+        assert ambient_status["temperature_c"] is None
+        assert ambient_status["humidity_percent"] is None
+        assert ambient_status["pressure_hpa"] is None
+        assert ambient_status["last_reading_monotonic_seconds"] is None
         assert t0_status["charge_temperature_c"] is None
         assert t0_status["detected_bean_temperature_c"] is None
         assert t0_status["reason"] is None

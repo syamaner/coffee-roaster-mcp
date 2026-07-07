@@ -10,6 +10,23 @@ The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 ## Changelog
 
+### 0.1.12
+
+- feat(#185): ambient environmental sensor — read a Yoctopuce Yocto-Meteo-V2-C
+  USB probe (temperature / relative humidity / barometric pressure) as an
+  MCP-owned device, mirroring the first-crack microphone pipeline. The triad
+  rides the existing `get_roast_state` session state as `ambient_status`
+  (mode / status / `temperature_c` / `humidity_percent` / `pressure_hpa` +
+  liveness), so no new tool is added. Default `ambient.mode: disabled` — zero
+  behaviour change for existing configs. **Fail-soft**: an absent, unplugged,
+  or erroring probe (or a missing `yoctopuce` package) reports `unavailable`
+  with null readings and never blocks or faults a roast. The reader is
+  lazy-loaded and polled at most once per `poll_interval_seconds` (default 30 s)
+  so the USB bus is never hit at the 1 Hz state-read rate; the last-known-good
+  reading is preserved across a transient read error. Adds the `yoctopuce`
+  runtime dependency. Agent-side consumer: roastpilot-agent#342 (revises D60 →
+  D85: ambient is MCP-owned, mirroring the mic).
+
 ### 0.1.6
 
 - fix(#163): `drop_beans` keeps the drum running so beans eject; `stop_cooling`

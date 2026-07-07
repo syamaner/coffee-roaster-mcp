@@ -73,15 +73,21 @@ python -c "import os, tempfile; from coffee_roaster_mcp.config import load_confi
 
 ```text
 src/coffee_roaster_mcp/
-  __init__.py     - package version
-  cli.py          - console entrypoint
-  config.py       - typed configuration loading from defaults, YAML, and env vars
-  mcp_server.py   - FastMCP stdio entrypoint and bootstrap-safe tools
-  session.py      - authoritative roast session lifecycle, event timeline, and active-session owner
+  __init__.py         - package version
+  cli.py              - console entrypoint
+  config.py           - typed configuration loading from defaults, YAML, and env vars
+  mcp_server.py       - FastMCP stdio entrypoint and bootstrap-safe tools
+  session.py          - authoritative roast session lifecycle, event timeline, and active-session owner
+  ambient.py          - Yoctopuce Yocto-Meteo ambient sensor reader (#185), mirrors audio.py's
+                        lazy-load pattern; read-only, no roaster-write involvement
+  ambient_runtime.py  - session-owned ambient runtime (#185): lazy-refresh-with-staleness cache,
+                        fail-soft on any probe error, mirrors first_crack_runtime.py's shape
 tests/
-  test_package.py - package and CLI smoke coverage
-  test_config.py  - config defaults, YAML, env override, and validation coverage
-  test_session.py - roast session lifecycle and active-session ownership coverage
+  test_package.py         - package and CLI smoke coverage
+  test_config.py          - config defaults, YAML, env override, and validation coverage
+  test_session.py         - roast session lifecycle and active-session ownership coverage
+  test_ambient.py         - Yocto-Meteo reader unit coverage, incl. missing-runtime fail-soft
+  test_ambient_runtime.py - ambient runtime fail-soft + poll-caching coverage
 docs/state/
   registry.md     - active project state pointer
   epics/          - durable epic and story state

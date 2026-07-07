@@ -12,6 +12,7 @@ from typing import Any, cast
 import pytest
 from mcp.server.fastmcp import FastMCP
 
+from coffee_roaster_mcp.ambient_runtime import AmbientRuntimeSnapshot, AmbientRuntimeState
 from coffee_roaster_mcp.drivers import EmergencyStopResult, MockRoasterDriver, RoasterState
 from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackRuntimeSnapshot,
@@ -902,6 +903,133 @@ def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
     assert fault_state.first_crack_status.status == "faulted"
 
 
+def test_get_roast_state_exposes_ambient_status_disabled_by_default(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    assert start_result.session.ambient_status.status == "disabled"
+    assert start_result.session.ambient_status.mode == "disabled"
+    assert start_result.session.ambient_status.temperature_c is None
+
+    state = _call_tool(
+        server,
+        "get_roast_state",
+        ctx,
+        session_id=start_result.session.session_id,
+    )
+
+    assert state.ambient_status.status == "disabled"
+    assert state.ambient_status.ambient_running is False
+    assert state.ambient_status.reason == "Ambient sensing is disabled by configuration."
+
+
+def test_get_roast_state_exposes_ambient_status_unavailable_when_probe_missing(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "ambient:",
+                "  mode: yoctopuce",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    _set_ambient_runtime(
+        server_context,
+        FakeAmbientRuntime(status="unavailable", reason="No Yocto-Meteo device found."),
+    )
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+
+    assert start_result.session.ambient_status.status == "unavailable"
+    assert start_result.session.ambient_status.mode == "yoctopuce"
+    assert start_result.session.ambient_status.reason == "No Yocto-Meteo device found."
+    assert start_result.session.ambient_status.temperature_c is None
+
+
+def test_get_roast_state_exposes_ambient_status_ok_with_readings(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "ambient:",
+                "  mode: yoctopuce",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    _set_ambient_runtime(
+        server_context,
+        FakeAmbientRuntime(
+            status="ok",
+            ambient_running=True,
+            temperature_c=21.4,
+            humidity_percent=42.0,
+            pressure_hpa=1012.3,
+            last_reading_monotonic_seconds=123.0,
+        ),
+    )
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    state = _call_tool(
+        server,
+        "get_roast_state",
+        ctx,
+        session_id=start_result.session.session_id,
+    )
+
+    assert state.ambient_status.status == "ok"
+    assert state.ambient_status.ambient_running is True
+    assert state.ambient_status.temperature_c == 21.4
+    assert state.ambient_status.humidity_percent == 42.0
+    assert state.ambient_status.pressure_hpa == 1012.3
+    assert state.ambient_status.last_reading_monotonic_seconds == 123.0
+
+
+def test_ambient_runtime_stops_on_terminal_session_transitions(tmp_path: Path) -> None:
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "ambient:",
+                "  mode: yoctopuce",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    fake_ambient = FakeAmbientRuntime(status="ok", ambient_running=True)
+    _set_ambient_runtime(server_context, fake_ambient)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    start_result = _call_tool(server, "start_roast_session", ctx)
+    assert fake_ambient.started_sessions == [start_result.session.session_id]
+
+    _call_tool(server, "mark_beans_added", ctx)
+    _call_tool(server, "drop_beans", ctx)
+    assert fake_ambient.stopped_sessions == []
+
+    _call_tool(server, "stop_cooling", ctx)
+
+    assert fake_ambient.stopped_sessions == [start_result.session.session_id]
+
+
 def test_get_roast_state_scopes_runtime_metrics_to_requested_session(tmp_path: Path) -> None:
     config_path = tmp_path / "audio.yaml"
     config_path.write_text(
@@ -1601,6 +1729,60 @@ class FakeFirstCrackRuntime:
         )
 
 
+class FakeAmbientRuntime:
+    """Runtime double that keeps ambient-mode MCP tests hardware-free (#185)."""
+
+    def __init__(
+        self,
+        *,
+        status: str = "unavailable",
+        reason: str | None = None,
+        ambient_running: bool = False,
+        temperature_c: float | None = None,
+        humidity_percent: float | None = None,
+        pressure_hpa: float | None = None,
+        last_reading_monotonic_seconds: float | None = None,
+    ) -> None:
+        self.status = status
+        self.reason = reason
+        self.ambient_running = ambient_running
+        self.temperature_c = temperature_c
+        self.humidity_percent = humidity_percent
+        self.pressure_hpa = pressure_hpa
+        self.last_reading_monotonic_seconds = last_reading_monotonic_seconds
+        self.active_session_id: str | None = None
+        self.started_sessions: list[str] = []
+        self.stopped_sessions: list[str] = []
+
+    def start_for_session(self, session: RoastSession) -> AmbientRuntimeSnapshot:
+        self.active_session_id = session.id
+        self.started_sessions.append(session.id)
+        return self.snapshot()
+
+    def poll(self) -> AmbientRuntimeSnapshot:
+        return self.snapshot()
+
+    def stop_for_session(self, session_id: str, *, reason: str) -> AmbientRuntimeSnapshot:
+        self.stopped_sessions.append(session_id)
+        self.reason = reason
+        return self.snapshot()
+
+    def shutdown(self) -> AmbientRuntimeSnapshot:
+        return self.snapshot()
+
+    def snapshot(self) -> AmbientRuntimeSnapshot:
+        return AmbientRuntimeSnapshot(
+            status=cast(AmbientRuntimeState, self.status),
+            active_session_id=self.active_session_id,
+            reason=self.reason,
+            ambient_running=self.ambient_running,
+            temperature_c=self.temperature_c,
+            humidity_percent=self.humidity_percent,
+            pressure_hpa=self.pressure_hpa,
+            last_reading_monotonic_seconds=self.last_reading_monotonic_seconds,
+        )
+
+
 def _ctx(server_context: ServerContext) -> Any:
     """Build the minimal context shape used by FastMCP tool functions."""
     return SimpleNamespace(request_context=SimpleNamespace(lifespan_context=server_context))
@@ -1611,6 +1793,13 @@ def _set_first_crack_runtime(
     runtime: FakeFirstCrackRuntime,
 ) -> None:
     object.__setattr__(server_context, "first_crack_runtime", runtime)
+
+
+def _set_ambient_runtime(
+    server_context: ServerContext,
+    runtime: FakeAmbientRuntime,
+) -> None:
+    object.__setattr__(server_context, "ambient_runtime", runtime)
 
 
 def _record_tool_error(
