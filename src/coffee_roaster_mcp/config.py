@@ -18,6 +18,7 @@ ModelPrecision = Literal["int8", "fp32"]
 AudioSource = Literal["microphone", "wav"]
 AudioReplayMode = Literal["realtime", "detector_paced"]
 ExportFormat = Literal["jsonl", "csv", "summary"]
+AmbientMode = Literal["disabled", "yoctopuce"]
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,32 @@ class AudioConfig:
 
 
 @dataclass(frozen=True)
+class AmbientConfig:
+    """Ambient environmental sensor configuration (#185).
+
+    Mirrors the first-crack microphone pipeline: an MCP-owned USB device that
+    is read-only, has no roaster-write or control-loop involvement, and is
+    disabled by default so existing configs are unchanged. Corpus-metadata for
+    the roast record (Yoctopuce Yocto-Meteo-V2-C: temperature, relative
+    humidity, barometric pressure).
+
+    Attributes:
+        mode: Ambient sensor mode: `disabled` or `yoctopuce`.
+        device: Optional Yoctopuce module serial number or logical name to
+            target a specific probe. When unset, the first detected Yocto
+            Meteo device is used.
+        poll_interval_seconds: Minimum seconds between USB reads. The runtime
+            caches the last reading and refreshes at most once per interval
+            when polled from the state-read path, so the USB bus is never hit
+            on every 1 Hz `get_roast_state` call.
+    """
+
+    mode: AmbientMode = "disabled"
+    device: str | None = None
+    poll_interval_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     """Roast logging configuration."""
 
@@ -172,6 +199,7 @@ class AppConfig:
     roaster: RoasterConfig = field(default_factory=RoasterConfig)
     first_crack: FirstCrackConfig = field(default_factory=FirstCrackConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
+    ambient: AmbientConfig = field(default_factory=AmbientConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
@@ -249,6 +277,7 @@ def _config_from_mapping(raw_config: Mapping[str, Any], source_path: Path | None
         roaster=_roaster_from_mapping(_section(raw_config, "roaster")),
         first_crack=_first_crack_from_mapping(_section(raw_config, "first_crack")),
         audio=_audio_from_mapping(_section(raw_config, "audio")),
+        ambient=_ambient_from_mapping(_section(raw_config, "ambient")),
         logging=_logging_from_mapping(_section(raw_config, "logging")),
         recording=_recording_from_mapping(_section(raw_config, "recording")),
         session=_session_from_mapping(_section(raw_config, "session")),
@@ -372,6 +401,22 @@ def _audio_from_mapping(raw: Mapping[str, Any]) -> AudioConfig:
     )
 
 
+def _ambient_from_mapping(raw: Mapping[str, Any]) -> AmbientConfig:
+    return AmbientConfig(
+        mode=_ambient_mode(
+            _string(raw, "mode", "disabled", label="ambient.mode"),
+            label="ambient.mode",
+        ),
+        device=_optional_string(raw, "device", label="ambient.device"),
+        poll_interval_seconds=_positive_float(
+            raw,
+            "poll_interval_seconds",
+            30.0,
+            label="ambient.poll_interval_seconds",
+        ),
+    )
+
+
 def _logging_from_mapping(raw: Mapping[str, Any]) -> LoggingConfig:
     return LoggingConfig(
         log_dir=_path(raw, "log_dir", Path("./logs"), label="logging.log_dir"),
@@ -438,6 +483,7 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
     roaster = config.roaster
     first_crack = config.first_crack
     audio = config.audio
+    ambient = config.ambient
     logging = config.logging
     recording = config.recording
 
@@ -581,6 +627,22 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
         window_label="COFFEE_AUDIO_WINDOW_SECONDS",
     )
 
+    if "COFFEE_AMBIENT_MODE" in environ:
+        ambient = replace(
+            ambient,
+            mode=_ambient_mode(environ["COFFEE_AMBIENT_MODE"], label="COFFEE_AMBIENT_MODE"),
+        )
+    if "COFFEE_AMBIENT_DEVICE" in environ:
+        ambient = replace(ambient, device=_none_if_empty(environ["COFFEE_AMBIENT_DEVICE"]))
+    if "COFFEE_AMBIENT_POLL_INTERVAL_SECONDS" in environ:
+        ambient = replace(
+            ambient,
+            poll_interval_seconds=_parse_positive_float(
+                environ["COFFEE_AMBIENT_POLL_INTERVAL_SECONDS"],
+                "COFFEE_AMBIENT_POLL_INTERVAL_SECONDS",
+            ),
+        )
+
     if "COFFEE_ROAST_LOG_DIR" in environ:
         logging = replace(
             logging,
@@ -637,6 +699,7 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
         roaster=roaster,
         first_crack=first_crack,
         audio=audio,
+        ambient=ambient,
         logging=logging,
         recording=recording,
         session=session,
@@ -929,6 +992,13 @@ def _audio_replay_mode(value: str, label: str = "audio.replay_mode") -> AudioRep
     if normalized not in {"realtime", "detector_paced"}:
         raise ConfigError(f"{label} must be one of: realtime, detector_paced.")
     return cast(AudioReplayMode, normalized)
+
+
+def _ambient_mode(value: str, label: str = "ambient.mode") -> AmbientMode:
+    normalized = _normalized_token(value)
+    if normalized not in {"disabled", "yoctopuce"}:
+        raise ConfigError(f"{label} must be one of: disabled, yoctopuce.")
+    return cast(AmbientMode, normalized)
 
 
 def _export_formats(value: object) -> tuple[ExportFormat, ...]:

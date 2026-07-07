@@ -16,7 +16,18 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
 from coffee_roaster_mcp import __version__
-from coffee_roaster_mcp.config import AppConfig, ConfigError, FirstCrackMode, load_config
+from coffee_roaster_mcp.ambient_runtime import (
+    AmbientRuntimeSnapshot,
+    AmbientSessionRuntime,
+    build_ambient_session_runtime,
+)
+from coffee_roaster_mcp.config import (
+    AmbientMode,
+    AppConfig,
+    ConfigError,
+    FirstCrackMode,
+    load_config,
+)
 from coffee_roaster_mcp.drivers import RoasterDriver, RoasterState, create_roaster_driver
 from coffee_roaster_mcp.exports import export_roast_snapshot
 from coffee_roaster_mcp.first_crack_runtime import (
@@ -47,6 +58,7 @@ class ServerContext:
         session_store: Authoritative in-process roast session owner.
         roaster_driver: Configured driver boundary.
         first_crack_runtime: Session-owned first-crack detector runtime.
+        ambient_runtime: Session-owned ambient sensor runtime (#185).
         telemetry_sampler: Session-owned autonomous telemetry sampler.
         started_at_utc: UTC time when the MCP process initialized.
     """
@@ -56,6 +68,7 @@ class ServerContext:
     session_store: RoastSessionStore
     roaster_driver: RoasterDriver
     first_crack_runtime: FirstCrackSessionRuntime
+    ambient_runtime: AmbientSessionRuntime
     telemetry_sampler: _TelemetrySampler
     started_at_utc: datetime
 
@@ -242,6 +255,8 @@ FirstCrackRuntimeStatus = Literal[
     "unavailable",
 ]
 
+AmbientRuntimeStatus = Literal["disabled", "unavailable", "ok"]
+
 
 @dataclass(frozen=True)
 class RoasterDeviceState:
@@ -306,6 +321,38 @@ class FirstCrackStatus:
     mic_rms_dbfs: float | None = None
 
 
+@dataclass(frozen=True)
+class AmbientStatus:
+    """Serializable ambient sensor status for the roast record (#185).
+
+    Read-only corpus metadata: no roaster-write or control-loop involvement.
+    Fail-soft by design — an absent, unplugged, or erroring probe always
+    reports `unavailable` with null readings rather than raising or blocking
+    the roast.
+
+    Attributes:
+        mode: Configured ambient sensor mode.
+        status: Current ambient runtime status.
+        reason: Human-readable reason when status needs extra context.
+        ambient_running: Whether the session-owned ambient runtime is prepared
+            to poll readings.
+        temperature_c: Last-known ambient temperature in Celsius, or `None`.
+        humidity_percent: Last-known relative humidity percentage, or `None`.
+        pressure_hpa: Last-known barometric pressure in hectopascals, or `None`.
+        last_reading_monotonic_seconds: Monotonic timestamp of the last
+            successful reading, or `None` if none has ever succeeded.
+    """
+
+    mode: AmbientMode
+    status: AmbientRuntimeStatus
+    reason: str | None = None
+    ambient_running: bool = False
+    temperature_c: float | None = None
+    humidity_percent: float | None = None
+    pressure_hpa: float | None = None
+    last_reading_monotonic_seconds: float | None = None
+
+
 T0RuntimeStatus = Literal["disabled", "pending", "detected", "unavailable"]
 
 
@@ -367,6 +414,7 @@ class RoastSessionState:
     device_state: RoasterDeviceState | None
     t0_status: T0Status
     first_crack_status: FirstCrackStatus
+    ambient_status: AmbientStatus
     events: tuple[EventSnapshot, ...]
     log_dir: str | None
 
@@ -470,6 +518,7 @@ def build_server_context(
         ),
         roaster_driver=roaster_driver,
         first_crack_runtime=build_first_crack_session_runtime(config),
+        ambient_runtime=build_ambient_session_runtime(config),
         telemetry_sampler=telemetry_sampler,
         started_at_utc=datetime.now(UTC),
     )
@@ -500,6 +549,7 @@ def create_mcp_server(
         finally:
             server_context.telemetry_sampler.shutdown()
             server_context.first_crack_runtime.shutdown()
+            server_context.ambient_runtime.shutdown()
 
     mcp = FastMCP(
         name="RoastPilot",
@@ -584,12 +634,14 @@ def create_mcp_server(
             server_context.session_store.clear_session_start_reservation(reservation)
             raise
         _start_first_crack_runtime(server_context, session=session)
+        server_context.ambient_runtime.start_for_session(session)
         server_context.telemetry_sampler.start_for_session(session.id)
         return StartRoastSessionResult(
             session=_serialize_session_state(
                 session,
                 config=server_context.config,
                 first_crack_runtime=server_context.first_crack_runtime.snapshot(),
+                ambient_runtime=server_context.ambient_runtime.snapshot(),
             )
         )
 
@@ -620,12 +672,14 @@ def create_mcp_server(
                 reason="Dropped queued pre-T0 detector windows after automatic T0.",
             )
         _process_first_crack_runtime_for_active_session(server_context, session_id=session_id)
+        _process_ambient_runtime_for_active_session(server_context, session_id=session_id)
         session = _resolve_session(server_context, session_id=session_id)
         return _serialize_session_state(
             session,
             config=server_context.config,
             device_state=device_state,
             first_crack_runtime=server_context.first_crack_runtime.snapshot(),
+            ambient_runtime=server_context.ambient_runtime.snapshot(),
         )
 
     @mcp.tool()
@@ -712,6 +766,7 @@ def create_mcp_server(
         )
         if not snapshot.active:
             server_context.telemetry_sampler.stop_for_session(snapshot.id, reason="beans dropped")
+            server_context.ambient_runtime.stop_for_session(snapshot.id, reason="beans dropped")
         return _serialize_event_result(snapshot=snapshot, event=event)
 
     @mcp.tool()
@@ -744,6 +799,10 @@ def create_mcp_server(
             reason="cooling stopped",
         )
         server_context.telemetry_sampler.stop_for_session(
+            snapshot.id,
+            reason="cooling stopped",
+        )
+        server_context.ambient_runtime.stop_for_session(
             snapshot.id,
             reason="cooling stopped",
         )
@@ -794,6 +853,10 @@ def create_mcp_server(
             reason="emergency stop",
         )
         server_context.telemetry_sampler.stop_for_session(
+            snapshot.id,
+            reason="emergency stop",
+        )
+        server_context.ambient_runtime.stop_for_session(
             snapshot.id,
             reason="emergency stop",
         )
@@ -960,6 +1023,26 @@ def _process_first_crack_runtime_for_active_session(
         session_store=server_context.session_store,
         session=active_session,
     )
+
+
+def _process_ambient_runtime_for_active_session(
+    server_context: ServerContext,
+    *,
+    session_id: str | None,
+) -> None:
+    """Refresh the ambient sensor cache when the requested session is active.
+
+    The ambient runtime's own `poll` is already bounded by
+    `poll_interval_seconds` and fail-soft on read errors, so this is safe to
+    call on every `get_roast_state` tick without hitting the USB bus each time
+    or ever raising into the state-read hot path.
+    """
+    active_session = server_context.session_store.get_active_session()
+    if active_session is None:
+        return
+    if session_id is not None and session_id != active_session.id:
+        return
+    server_context.ambient_runtime.poll()
 
 
 def _process_auto_t0_for_active_session(
@@ -1289,6 +1372,10 @@ def _fault_active_session_after_sampler_failure(
         snapshot.id,
         reason="autonomous telemetry sampler failure",
     )
+    server_context.ambient_runtime.stop_for_session(
+        snapshot.id,
+        reason="autonomous telemetry sampler failure",
+    )
 
 
 def _serialize_session_state(
@@ -1297,6 +1384,7 @@ def _serialize_session_state(
     config: AppConfig,
     device_state: RoasterDeviceState | None = None,
     first_crack_runtime: FirstCrackRuntimeSnapshot | None = None,
+    ambient_runtime: AmbientRuntimeSnapshot | None = None,
 ) -> RoastSessionState:
     """Convert one in-memory session into an MCP-safe snapshot."""
     metrics = compute_roast_metrics(
@@ -1339,6 +1427,10 @@ def _serialize_session_state(
             session,
             config=config,
             first_crack_runtime=first_crack_runtime,
+        ),
+        ambient_status=_serialize_ambient_status(
+            config=config,
+            ambient_runtime=ambient_runtime,
         ),
         events=tuple(_serialize_event(event) for event in session.event_timeline),
         log_dir=str(session.log_writer.log_dir.resolve())
@@ -1500,6 +1592,43 @@ def _runtime_metrics(
         status="disabled",
         active_session_id=None,
         active=False,
+    )
+
+
+def _serialize_ambient_status(
+    *,
+    config: AppConfig,
+    ambient_runtime: AmbientRuntimeSnapshot | None,
+) -> AmbientStatus:
+    """Derive ambient sensor status from config and the runtime snapshot.
+
+    Simpler state machine than first-crack's: `disabled` (config off) →
+    `unavailable` (no runtime snapshot yet, or the probe could not be
+    prepared/read) → `ok` (a live cached reading is available). Read-only
+    corpus metadata, so there is no session-timeline-derived "detected" state
+    to branch on.
+    """
+    if config.ambient.mode == "disabled":
+        return AmbientStatus(
+            mode=config.ambient.mode,
+            status="disabled",
+            reason="Ambient sensing is disabled by configuration.",
+        )
+    if ambient_runtime is None:
+        return AmbientStatus(
+            mode=config.ambient.mode,
+            status="unavailable",
+            reason="Ambient sensing has not started.",
+        )
+    return AmbientStatus(
+        mode=config.ambient.mode,
+        status=ambient_runtime.status,
+        reason=ambient_runtime.reason,
+        ambient_running=ambient_runtime.ambient_running,
+        temperature_c=ambient_runtime.temperature_c,
+        humidity_percent=ambient_runtime.humidity_percent,
+        pressure_hpa=ambient_runtime.pressure_hpa,
+        last_reading_monotonic_seconds=ambient_runtime.last_reading_monotonic_seconds,
     )
 
 
