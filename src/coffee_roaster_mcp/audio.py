@@ -1484,6 +1484,16 @@ class AudioCapturePipeline:
         self._windows: Queue[AudioWindow] = Queue(maxsize=settings.queue_limit)
         self._sample_buffer: list[float] = []
         self._stop_requested = Event()
+        # coffee-roaster-mcp#195 CI follow-up: a runtime-boundary discard
+        # (charge/T0) must drop audio buffered ANYWHERE in the pipeline, not
+        # just already-emitted windows. _sample_buffer/_buffered_chunk_bounds
+        # are single-writer state owned by the processing thread — this flag
+        # asks that thread to clear them itself on its next iteration rather
+        # than mutating them from the caller's thread, which would race the
+        # same way #193's un-locked deque did. The ack Event lets the caller
+        # wait deterministically instead of guessing a sleep duration.
+        self._discard_pending_audio_requested = Event()
+        self._discard_pending_audio_acknowledged = Event()
         self._state_lock = Lock()
         self._thread: Thread | None = None
         self._next_sequence_number = 0
@@ -1652,6 +1662,51 @@ class AudioCapturePipeline:
         except Empty:
             return None
 
+    def discard_pending_audio(self, *, timeout_seconds: float = 1.0) -> None:
+        """Drop every window/chunk/sample buffered anywhere in the pipeline.
+
+        coffee-roaster-mcp#195 CI follow-up: `drain_windows()` alone only
+        clears already-emitted windows. Audio captured before a runtime
+        boundary (e.g. `beans_added`) can still be sitting unprocessed in
+        the reader thread's backlog or the processing thread's partial
+        sample buffer at the moment the boundary is recorded — and with
+        accurate capture-time window stamps (#190/#195), that stale audio
+        can later be assembled into a window whose `started_at_monotonic_seconds`
+        predates the boundary. Call this immediately after recording the
+        boundary event to guarantee no pre-boundary audio survives into a
+        later window.
+
+        When the processing thread is running, the discard is requested and
+        this method blocks (bounded by `timeout_seconds`) until that thread
+        acknowledges having cleared its own single-writer state — mutating
+        `_sample_buffer` from this thread instead would race the processing
+        thread's own writes to it. When the thread is not running, there is
+        no concurrent writer, so the buffers are cleared directly.
+
+        Args:
+            timeout_seconds: Maximum time to wait for the processing thread
+                to acknowledge the discard. A timeout is a defensive
+                fallback only (e.g. a wedged worker) — normal operation
+                acknowledges in well under a millisecond since the discard
+                check runs at the top of every loop iteration.
+        """
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            self._clear_buffered_audio()
+            return
+        self._discard_pending_audio_acknowledged.clear()
+        self._discard_pending_audio_requested.set()
+        if not self._discard_pending_audio_acknowledged.wait(timeout=timeout_seconds):
+            _LOGGER.warning(
+                "Audio capture discard request was not acknowledged within "
+                "%.1fs; the processing thread may be wedged. Falling back to "
+                "a direct clear, which races that thread's writes but is "
+                "safer than leaving stale pre-boundary audio buffered.",
+                timeout_seconds,
+            )
+            self._clear_buffered_audio()
+            self._discard_pending_audio_requested.clear()
+
     def drain_windows(self, *, max_windows: int | None = None) -> tuple[AudioWindow, ...]:
         """Return all currently queued detector windows without blocking."""
         if max_windows is not None and max_windows < 0:
@@ -1766,6 +1821,20 @@ class AudioCapturePipeline:
                 self._disable_recorder()
         try:
             while True:
+                if self._discard_pending_audio_requested.is_set():
+                    # coffee-roaster-mcp#195 CI follow-up: a runtime boundary
+                    # (e.g. beans_added) was just recorded and the caller
+                    # wants every window/chunk/sample buffered anywhere in
+                    # this pipeline dropped — not just the already-emitted
+                    # windows drain_windows() can see. Clear from THIS
+                    # thread (the single writer of _sample_buffer /
+                    # _buffered_chunk_bounds) so no pre-boundary audio can
+                    # survive into the next emitted window with an
+                    # accurate-but-stale capture-time stamp.
+                    self._clear_buffered_audio()
+                    self._discard_pending_audio_requested.clear()
+                    self._discard_pending_audio_acknowledged.set()
+                    continue
                 stop_was_requested = self._stop_requested.is_set()
                 try:
                     # #190 review finding (P1): once stop() sets
@@ -1939,15 +2008,23 @@ class AudioCapturePipeline:
         with self._state_lock:
             self._emitted_window_count += 1
 
-    def _reset_run_state_locked(self) -> None:
+    def _clear_buffered_audio(self) -> None:
+        """Drop every window/chunk/sample currently buffered anywhere in the
+        pipeline: the emitted-window queue, the reader's raw-chunk backlog,
+        and the processing thread's own partial sample buffer.
+
+        Safe to call from `start()` before either worker thread exists. Once
+        the processing thread is running, `_sample_buffer` and
+        `_buffered_chunk_bounds` are its single-writer state — only that
+        thread may call this (see `_run_processing_loop`'s discard check);
+        `_windows` and `_raw_reads` are thread-safe `Queue`s so draining them
+        from any thread is fine.
+        """
         while True:
             try:
                 self._windows.get_nowait()
             except Empty:
                 break
-        # Also drain any raw sample blocks left over from a prior run (#190):
-        # a fresh start() must never process stale audio queued before this
-        # restart.
         while True:
             try:
                 self._raw_reads.get_nowait()
@@ -1955,6 +2032,12 @@ class AudioCapturePipeline:
                 break
         self._sample_buffer.clear()
         self._buffered_chunk_bounds.clear()
+
+    def _reset_run_state_locked(self) -> None:
+        # Also drain any raw sample blocks left over from a prior run (#190):
+        # a fresh start() must never process stale audio queued before this
+        # restart.
+        self._clear_buffered_audio()
         self._next_sequence_number = 0
         self._emitted_window_count = 0
         self._dropped_window_count = 0

@@ -320,6 +320,50 @@ def test_process_window_observed_reports_candidate_before_confirmation() -> None
     assert confirmed.event.kind == "first_crack_detected"
 
 
+def test_process_window_observed_rejects_a_window_before_the_eligible_cutoff() -> None:
+    """coffee-roaster-mcp#195 CI follow-up: a positive window whose capture
+    started before `earliest_eligible_monotonic_seconds` must never join the
+    confirmation candidates, even though it is confirmed=True. Reported
+    accurately (confidence still surfaces) but treated as `listening`."""
+    backend = MockDetectorBackend((FirstCrackDetectorOutput(confirmed=True, confidence=0.9),))
+    adapter = build_first_crack_detector_adapter(
+        FirstCrackConfig(confidence_threshold=0.6),
+        _resolved_detector_artifacts(),
+        backend,
+    )
+
+    observation = adapter.process_window_observed(
+        _audio_window(sequence_number=40, started_at_monotonic_seconds=99.5),
+        earliest_eligible_monotonic_seconds=100.0,
+    )
+
+    assert observation.confidence == 0.9
+    assert observation.positive_window_count == 0
+    assert observation.confirmed is False
+    assert observation.fc_status == "listening"
+    assert observation.event is None
+
+
+def test_process_window_observed_accepts_a_window_at_or_after_the_eligible_cutoff() -> None:
+    """A window starting exactly at (or after) the cutoff is eligible — the
+    bound is exclusive on the pre-cutoff side only."""
+    backend = MockDetectorBackend((FirstCrackDetectorOutput(confirmed=True, confidence=0.9),))
+    adapter = build_first_crack_detector_adapter(
+        FirstCrackConfig(confidence_threshold=0.6),
+        _resolved_detector_artifacts(),
+        backend,
+    )
+
+    observation = adapter.process_window_observed(
+        _audio_window(sequence_number=41, started_at_monotonic_seconds=100.0),
+        earliest_eligible_monotonic_seconds=100.0,
+    )
+
+    assert observation.confirmed is True
+    assert observation.fc_status == "confirmed"
+    assert observation.event is not None
+
+
 def test_process_window_delegates_to_observed() -> None:
     backend = MockDetectorBackend((FirstCrackDetectorOutput(confirmed=True, confidence=0.95),))
     adapter = build_first_crack_detector_adapter(

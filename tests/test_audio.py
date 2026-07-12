@@ -1291,6 +1291,87 @@ def test_window_started_at_reflects_true_capture_time_not_emission_time(
     assert windows[0].started_at_monotonic_seconds == 101.0
 
 
+def test_discard_pending_audio_drops_backlogged_precharge_samples(tmp_path: Path) -> None:
+    """coffee-roaster-mcp#195 CI follow-up: discard_pending_audio() must drop
+    audio buffered ANYWHERE in the pipeline, not just already-emitted
+    windows — otherwise a processing-thread backlog (exactly what CPU
+    contention on a small CI runner produces) lets pre-boundary samples
+    survive into a window assembled AFTER the discard call, with an
+    accurate-but-stale capture-time stamp (reproduces the #195 CI failure:
+    test_recording_spans_charge_to_session_stop_not_to_first_crack faulted
+    with "Detected first crack cannot be before beans are added" because
+    discard_queued_windows_for_session only drained the emitted-window
+    queue).
+    """
+    clock = ClockHarness()
+    released = Event()
+    recorder = _GatedRecorder(
+        released=released,
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.recording.json",
+        sample_rate=4,
+        session_id="s",
+    )
+    audio_input = MutableAudioInput((0.1, 0.2, 0.3, 0.4))
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+        recorder=recorder,
+        monotonic_now=clock.monotonic_now,
+    )
+
+    pipeline.start()
+    try:
+        # Pre-charge audio is read (and stamped) by the reader thread while
+        # the processing thread is blocked on the gated recorder write —
+        # exactly the backlog a slow/contended runner produces. Nothing has
+        # been assembled into a window yet.
+        _wait_for(lambda: len(audio_input.read_counts) >= 4, timeout_seconds=5.0)
+        assert pipeline.snapshot().emitted_window_count == 0
+
+        # The "charge boundary" fires while that pre-charge audio is still
+        # backlogged in _raw_reads/_sample_buffer, unprocessed.
+        pipeline.discard_pending_audio(timeout_seconds=5.0)
+
+        # Release the gate and feed fresh post-boundary audio. If the
+        # pre-charge backlog survived the discard, it would combine with
+        # this into a window whose first sample is one of the pre-charge
+        # ones (stamped 101.0-104.0, the reads captured before discard).
+        released.set()
+        audio_input.add_samples((0.5, 0.6, 0.7, 0.8))
+        _wait_for(lambda: pipeline.snapshot().emitted_window_count >= 1, timeout_seconds=5.0)
+    finally:
+        pipeline.stop()
+
+    windows = pipeline.drain_windows()
+    assert len(windows) == 1
+    assert windows[0].samples == (0.5, 0.6, 0.7, 0.8)
+    # The window's capture-time start must be a POST-discard read, not one
+    # of the four pre-charge reads (clock values 101.0-104.0).
+    assert windows[0].started_at_monotonic_seconds >= 105.0
+
+
+def test_discard_pending_audio_is_a_direct_clear_when_pipeline_not_running() -> None:
+    """discard_pending_audio() on a never-started (or already-stopped)
+    pipeline has no processing thread to acknowledge a request, so it must
+    clear synchronously rather than waiting on an Event nothing will ever
+    set."""
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(input_device=None, sample_rate=4, window_seconds=1.0),
+        audio_input=FiniteAudioInput((0.1, 0.2, 0.3, 0.4)),
+    )
+
+    # No AssertionError/timeout: returns promptly since self._thread is None.
+    pipeline.discard_pending_audio(timeout_seconds=5.0)
+
+    assert pipeline.snapshot().queued_window_count == 0
+
+
 class _NumpyArrayAudioInput:
     """AudioInput double that returns samples as a numpy array rather than a
     tuple/list (#190 review finding P3). Structurally satisfies the

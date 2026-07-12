@@ -91,6 +91,43 @@ def test_integrator_ignores_confirmed_detector_output_before_beans_are_added() -
     assert session.phase == "pre_roast"
 
 
+def test_integrator_ignores_a_precharge_window_that_arrives_during_roasting_phase() -> None:
+    """coffee-roaster-mcp#195 CI follow-up: a window whose capture started
+    before beans_added must be rejected even once phase is "roasting" — the
+    phase gate alone (see the sibling test above) is not enough, because a
+    window that was already buffered before the phase flip (or captured in
+    the wall-clock gap between recording beans_added and a caller's
+    discard_pending_audio() call) can still arrive here with a pre-charge
+    started_at. Also exercises the absolute/session-elapsed domain rebase:
+    beans_added_monotonic_seconds is SESSION-elapsed while the window's
+    started_at is ABSOLUTE monotonic (session.monotonic_start=500.0 here),
+    so a naive unrebased comparison would silently pass this window through.
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    assert session.beans_added_monotonic_seconds == 5.0  # session-elapsed
+    backend = MockDetectorBackend((FirstCrackDetectorOutput(confirmed=True, confidence=0.9),))
+    config = FirstCrackConfig(mode="audio")
+    adapter = build_first_crack_detector_adapter(config, _resolved_detector_artifacts(), backend)
+
+    # Absolute start 504.9 is BEFORE beans_added's absolute instant (500.0 +
+    # 5.0 = 505.0) by 0.1s, even though the call happens once phase is
+    # already "roasting".
+    result = integrate_first_crack_window_with_session(
+        config=config,
+        adapter=adapter,
+        session_store=store,
+        session=session,
+        window=_audio_window(started_at_monotonic_seconds=504.9),
+    )
+
+    assert result is None
+    assert [event.kind for event in session.event_timeline] == ["beans_added"]
+
+
 def test_integrator_ignores_confirmed_detector_output_after_roasting_phase() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)

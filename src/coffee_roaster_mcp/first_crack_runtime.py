@@ -58,6 +58,10 @@ class FirstCrackAudioPipeline(Protocol):
         """Return queued detector windows without blocking."""
         ...
 
+    def discard_pending_audio(self, *, timeout_seconds: float = 1.0) -> None:
+        """Drop every window/chunk/sample buffered anywhere in the pipeline."""
+        ...
+
     def snapshot(self) -> AudioCaptureSnapshot:
         """Return current capture status."""
         ...
@@ -336,14 +340,24 @@ class FirstCrackSessionRuntime:
         *,
         reason: str,
     ) -> FirstCrackRuntimeSnapshot:
-        """Drop queued detector windows that were captured before a runtime boundary."""
+        """Drop queued detector windows that were captured before a runtime boundary.
+
+        coffee-roaster-mcp#195 CI follow-up: draining only the emitted-window
+        queue is not enough once window timestamps reflect true capture time
+        (#190/#195) — audio captured before the boundary can still be
+        sitting unprocessed in the reader thread's backlog or the
+        processing thread's partial sample buffer when this is called (a
+        processing-thread backlog is exactly what CPU contention on a small
+        CI runner produces). Uses `discard_pending_audio()`, which clears
+        every stage of the pipeline, not just `drain_windows()`'s queue.
+        """
         with self._lock:
             if self._active_session_id != session_id:
                 return self.snapshot()
             if self._pipeline is not None and not _uses_detector_paced_wav_replay(
                 self._config.audio
             ):
-                self._pipeline.drain_windows()
+                self._pipeline.discard_pending_audio()
             if self._status == "pending":
                 self._reason = reason
             return self.snapshot()
