@@ -18,6 +18,7 @@ from coffee_roaster_mcp.audio import (
     AudioInput,
     DetectorPacedWavReplayPipeline,
     MicrophoneAudioInput,
+    OverflowSnapshot,
     RoastAudioRecorder,
     WavAudioInput,
     amplitude_to_dbfs,
@@ -599,6 +600,54 @@ def test_audio_capture_pipeline_resets_run_state_on_restart() -> None:
     assert windows[0].samples == (3.0, 4.0, 5.0, 6.0)
 
 
+def test_audio_capture_pipeline_resets_overflow_tracking_on_restart() -> None:
+    """coffee-roaster-mcp#193 review finding: a pipeline can be start()ed
+    more than once against the SAME microphone input (the sibling
+    non-overflow restart test above proves this is a real, already-tested
+    pattern) — total_overflow_count is documented as "lifetime... for the
+    CURRENT capture run", so a prior run's overflow history must not leak
+    into a fresh roast's totals.
+    """
+    FakeRawInputStream.created.clear()
+    settings = audio_capture_settings_from_config(AudioConfig(source="microphone", sample_rate=4))
+    clock = ClockHarness()
+    clock.value = 0.0
+    audio_input = MicrophoneAudioInput(
+        settings,
+        sounddevice_module=FakeSoundDeviceModule(),
+        max_consecutive_overflows=10,
+        monotonic_now=lambda: clock.value,
+    )
+    pipeline = AudioCapturePipeline(settings=settings, audio_input=audio_input)
+
+    # First run: drive one overflowed read directly (no background thread
+    # racing this, per the sibling overflow tests' documented discipline),
+    # then reset via a second start() — start()/stop() themselves don't
+    # spawn a worker whose reads would interfere with this direct call.
+    audio_input.read_samples(1)  # opens the stream; clean read at t=0.0
+    stream = FakeRawInputStream.created[-1]
+    clock.value = 1.0
+    stream.overflowed = True
+    audio_input.read_samples(1)
+    assert audio_input.overflow_snapshot.total_count == 1
+    # Clear the fake stream's overflow flag before the real background
+    # worker below starts reading — it never resets on its own, and the
+    # point of this test is the RESET plumbing, not accumulating more
+    # overflows from the worker's own reads.
+    stream.overflowed = False
+
+    # A fresh start() (the same restart pattern the sibling test exercises
+    # for windows/buffers) must reset overflow tracking too, not just
+    # windows/buffers/the level meter.
+    pipeline.start()
+    pipeline.stop()
+
+    fresh_snapshot = audio_input.overflow_snapshot
+    assert fresh_snapshot.total_count == 0
+    assert fresh_snapshot.count_last_minute == 0
+    assert fresh_snapshot.estimated_lost_audio_ms_last_minute == 0.0
+
+
 def test_audio_capture_pipeline_keeps_blocking_consumer_across_restart() -> None:
     audio_input = MutableAudioInput((10.0, 11.0, 12.0, 13.0))
     pipeline = AudioCapturePipeline(
@@ -1074,6 +1123,19 @@ class _BoundedInput:
         self.closed = True
 
 
+class _BoundedInputWithFixedOverflow(_BoundedInput):
+    """`_BoundedInput` that also reports a fixed overflow snapshot (#193
+    review finding coverage: additional-device overflow aggregation)."""
+
+    def __init__(self, amplitude: float, reads: int, overflow: OverflowSnapshot) -> None:
+        super().__init__(amplitude, reads)
+        self._overflow = overflow
+
+    @property
+    def overflow_snapshot(self) -> OverflowSnapshot:
+        return self._overflow
+
+
 def test_multi_device_recorder_writes_two_wavs(tmp_path: Path) -> None:
     import json
     import time
@@ -1128,6 +1190,134 @@ def test_multi_device_recorder_writes_two_wavs(tmp_path: Path) -> None:
     assert sidecar["wav_filename"] == "roast.usb-pnp.wav"
     assert sidecar["milestones"] == {"beans_added": 1.0, "first_crack": 9.0}
     assert recorder.additional_wav_paths == (tmp_path / "roast.atr2100x.wav",)
+
+
+def test_multi_device_recorder_aggregates_overflow_across_additional_streams(
+    tmp_path: Path,
+) -> None:
+    """coffee-roaster-mcp#193 review finding: each additional device has its
+    OWN overflow tracker, previously invisible to any diagnostic —
+    MultiDeviceRoastRecorder.overflow_snapshot must aggregate them
+    additively (count/estimated-ms/lifetime-total all sum across streams).
+    """
+    import time
+
+    from coffee_roaster_mcp.audio import AdditionalRecordingDevice, MultiDeviceRoastRecorder
+
+    inputs: dict[str, _BoundedInputWithFixedOverflow] = {}
+
+    def factory(device: AdditionalRecordingDevice) -> _BoundedInputWithFixedOverflow:
+        overflow = (
+            OverflowSnapshot(
+                count_last_minute=2, estimated_lost_audio_ms_last_minute=200.0, total_count=5
+            )
+            if device.device_label == "MIC-A"
+            else OverflowSnapshot(
+                count_last_minute=3, estimated_lost_audio_ms_last_minute=150.0, total_count=1
+            )
+        )
+        created = _BoundedInputWithFixedOverflow(amplitude=0.5, reads=4, overflow=overflow)
+        inputs[device.device_label] = created
+        return created
+
+    recorder = MultiDeviceRoastRecorder(
+        detector_wav_path=tmp_path / "roast.usb-pnp.wav",
+        detector_device_label="USB PnP",
+        sidecar_path=tmp_path / "roast.recording.json",
+        sample_rate=4,
+        session_id="s",
+        additional_devices=[
+            AdditionalRecordingDevice("MIC-A", tmp_path / "roast.mic-a.wav", 4),
+            AdditionalRecordingDevice("MIC-B", tmp_path / "roast.mic-b.wav", 4),
+        ],
+        additional_input_factory=factory,
+        additional_read_seconds=0.25,
+        idle_sleep_seconds=0.001,
+        stop_timeout_seconds=2.0,
+    )
+
+    recorder.begin()
+    time.sleep(0.1)
+    recorder.close()
+
+    overflow = recorder.overflow_snapshot
+    assert overflow is not None
+    assert overflow.count_last_minute == 5  # 2 + 3
+    assert overflow.estimated_lost_audio_ms_last_minute == 350.0  # 200.0 + 150.0
+    assert overflow.total_count == 6  # 5 + 1
+
+
+def test_multi_device_recorder_overflow_snapshot_is_none_without_reporting_streams(
+    tmp_path: Path,
+) -> None:
+    """No additional devices (or none reporting overflows, e.g. plain test
+    doubles) must surface as `None`, matching the "no overflow-capable
+    input" convention `AudioCapturePipeline.snapshot()` already uses."""
+    from coffee_roaster_mcp.audio import MultiDeviceRoastRecorder
+
+    recorder = MultiDeviceRoastRecorder(
+        detector_wav_path=tmp_path / "roast.usb-pnp.wav",
+        detector_device_label="USB PnP",
+        sidecar_path=tmp_path / "roast.recording.json",
+        sample_rate=4,
+        session_id="s",
+    )
+
+    assert recorder.overflow_snapshot is None
+
+
+def test_pipeline_snapshot_folds_in_recorder_overflow_additively() -> None:
+    """coffee-roaster-mcp#193 review finding: AudioCapturePipeline.snapshot()
+    must merge the detector device's OWN overflow stats with the recorder's
+    aggregate (additional devices) additively, not overwrite one with the
+    other — the two are independent streams and neither double-counts.
+    """
+
+    class _RecorderWithOverflow:
+        overflow_snapshot = OverflowSnapshot(
+            count_last_minute=3, estimated_lost_audio_ms_last_minute=300.0, total_count=9
+        )
+
+        @property
+        def started_monotonic_seconds(self) -> float | None:
+            return None
+
+        def begin(self) -> None:
+            return None
+
+        def write_samples(self, samples: Sequence[float]) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    FakeRawInputStream.created.clear()
+    settings = audio_capture_settings_from_config(AudioConfig(source="microphone", sample_rate=4))
+    clock = ClockHarness()
+    clock.value = 0.0
+    audio_input = MicrophoneAudioInput(
+        settings,
+        sounddevice_module=FakeSoundDeviceModule(),
+        max_consecutive_overflows=10,
+        monotonic_now=lambda: clock.value,
+    )
+    pipeline = AudioCapturePipeline(
+        settings=settings,
+        audio_input=audio_input,
+        recorder=_RecorderWithOverflow(),
+    )
+
+    audio_input.read_samples(1)  # clean read at t=0.0, opens the stream
+    stream = FakeRawInputStream.created[-1]
+    clock.value = 1.0
+    stream.overflowed = True
+    audio_input.read_samples(1)  # detector device: 1 overflow, 750ms estimate
+
+    snapshot = pipeline.snapshot()
+    # Detector device (1, 750.0, 1) + recorder aggregate (3, 300.0, 9).
+    assert snapshot.overflow_count_last_minute == 4
+    assert snapshot.estimated_lost_audio_ms_last_minute == 1050.0
+    assert snapshot.total_overflow_count == 10
 
 
 def test_multi_device_recorder_drops_only_failing_stream(tmp_path: Path) -> None:

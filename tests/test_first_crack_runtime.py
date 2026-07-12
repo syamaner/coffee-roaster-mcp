@@ -386,6 +386,54 @@ def test_runtime_overflow_stats_survive_stop_unlike_live_mic_levels() -> None:
     assert stopped.total_overflow_count == 42
 
 
+def test_runtime_overflow_rolling_fields_decay_60s_after_stop() -> None:
+    """coffee-roaster-mcp#193 review finding: overflow_count_last_minute and
+    estimated_lost_audio_ms_last_minute are contractually a trailing-60-
+    SECOND rolling window (AudioCaptureSnapshot's docstring). Carrying them
+    through unchanged at stop (the sibling test above, task #59) must not
+    leave them frozen forever — a poll 60+ seconds after stop must see them
+    decayed to zero, same as a live rolling window naturally would. The
+    lifetime total_overflow_count is a whole-roast figure, not a rolling
+    one, so it must stay frozen regardless of how long ago capture stopped.
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    pipeline = FakeAudioPipeline(
+        overflow_count_last_minute=7,
+        estimated_lost_audio_ms_last_minute=700.0,
+        total_overflow_count=42,
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            MockDetectorBackend(()),
+        ),
+        monotonic_now=clock.monotonic_now,
+    )
+
+    runtime.start_for_session(session)
+    runtime.stop_for_session(session.id, reason="roast complete")
+
+    # A poll shortly after stop still sees the accurate figures.
+    clock.monotonic_value += 30.0
+    soon_after_stop = runtime.snapshot()
+    assert soon_after_stop.overflow_count_last_minute == 7
+    assert soon_after_stop.estimated_lost_audio_ms_last_minute == 700.0
+    assert soon_after_stop.total_overflow_count == 42
+
+    # A poll 60+ seconds after stop must see the rolling fields decayed —
+    # the lifetime total is untouched.
+    clock.monotonic_value += 31.0
+    long_after_stop = runtime.snapshot()
+    assert long_after_stop.overflow_count_last_minute == 0
+    assert long_after_stop.estimated_lost_audio_ms_last_minute == 0.0
+    assert long_after_stop.total_overflow_count == 42
+
+
 def test_audio_runtime_can_discard_queued_pre_t0_windows() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
