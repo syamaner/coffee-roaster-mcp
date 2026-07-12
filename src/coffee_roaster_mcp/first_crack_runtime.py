@@ -190,6 +190,15 @@ class FirstCrackSessionRuntime:
         #: ``set_recording_metadata`` arrives after this, the WAV names are already
         #: fixed and the late metadata is rejected with a clear warning.
         self._recorder_built_for_session = False
+        #: One-slot mutable box (coffee-roaster-mcp#191) the recorder's
+        #: milestones closure reads at close. process_pending_windows_after_drop
+        #: writes a recovered SESSION-ELAPSED first-crack timestamp here when a
+        #: genuine pre-drop window is classified only after the drop — this
+        #: overrides ONLY the sidecar's first_crack milestone, never
+        #: session.first_crack_monotonic_seconds or the event timeline. Reset to
+        #: a fresh empty box each session so a prior roast's recovery can never
+        #: leak into the next one's sidecar.
+        self._recovered_first_crack_holder: list[float | None] = []
 
     def set_recording_metadata(self, *, origin: str, roast_num: int) -> RecordingMetadata:
         """Store annotation-pipeline metadata for the next roast's recording.
@@ -251,6 +260,9 @@ class FirstCrackSessionRuntime:
             self._inference_stopped = False
             self._last_capture_snapshot = None
             self._last_capture_snapshot_as_of_monotonic_seconds = None
+            # Fresh empty box every session (#191): a prior roast's recovered
+            # milestone must never leak into this one's sidecar.
+            self._recovered_first_crack_holder = []
 
             if self._config.first_crack.mode != "audio":
                 self._status = _initial_status(self._config.first_crack)
@@ -263,6 +275,7 @@ class FirstCrackSessionRuntime:
                 self._config,
                 session,
                 metadata=self._recording_metadata,
+                recovered_first_crack_holder=self._recovered_first_crack_holder,
             )
             self._pending_recorder = recorder
             # Once the recorder exists the WAV names are fixed; a later
@@ -347,6 +360,181 @@ class FirstCrackSessionRuntime:
                         # WAVs. The pipeline finalises at stop_for_session.
                         self._inference_stopped = True
                         break
+            except (AudioCaptureError, FirstCrackDetectorError, SessionLifecycleError) as exc:
+                self._mark_faulted_locked(f"First-crack detection failed: {exc}")
+            except Exception as exc:  # noqa: BLE001 - detector backends vary.
+                self._mark_faulted_locked(
+                    f"First-crack detection failed: {type(exc).__name__}: {exc}"
+                )
+
+            return self.snapshot()
+
+    def process_pending_windows_after_drop(
+        self,
+        *,
+        session_store: RoastSessionStore,
+        session: RoastSession,
+    ) -> FirstCrackRuntimeSnapshot:
+        """Classify queued PRE-drop windows after `beans_dropped` was recorded,
+        recovering a straggler crack into the RECORDING's milestone only.
+
+        coffee-roaster-mcp#191: a first-crack-confirming window can be captured
+        but not yet drained by the poll cadence when an operator/agent-triggered
+        `drop_beans` fires. Draining BEFORE the drop (the naive fix) runs
+        detector inference synchronously ahead of the driver's drop command —
+        delaying a safety-relevant hardware action, which is the wrong trade.
+        This method is the safe alternative: call it AFTER `beans_dropped` is
+        already recorded and the driver drop already issued, so inference never
+        blocks the drop.
+
+        Deliberately does NOT call `integrate_first_crack_window_with_session`
+        or write `session.first_crack_monotonic_seconds` / a
+        `first_crack_detected` timeline event. The session's own phase-ordered
+        event transitions (`_ALLOWED_PHASES_BY_EVENT` in session.py) correctly
+        refuse a first-crack event once phase is "dropped" — recording one
+        there would put the CONTROL timeline out of causal order (nothing can
+        act on a crack classified after the roast already ended) for zero
+        control value. Instead, this writes the recovered timestamp into
+        `_recovered_first_crack_holder`, which ONLY the recorder's sidecar
+        milestone reads at close (see `build_session_recorder`). The session
+        event log and the recording sidecar are different contracts: the
+        session log is the causal control record, the sidecar milestone is
+        annotation metadata for the offline dataset/Label Studio pipeline,
+        where the crack's true position in the WAV is the entire point.
+
+        The exemption is bound on the window's END time (started + duration),
+        NOT its start time: the drop itself is acoustically crack-like (beans
+        cascading into the cooling tray is a burst of sharp transients — the
+        detector's known false-positive class). A window whose capture START
+        predates the drop but whose tail STRADDLES it could contain drop
+        clatter and confirm a phantom crack, which would poison the
+        ANNOTATION dataset even worse than the control timeline — it becomes
+        a training label. A genuinely lost pre-drop window — the case #191
+        actually reports — is a COMPLETE window that finished capturing
+        before the drop and was simply sitting undrained in the queue, so its
+        end time is already ≤ the drop timestamp by construction; the
+        end-time bound keeps that case while rejecting anything that overlaps
+        the drop.
+
+        Args:
+            session_store: Authoritative one-session mutation boundary (used
+                only for the phase-independent observability write, never the
+                timeline).
+            session: The session `beans_dropped` was just recorded on. Must have
+                `beans_dropped_monotonic_seconds` set (the caller records the
+                drop event before calling this).
+
+        Returns:
+            The resulting runtime snapshot.
+        """
+        with self._lock:
+            if not self._can_process_after_drop_locked(session):
+                return self.snapshot()
+            # Detector-paced WAV replay drives windows one at a time on its own
+            # deterministic clock for test/replay use, not a live drop race —
+            # #191's post-drop drain is a live-roast (realtime capture) concern.
+            if _uses_detector_paced_wav_replay(self._config.audio):
+                return self.snapshot()
+
+            pipeline = self._pipeline
+            adapter = self._adapter
+            if pipeline is None or adapter is None:  # pragma: no cover - defensive
+                # _can_process_after_drop_locked already requires status ==
+                # "pending", and every start_for_session path that leaves
+                # pipeline/adapter None also sets status to "unavailable" —
+                # so this is unreachable today; kept as a narrowing guard in
+                # case that invariant ever changes.
+                return self.snapshot()
+
+            drop_monotonic_seconds = session.beans_dropped_monotonic_seconds
+            if drop_monotonic_seconds is None:
+                return self.snapshot()
+            # AudioWindow timestamps are ABSOLUTE monotonic (the capture
+            # pipeline's own clock); session milestones are SESSION-elapsed.
+            # Rebase the drop cutoff into the absolute domain once, the same
+            # transform the session store applies in reverse for FC detection
+            # (session.py's _detected_elapsed_seconds).
+            drop_cutoff_absolute = session.monotonic_start + drop_monotonic_seconds
+            # coffee-roaster-mcp#192: bound the OTHER end too. A window whose
+            # capture started before beans_added must never join the
+            # adapter's confirmation-window candidates here either — the
+            # live path (integrate_first_crack_window_with_session) applies
+            # the same cutoff, but this drain loop calls the adapter
+            # directly and would otherwise let a pre-charge candidate
+            # (empty-drum rattle, charge pour) seed a recovered milestone
+            # once combined with a genuine post-charge confirming window.
+            beans_added_monotonic_seconds = session.beans_added_monotonic_seconds
+            earliest_eligible_absolute = (
+                None
+                if beans_added_monotonic_seconds is None
+                else session.monotonic_start + beans_added_monotonic_seconds
+            )
+
+            try:
+                for window in pipeline.drain_windows():
+                    window_end_absolute = (
+                        window.started_at_monotonic_seconds + window.duration_seconds
+                    )
+                    if window_end_absolute >= drop_cutoff_absolute:
+                        # Straddles, ends exactly at, or postdates the drop:
+                        # its tail may contain drop-clatter transients (a known
+                        # false-positive class) or genuine cooling-phase audio.
+                        # The boundary tie is rejected too — err toward safety
+                        # rather than assume a same-instant end truly missed
+                        # the drop noise. Skip it — only a window that finished
+                        # capturing strictly before the drop is eligible for
+                        # the post-drop exemption.
+                        continue
+                    self._processed_window_count += 1
+                    observation = adapter.process_window_observed(
+                        window,
+                        earliest_eligible_monotonic_seconds=earliest_eligible_absolute,
+                    )
+                    session_store.record_first_crack_window_observation(
+                        session,
+                        window_sequence_number=observation.window_sequence_number,
+                        confidence=observation.confidence,
+                        positive_window_count=observation.positive_window_count,
+                        confirmed=observation.confirmed,
+                        fc_status=observation.fc_status,
+                    )
+                    detection_event = observation.event
+                    if detection_event is None:
+                        continue
+                    # Recovered SESSION-ELAPSED first-crack timestamp: the
+                    # detector's backdated crack onset is absolute monotonic
+                    # (same domain as AudioWindow), so rebase it the same way
+                    # every other session milestone is stored.
+                    recovered_session_elapsed = round(
+                        detection_event.detected_at_monotonic_seconds - session.monotonic_start,
+                        6,
+                    )
+                    self._recovered_first_crack_holder.clear()
+                    self._recovered_first_crack_holder.append(recovered_session_elapsed)
+                    recording_relative_seconds = round(
+                        detection_event.detected_at_monotonic_seconds - drop_cutoff_absolute,
+                        6,
+                    )
+                    _LOGGER.warning(
+                        "First crack recovered from a PRE-DROP window classified only "
+                        "AFTER beans_dropped (coffee-roaster-mcp#191): recovered "
+                        "onset %.3fs relative to the drop (negative = before drop), "
+                        "session-elapsed %.3fs. Recorded into the recording sidecar's "
+                        "first_crack milestone ONLY — the session event log correctly "
+                        "stays silent (a post-drop crack has no control value and "
+                        "would break the timeline's causal order).",
+                        recording_relative_seconds,
+                        recovered_session_elapsed,
+                    )
+                    self._status = "detected"
+                    self._reason = (
+                        "First crack was recovered into the recording milestone from a "
+                        "pre-drop window classified after the drop (#191); the session "
+                        "event log intentionally has no first_crack_detected event for "
+                        "this roast."
+                    )
+                    self._inference_stopped = True
+                    break
             except (AudioCaptureError, FirstCrackDetectorError, SessionLifecycleError) as exc:
                 self._mark_faulted_locked(f"First-crack detection failed: {exc}")
             except Exception as exc:  # noqa: BLE001 - detector backends vary.
@@ -506,6 +694,33 @@ class FirstCrackSessionRuntime:
             return False
         return session.active and session.phase == "roasting"
 
+    def _can_process_after_drop_locked(self, session: RoastSession) -> bool:
+        """Guard for :meth:`process_pending_windows_after_drop` (#191).
+
+        Mirrors ``_can_process_locked`` except the phase check accepts
+        ``"dropped"`` OR ``"cooling"`` instead of ``"roasting"`` — this method
+        exists specifically to run AFTER that transition. Every real driver
+        (mock and Hottop) records ``cooling_started`` in the SAME atomic call
+        as ``beans_dropped`` whenever the driver reports cooling engaged
+        (RoasterSessionStore.complete_reserved_driver_drop_snapshot), which is
+        universal for Hottop's compound drop command (the drum keeps running
+        into cooling, #163) — so by the time this method runs, the session has
+        USUALLY already advanced straight to ``"cooling"``; ``"dropped"``
+        alone is checked too only in case a driver ever reports
+        cooling-not-engaged at drop time. ``session.active`` is not required:
+        a session stays active through cooling, so gating on it here would be
+        redundant, not protective.
+        """
+        if self._config.first_crack.mode != "audio":
+            return False
+        if self._active_session_id != session.id:
+            return False
+        if self._inference_stopped:
+            return False
+        if self._status != "pending":
+            return False
+        return session.phase in ("dropped", "cooling")
+
     def _mark_faulted_locked(self, reason: str) -> None:
         self._status = "faulted"
         self._reason = reason
@@ -594,6 +809,7 @@ def build_session_recorder(
     session: RoastSession,
     *,
     metadata: RecordingMetadata | None = None,
+    recovered_first_crack_holder: list[float | None] | None = None,
 ) -> RoastRecorder | None:
     """Build a per-roast audio recorder for one session, or `None` when disabled.
 
@@ -625,6 +841,16 @@ def build_session_recorder(
             timestamps are read at close to compute recording-relative offsets.
         metadata: Optional annotation-pipeline metadata (origin + roast number).
             Falls back to ``origin=session.id`` and ``roast_num=0`` when omitted.
+        recovered_first_crack_holder: Optional one-slot mutable box
+            (coffee-roaster-mcp#191) that, if set to a non-``None`` monotonic
+            timestamp before the recorder closes, overrides the sidecar's
+            ``first_crack`` milestone WITHOUT touching
+            ``session.first_crack_monotonic_seconds`` or the session event
+            timeline. Recovers a pre-drop crack that was classified only after
+            `beans_dropped` (so it could never legally re-enter the causal,
+            phase-ordered session log) into the RECORDING'S annotation
+            metadata, which is a genuinely separate contract from the control
+            timeline — see `FirstCrackSessionRuntime.process_pending_windows_after_drop`.
 
     Returns:
         A configured recorder, or `None` when recording is disabled or capture
@@ -664,9 +890,13 @@ def build_session_recorder(
         recording_started_monotonic = (
             recorder.started_monotonic_seconds if recorder is not None else None
         )
+        first_crack_override = (
+            recovered_first_crack_holder[0] if recovered_first_crack_holder else None
+        )
         return recording_relative_milestones(
             session,
             recording_started_monotonic_seconds=recording_started_monotonic,
+            first_crack_override_monotonic_seconds=first_crack_override,
         )
 
     # Per-device labels for the annotation session JSON, in device order. The
@@ -730,6 +960,7 @@ def recording_relative_milestones(
     session: RoastSession,
     *,
     recording_started_monotonic_seconds: float | None,
+    first_crack_override_monotonic_seconds: float | None = None,
 ) -> dict[str, float | None]:
     """Return roast milestones in RECORDING-relative seconds for the sidecar.
 
@@ -754,6 +985,14 @@ def recording_relative_milestones(
         session: Live roast session.
         recording_started_monotonic_seconds: The recorder's absolute monotonic
             start instant, or `None` if recording never started.
+        first_crack_override_monotonic_seconds: coffee-roaster-mcp#191 — a
+            SESSION-ELAPSED first-crack timestamp recovered by the post-drop
+            drain, used in place of `session.first_crack_monotonic_seconds`
+            when set. The session's own field is deliberately left untouched
+            (the control timeline never records a post-drop crack), so this is
+            the only way the sidecar can carry a first_crack milestone that a
+            straggler pre-drop window supplied. `None` (the default) falls
+            back to the session's own value, unchanged from prior behavior.
 
     Returns:
         Mapping of milestone name to recording-relative seconds, or `None` when
@@ -769,9 +1008,14 @@ def recording_relative_milestones(
             return None
         return round(value - offset, 6)
 
+    first_crack_session_elapsed = (
+        session.first_crack_monotonic_seconds
+        if first_crack_override_monotonic_seconds is None
+        else first_crack_override_monotonic_seconds
+    )
     return {
         "beans_added": _rebase(session.beans_added_monotonic_seconds),
-        "first_crack": _rebase(session.first_crack_monotonic_seconds),
+        "first_crack": _rebase(first_crack_session_elapsed),
     }
 
 
