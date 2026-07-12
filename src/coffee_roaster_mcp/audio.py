@@ -717,8 +717,19 @@ class MicrophoneAudioInput:
         run if the owning pipeline is `start()`ed again on the same
         instance. Duck-typed by `AudioCapturePipeline._reset_run_state_locked`
         (only microphone inputs report overflows at all).
+
+        Also resets `_last_read_returned_at` (coffee-roaster-mcp#193 review
+        finding, round 2): without this, the first overflowed read of a
+        restarted run computes its gap against the PREVIOUS run's last
+        read — which can be an arbitrarily long real-world pause between
+        roasts — producing one phantom, wildly inflated lost-audio spike
+        that has nothing to do with this run's actual capture behaviour.
+        `None` restores the "no prior read" branch in `read_samples`, which
+        falls back to the read's own nominal duration for that first
+        estimate, exactly like a freshly-constructed input would.
         """
         self._overflow_tracker.reset()
+        self._last_read_returned_at = None
 
     def close(self) -> None:
         """Stop and close the microphone stream.

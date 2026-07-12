@@ -11,7 +11,7 @@ from coffee_roaster_mcp.artifacts import (
     ResolvedArtifact,
     ResolvedDetectorArtifacts,
 )
-from coffee_roaster_mcp.audio import AudioCaptureSnapshot, AudioWindow
+from coffee_roaster_mcp.audio import AudioCaptureError, AudioCaptureSnapshot, AudioWindow
 from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig
 from coffee_roaster_mcp.detector import (
     FirstCrackDetectorAdapter,
@@ -432,6 +432,65 @@ def test_runtime_overflow_rolling_fields_decay_60s_after_stop() -> None:
     assert long_after_stop.overflow_count_last_minute == 0
     assert long_after_stop.estimated_lost_audio_ms_last_minute == 0.0
     assert long_after_stop.total_overflow_count == 42
+
+
+def test_runtime_overflow_rolling_fields_decay_from_last_live_poll_when_stop_itself_fails() -> None:
+    """coffee-roaster-mcp#193 review finding, round 2: decay must be keyed
+    off the AGE of the events behind the aggregate — the LAST LIVE poll
+    that actually observed them — not off time-since-STOP as a proxy.
+    Normally `stop_for_session`'s own `pipeline.stop()` call is itself a
+    fresh live read, so its "as of" instant IS the stop instant. But if
+    `pipeline.stop()` itself RAISES, `_last_capture_snapshot` is never
+    refreshed by that call — it retains whatever the LAST SUCCESSFUL live
+    poll observed, which can be arbitrarily older than "now" the moment
+    stop_for_session returns. Decay must measure from that live poll's
+    true age, not incorrectly reset the clock to the (failed) stop attempt.
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+
+    class _StopFailingPipeline(FakeAudioPipeline):
+        def stop(self, *, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
+            raise AudioCaptureError("device unplugged mid-stop")
+
+    pipeline = _StopFailingPipeline(
+        overflow_count_last_minute=7,
+        estimated_lost_audio_ms_last_minute=700.0,
+        total_overflow_count=42,
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            MockDetectorBackend(()),
+        ),
+        monotonic_now=clock.monotonic_now,
+    )
+
+    runtime.start_for_session(session)
+    # One live poll observes the aggregate — this is the true "as of" instant.
+    live_poll = runtime.snapshot()
+    assert live_poll.overflow_count_last_minute == 7
+
+    # A long stretch passes with capture still running but no further poll —
+    # the aggregate is now 90 seconds old.
+    clock.monotonic_value += 90.0
+
+    # stop_for_session's own pipeline.stop() call RAISES, so it can never
+    # refresh _last_capture_snapshot with a fresh stop-instant read — the
+    # 90-second-old live poll is all that remains.
+    stopped = runtime.stop_for_session(session.id, reason="roast complete")
+    # The stop failure itself faults the runtime; the overflow fields must
+    # still reflect the correctly-decayed 90-second-old aggregate rather
+    # than a value frozen fresh at the (failed) stop instant.
+    assert stopped.status == "faulted"
+    assert stopped.overflow_count_last_minute == 0
+    assert stopped.estimated_lost_audio_ms_last_minute == 0.0
+    # The lifetime total survives regardless of decay.
+    assert stopped.total_overflow_count == 42
 
 
 def test_audio_runtime_can_discard_queued_pre_t0_windows() -> None:

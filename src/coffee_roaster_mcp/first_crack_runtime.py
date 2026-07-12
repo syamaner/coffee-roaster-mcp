@@ -156,14 +156,18 @@ class FirstCrackSessionRuntime:
         self._reason: str | None = _initial_reason(config.first_crack)
         self._processed_window_count = 0
         self._last_capture_snapshot: AudioCaptureSnapshot | None = None
-        #: Wall-clock instant capture was last stopped (#193 review finding).
-        #: Used to decay the rolling "last minute" overflow fields on
-        #: `_stopped_capture_snapshot` — those fields are contractually a
-        #: trailing-60-second rolling window (see `AudioCaptureSnapshot`'s
-        #: docstring), which must not stay frozen at whatever was true at
-        #: the instant capture stopped once real wall-clock time has moved
-        #: the window past every event that contributed to it.
-        self._stopped_at_monotonic_seconds: float | None = None
+        #: Wall-clock instant `_last_capture_snapshot` was captured from a
+        #: LIVE poll (#193 review finding, round 2 — NOT the stop instant:
+        #: an aggregate observed from a live poll seconds or minutes before
+        #: the actual stop() call is already that much older than "now" the
+        #: moment stop happens, and gating decay purely on time-since-STOP
+        #: ignored that staleness). Used to decay the rolling "last minute"
+        #: overflow fields on `_stopped_capture_snapshot` by the true AGE of
+        #: the events that produced the aggregate, not by how long ago
+        #: capture stopped — those fields are contractually a trailing-60-
+        #: second rolling window (see `AudioCaptureSnapshot`'s docstring),
+        #: which must not stay frozen at whatever was true when last polled.
+        self._last_capture_snapshot_as_of_monotonic_seconds: float | None = None
         #: Whether inference/draining has been stopped for this session while the
         #: capture worker + recorder keep running (#181). Set at first-crack
         #: detection so the runtime stops draining/detecting but the recording
@@ -242,7 +246,7 @@ class FirstCrackSessionRuntime:
             self._processed_window_count = 0
             self._inference_stopped = False
             self._last_capture_snapshot = None
-            self._stopped_at_monotonic_seconds = None
+            self._last_capture_snapshot_as_of_monotonic_seconds = None
 
             if self._config.first_crack.mode != "audio":
                 self._status = _initial_status(self._config.first_crack)
@@ -391,6 +395,16 @@ class FirstCrackSessionRuntime:
             capture_snapshot = self._pipeline.snapshot() if self._pipeline is not None else None
             if capture_snapshot is not None:
                 self._last_capture_snapshot = capture_snapshot
+                # coffee-roaster-mcp#193 review finding, round 2: stamp EVERY
+                # live poll, not just the final stop. A live-polled aggregate
+                # is already however old the polling cadence made it by the
+                # time capture actually stops — gating decay purely on
+                # time-since-STOP ignored that: an aggregate observed from a
+                # sparse live poll minutes before stop would incorrectly be
+                # treated as "fresh" for a further 60 seconds after stop.
+                # Decay must be measured from when this aggregate was
+                # actually TRUE (this poll), not from the stop instant.
+                self._last_capture_snapshot_as_of_monotonic_seconds = self._monotonic_now()
             elif self._last_capture_snapshot is not None:
                 capture_snapshot = _stopped_capture_snapshot(self._last_capture_snapshot)
                 # coffee-roaster-mcp#193 review finding: overflow_count_last_minute
@@ -399,16 +413,18 @@ class FirstCrackSessionRuntime:
                 # docstring) — carrying them through unchanged at stop (task #59,
                 # so an operator reviewing right after drop/stop sees the roast's
                 # overflow history) must not leave them frozen forever. Decay them
-                # here, at READ time, based on how long ago capture actually
-                # stopped, rather than baking a point-in-time value into the
-                # snapshot once — a poll seconds after stop still sees the
-                # accurate figure; a poll 60+ seconds later correctly sees it
-                # decayed to zero, same as a live rolling window would. The
-                # lifetime total_overflow_count is untouched — it is a whole-roast
-                # figure, not a rolling one, so it stays frozen by design.
-                if self._stopped_at_monotonic_seconds is not None:
-                    stopped_seconds_ago = self._monotonic_now() - self._stopped_at_monotonic_seconds
-                    if stopped_seconds_ago >= 60.0:
+                # here, at READ time, by the AGE of the events that produced this
+                # aggregate (time since the LAST LIVE POLL that observed it), not
+                # by how long ago capture stopped — a poll seconds after that
+                # live observation still sees the accurate figure; 60+ seconds
+                # after it correctly sees it decayed to zero, same as a live
+                # rolling window would. The lifetime total_overflow_count is
+                # untouched — it is a whole-roast figure, not a rolling one, so
+                # it stays frozen by design.
+                as_of = self._last_capture_snapshot_as_of_monotonic_seconds
+                if as_of is not None:
+                    aggregate_age_seconds = self._monotonic_now() - as_of
+                    if aggregate_age_seconds >= 60.0:
                         capture_snapshot = dataclasses.replace(
                             capture_snapshot,
                             overflow_count_last_minute=0,
@@ -485,10 +501,15 @@ class FirstCrackSessionRuntime:
         pipeline = self._pipeline
         if pipeline is not None:
             try:
+                # pipeline.stop() returns a FINAL LIVE snapshot taken during
+                # the stop call itself, so "now" genuinely is this
+                # aggregate's true as-of instant (#193 review finding,
+                # round 2) — same stamping discipline as every other live
+                # poll in snapshot().
                 self._last_capture_snapshot = _stopped_capture_snapshot(
                     pipeline.stop(timeout_seconds=self._stop_timeout_seconds)
                 )
-                self._stopped_at_monotonic_seconds = self._monotonic_now()
+                self._last_capture_snapshot_as_of_monotonic_seconds = self._monotonic_now()
             except Exception as exc:  # noqa: BLE001 - shutdown should be best effort.
                 self._status = "faulted"
                 self._reason = f"Audio capture stop failed: {type(exc).__name__}: {exc}"

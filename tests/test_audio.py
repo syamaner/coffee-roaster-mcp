@@ -648,6 +648,58 @@ def test_audio_capture_pipeline_resets_overflow_tracking_on_restart() -> None:
     assert fresh_snapshot.estimated_lost_audio_ms_last_minute == 0.0
 
 
+def test_reset_overflow_tracking_clears_the_inter_read_clock_too() -> None:
+    """coffee-roaster-mcp#193 review finding, round 2: resetting the overflow
+    EVENT deque is not enough — without also resetting
+    `_last_read_returned_at`, the first overflowed read of a restarted run
+    computes its gap against the PREVIOUS run's last read, which can be an
+    arbitrarily long real-world pause between roasts (operators can leave a
+    process running idle between roasts for hours). That produces one
+    phantom, wildly inflated lost-audio spike with no relationship to this
+    run's actual capture behaviour.
+    """
+    FakeRawInputStream.created.clear()
+    settings = audio_capture_settings_from_config(AudioConfig(source="microphone", sample_rate=4))
+    clock = ClockHarness()
+    clock.value = 0.0
+    audio_input = MicrophoneAudioInput(
+        settings,
+        sounddevice_module=FakeSoundDeviceModule(),
+        max_consecutive_overflows=10,
+        monotonic_now=lambda: clock.value,
+    )
+    pipeline = AudioCapturePipeline(settings=settings, audio_input=audio_input)
+
+    # Run 1: a single clean read establishes _last_read_returned_at at t=0.0.
+    audio_input.read_samples(1)
+    stream = FakeRawInputStream.created[-1]
+
+    # A long real-world gap between roasts: the operator leaves the process
+    # idle for an hour before starting the next roast.
+    clock.value = 3600.0
+
+    # A fresh restart must reset the inter-read clock, not just the event
+    # deque — otherwise the run-2 stream's first overflowed read below
+    # would compute its gap against t=0.0 (run 1's last read), a ~3600
+    # SECOND phantom gap, instead of correctly falling back to the read's
+    # own nominal duration (the documented "no prior read" behaviour).
+    # Calls the reset hook directly (not the full start()/stop() cycle) to
+    # avoid racing a real background worker thread against this test's own
+    # direct read_samples() calls, per the sibling overflow tests'
+    # documented discipline.
+    pipeline._reset_run_state_locked()  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+
+    stream.overflowed = True
+    audio_input.read_samples(1)  # run 2's first (and only) read: overflowed
+
+    snapshot = audio_input.overflow_snapshot
+    assert snapshot.total_count == 1
+    # Falls back to this read's OWN nominal duration (1 sample @ 4Hz =
+    # 250ms), the documented "no prior read" estimate — not a multi-hour
+    # phantom spike computed against the previous run's clock.
+    assert snapshot.estimated_lost_audio_ms_last_minute == 250.0
+
+
 def test_audio_capture_pipeline_keeps_blocking_consumer_across_restart() -> None:
     audio_input = MutableAudioInput((10.0, 11.0, 12.0, 13.0))
     pipeline = AudioCapturePipeline(
