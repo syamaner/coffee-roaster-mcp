@@ -3,11 +3,14 @@ from __future__ import annotations
 import struct
 import time
 import wave
+from collections import deque
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread, current_thread
+from typing import cast
 
+import numpy as np
 import pytest
 
 from coffee_roaster_mcp import audio as audio_module
@@ -15,6 +18,7 @@ from coffee_roaster_mcp.audio import (
     AudioCaptureError,
     AudioCapturePipeline,
     AudioCaptureSettings,
+    AudioCaptureSnapshot,
     AudioInput,
     DetectorPacedWavReplayPipeline,
     MicrophoneAudioInput,
@@ -480,10 +484,17 @@ def test_audio_capture_pipeline_feeds_detector_windows_from_mock_input() -> None
     assert {window.input_device for window in windows} == {"mock-mic"}
     assert {window.sample_rate for window in windows} == {4}
     assert {window.duration_seconds for window in windows} == {1.0}
-    assert [window.started_at_monotonic_seconds for window in windows] == [101.0, 102.0]
+    # started_at_monotonic_seconds is the TRUE capture-time instant of each
+    # window's first sample (#190 review finding), not the emission-time
+    # instant. At sample_rate=4 the reader's chunk size clamps to 1 sample,
+    # so the clock advances once per stream.read() call: sample 0's read is
+    # the 1st (clock=101.0) and sample 4's read is the 5th (clock=105.0) —
+    # correctly reflecting when each window's audio was actually captured.
+    assert [window.started_at_monotonic_seconds for window in windows] == [101.0, 105.0]
 
 
 def test_audio_capture_pipeline_emits_overlapping_windows_from_mock_input() -> None:
+    clock = ClockHarness()
     audio_input = FiniteAudioInput(tuple(float(value) for value in range(10)))
     pipeline = AudioCapturePipeline(
         settings=AudioCaptureSettings(
@@ -494,6 +505,7 @@ def test_audio_capture_pipeline_emits_overlapping_windows_from_mock_input() -> N
             idle_sleep_seconds=0.001,
         ),
         audio_input=audio_input,
+        monotonic_now=clock.monotonic_now,
     )
 
     pipeline.start()
@@ -507,6 +519,17 @@ def test_audio_capture_pipeline_emits_overlapping_windows_from_mock_input() -> N
         (2.0, 3.0, 4.0, 5.0),
         (4.0, 5.0, 6.0, 7.0),
         (6.0, 7.0, 8.0, 9.0),
+    ]
+    # Overlap (hop=2 < window=4) means _advance_buffered_chunk_bounds must
+    # partially trim a chunk rather than dropping it whole (#190 review
+    # finding coverage). Each sample is its own 1-sample read/chunk at this
+    # sample rate, so each window's start is exactly its first sample's
+    # capture-time read: sample i's read is the (i+1)th clock call.
+    assert [window.started_at_monotonic_seconds for window in windows] == [
+        101.0,
+        103.0,
+        105.0,
+        107.0,
     ]
 
 
@@ -1190,6 +1213,214 @@ def test_stop_join_order_processing_thread_first_then_reader(tmp_path: Path) -> 
     assert processing_thread is not None
     _wait_for(lambda: not reader_thread.is_alive(), timeout_seconds=2.0)
     _wait_for(lambda: not processing_thread.is_alive(), timeout_seconds=2.0)
+
+
+class _GatedRecorder(RoastAudioRecorder):
+    """Recorder double whose write_samples() blocks on an Event until
+    released, letting a test force a controlled reader/processing backlog
+    (#190 review finding: timestamp provenance under backlog)."""
+
+    def __init__(self, *, released: Event, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self._released = released
+
+    def write_samples(self, samples: Sequence[float]) -> None:
+        self._released.wait(timeout=5.0)
+        super().write_samples(samples)
+
+
+def test_window_started_at_reflects_true_capture_time_not_emission_time(
+    tmp_path: Path,
+) -> None:
+    """#190 review finding: AudioWindow.started_at_monotonic_seconds must be
+    the instant its samples were CAPTURED (stamped in the reader thread),
+    not the instant the processing thread got around to emitting a window
+    from them. Forces a real backlog by gating the recorder's write —
+    several chunks queue up in _raw_reads before the processing thread ever
+    touches them — then asserts the emitted window's timestamp matches the
+    EARLY clock value from when its first chunk was actually read, not the
+    LATE value the clock reaches once processing finally drains it.
+    """
+    clock = ClockHarness()
+    released = Event()
+    recorder = _GatedRecorder(
+        released=released,
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.recording.json",
+        sample_rate=4,
+        session_id="s",
+    )
+    # 4 samples = exactly one window at window_seconds=1.0, sample_rate=4.
+    # Read one sample at a time (reader_chunk_sample_count clamps to 1 at
+    # this sample rate), so the clock advances once per chunk captured.
+    audio_input = FiniteAudioInput((0.1, 0.2, 0.3, 0.4))
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+        recorder=recorder,
+        monotonic_now=clock.monotonic_now,
+    )
+
+    pipeline.start()
+    try:
+        # All 4 chunks are read (and stamped) by the reader thread while the
+        # processing thread is blocked on the FIRST recorder write — proving
+        # the reader is never gated by processing. Clock reaches 104.0
+        # (4 reads) before any window is ever assembled.
+        _wait_for(lambda: len(audio_input.read_counts) >= 4, timeout_seconds=5.0)
+        # Now release the gate: the processing thread drains the backlog and
+        # emits the window. If the window were stamped at emission time
+        # (the pre-review-fix bug), its timestamp would reflect however much
+        # LATER the clock has advanced to by the time processing catches up
+        # (calls monotonic_now() again for its own bookkeeping) — not the
+        # true 101.0 capture instant of sample 0.
+        released.set()
+        _wait_for(lambda: pipeline.snapshot().emitted_window_count >= 1, timeout_seconds=5.0)
+    finally:
+        pipeline.stop()
+
+    windows = pipeline.drain_windows()
+    assert len(windows) == 1
+    # Sample 0's read is the reader's 1st call: clock=101.0. This must be
+    # the window's start regardless of how long emission was delayed.
+    assert windows[0].started_at_monotonic_seconds == 101.0
+
+
+class _NumpyArrayAudioInput:
+    """AudioInput double that returns samples as a numpy array rather than a
+    tuple/list (#190 review finding P3). Structurally satisfies the
+    Sequence[float] protocol, but bool(array) raises ValueError for any
+    multi-element array — proves the reader thread's truthiness checks
+    survive an AudioInput implementation that legitimately hands back numpy
+    output directly instead of converting to a plain sequence first."""
+
+    def __init__(self, samples: Sequence[float]) -> None:
+        self._array = np.asarray(samples, dtype=np.float64)
+
+    def read_samples(self, sample_count: int) -> Sequence[float]:
+        chunk = self._array[:sample_count]
+        self._array = self._array[sample_count:]
+        # numpy's ndarray typing doesn't structurally match Sequence[float]
+        # (element access yields np.float64, not float), but it DOES satisfy
+        # the runtime Protocol (len/getitem/iteration) — which is exactly
+        # the case this double exists to exercise. cast documents that gap
+        # rather than papering over it.
+        return cast("Sequence[float]", chunk)
+
+
+def test_reader_survives_numpy_array_input_without_crashing() -> None:
+    """#190 review finding (P3): an AudioInput returning a numpy array must
+    not crash the reader thread's `if not raw_samples:` / `_normalize_samples_block`
+    truthiness checks — those now use explicit len() checks instead."""
+    audio_input = _NumpyArrayAudioInput((0.1, 0.2, 0.3, 0.4))
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+    )
+
+    pipeline.start()
+    try:
+        _wait_for(lambda: pipeline.snapshot().emitted_window_count >= 1, timeout_seconds=5.0)
+    finally:
+        pipeline.stop()
+
+    snapshot = pipeline.snapshot()
+    assert snapshot.latest_error is None
+    windows = pipeline.drain_windows()
+    assert len(windows) == 1
+    assert windows[0].samples == (0.1, 0.2, 0.3, 0.4)
+
+
+def test_process_captured_chunk_skips_bounds_tracking_for_an_empty_chunk() -> None:
+    """An empty _CapturedChunk (samples=()) must not append to
+    _buffered_chunk_bounds — a zero-length chunk-boundary entry would let
+    _chunk_capture_time_at_offset's walk stall on it forever without ever
+    advancing past it. In practice the reader never queues an empty chunk
+    (its own len() guard filters that), but _process_captured_chunk should
+    still be defensively correct if that invariant ever changes."""
+    from coffee_roaster_mcp.audio import _CapturedChunk  # pyright: ignore[reportPrivateUsage]
+
+    audio_input = FiniteAudioInput(())
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(input_device=None, sample_rate=4, window_seconds=1.0),
+        audio_input=audio_input,
+    )
+
+    pipeline._process_captured_chunk(  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+        _CapturedChunk(samples=(), captured_at_monotonic_seconds=100.0)
+    )
+
+    assert pipeline._buffered_chunk_bounds == deque()  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    assert pipeline._sample_buffer == []  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+
+
+def test_stop_drains_queued_backlog_before_finalizing_recorder(tmp_path: Path) -> None:
+    """#190 review finding (P1): stop() must not abandon chunks still
+    queued in _raw_reads when _stop_requested is set — that would truncate
+    up to ~3s of recording TAIL, exactly the drop-clatter / final-crack
+    audio the annotation workflow cares about (stop() is called right at
+    drop). Forces a genuine backlog by gating every recorder write, calls
+    stop() WHILE that backlog exists (from a background thread, since
+    stop() blocks joining), then releases the gate and asserts every
+    sample the reader ever captured still lands in the WAV — none silently
+    dropped by an early processing-thread exit.
+    """
+    released = Event()
+    recorder = _GatedRecorder(
+        released=released,
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.recording.json",
+        sample_rate=4,
+        session_id="s",
+    )
+    audio_input = FiniteAudioInput((0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8))
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=4,
+            window_seconds=1.0,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+        recorder=recorder,
+    )
+
+    pipeline.start()
+    # All 8 chunks are read by the reader thread while the processing thread
+    # is blocked on the FIRST gated recorder write — proving a genuine
+    # backlog builds up in _raw_reads before any of it is processed.
+    _wait_for(lambda: len(audio_input.read_counts) >= 8, timeout_seconds=5.0)
+
+    stop_result: list[AudioCaptureSnapshot] = []
+
+    def call_stop() -> None:
+        stop_result.append(pipeline.stop(timeout_seconds=5.0))
+
+    stop_thread = Thread(target=call_stop)
+    stop_thread.start()
+    # Give stop() a moment to set _stop_requested and block on the join
+    # while the backlog is still fully queued, THEN release the gate — the
+    # exact race #190's drain fix must survive.
+    time.sleep(0.05)
+    released.set()
+    stop_thread.join(timeout=5.0)
+
+    assert not stop_thread.is_alive()
+    assert stop_result
+    assert stop_result[0].latest_error is None
+    values, _, _ = _read_wav_samples(tmp_path / "roast.wav")
+    # All 8 samples must have reached the WAV — none abandoned in the queue.
+    assert len(values) == 8
 
 
 def test_stop_without_start_closes_input_and_is_a_safe_no_op() -> None:

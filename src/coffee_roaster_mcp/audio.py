@@ -9,6 +9,7 @@ import math
 import struct
 import time
 import wave
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -32,6 +33,33 @@ DEFAULT_AUDIO_IDLE_SLEEP_SECONDS = 0.01
 #: growth; a reader that outpaces processing this much for this long
 #: indicates the processing thread itself is starved for a different reason.
 _READER_QUEUE_MAXSIZE = 30
+
+
+@dataclass(frozen=True)
+class _CapturedChunk:
+    """One raw sample block plus the monotonic instant it was CAPTURED.
+
+    coffee-roaster-mcp#190 review finding: under reader/processing backlog
+    (the ``_raw_reads`` queue can hold up to ``_READER_QUEUE_MAXSIZE``
+    chunks), a chunk's samples can sit queued for up to several seconds
+    before the processing thread ever sees them. Stamping capture time in
+    the READER thread — at the ``stream.read()`` call itself, not at
+    eventual window emission — is what lets
+    :class:`AudioWindow`.started_at_monotonic_seconds reflect when the
+    audio was actually captured off the device rather than when the
+    processing thread got around to assembling a window from it. This is
+    the timestamp provenance the coffee-roaster-mcp#191 post-drop drain's
+    end-time bound (and every other consumer of window timestamps) depends
+    on being accurate.
+
+    Attributes:
+        samples: Normalized mono float samples for this chunk.
+        captured_at_monotonic_seconds: Monotonic instant the reader thread's
+            ``stream.read()`` call returned this chunk.
+    """
+
+    samples: tuple[float, ...]
+    captured_at_monotonic_seconds: float
 
 
 class AudioCaptureError(RuntimeError):
@@ -1479,7 +1507,7 @@ class AudioCapturePipeline:
         # A bounded queue here (not unbounded) still lets read() run far more
         # often than the processing work does, while capping memory if the
         # processing thread ever falls meaningfully behind.
-        self._raw_reads: Queue[tuple[float, ...] | None] = Queue(maxsize=_READER_QUEUE_MAXSIZE)
+        self._raw_reads: Queue[_CapturedChunk | None] = Queue(maxsize=_READER_QUEUE_MAXSIZE)
         self._reader_thread: Thread | None = None
         # Fixed small read chunk (independent of the processing thread's
         # buffer state) so read() cadence never depends on how much work the
@@ -1488,6 +1516,14 @@ class AudioCapturePipeline:
         # keep PortAudio's buffer well-drained, large enough not to spin on
         # syscalls.
         self._reader_chunk_sample_count = max(1, round(settings.sample_rate * 0.1))
+        # Chunk-boundary metadata for samples currently sitting in
+        # _sample_buffer, oldest first (#190 review finding). Each entry
+        # covers a contiguous run of samples with a known capture instant;
+        # _emit_complete_windows consults this to derive a window's true
+        # capture-time start instead of stamping it at emission time, which
+        # would drift from reality by however long the chunk sat queued in
+        # _raw_reads under processing backlog.
+        self._buffered_chunk_bounds: deque[tuple[float, int]] = deque()
 
     @property
     def settings(self) -> AudioCaptureSettings:
@@ -1674,7 +1710,17 @@ class AudioCapturePipeline:
         try:
             while not self._stop_requested.is_set():
                 raw_samples = self._audio_input.read_samples(self._reader_chunk_sample_count)
-                if not raw_samples:
+                # Stamp the capture instant IMMEDIATELY on read() returning —
+                # before normalize/queue work — so it reflects when the
+                # device actually produced this audio, not when the
+                # processing thread eventually gets to it (#190 review
+                # finding: under backlog the two can differ by seconds).
+                captured_at = self._monotonic_now()
+                # Explicit len() check, not `if not raw_samples:` (#190
+                # review finding P3) — see _normalize_samples_block's
+                # docstring for why a numpy-array-returning AudioInput would
+                # otherwise crash this thread on a truthiness check.
+                if len(raw_samples) == 0:
                     time.sleep(self._settings.idle_sleep_seconds)
                     continue
                 samples = _normalize_samples_block(raw_samples)
@@ -1684,7 +1730,9 @@ class AudioCapturePipeline:
                 # slowing the reader down is correct back-pressure rather
                 # than silently dropping raw audio the recorder/detector
                 # would otherwise never see at all.
-                self._raw_reads.put(samples)
+                self._raw_reads.put(
+                    _CapturedChunk(samples=samples, captured_at_monotonic_seconds=captured_at)
+                )
         except Exception as exc:  # noqa: BLE001 - backend/validation exceptions vary.
             # Covers both a genuine read failure (device gone, backend error)
             # and a validation failure (_normalize_sample rejecting a
@@ -1717,34 +1765,34 @@ class AudioCapturePipeline:
                 _LOGGER.warning("Roast audio recording start failed; continuing: %s", exc)
                 self._disable_recorder()
         try:
-            while not self._stop_requested.is_set():
+            while True:
+                stop_was_requested = self._stop_requested.is_set()
                 try:
-                    samples = self._raw_reads.get(timeout=self._settings.idle_sleep_seconds)
+                    # #190 review finding (P1): once stop() sets
+                    # _stop_requested, still drain whatever the reader
+                    # already queued rather than exiting immediately —
+                    # otherwise up to _READER_QUEUE_MAXSIZE chunks (~3s of
+                    # audio, e.g. the drop clatter / final crack the
+                    # annotation workflow cares about) are silently
+                    # abandoned. Once stop is requested, poll non-blockingly
+                    # (timeout=0) instead of the normal idle-sleep wait, so
+                    # a genuinely empty queue exits promptly rather than
+                    # waiting out one more idle_sleep_seconds for nothing.
+                    chunk = self._raw_reads.get(
+                        timeout=0 if stop_was_requested else self._settings.idle_sleep_seconds
+                    )
                 except Empty:
+                    if stop_was_requested:
+                        break
                     continue
-                if samples is None:
-                    # Reader-thread shutdown sentinel (see _run_reader_loop).
-                    break
-                self._sample_buffer.extend(samples)
-                # Update the live mic-levels meter from the SAME samples the
-                # detector consumes (#178). Cheap, vectorised, and never raises;
-                # purely observational so it cannot affect detection.
-                self._level_meter.observe(samples)
-                # Tee the SAME samples the detector consumes into the recording
-                # WAV right after the buffer extend (#176). This is the verified
-                # non-disturbing tee point: the detector still windows the buffer
-                # below, untouched. Recording failures must never kill detection,
-                # so a recorder error is logged and capture continues.
-                if self._recorder is not None:
-                    try:
-                        self._recorder.write_samples(samples)
-                    except Exception as exc:  # noqa: BLE001 - recording is best effort.
-                        _LOGGER.warning("Roast audio recording write failed; continuing: %s", exc)
-                        # Finalize what was captured (flush the WAV + write the
-                        # sidecar) BEFORE dropping the recorder, so the partial
-                        # recording is not leaked or lost.
-                        self._disable_recorder()
-                self._emit_complete_windows()
+                if chunk is None:
+                    # Reader-thread shutdown sentinel (see _run_reader_loop):
+                    # the reader is done producing chunks. Keep draining any
+                    # chunks that arrived before the sentinel — put_nowait
+                    # from the reader's finally can still land after a
+                    # backlog, so this is not necessarily the last item.
+                    continue
+                self._process_captured_chunk(chunk)
         except Exception as exc:  # noqa: BLE001 - worker stores error for caller inspection.
             with self._state_lock:
                 self._latest_error = str(exc)
@@ -1756,6 +1804,42 @@ class AudioCapturePipeline:
             if self._recorder is not None:
                 with suppress(Exception):
                     self._recorder.close()
+
+    def _process_captured_chunk(self, chunk: _CapturedChunk) -> None:
+        """Buffer, meter, record, and window one chunk from the reader.
+
+        Extracted from the processing loop's body (#190 review finding P1)
+        so it runs identically whether called from the normal draining loop
+        or from the post-stop drain that empties any backlog left in
+        ``_raw_reads`` before the recorder finalizes.
+        """
+        samples = chunk.samples
+        self._sample_buffer.extend(samples)
+        if samples:
+            # Track this chunk's capture-time provenance alongside the
+            # samples it contributed (#190 review finding), so
+            # _emit_complete_windows can derive a window's TRUE capture-time
+            # start instead of stamping emission time.
+            self._buffered_chunk_bounds.append((chunk.captured_at_monotonic_seconds, len(samples)))
+        # Update the live mic-levels meter from the SAME samples the
+        # detector consumes (#178). Cheap, vectorised, and never raises;
+        # purely observational so it cannot affect detection.
+        self._level_meter.observe(samples)
+        # Tee the SAME samples the detector consumes into the recording WAV
+        # right after the buffer extend (#176). This is the verified
+        # non-disturbing tee point: the detector still windows the buffer
+        # below, untouched. Recording failures must never kill detection, so
+        # a recorder error is logged and capture continues.
+        if self._recorder is not None:
+            try:
+                self._recorder.write_samples(samples)
+            except Exception as exc:  # noqa: BLE001 - recording is best effort.
+                _LOGGER.warning("Roast audio recording write failed; continuing: %s", exc)
+                # Finalize what was captured (flush the WAV + write the
+                # sidecar) BEFORE dropping the recorder, so the partial
+                # recording is not leaked or lost.
+                self._disable_recorder()
+        self._emit_complete_windows()
 
     def _disable_recorder(self) -> None:
         """Finalize and drop the recorder after a best-effort recording failure.
@@ -1775,17 +1859,75 @@ class AudioCapturePipeline:
         window_sample_count = self._settings.window_sample_count
         while len(self._sample_buffer) >= window_sample_count:
             window_samples = tuple(self._sample_buffer[:window_sample_count])
+            # Derive the window's TRUE capture-time start from the first
+            # buffered chunk's capture instant, BEFORE trimming the buffer
+            # (#190 review finding) — not self._monotonic_now(), which would
+            # be the emission instant and can drift from actual capture time
+            # by however long this window's samples sat queued in
+            # _raw_reads under processing backlog.
+            window_started_at = self._chunk_capture_time_at_offset(0)
             del self._sample_buffer[: self._settings.hop_sample_count]
+            self._advance_buffered_chunk_bounds(self._settings.hop_sample_count)
             window = AudioWindow(
                 sequence_number=self._next_sequence_number,
                 input_device=self._settings.input_device,
                 sample_rate=self._settings.sample_rate,
-                started_at_monotonic_seconds=self._monotonic_now(),
+                started_at_monotonic_seconds=window_started_at,
                 duration_seconds=round(window_sample_count / self._settings.sample_rate, 6),
                 samples=window_samples,
             )
             self._next_sequence_number += 1
             self._publish_window(window)
+
+    def _chunk_capture_time_at_offset(self, sample_offset: int) -> float:
+        """Return the capture-time instant of the sample at ``sample_offset``.
+
+        ``_buffered_chunk_bounds`` holds ``(captured_at, chunk_length)`` pairs
+        oldest-first, covering the samples currently in ``_sample_buffer`` in
+        order. Walks forward to find which chunk contains ``sample_offset``,
+        then adds the in-chunk offset (converted to seconds at the configured
+        sample rate) to that chunk's capture instant — an exact answer when
+        one chunk's samples were all captured back-to-back by one
+        ``stream.read()`` call, and a reasonable linear estimate otherwise.
+
+        Falls back to ``self._monotonic_now()`` (the pre-#190-review-fix
+        behavior) only if the bounds tracking is empty — defensive, since
+        every code path that extends ``_sample_buffer`` also appends here.
+
+        Args:
+            sample_offset: Zero-based index into the current sample buffer.
+
+        Returns:
+            The estimated monotonic capture instant for that sample.
+        """
+        remaining_offset = sample_offset
+        for captured_at, chunk_length in self._buffered_chunk_bounds:
+            if remaining_offset < chunk_length:
+                return round(
+                    captured_at + remaining_offset / self._settings.sample_rate,
+                    6,
+                )
+            remaining_offset -= chunk_length
+        return self._monotonic_now()  # pragma: no cover - defensive, see docstring
+
+    def _advance_buffered_chunk_bounds(self, sample_count: int) -> None:
+        """Trim ``_buffered_chunk_bounds`` by ``sample_count`` samples.
+
+        Mirrors ``del self._sample_buffer[:sample_count]`` so the two stay in
+        lockstep: full chunks entirely consumed by the trim are dropped, and
+        a chunk only partially consumed has its recorded length reduced (its
+        capture instant is unchanged — capture time is per-chunk, not
+        re-derived per sample).
+        """
+        remaining = sample_count
+        while remaining > 0 and self._buffered_chunk_bounds:
+            captured_at, chunk_length = self._buffered_chunk_bounds[0]
+            if chunk_length <= remaining:
+                self._buffered_chunk_bounds.popleft()
+                remaining -= chunk_length
+            else:
+                self._buffered_chunk_bounds[0] = (captured_at, chunk_length - remaining)
+                remaining = 0
 
     def _publish_window(self, window: AudioWindow) -> None:
         try:
@@ -1812,6 +1954,7 @@ class AudioCapturePipeline:
             except Empty:
                 break
         self._sample_buffer.clear()
+        self._buffered_chunk_bounds.clear()
         self._next_sequence_number = 0
         self._emitted_window_count = 0
         self._dropped_window_count = 0
@@ -1996,7 +2139,14 @@ def _normalize_samples_block(raw_samples: Sequence[float]) -> tuple[float, ...]:
     Raises:
         AudioCaptureError: If any sample is not finite.
     """
-    if not raw_samples:
+    # Explicit len() check, not `if not raw_samples:` (#190 review finding
+    # P3): AudioInput.read_samples is typed Sequence[float], and a numpy
+    # array satisfies that Protocol structurally — bool(array) raises
+    # ValueError for any multi-element array ("truth value of an array...is
+    # ambiguous"), so a test double or future AudioInput implementation that
+    # legitimately returns samples as a numpy array would crash the reader
+    # thread here instead of failing cleanly (or working at all).
+    if len(raw_samples) == 0:
         return ()
     array = np.asarray(raw_samples, dtype=np.float64)
     if not np.isfinite(array).all():
