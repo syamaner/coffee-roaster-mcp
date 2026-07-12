@@ -10,6 +10,20 @@ The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 ## Changelog
 
+### 0.1.13
+
+- #190 audio-overflow arc: dedicated capture reader thread (blocking-read
+  starvation fixed; measured streaks 16->2), capture-time-stamped windows
+  (block START), drain-on-stop, restart guards (PR #195).
+- fc_status overflow diagnostics: overflow_count_last_minute,
+  estimated_lost_audio_ms_last_minute, total_overflow_count — additive
+  (PR #193).
+- #191 milestone recovery: a pre-drop first-crack window queued at drop time
+  is recovered into the recording sidecar milestone, end-time bounded; the
+  session event log stays causally clean (PR #192). Fixes null
+  milestones.first_crack manifests.
+- Pi 5 soak with the real inference stack tracked as #194 (E11 gate).
+
 ### 0.1.12
 
 - feat(#185): ambient environmental sensor — read a Yoctopuce Yocto-Meteo-V2-C
