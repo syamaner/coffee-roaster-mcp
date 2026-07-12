@@ -487,10 +487,13 @@ def test_audio_capture_pipeline_feeds_detector_windows_from_mock_input() -> None
     # started_at_monotonic_seconds is the TRUE capture-time instant of each
     # window's first sample (#190 review finding), not the emission-time
     # instant. At sample_rate=4 the reader's chunk size clamps to 1 sample,
-    # so the clock advances once per stream.read() call: sample 0's read is
-    # the 1st (clock=101.0) and sample 4's read is the 5th (clock=105.0) —
-    # correctly reflecting when each window's audio was actually captured.
-    assert [window.started_at_monotonic_seconds for window in windows] == [101.0, 105.0]
+    # so the clock advances once per stream.read() call: sample 0's read
+    # RETURNS at the 1st clock call (101.0) and sample 4's read RETURNS at
+    # the 5th (105.0). read_samples() is blocking, so those are block-END
+    # instants — the block-START instant (when this 1-sample/4Hz chunk's
+    # capture actually began, #195 review finding final fold) is 0.25s
+    # earlier: 100.75 and 104.75.
+    assert [window.started_at_monotonic_seconds for window in windows] == [100.75, 104.75]
 
 
 def test_audio_capture_pipeline_emits_overlapping_windows_from_mock_input() -> None:
@@ -523,13 +526,18 @@ def test_audio_capture_pipeline_emits_overlapping_windows_from_mock_input() -> N
     # Overlap (hop=2 < window=4) means _advance_buffered_chunk_bounds must
     # partially trim a chunk rather than dropping it whole (#190 review
     # finding coverage). Each sample is its own 1-sample read/chunk at this
-    # sample rate, so each window's start is exactly its first sample's
-    # capture-time read: sample i's read is the (i+1)th clock call.
+    # sample rate, so a "partial trim" here is trivially the whole 1-sample
+    # chunk — the genuinely-partial-trim-within-a-multi-sample-chunk case is
+    # covered separately (see the dedicated hop-trim test below). Sample i's
+    # read RETURNS at the (i+1)th clock call, but read_samples() is
+    # blocking, so that is the block-END instant; the block-START instant
+    # (#195 review finding, final fold) is 0.25s earlier for this 1-sample/
+    # 4Hz chunk.
     assert [window.started_at_monotonic_seconds for window in windows] == [
-        101.0,
-        103.0,
-        105.0,
-        107.0,
+        100.75,
+        102.75,
+        104.75,
+        106.75,
     ]
 
 
@@ -703,6 +711,54 @@ def test_audio_capture_pipeline_rejects_double_start() -> None:
         pipeline.stop()
 
 
+def test_start_refuses_while_a_previous_readers_thread_is_still_alive() -> None:
+    """coffee-roaster-mcp#195 review finding (final fold): start()'s guard
+    only checked the PROCESSING thread. stop() joins each thread against
+    its own timeout budget — the processing thread is never blocked in a
+    syscall so it exits quickly, but the reader thread CAN genuinely time
+    out while still mid-blocking-read. Checking only the processing thread
+    would let a caller start a SECOND reader thread against the same
+    still-alive input — two threads racing one native PortAudio stream,
+    exactly the corruption the single-reader-owns-reads invariant (#190)
+    exists to prevent.
+    """
+    audio_input = BlockingClosableAudioInput()
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device="mock-mic",
+            sample_rate=4,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+    )
+
+    pipeline.start()
+    assert audio_input.read_started.wait(timeout=1.0)
+    # Deterministically reproduce a timed-out stop() by driving the
+    # processing thread's own exit directly: request stop and join it for
+    # real (it is never blocked in a syscall, and _raw_reads is empty, so
+    # it exits promptly) while the reader is still genuinely blocked in
+    # read() and cannot join within any bounded timeout.
+    processing_thread = pipeline._thread  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    reader_thread = pipeline._reader_thread  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    assert processing_thread is not None
+    assert reader_thread is not None
+    pipeline._stop_requested.set()  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    processing_thread.join(timeout=2.0)
+    assert not processing_thread.is_alive()
+    assert reader_thread.is_alive()
+
+    try:
+        with pytest.raises(AudioCaptureError, match="reader thread"):
+            pipeline.start()
+    finally:
+        # Clean up: release the stuck reader so its thread can actually exit.
+        audio_input.release()
+        worker = audio_input.worker_thread
+        assert worker is not None
+        worker.join(timeout=2.0)
+
+
 def test_audio_capture_pipeline_validates_finite_samples() -> None:
     pipeline = AudioCapturePipeline(
         settings=AudioCaptureSettings(input_device=None, sample_rate=4),
@@ -785,6 +841,66 @@ def test_audio_capture_stop_does_not_close_input_while_worker_reads() -> None:
     assert worker is not None
     worker.join(timeout=1.0)
     assert not worker.is_alive()
+
+
+def test_stop_drains_the_readers_final_chunk_after_a_timed_out_join() -> None:
+    """coffee-roaster-mcp#195 review finding (final fold): the processing
+    thread's own stop-drain uses timeout=0 once _stop_requested is set, so
+    it can observe an EMPTY _raw_reads and exit while the reader thread is
+    still mid-blocking-read. That reader's one remaining chunk then has no
+    consumer — same class as the earlier drain-on-stop fix (#195 P1), one
+    chunk narrower. stop() must drain _raw_reads once more after both
+    threads have joined (or timed out) to recover it.
+    """
+    audio_input = BlockingClosableAudioInput()
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device="mock-mic",
+            sample_rate=4,
+            window_seconds=0.25,  # 1 sample @ 4Hz: the reader's single
+            # chunk (clamped to 1 sample at this rate) is enough to
+            # complete a whole window on its own, keeping this test
+            # focused on drain plumbing rather than buffering more chunks.
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+    )
+
+    pipeline.start()
+    assert audio_input.read_started.wait(timeout=1.0)
+    # Deterministically reproduce the ordering the bug depends on by
+    # driving the two threads directly rather than relying on stop()'s own
+    # timing: request stop and wait for the PROCESSING thread to genuinely
+    # exit (it is never blocked in a syscall, and _raw_reads is empty, so
+    # it exits promptly) WHILE the reader is still parked in its blocking
+    # read.
+    processing_thread = pipeline._thread  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    assert processing_thread is not None
+    pipeline._stop_requested.set()  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    processing_thread.join(timeout=2.0)
+    assert not processing_thread.is_alive()
+
+    # NOW release the reader's blocked read. It finishes, stamps the
+    # chunk, and puts it (plus its shutdown sentinel) into _raw_reads — but
+    # the processing thread that would normally drain that queue has
+    # ALREADY exited. Nothing is consuming _raw_reads at this point except
+    # whatever stop() itself does when the caller eventually calls it.
+    audio_input.release()
+    worker = audio_input.worker_thread
+    assert worker is not None
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+    raw_reads = pipeline._raw_reads  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    assert raw_reads.qsize() == 2  # the chunk + the None sentinel
+
+    # A real stop() call, made by a caller who does not know the reader's
+    # chunk arrived after the processing thread already exited, must still
+    # recover it.
+    pipeline.stop(timeout_seconds=1.0)
+
+    windows = pipeline.drain_windows()
+    assert len(windows) == 1
+    assert windows[0].samples == (0.1,)
 
 
 def _wait_for(predicate: Callable[[], bool], *, timeout_seconds: float = 1.0) -> None:
@@ -1286,9 +1402,12 @@ def test_window_started_at_reflects_true_capture_time_not_emission_time(
 
     windows = pipeline.drain_windows()
     assert len(windows) == 1
-    # Sample 0's read is the reader's 1st call: clock=101.0. This must be
-    # the window's start regardless of how long emission was delayed.
-    assert windows[0].started_at_monotonic_seconds == 101.0
+    # Sample 0's read RETURNS at the reader's 1st clock call (101.0), but
+    # read_samples() is blocking, so that is the block-END instant — the
+    # block-START instant (#195 review finding, final fold) is 0.25s
+    # earlier (1 sample @ 4Hz = 0.25s). This must be the window's start
+    # regardless of how long emission was delayed.
+    assert windows[0].started_at_monotonic_seconds == 100.75
 
 
 def test_discard_pending_audio_drops_backlogged_precharge_samples(tmp_path: Path) -> None:
@@ -1443,6 +1562,48 @@ def test_process_captured_chunk_skips_bounds_tracking_for_an_empty_chunk() -> No
 
     assert pipeline._buffered_chunk_bounds == deque()  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
     assert pipeline._sample_buffer == []  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+
+
+def test_advance_buffered_chunk_bounds_advances_the_remainders_timestamp() -> None:
+    """coffee-roaster-mcp#195 review finding (final fold): a PARTIAL trim of
+    a multi-sample chunk must advance that chunk's recorded capture instant
+    by the trimmed portion's duration, not leave it at the whole original
+    chunk's capture instant. Samples within one chunk were captured
+    back-to-back at the configured sample rate (the same assumption
+    `_chunk_capture_time_at_offset` already makes for reading), so the
+    remainder's first sample was captured
+    `trimmed_samples / sample_rate` seconds AFTER the original stamp.
+    """
+    from coffee_roaster_mcp.audio import _CapturedChunk  # pyright: ignore[reportPrivateUsage]
+
+    # window_seconds=2.0 at sample_rate=4 needs 8 samples per window — this
+    # single 4-sample chunk is not enough to complete one, so
+    # _process_captured_chunk's own _emit_complete_windows() call leaves it
+    # sitting in the buffer for this test to trim directly, isolating
+    # _advance_buffered_chunk_bounds from window-completion side effects.
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(input_device=None, sample_rate=4, window_seconds=2.0),
+        audio_input=FiniteAudioInput(()),
+    )
+    # One chunk of 4 samples, captured starting at t=100.0 (back-to-back at
+    # 4Hz: sample 0 at 100.0, sample 1 at 100.25, sample 2 at 100.5, sample
+    # 3 at 100.75).
+    pipeline._process_captured_chunk(  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+        _CapturedChunk(samples=(0.1, 0.2, 0.3, 0.4), captured_at_monotonic_seconds=100.0)
+    )
+
+    # Trim 2 samples (a PARTIAL trim: 2 of this chunk's 4 samples remain) —
+    # mirrors what _emit_complete_windows does for an overlapping hop that
+    # lands mid-chunk.
+    pipeline._advance_buffered_chunk_bounds(2)  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+
+    remaining_bounds = list(pipeline._buffered_chunk_bounds)  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    assert len(remaining_bounds) == 1
+    remaining_captured_at, remaining_length = remaining_bounds[0]
+    # The remainder is samples 2-3, whose first sample (index 2) was
+    # captured at 100.0 + 2/4 = 100.5 — NOT the original chunk's 100.0.
+    assert remaining_captured_at == 100.5
+    assert remaining_length == 2
 
 
 def test_stop_drains_queued_backlog_before_finalizing_recorder(tmp_path: Path) -> None:
