@@ -170,6 +170,25 @@ class AudioCaptureSnapshot:
         rms_dbfs: Rolling RMS level of the captured stream in dBFS over the most
             recent measurement window, or ``None`` before any samples are read
             (#178). ``-inf`` for pure silence.
+        overflow_count_last_minute: Microphone input-overflow events (#190) in
+            the trailing 60 seconds of wall-clock time, or ``0`` when the audio
+            input does not report overflows (e.g. WAV replay). Surfaces
+            sustained degradation as an operator-visible diagnostic instead of
+            stderr-only warning logs.
+        estimated_lost_audio_ms_last_minute: Estimated milliseconds of audio at
+            risk from overflow events in the trailing 60 seconds. Each
+            overflow event contributes ``max(0, actual_gap - expected_duration)``
+            — the ACTUAL wall-clock gap since the previous read attempt minus
+            what that read's requested sample count should have taken (#190
+            review finding: a fixed single-read-duration estimate can
+            UNDERESTIMATE, not over-, when PortAudio's overflow flag — which
+            covers all loss since the previous read — spans several
+            consecutive overflowed reads during one sustained stall). This is
+            still an estimate, not an exact lost-sample count: PortAudio
+            never reports how many samples were actually dropped.
+        total_overflow_count: Lifetime overflow event count for the current
+            capture run, for a whole-roast severity view alongside the rolling
+            per-minute figures.
     """
 
     running: bool
@@ -179,6 +198,9 @@ class AudioCaptureSnapshot:
     latest_error: str | None
     peak_dbfs: float | None = None
     rms_dbfs: float | None = None
+    overflow_count_last_minute: int = 0
+    estimated_lost_audio_ms_last_minute: float = 0.0
+    total_overflow_count: int = 0
 
 
 def amplitude_to_dbfs(amplitude: float) -> float:
@@ -270,6 +292,146 @@ class _RollingLevelMeter:
         """Clear the retained samples and reported levels for a fresh run."""
         self._samples = np.empty(0, dtype=np.float64)
         self._levels = None
+
+
+@dataclass(frozen=True)
+class OverflowSnapshot:
+    """Rolling and lifetime microphone input-overflow stats (#190).
+
+    Attributes:
+        count_last_minute: Overflow events in the trailing 60 seconds.
+        estimated_lost_audio_ms_last_minute: Estimated at-risk audio in the
+            trailing 60 seconds; see :class:`AudioCaptureSnapshot` for the
+            estimation method (derived from the actual inter-read gap, not a
+            fixed per-read duration — #190 review finding).
+        total_count: Lifetime overflow event count for the capture run.
+    """
+
+    count_last_minute: int
+    estimated_lost_audio_ms_last_minute: float
+    total_count: int
+
+
+def _merge_overflow_snapshots(
+    primary: OverflowSnapshot | None,
+    secondary: OverflowSnapshot | None,
+) -> OverflowSnapshot | None:
+    """Additively combine two overflow snapshots from independent streams.
+
+    coffee-roaster-mcp#193 review finding: the detector device's own
+    overflow tracker and an additional-device aggregate (from
+    `MultiDeviceRoastRecorder`) are two INDEPENDENT streams — neither
+    double-counts the other's events, so their counts/estimated-ms/lifetime
+    totals simply sum. `None` when neither side has anything to report,
+    matching the existing "no overflow-capable input" convention.
+    """
+    if primary is None:
+        return secondary
+    if secondary is None:
+        return primary
+    return OverflowSnapshot(
+        count_last_minute=primary.count_last_minute + secondary.count_last_minute,
+        estimated_lost_audio_ms_last_minute=round(
+            primary.estimated_lost_audio_ms_last_minute
+            + secondary.estimated_lost_audio_ms_last_minute,
+            3,
+        ),
+        total_count=primary.total_count + secondary.total_count,
+    )
+
+
+class _OverflowTracker:
+    """Track microphone input-overflow events over a trailing 60-second window.
+
+    A PortAudio blocking-read overflow (``stream.read()``'s ``overflowed``
+    flag) reports only that input was lost since the previous read, never how
+    many samples — so each event's "lost audio" contribution is estimated
+    from the ACTUAL wall-clock gap since the previous read attempt (see
+    :class:`AudioCaptureSnapshot` for the estimation method — #190 review
+    finding: a fixed single-read-duration estimate can underestimate a
+    multi-interval stall). Events older than 60 seconds of WALL-CLOCK time
+    (not roast-elapsed time) are excluded from the rolling figures so they
+    reflect genuinely recent degradation, matching the #190 report's
+    "per-minute" framing.
+
+    WRITER/READER SPLIT (#190 safety review) — CORRECTED: ``observe_overflow``
+    runs only on the audio-input's own read call (the single capture-owning
+    thread); ``snapshot`` is called from other threads (the processing
+    thread's periodic status reads). A first pass at this class reasoned that
+    ``snapshot`` never *mutating* ``_events`` made it safe to read
+    lock-free — but that missed that ``snapshot`` still *iterates* over
+    ``_events`` (to filter the trailing-60s window), and ``deque`` iteration
+    is NOT safe against a concurrent mutation on another thread even when
+    each individual append/popleft is itself atomic: Python explicitly raises
+    ``RuntimeError: deque mutated during iteration`` if a writer's
+    ``popleft()`` lands mid-iteration on the reader thread — a genuine crash
+    risk under exactly the sustained-overflow conditions #190 is about
+    (frequent ``observe_overflow`` calls racing a concurrent ``snapshot``
+    poll). Both methods now hold ``_lock`` for their full body, which is
+    correct AND still cheap: the critical section is a handful of `deque`
+    operations, never I/O or anything GIL-releasing, so contention is brief
+    even under a real overflow storm.
+    """
+
+    def __init__(self, *, monotonic_now: Callable[[], float] | None = None) -> None:
+        """Configure the tracker.
+
+        Args:
+            monotonic_now: Optional monotonic clock supplier for tests.
+        """
+        self._monotonic_now = monotonic_now or time.monotonic
+        self._events: deque[tuple[float, float]] = deque()
+        self._total_count = 0
+        self._lock = Lock()
+
+    def observe_overflow(self, *, estimated_lost_audio_ms: float) -> None:
+        """Record one overflow event with its estimated lost-audio duration.
+
+        Thread-safe: holds the tracker's lock for its full body (see the
+        class docstring for why a mutation-only guarantee isn't enough).
+        """
+        now = self._monotonic_now()
+        with self._lock:
+            self._events.append((now, estimated_lost_audio_ms))
+            self._total_count += 1
+            cutoff = now - 60.0
+            while self._events and self._events[0][0] < cutoff:
+                self._events.popleft()
+
+    def reset(self) -> None:
+        """Clear all tracked overflow events and the lifetime count.
+
+        coffee-roaster-mcp#193 review finding: a `MicrophoneAudioInput` can
+        outlive a single roast (the owning `AudioCapturePipeline` can be
+        `start()`ed more than once against the same input), so
+        `total_overflow_count` — documented as "lifetime... for the CURRENT
+        capture run" — must never carry a prior run's overflow history into
+        a fresh one. Thread-safe for the same reason `observe_overflow`/
+        `snapshot` are: called from `_reset_run_state_locked`, which itself
+        runs under the pipeline's own state lock, but this lock is held too
+        for defence in depth and symmetry with the other mutating method.
+        """
+        with self._lock:
+            self._events.clear()
+            self._total_count = 0
+
+    def snapshot(self) -> OverflowSnapshot:
+        """Return the current rolling and lifetime overflow stats.
+
+        Thread-safe: holds the tracker's lock for its full body — including
+        the iteration over ``_events`` — so this can never race a concurrent
+        ``observe_overflow`` mutation on another thread (see the class
+        docstring).
+        """
+        cutoff = self._monotonic_now() - 60.0
+        with self._lock:
+            recent = [lost for observed_at, lost in self._events if observed_at >= cutoff]
+            total_count = self._total_count
+        return OverflowSnapshot(
+            count_last_minute=len(recent),
+            estimated_lost_audio_ms_last_minute=round(sum(recent), 3),
+            total_count=total_count,
+        )
 
 
 def audio_capture_settings_from_config(
@@ -462,6 +624,7 @@ class MicrophoneAudioInput:
         *,
         sounddevice_module: Any | None = None,
         max_consecutive_overflows: int = _DEFAULT_MAX_CONSECUTIVE_OVERFLOWS,
+        monotonic_now: Callable[[], float] | None = None,
     ) -> None:
         """Configure a microphone input that opens lazily on first read.
 
@@ -472,6 +635,8 @@ class MicrophoneAudioInput:
                 capture faults. A transient overflow is logged and the captured
                 samples are still returned; only a sustained run (the device cannot
                 keep up at all) raises ``AudioCaptureError``.
+            monotonic_now: Optional monotonic clock supplier for tests (#190
+                overflow-tracker rolling window).
         """
         _validate_settings(settings)
         self._settings = settings
@@ -480,6 +645,19 @@ class MicrophoneAudioInput:
         self._max_consecutive_overflows = max_consecutive_overflows
         self._consecutive_overflows = 0
         self._close_lock = Lock()
+        self._monotonic_now = monotonic_now or time.monotonic
+        #: Per-minute overflow diagnostics (#190), read by the capture pipeline
+        #: each loop tick and surfaced in AudioCaptureSnapshot / fc_status so
+        #: sustained degradation is operator-visible, not just stderr.
+        self._overflow_tracker = _OverflowTracker(monotonic_now=monotonic_now)
+        #: Wall-clock instant the previous read_samples() call returned, or
+        #: None before the first read. Used to estimate lost audio from the
+        #: ACTUAL inter-read gap (#190 review finding), not just this read's
+        #: nominal requested duration — PortAudio's overflowed flag can cover
+        #: loss accumulated across MULTIPLE consecutive overflowed reads, so a
+        #: single-read-duration estimate can genuinely underestimate for a
+        #: multi-interval stall (the opposite of "upper bound").
+        self._last_read_returned_at: float | None = None
 
     def _ensure_stream(self) -> Any:
         if self._stream is not None:
@@ -515,12 +693,33 @@ class MicrophoneAudioInput:
         except Exception as exc:  # noqa: BLE001 - backend exceptions vary by platform.
             # A genuine read failure (device gone, backend error) is still fatal.
             raise AudioCaptureError(f"Could not read microphone audio source: {exc}") from exc
+        read_returned_at = self._monotonic_now()
         if overflowed:
             # Transient: the device dropped some input but `raw_data` still holds
             # the samples it captured. Log, count, and keep going rather than
             # killing capture for the whole roast; only a sustained run of
             # consecutive overflows (the device cannot keep up at all) faults.
             self._consecutive_overflows += 1
+            # PortAudio's overflowed flag reports only that input was lost
+            # SINCE THE PREVIOUS READ, which can span multiple consecutive
+            # overflowed reads during a genuine multi-second stall — so a
+            # single-read-duration estimate can UNDERESTIMATE for a
+            # multi-interval gap (#190 review finding: the prior "upper
+            # bound" framing was backwards). Estimate instead from the
+            # ACTUAL wall-clock gap since the previous read attempt: the
+            # portion of that gap beyond what this read's requested sample
+            # count should have taken is exactly the time PortAudio's ring
+            # buffer was filling unread. Clamped to >= 0 and falls back to
+            # this read's nominal duration when there is no prior read to
+            # compare against (the first read of a run) — see
+            # OverflowSnapshot's docstring for the estimate's honest bounds.
+            expected_duration_ms = 1000.0 * sample_count / self._settings.sample_rate
+            if self._last_read_returned_at is None:
+                estimated_lost_audio_ms = expected_duration_ms
+            else:
+                actual_gap_ms = 1000.0 * (read_returned_at - self._last_read_returned_at)
+                estimated_lost_audio_ms = max(0.0, actual_gap_ms - expected_duration_ms)
+            self._overflow_tracker.observe_overflow(estimated_lost_audio_ms=estimated_lost_audio_ms)
             _LOGGER.warning(
                 "Microphone audio input overflowed (%d consecutive); continuing.",
                 self._consecutive_overflows,
@@ -533,7 +732,38 @@ class MicrophoneAudioInput:
                 )
         else:
             self._consecutive_overflows = 0
+        # Update on EVERY read (overflowed or not) so the next call's gap
+        # estimate is always measured from the most recent read, not a stale
+        # earlier one.
+        self._last_read_returned_at = read_returned_at
         return tuple(float(sample[0]) for sample in struct.iter_unpack("f", bytes(raw_data)))
+
+    @property
+    def overflow_snapshot(self) -> OverflowSnapshot:
+        """Return current rolling and lifetime overflow stats (#190)."""
+        return self._overflow_tracker.snapshot()
+
+    def reset_overflow_tracking(self) -> None:
+        """Clear overflow history so a reused input starts each run fresh.
+
+        coffee-roaster-mcp#193 review finding: this input's lifetime spans
+        as long as it is referenced, which can be more than one capture
+        run if the owning pipeline is `start()`ed again on the same
+        instance. Duck-typed by `AudioCapturePipeline._reset_run_state_locked`
+        (only microphone inputs report overflows at all).
+
+        Also resets `_last_read_returned_at` (coffee-roaster-mcp#193 review
+        finding, round 2): without this, the first overflowed read of a
+        restarted run computes its gap against the PREVIOUS run's last
+        read — which can be an arbitrarily long real-world pause between
+        roasts — producing one phantom, wildly inflated lost-audio spike
+        that has nothing to do with this run's actual capture behaviour.
+        `None` restores the "no prior read" branch in `read_samples`, which
+        falls back to the read's own nominal duration for that first
+        estimate, exactly like a freshly-constructed input would.
+        """
+        self._overflow_tracker.reset()
+        self._last_read_returned_at = None
 
     def close(self) -> None:
         """Stop and close the microphone stream.
@@ -918,6 +1148,20 @@ class _IndependentCaptureStream:
         """Return this stream's WAV writer."""
         return self._writer
 
+    @property
+    def overflow_snapshot(self) -> OverflowSnapshot | None:
+        """Return this stream's overflow diagnostics, if its input reports them.
+
+        coffee-roaster-mcp#193 review finding: each additional device opens
+        its OWN `MicrophoneAudioInput` with its own overflow tracker — duck-
+        typed the same way `AudioCapturePipeline.snapshot()` reads the
+        detector device's, since only microphone inputs report overflows.
+        """
+        return cast(
+            "OverflowSnapshot | None",
+            getattr(self._audio_input, "overflow_snapshot", None),
+        )
+
     def start(self) -> None:
         """Open the WAV and spawn the capture thread."""
         self._writer.begin()
@@ -1246,6 +1490,46 @@ class MultiDeviceRoastRecorder:
         return self._started_monotonic_seconds
 
     @property
+    def overflow_snapshot(self) -> OverflowSnapshot | None:
+        """Return overflow diagnostics AGGREGATED across additional devices.
+
+        coffee-roaster-mcp#193 review finding: the pipeline's own
+        `overflow_snapshot` (surfaced in fc_status) only covers the
+        detector device — this recorder's additional independently-captured
+        streams (#176 option A) each have their own `MicrophoneAudioInput`
+        and were previously invisible to any diagnostic. Additive fix:
+        `AudioCapturePipeline.snapshot()` duck-types this property on the
+        recorder and folds it into the detector device's own figures, so no
+        existing caller/contract changes shape — a recorder with no
+        additional devices (or none reporting overflows) returns `None`,
+        which the pipeline already treats as "nothing to add".
+
+        The detector device's OWN overflow stats are NOT included here —
+        they belong to the pipeline's audio input, not this recorder, so
+        summing them at both layers would double-count. This aggregates
+        only the streams THIS recorder independently owns.
+
+        Counts and estimated-lost-ms are summed (additive across streams);
+        the lifetime total is summed too. `None` when there are no
+        additional devices, or none of them report overflows (e.g. all
+        fake/non-microphone inputs in tests).
+        """
+        snapshots = [
+            snapshot
+            for stream in self._additional_streams
+            if (snapshot := stream.overflow_snapshot) is not None
+        ]
+        if not snapshots:
+            return None
+        return OverflowSnapshot(
+            count_last_minute=sum(snapshot.count_last_minute for snapshot in snapshots),
+            estimated_lost_audio_ms_last_minute=round(
+                sum(snapshot.estimated_lost_audio_ms_last_minute for snapshot in snapshots), 3
+            ),
+            total_count=sum(snapshot.total_count for snapshot in snapshots),
+        )
+
+    @property
     def additional_wav_paths(self) -> tuple[Path, ...]:
         """Return the WAV paths for the independently-captured devices."""
         return tuple(stream.writer.wav_path for stream in self._additional_streams)
@@ -1435,6 +1719,14 @@ class _LazyAdditionalAudioInput:
         self._device = device
         self._factory = factory
         self._input: AudioInput | None = None
+        #: Last observed overflow snapshot, cached at close() (#193 review
+        #: finding). close() drops `_input` so a post-close read of a
+        #: LIVE property would silently go None — this stream's overflow
+        #: history must survive close the same way the pipeline's own
+        #: overflow stats survive stop() (task #59), so an operator
+        #: reviewing a roast right after it ends still sees every device's
+        #: figures, not just the detector's.
+        self._closed_overflow_snapshot: OverflowSnapshot | None = None
 
     def read_samples(self, sample_count: int) -> Sequence[float]:
         """Open the input on first call, then read up to `sample_count` samples."""
@@ -1445,8 +1737,26 @@ class _LazyAdditionalAudioInput:
     def close(self) -> None:
         """Close the underlying input if it was opened."""
         if self._input is not None:
+            self._closed_overflow_snapshot = cast(
+                "OverflowSnapshot | None",
+                getattr(self._input, "overflow_snapshot", None),
+            )
             _close_audio_input_if_supported(self._input)
             self._input = None
+
+    @property
+    def overflow_snapshot(self) -> OverflowSnapshot | None:
+        """Return the wrapped input's overflow diagnostics, if any (#193).
+
+        Live while the input is open; the last-observed value once closed
+        (see `_closed_overflow_snapshot`). `None` before the input has ever
+        been opened, or when it does not report overflows at all — duck-
+        typed identically to every other `overflow_snapshot` accessor in
+        this module.
+        """
+        if self._input is None:
+            return self._closed_overflow_snapshot
+        return cast("OverflowSnapshot | None", getattr(self._input, "overflow_snapshot", None))
 
 
 class AudioCapturePipeline:
@@ -1771,6 +2081,25 @@ class AudioCapturePipeline:
         # meter is written outside _state_lock by the capture worker, so two
         # separate property reads could tear; one tuple read cannot.
         levels = self._level_meter.levels
+        # Overflow diagnostics (#190) are only reported by microphone inputs;
+        # duck-type the optional property so WAV replay and other AudioInput
+        # implementations (including test doubles) need not carry it.
+        overflow = cast(
+            "OverflowSnapshot | None",
+            getattr(self._audio_input, "overflow_snapshot", None),
+        )
+        # coffee-roaster-mcp#193 review finding: independently-captured
+        # additional recording devices (#176 option A) each own a separate
+        # microphone input whose overflow stats were previously invisible —
+        # duck-type the recorder's own aggregate (MultiDeviceRoastRecorder
+        # exposes one; a plain RoastAudioRecorder or test double does not,
+        # which _merge_overflow_snapshots treats identically to "nothing to
+        # add") and fold it in additively alongside the detector device's.
+        recorder_overflow = cast(
+            "OverflowSnapshot | None",
+            getattr(self._recorder, "overflow_snapshot", None),
+        )
+        overflow = _merge_overflow_snapshots(overflow, recorder_overflow)
         with self._state_lock:
             # Both threads must be alive for capture to be genuinely running
             # (#190): if the reader thread has died (e.g. a fatal overflow
@@ -1791,6 +2120,11 @@ class AudioCapturePipeline:
                 latest_error=self._latest_error,
                 peak_dbfs=None if levels is None else levels[0],
                 rms_dbfs=None if levels is None else levels[1],
+                overflow_count_last_minute=0 if overflow is None else overflow.count_last_minute,
+                estimated_lost_audio_ms_last_minute=(
+                    0.0 if overflow is None else overflow.estimated_lost_audio_ms_last_minute
+                ),
+                total_overflow_count=0 if overflow is None else overflow.total_count,
             )
 
     def _run_reader_loop(self) -> None:
@@ -2111,6 +2445,18 @@ class AudioCapturePipeline:
         self._dropped_window_count = 0
         self._latest_error = None
         self._level_meter.reset()
+        # coffee-roaster-mcp#193 review finding: a pipeline instance can be
+        # start()ed more than once against the SAME audio input (see
+        # test_audio_capture_pipeline_resets_run_state_on_restart) — without
+        # this, overflow diagnostics from a PRIOR run leak into a fresh
+        # roast's total_overflow_count and rolling last-minute figures,
+        # exactly the stale-state class this method already guards against
+        # for windows/buffers/the level meter. Duck-typed the same way
+        # `AudioCapturePipeline.snapshot()` reads `overflow_snapshot` —
+        # only microphone inputs report overflows.
+        reset_overflow_tracking = getattr(self._audio_input, "reset_overflow_tracking", None)
+        if reset_overflow_tracking is not None:
+            reset_overflow_tracking()
 
 
 class DetectorPacedWavReplayPipeline(AudioCapturePipeline):

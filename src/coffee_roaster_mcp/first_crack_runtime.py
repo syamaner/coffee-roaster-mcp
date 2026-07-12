@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,6 +92,18 @@ class FirstCrackRuntimeSnapshot:
             silence. Lets a mis-gained / dead mic be caught under real conditions.
         mic_rms_dbfs: Live rolling RMS level of the captured mic stream in dBFS
             (#178), or ``None`` when no audio capture is running.
+        overflow_count_last_minute: Microphone input-overflow events (#190) in
+            the trailing 60 seconds, or ``0`` when no audio capture is running
+            or the input does not report overflows. Surfaces sustained
+            degradation (e.g. under CPU contention) as an operator-visible
+            diagnostic instead of stderr-only warning logs.
+        estimated_lost_audio_ms_last_minute: Estimated milliseconds of audio at
+            risk from overflow events in the trailing 60 seconds. See
+            :class:`~coffee_roaster_mcp.audio.OverflowSnapshot` for the
+            estimation method (derived from the actual inter-read gap).
+        total_overflow_count: Lifetime overflow event count for the current
+            capture run, for a whole-roast severity view alongside the rolling
+            per-minute figures.
     """
 
     status: FirstCrackRuntimeState
@@ -103,6 +117,9 @@ class FirstCrackRuntimeSnapshot:
     processed_window_count: int = 0
     mic_peak_dbfs: float | None = None
     mic_rms_dbfs: float | None = None
+    overflow_count_last_minute: int = 0
+    estimated_lost_audio_ms_last_minute: float = 0.0
+    total_overflow_count: int = 0
 
 
 class FirstCrackSessionRuntime:
@@ -115,6 +132,7 @@ class FirstCrackSessionRuntime:
         audio_pipeline_factory: FirstCrackAudioPipelineFactory | None = None,
         detector_adapter_factory: FirstCrackDetectorAdapterFactory | None = None,
         stop_timeout_seconds: float = 1.0,
+        monotonic_now: Callable[[], float] | None = None,
     ) -> None:
         """Initialize a session-owned first-crack runtime.
 
@@ -123,6 +141,9 @@ class FirstCrackSessionRuntime:
             audio_pipeline_factory: Optional test double for audio capture.
             detector_adapter_factory: Optional test double for detector adapter construction.
             stop_timeout_seconds: Maximum seconds to wait for capture shutdown.
+            monotonic_now: Optional monotonic clock supplier for tests. Used
+                to decay the rolling overflow fields on the post-stop
+                snapshot (coffee-roaster-mcp#193 review finding).
         """
         self._config = config
         self._audio_pipeline_factory = audio_pipeline_factory or self._build_default_audio_pipeline
@@ -130,6 +151,7 @@ class FirstCrackSessionRuntime:
             detector_adapter_factory or _build_released_detector_adapter
         )
         self._stop_timeout_seconds = stop_timeout_seconds
+        self._monotonic_now = monotonic_now or time.monotonic
         self._lock = RLock()
         self._active_session_id: str | None = None
         self._pipeline: FirstCrackAudioPipeline | None = None
@@ -138,6 +160,18 @@ class FirstCrackSessionRuntime:
         self._reason: str | None = _initial_reason(config.first_crack)
         self._processed_window_count = 0
         self._last_capture_snapshot: AudioCaptureSnapshot | None = None
+        #: Wall-clock instant `_last_capture_snapshot` was captured from a
+        #: LIVE poll (#193 review finding, round 2 — NOT the stop instant:
+        #: an aggregate observed from a live poll seconds or minutes before
+        #: the actual stop() call is already that much older than "now" the
+        #: moment stop happens, and gating decay purely on time-since-STOP
+        #: ignored that staleness). Used to decay the rolling "last minute"
+        #: overflow fields on `_stopped_capture_snapshot` by the true AGE of
+        #: the events that produced the aggregate, not by how long ago
+        #: capture stopped — those fields are contractually a trailing-60-
+        #: second rolling window (see `AudioCaptureSnapshot`'s docstring),
+        #: which must not stay frozen at whatever was true when last polled.
+        self._last_capture_snapshot_as_of_monotonic_seconds: float | None = None
         #: Whether inference/draining has been stopped for this session while the
         #: capture worker + recorder keep running (#181). Set at first-crack
         #: detection so the runtime stops draining/detecting but the recording
@@ -216,6 +250,7 @@ class FirstCrackSessionRuntime:
             self._processed_window_count = 0
             self._inference_stopped = False
             self._last_capture_snapshot = None
+            self._last_capture_snapshot_as_of_monotonic_seconds = None
 
             if self._config.first_crack.mode != "audio":
                 self._status = _initial_status(self._config.first_crack)
@@ -374,8 +409,41 @@ class FirstCrackSessionRuntime:
             capture_snapshot = self._pipeline.snapshot() if self._pipeline is not None else None
             if capture_snapshot is not None:
                 self._last_capture_snapshot = capture_snapshot
+                # coffee-roaster-mcp#193 review finding, round 2: stamp EVERY
+                # live poll, not just the final stop. A live-polled aggregate
+                # is already however old the polling cadence made it by the
+                # time capture actually stops — gating decay purely on
+                # time-since-STOP ignored that: an aggregate observed from a
+                # sparse live poll minutes before stop would incorrectly be
+                # treated as "fresh" for a further 60 seconds after stop.
+                # Decay must be measured from when this aggregate was
+                # actually TRUE (this poll), not from the stop instant.
+                self._last_capture_snapshot_as_of_monotonic_seconds = self._monotonic_now()
             elif self._last_capture_snapshot is not None:
                 capture_snapshot = _stopped_capture_snapshot(self._last_capture_snapshot)
+                # coffee-roaster-mcp#193 review finding: overflow_count_last_minute
+                # and estimated_lost_audio_ms_last_minute are contractually a
+                # trailing-60-SECOND rolling window (see AudioCaptureSnapshot's
+                # docstring) — carrying them through unchanged at stop (task #59,
+                # so an operator reviewing right after drop/stop sees the roast's
+                # overflow history) must not leave them frozen forever. Decay them
+                # here, at READ time, by the AGE of the events that produced this
+                # aggregate (time since the LAST LIVE POLL that observed it), not
+                # by how long ago capture stopped — a poll seconds after that
+                # live observation still sees the accurate figure; 60+ seconds
+                # after it correctly sees it decayed to zero, same as a live
+                # rolling window would. The lifetime total_overflow_count is
+                # untouched — it is a whole-roast figure, not a rolling one, so
+                # it stays frozen by design.
+                as_of = self._last_capture_snapshot_as_of_monotonic_seconds
+                if as_of is not None:
+                    aggregate_age_seconds = self._monotonic_now() - as_of
+                    if aggregate_age_seconds >= 60.0:
+                        capture_snapshot = dataclasses.replace(
+                            capture_snapshot,
+                            overflow_count_last_minute=0,
+                            estimated_lost_audio_ms_last_minute=0.0,
+                        )
             status = self._status
             reason = self._reason
             if (
@@ -414,6 +482,15 @@ class FirstCrackSessionRuntime:
                 processed_window_count=self._processed_window_count,
                 mic_peak_dbfs=mic_peak_dbfs,
                 mic_rms_dbfs=mic_rms_dbfs,
+                overflow_count_last_minute=0
+                if capture_snapshot is None
+                else capture_snapshot.overflow_count_last_minute,
+                estimated_lost_audio_ms_last_minute=0.0
+                if capture_snapshot is None
+                else capture_snapshot.estimated_lost_audio_ms_last_minute,
+                total_overflow_count=0
+                if capture_snapshot is None
+                else capture_snapshot.total_overflow_count,
             )
 
     def _can_process_locked(self, session: RoastSession) -> bool:
@@ -438,9 +515,15 @@ class FirstCrackSessionRuntime:
         pipeline = self._pipeline
         if pipeline is not None:
             try:
+                # pipeline.stop() returns a FINAL LIVE snapshot taken during
+                # the stop call itself, so "now" genuinely is this
+                # aggregate's true as-of instant (#193 review finding,
+                # round 2) — same stamping discipline as every other live
+                # poll in snapshot().
                 self._last_capture_snapshot = _stopped_capture_snapshot(
                     pipeline.stop(timeout_seconds=self._stop_timeout_seconds)
                 )
+                self._last_capture_snapshot_as_of_monotonic_seconds = self._monotonic_now()
             except Exception as exc:  # noqa: BLE001 - shutdown should be best effort.
                 self._status = "faulted"
                 self._reason = f"Audio capture stop failed: {type(exc).__name__}: {exc}"
@@ -714,6 +797,12 @@ def _stopped_capture_snapshot(snapshot: AudioCaptureSnapshot) -> AudioCaptureSna
     # A stopped capture carries no LIVE mic levels: the meter's last values are
     # stale once capture stops, so drop them (the runtime snapshot also gates the
     # levels on ``audio_running``, so a stale value would never surface anyway).
+    #
+    # Overflow stats (#190 review finding) are the OPPOSITE case — they are
+    # exactly what an operator wants to review right after drop/stop, not a
+    # live-only signal to discard. Carry them through unchanged so fc_status
+    # doesn't silently zero out the roast's overflow history the moment
+    # capture stops, which is precisely when it matters most.
     return AudioCaptureSnapshot(
         running=False,
         queued_window_count=snapshot.queued_window_count,
@@ -722,6 +811,9 @@ def _stopped_capture_snapshot(snapshot: AudioCaptureSnapshot) -> AudioCaptureSna
         latest_error=snapshot.latest_error,
         peak_dbfs=None,
         rms_dbfs=None,
+        overflow_count_last_minute=snapshot.overflow_count_last_minute,
+        estimated_lost_audio_ms_last_minute=snapshot.estimated_lost_audio_ms_last_minute,
+        total_overflow_count=snapshot.total_overflow_count,
     )
 
 

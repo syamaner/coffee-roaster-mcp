@@ -11,7 +11,7 @@ from coffee_roaster_mcp.artifacts import (
     ResolvedArtifact,
     ResolvedDetectorArtifacts,
 )
-from coffee_roaster_mcp.audio import AudioCaptureSnapshot, AudioWindow
+from coffee_roaster_mcp.audio import AudioCaptureError, AudioCaptureSnapshot, AudioWindow
 from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig
 from coffee_roaster_mcp.detector import (
     FirstCrackDetectorAdapter,
@@ -53,12 +53,18 @@ class FakeAudioPipeline:
         running_after_stop: bool = False,
         peak_dbfs: float | None = None,
         rms_dbfs: float | None = None,
+        overflow_count_last_minute: int = 0,
+        estimated_lost_audio_ms_last_minute: float = 0.0,
+        total_overflow_count: int = 0,
     ) -> None:
         self._windows = list(windows)
         self.latest_error = latest_error
         self.running_after_stop = running_after_stop
         self.peak_dbfs = peak_dbfs
         self.rms_dbfs = rms_dbfs
+        self.overflow_count_last_minute = overflow_count_last_minute
+        self.estimated_lost_audio_ms_last_minute = estimated_lost_audio_ms_last_minute
+        self.total_overflow_count = total_overflow_count
         self.started = False
         self.stopped = False
         self.stop_reasons: list[float] = []
@@ -103,6 +109,9 @@ class FakeAudioPipeline:
             latest_error=self.latest_error,
             peak_dbfs=self.peak_dbfs,
             rms_dbfs=self.rms_dbfs,
+            overflow_count_last_minute=self.overflow_count_last_minute,
+            estimated_lost_audio_ms_last_minute=self.estimated_lost_audio_ms_last_minute,
+            total_overflow_count=self.total_overflow_count,
         )
 
 
@@ -343,6 +352,153 @@ def test_runtime_mic_levels_are_live_only_and_none_after_stop() -> None:
     # The last capture snapshot is retained, but the stale levels are not surfaced.
     assert stopped.mic_peak_dbfs is None
     assert stopped.mic_rms_dbfs is None
+
+
+def test_runtime_overflow_stats_survive_stop_unlike_live_mic_levels() -> None:
+    """Overflow stats (#190 review finding) are the OPPOSITE of mic levels:
+    they must SURVIVE stop_for_session, not go None/zero. An operator
+    reviewing a roast right after drop/stop is exactly when the roast's
+    overflow history matters most — zeroing it out at the moment it's
+    needed would be a real observability gap.
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    pipeline = FakeAudioPipeline(
+        overflow_count_last_minute=7,
+        estimated_lost_audio_ms_last_minute=700.0,
+        total_overflow_count=42,
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            MockDetectorBackend(()),
+        ),
+    )
+
+    runtime.start_for_session(session)
+    live = runtime.snapshot()
+    assert live.overflow_count_last_minute == 7
+    assert live.estimated_lost_audio_ms_last_minute == 700.0
+    assert live.total_overflow_count == 42
+
+    stopped = runtime.stop_for_session(session.id, reason="roast complete")
+    assert stopped.audio_running is False
+    # Unlike mic_peak_dbfs/mic_rms_dbfs (live-only, correctly None here),
+    # overflow stats carry through unchanged.
+    assert stopped.overflow_count_last_minute == 7
+    assert stopped.estimated_lost_audio_ms_last_minute == 700.0
+    assert stopped.total_overflow_count == 42
+
+
+def test_runtime_overflow_rolling_fields_decay_60s_after_stop() -> None:
+    """coffee-roaster-mcp#193 review finding: overflow_count_last_minute and
+    estimated_lost_audio_ms_last_minute are contractually a trailing-60-
+    SECOND rolling window (AudioCaptureSnapshot's docstring). Carrying them
+    through unchanged at stop (the sibling test above, task #59) must not
+    leave them frozen forever — a poll 60+ seconds after stop must see them
+    decayed to zero, same as a live rolling window naturally would. The
+    lifetime total_overflow_count is a whole-roast figure, not a rolling
+    one, so it must stay frozen regardless of how long ago capture stopped.
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    pipeline = FakeAudioPipeline(
+        overflow_count_last_minute=7,
+        estimated_lost_audio_ms_last_minute=700.0,
+        total_overflow_count=42,
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            MockDetectorBackend(()),
+        ),
+        monotonic_now=clock.monotonic_now,
+    )
+
+    runtime.start_for_session(session)
+    runtime.stop_for_session(session.id, reason="roast complete")
+
+    # A poll shortly after stop still sees the accurate figures.
+    clock.monotonic_value += 30.0
+    soon_after_stop = runtime.snapshot()
+    assert soon_after_stop.overflow_count_last_minute == 7
+    assert soon_after_stop.estimated_lost_audio_ms_last_minute == 700.0
+    assert soon_after_stop.total_overflow_count == 42
+
+    # A poll 60+ seconds after stop must see the rolling fields decayed —
+    # the lifetime total is untouched.
+    clock.monotonic_value += 31.0
+    long_after_stop = runtime.snapshot()
+    assert long_after_stop.overflow_count_last_minute == 0
+    assert long_after_stop.estimated_lost_audio_ms_last_minute == 0.0
+    assert long_after_stop.total_overflow_count == 42
+
+
+def test_runtime_overflow_rolling_fields_decay_from_last_live_poll_when_stop_itself_fails() -> None:
+    """coffee-roaster-mcp#193 review finding, round 2: decay must be keyed
+    off the AGE of the events behind the aggregate — the LAST LIVE poll
+    that actually observed them — not off time-since-STOP as a proxy.
+    Normally `stop_for_session`'s own `pipeline.stop()` call is itself a
+    fresh live read, so its "as of" instant IS the stop instant. But if
+    `pipeline.stop()` itself RAISES, `_last_capture_snapshot` is never
+    refreshed by that call — it retains whatever the LAST SUCCESSFUL live
+    poll observed, which can be arbitrarily older than "now" the moment
+    stop_for_session returns. Decay must measure from that live poll's
+    true age, not incorrectly reset the clock to the (failed) stop attempt.
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+
+    class _StopFailingPipeline(FakeAudioPipeline):
+        def stop(self, *, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
+            raise AudioCaptureError("device unplugged mid-stop")
+
+    pipeline = _StopFailingPipeline(
+        overflow_count_last_minute=7,
+        estimated_lost_audio_ms_last_minute=700.0,
+        total_overflow_count=42,
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            MockDetectorBackend(()),
+        ),
+        monotonic_now=clock.monotonic_now,
+    )
+
+    runtime.start_for_session(session)
+    # One live poll observes the aggregate — this is the true "as of" instant.
+    live_poll = runtime.snapshot()
+    assert live_poll.overflow_count_last_minute == 7
+
+    # A long stretch passes with capture still running but no further poll —
+    # the aggregate is now 90 seconds old.
+    clock.monotonic_value += 90.0
+
+    # stop_for_session's own pipeline.stop() call RAISES, so it can never
+    # refresh _last_capture_snapshot with a fresh stop-instant read — the
+    # 90-second-old live poll is all that remains.
+    stopped = runtime.stop_for_session(session.id, reason="roast complete")
+    # The stop failure itself faults the runtime; the overflow fields must
+    # still reflect the correctly-decayed 90-second-old aggregate rather
+    # than a value frozen fresh at the (failed) stop instant.
+    assert stopped.status == "faulted"
+    assert stopped.overflow_count_last_minute == 0
+    assert stopped.estimated_lost_audio_ms_last_minute == 0.0
+    # The lifetime total survives regardless of decay.
+    assert stopped.total_overflow_count == 42
 
 
 def test_audio_runtime_can_discard_queued_pre_t0_windows() -> None:
