@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -13,10 +14,18 @@ import pytest
 from mcp.server.fastmcp import FastMCP
 
 from coffee_roaster_mcp.ambient_runtime import AmbientRuntimeSnapshot, AmbientRuntimeState
+from coffee_roaster_mcp.artifacts import ResolvedArtifact, ResolvedDetectorArtifacts
+from coffee_roaster_mcp.audio import AudioCaptureSnapshot, AudioWindow
+from coffee_roaster_mcp.config import AppConfig, FirstCrackConfig
+from coffee_roaster_mcp.detector import (
+    FirstCrackDetectorOutput,
+    build_first_crack_detector_adapter,
+)
 from coffee_roaster_mcp.drivers import EmergencyStopResult, MockRoasterDriver, RoasterState
 from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackRuntimeSnapshot,
     FirstCrackRuntimeState,
+    FirstCrackSessionRuntime,
 )
 from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
@@ -1310,6 +1319,212 @@ def test_blocked_drop_command_does_not_block_emergency_stop(tmp_path: Path) -> N
     ]
 
 
+class _QueuedWindowAudioPipeline:
+    """Fake audio pipeline exposing detector windows queued after construction.
+
+    Models the real race behind coffee-roaster-mcp#191: a first-crack-confirming
+    window was already captured but the poll cadence has not drained it yet.
+    Appends to a SHARED call-order log so a test can prove drain_windows runs
+    strictly after the driver's drop_beans call, never before it.
+    """
+
+    def __init__(self, *, call_order: list[str]) -> None:
+        self._windows: list[AudioWindow] = []
+        self._call_order = call_order
+        self.stopped = False
+
+    def queue_window(self, window: AudioWindow) -> None:
+        self._windows.append(window)
+
+    def start(self) -> AudioCaptureSnapshot:
+        return self.snapshot()
+
+    def stop(self, *, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
+        self.stopped = True
+        self._call_order.append("pipeline.stop")
+        return self.snapshot()
+
+    def drain_windows(self, *, max_windows: int | None = None) -> tuple[AudioWindow, ...]:
+        self._call_order.append("pipeline.drain_windows")
+        drained = tuple(self._windows)
+        self._windows.clear()
+        return drained
+
+    def snapshot(self) -> AudioCaptureSnapshot:
+        return AudioCaptureSnapshot(
+            running=not self.stopped,
+            queued_window_count=len(self._windows),
+            emitted_window_count=1,
+            dropped_window_count=0,
+            latest_error=None,
+            peak_dbfs=None,
+            rms_dbfs=None,
+        )
+
+
+class _OneShotDetectorBackend:
+    """Backend double confirming first crack on the first window it sees."""
+
+    def __init__(self, *, call_order: list[str]) -> None:
+        self._call_order = call_order
+
+    def detect(self, window: AudioWindow) -> FirstCrackDetectorOutput:  # noqa: ARG002
+        self._call_order.append("detector.detect")
+        return FirstCrackDetectorOutput(confirmed=True, confidence=0.97)
+
+
+def _resolved_detector_artifacts_for_test() -> ResolvedDetectorArtifacts:
+    return ResolvedDetectorArtifacts(
+        onnx_model=ResolvedArtifact(
+            repo_id="syamaner/coffee-first-crack-detection",
+            revision="v0.1.0",
+            filename="onnx/int8/model_quantized.onnx",
+            local_path=Path("/tmp/model_quantized.onnx"),
+        ),
+        feature_extractor_config=ResolvedArtifact(
+            repo_id="syamaner/coffee-first-crack-detection",
+            revision="v0.1.0",
+            filename="onnx/int8/preprocessor_config.json",
+            local_path=Path("/tmp/preprocessor_config.json"),
+        ),
+    )
+
+
+def test_drop_beans_never_delays_drop_and_never_writes_a_session_fc_event(
+    tmp_path: Path,
+) -> None:
+    """Regression (coffee-roaster-mcp#191), option 1 per the safety review.
+
+    Two properties, proved together against ONE shared call-order log:
+
+    1. The driver's `drop_beans()` call happens BEFORE any detector inference
+       runs — a confirming window queued pre-drop must never delay the
+       hardware drop command itself (the naive pre-drop-drain fix traded a
+       lost milestone for a delayed drop; that trade is rejected).
+    2. The session event log stays untouched: NO first_crack_detected event
+       is ever recorded for a window classified after the drop, by design —
+       recovery happens only in the recording sidecar's milestone (see
+       test_first_crack_runtime.py for that half, driven through the real
+       recorder), never on the causal, phase-ordered control timeline.
+    """
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+
+    call_order: list[str] = []
+    driver = RecordingRoasterDriver()
+    driver.actions = call_order  # share the SAME list the pipeline/detector append to
+    object.__setattr__(server_context, "roaster_driver", driver)
+
+    pipeline = _QueuedWindowAudioPipeline(call_order=call_order)
+    backend = _OneShotDetectorBackend(call_order=call_order)
+    real_runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts_for_test(),
+            backend,
+        ),
+    )
+    object.__setattr__(server_context, "first_crack_runtime", real_runtime)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    call_order.clear()  # only the drop_beans call itself matters from here
+
+    # Queue the confirming window AFTER beans_added (so it postdates session
+    # start) and with a short duration ending comfortably before the drop
+    # fires moments below — a genuinely complete pre-drop window that was
+    # simply sitting undrained. No get_roast_state poll runs here: the poll
+    # cadence has not drained it, matching the real #191 race.
+    # A generous 1s safety margin absorbs real wall-clock overhead in the
+    # drop_beans call itself (session-store locking, event validation, the
+    # mock driver call) between "now" and when beans_dropped is actually
+    # recorded, so the window's END is unambiguously before the drop cutoff.
+    pipeline.queue_window(
+        AudioWindow(
+            sequence_number=1,
+            input_device="fake-mic",
+            sample_rate=16_000,
+            started_at_monotonic_seconds=time.monotonic() - 1.0,
+            duration_seconds=0.001,
+            samples=(0.0,) * 16_000,
+        )
+    )
+    drop_result = _call_tool(server, "drop_beans", ctx)
+
+    # Property 1: the driver's drop_beans() ran BEFORE any inference/drain.
+    assert "drop_beans" in call_order
+    assert "detector.detect" in call_order
+    assert call_order.index("drop_beans") < call_order.index("detector.detect")
+    assert call_order.index("drop_beans") < call_order.index("pipeline.drain_windows")
+
+    # Property 2: the session event log stays untouched — no post-drop
+    # first_crack_detected, regardless of how confidently the classifier
+    # confirmed the pre-drop window.
+    state = _call_tool(server, "get_roast_state", ctx, session_id=drop_result.session_id)
+    assert [event.kind for event in state.events] == [
+        "beans_added",
+        "beans_dropped",
+        "cooling_started",
+    ]
+    assert state.first_crack_at_utc is None
+
+
+def test_drop_beans_ignores_a_window_that_straddles_the_drop(tmp_path: Path) -> None:
+    """A window whose capture END is at/after the drop is rejected, even
+    though its START predates it (coffee-roaster-mcp#191): the drop itself is
+    acoustically crack-like (cascading beans), so a straddling window's tail
+    could contain drop clatter — a phantom milestone would poison the
+    annotation dataset. Only a window that finished capturing strictly before
+    the drop is eligible for the post-drop recovery.
+    """
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+
+    call_order: list[str] = []
+    pipeline = _QueuedWindowAudioPipeline(call_order=call_order)
+    backend = _OneShotDetectorBackend(call_order=call_order)
+    real_runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts_for_test(),
+            backend,
+        ),
+    )
+    object.__setattr__(server_context, "first_crack_runtime", real_runtime)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+
+    # Queue a window whose START is now (before the drop call below), but
+    # whose 10s duration carries its END well past the drop — a straddler.
+    pipeline.queue_window(
+        AudioWindow(
+            sequence_number=1,
+            input_device="fake-mic",
+            sample_rate=16_000,
+            started_at_monotonic_seconds=time.monotonic(),
+            duration_seconds=10.0,
+            samples=(0.0,) * 16_000,
+        )
+    )
+    drop_result = _call_tool(server, "drop_beans", ctx)
+
+    assert "detector.detect" not in call_order
+    state = _call_tool(server, "get_roast_state", ctx, session_id=drop_result.session_id)
+    assert "first_crack_detected" not in [event.kind for event in state.events]
+    assert state.first_crack_at_utc is None
+
+
 def test_stop_cooling_uses_driver_cooling_state_before_completing(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
@@ -1677,6 +1892,7 @@ class FakeFirstCrackRuntime:
         self.active_session_id: str | None = None
         self.started_sessions: list[str] = []
         self.processed_sessions: list[str] = []
+        self.processed_after_drop_sessions: list[bool] = []
         self.stopped_sessions: list[str] = []
         self.discarded_sessions: list[str] = []
 
@@ -1699,6 +1915,22 @@ class FakeFirstCrackRuntime:
         ):
             session_store.record_event_snapshot(session, "first_crack_detected")
             self.status = "detected"
+        return self.snapshot()
+
+    def process_pending_windows_after_drop(
+        self,
+        *,
+        session_store: RoastSessionStore,
+        session: RoastSession,
+    ) -> FirstCrackRuntimeSnapshot:
+        """No-op double for the coffee-roaster-mcp#191 post-drop drain.
+
+        Real callers never write a session event here (that's the whole
+        point — see FirstCrackSessionRuntime.process_pending_windows_after_drop),
+        so this fake simply records the call and returns the current snapshot.
+        """
+        del session_store, session
+        self.processed_after_drop_sessions.append(True)
         return self.snapshot()
 
     def stop_for_session(self, session_id: str, *, reason: str) -> FirstCrackRuntimeSnapshot:

@@ -772,6 +772,21 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _require_active_session(server_context)
         event, snapshot = _run_reserved_driver_drop(server_context, session)
+        # coffee-roaster-mcp#191: classify any detector window captured BEFORE
+        # this drop but not yet drained by the poll cadence, so a genuine
+        # pre-drop first crack is not silently lost from the RECORDING'S
+        # milestone. Deliberately AFTER the drop command above (never before
+        # it) — inference must never delay a safety-relevant hardware drop.
+        # `session` already carries beans_dropped_monotonic_seconds from the
+        # mutation above, which bounds acceptance to windows that finished
+        # capturing strictly before the drop. This never writes
+        # first_crack_detected to the session event log — see
+        # process_pending_windows_after_drop's docstring for why that stays
+        # untouched by design.
+        server_context.first_crack_runtime.process_pending_windows_after_drop(
+            session_store=server_context.session_store,
+            session=session,
+        )
         server_context.first_crack_runtime.stop_for_session(
             snapshot.id,
             reason="beans dropped",

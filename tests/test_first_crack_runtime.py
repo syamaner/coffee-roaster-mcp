@@ -1001,6 +1001,292 @@ def test_built_recorder_writes_recording_relative_milestones(tmp_path: Path) -> 
     assert sidecar["milestones"]["first_crack"] == round(95.5 - recording_start_session_elapsed, 6)
 
 
+def test_recording_relative_milestones_first_crack_override_bypasses_session_field() -> None:
+    """recording_relative_milestones's override wins over session.first_crack_monotonic_seconds
+    without ever touching the session field itself (coffee-roaster-mcp#191)."""
+    from coffee_roaster_mcp.first_crack_runtime import recording_relative_milestones
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+
+    # The session's own field stays None (a post-drop crack never writes it).
+    assert session.first_crack_monotonic_seconds is None
+
+    milestones = recording_relative_milestones(
+        session,
+        recording_started_monotonic_seconds=None,
+        first_crack_override_monotonic_seconds=42.5,
+    )
+
+    assert milestones["first_crack"] == 42.5
+    assert session.first_crack_monotonic_seconds is None  # still untouched
+
+    # Omitting the override falls back to the session's own value, unchanged.
+    session.first_crack_monotonic_seconds = 10.0
+    fallback = recording_relative_milestones(session, recording_started_monotonic_seconds=None)
+    assert fallback["first_crack"] == 10.0
+
+
+def test_built_recorder_recovers_first_crack_milestone_from_holder_not_session(
+    tmp_path: Path,
+) -> None:
+    """End to end (coffee-roaster-mcp#191): a value written into the
+    recovered_first_crack_holder overrides the sidecar's first_crack
+    milestone WITHOUT ever writing session.first_crack_monotonic_seconds or a
+    first_crack_detected timeline event — proving the recording and the
+    session event log are genuinely independent contracts, exactly as
+    process_pending_windows_after_drop relies on.
+    """
+    import json
+
+    from coffee_roaster_mcp.config import RecordingConfig
+    from coffee_roaster_mcp.first_crack_runtime import build_session_recorder
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    recovered_first_crack_holder: list[float | None] = []
+    recorder = build_session_recorder(
+        AppConfig(
+            recording=RecordingConfig(
+                enabled=True,
+                autocapture=True,
+                export_location=tmp_path,
+                sample_rate=8,
+            ),
+        ),
+        session,
+        recovered_first_crack_holder=recovered_first_crack_holder,
+    )
+    assert recorder is not None
+
+    recorder.begin()
+    recording_started = recorder.started_monotonic_seconds
+    assert recording_started is not None
+    recording_start_session_elapsed = recording_started - session.monotonic_start
+
+    session.beans_added_monotonic_seconds = 12.0
+    store.record_event(session, "beans_added")
+    store.record_event(session, "beans_dropped")
+    assert session.phase == "dropped"
+    # Simulate process_pending_windows_after_drop writing a recovered
+    # SESSION-ELAPSED first-crack timestamp into the holder — never into
+    # session.first_crack_monotonic_seconds and never as a timeline event.
+    recovered_first_crack_holder.append(95.5)
+
+    recorder.write_samples((0.1,) * 8)
+    recorder.close()
+
+    sidecar = json.loads(
+        (tmp_path / session.id / "roast.recording.json").read_text(encoding="utf-8")
+    )
+    assert sidecar["milestones"]["first_crack"] == round(95.5 - recording_start_session_elapsed, 6)
+    # The control-timeline contract stays untouched by the recovery.
+    assert session.first_crack_monotonic_seconds is None
+    assert "first_crack_detected" not in [event.kind for event in session.event_timeline]
+
+
+def test_process_pending_windows_after_drop_recovers_holder_and_logs_loudly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """process_pending_windows_after_drop recovers the holder and logs a
+    WARNING breadcrumb (coffee-roaster-mcp#191): a complete pre-drop window
+    (end <= drop cutoff) is classified after beans_dropped, written into
+    _recovered_first_crack_holder, and never touches the session timeline.
+    """
+    import logging
+
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(
+                confirmed=True, confidence=0.94, detected_at_monotonic_seconds=506.0
+            ),
+        )
+    )
+    # The window's end (505.0 + 1.0 = 506.0) is strictly before the drop at
+    # session-elapsed 20.0 (absolute 520.0) — a genuinely complete pre-drop
+    # window, the case #191 reports.
+    pipeline = FakeAudioPipeline(
+        (_audio_window(sequence_number=1, started_at_monotonic_seconds=505.0),)
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+    )
+    runtime.start_for_session(session)
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 520.0
+    store.record_event(session, "beans_dropped")
+    assert session.phase == "dropped"
+
+    with caplog.at_level(logging.WARNING, logger="coffee_roaster_mcp.first_crack_runtime"):
+        result = runtime.process_pending_windows_after_drop(session_store=store, session=session)
+
+    assert result.status == "detected"
+    assert any(
+        "recovered" in record.message and "coffee-roaster-mcp#191" in record.message
+        for record in caplog.records
+    )
+    # Backdated crack onset (window seq 1 starts at 505.0, absolute) rebased
+    # into SESSION-ELAPSED: 505.0 - session.monotonic_start (500.0) = 5.0.
+    recovered_holder = runtime._recovered_first_crack_holder  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    assert recovered_holder == [5.0]
+    # The control timeline stays untouched — the whole point of #191's fix.
+    assert session.first_crack_monotonic_seconds is None
+    assert [event.kind for event in session.event_timeline] == ["beans_added", "beans_dropped"]
+
+
+def test_process_pending_windows_after_drop_rejects_a_straddling_window() -> None:
+    """A window whose END is at/after the drop is rejected (coffee-roaster-mcp#191):
+    the drop's own cascading-beans clatter is acoustically crack-like, so a
+    straddling window's tail could confirm a phantom milestone."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    backend = MockDetectorBackend(
+        (
+            FirstCrackDetectorOutput(
+                confirmed=True, confidence=0.94, detected_at_monotonic_seconds=506.0
+            ),
+        )
+    )
+    # started_at=505.0 + duration=20.0 => end=525.0, AFTER the drop at
+    # session-elapsed 20.0 (absolute 520.0) — a straddler.
+    pipeline = FakeAudioPipeline(
+        (
+            AudioWindow(
+                sequence_number=1,
+                input_device="fake-mic",
+                sample_rate=16_000,
+                started_at_monotonic_seconds=505.0,
+                duration_seconds=20.0,
+                samples=(0.0,) * 16_000,
+            ),
+        )
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+    )
+    runtime.start_for_session(session)
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 520.0
+    store.record_event(session, "beans_dropped")
+
+    result = runtime.process_pending_windows_after_drop(session_store=store, session=session)
+
+    assert result.status != "detected"
+    recovered_holder = runtime._recovered_first_crack_holder  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    assert recovered_holder == []
+    assert session.first_crack_monotonic_seconds is None
+    assert backend.windows == []  # the detector was never even invoked
+
+
+def test_process_pending_windows_after_drop_skips_detector_paced_wav_replay() -> None:
+    """Detector-paced WAV replay is a test/replay concern with its own
+    deterministic clock, not a live drop race — the post-drop drain no-ops
+    for it rather than draining against a mismatched clock domain (#191)."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    pipeline = FakeAudioPipeline((_audio_window(sequence_number=1),))
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+            audio=AudioConfig(
+                source="wav",
+                wav_path=Path("replay.wav"),
+                replay_mode="detector_paced",
+            ),
+        ),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            MockDetectorBackend(()),
+        ),
+    )
+    runtime.start_for_session(session)
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 520.0
+    store.record_event(session, "beans_dropped")
+
+    result = runtime.process_pending_windows_after_drop(session_store=store, session=session)
+
+    assert result.status == "pending"
+    assert pipeline.drain_limits == []  # never even drained
+
+
+def test_process_pending_windows_after_drop_noops_when_mode_is_not_audio() -> None:
+    """A non-audio first-crack mode is a safe no-op (#191): the "pending"
+    status/pipeline pair this method needs never exists outside audio mode."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="disabled")),
+    )
+    runtime.start_for_session(session)
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 520.0
+    store.record_event(session, "beans_dropped")
+
+    result = runtime.process_pending_windows_after_drop(session_store=store, session=session)
+
+    assert result.status == "disabled"
+
+
+def test_process_pending_windows_after_drop_noops_without_a_drop_timestamp() -> None:
+    """A session somehow reaching 'dropped'/'cooling' phase without
+    beans_dropped_monotonic_seconds set is defensive-only, but must still
+    no-op safely rather than crash (#191)."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    pipeline = FakeAudioPipeline((_audio_window(sequence_number=1),))
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            MockDetectorBackend(()),
+        ),
+    )
+    runtime.start_for_session(session)
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 520.0
+    store.record_event(session, "beans_dropped")
+    # Force the defensive gap directly: a real store always sets this
+    # alongside the phase transition, so this line only guards against a
+    # future refactor breaking that invariant.
+    session.beans_dropped_monotonic_seconds = None
+
+    result = runtime.process_pending_windows_after_drop(session_store=store, session=session)
+
+    assert result.status == "pending"
+    assert pipeline.drain_limits == []  # never even drained
+
+
 def test_build_session_recorder_multi_device(tmp_path: Path) -> None:
     from coffee_roaster_mcp.audio import MultiDeviceRoastRecorder
     from coffee_roaster_mcp.config import RecordingConfig
