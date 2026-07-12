@@ -1659,25 +1659,44 @@ def test_microphone_audio_input_overflow_snapshot_tracks_overflows() -> None:
         assert baseline.count_last_minute == 0
         assert baseline.total_count == 0
 
-        audio_input.read_samples(1)  # opens the stream; clean read
+        audio_input.read_samples(1)  # opens the stream; clean read at t=0.0
         stream = FakeRawInputStream.created[-1]
+        # Advance the clock BEYOND the expected 250ms-per-sample duration
+        # before each overflowed read, so the actual-gap-based estimate
+        # (#190 review finding) has a genuine gap to measure — a clock that
+        # never advances (the old test) always yields the fixed
+        # single-read-duration estimate, which is exactly the semantics this
+        # fix replaced.
+        clock.value = 1.0  # gap since last read: 1000ms
         stream.overflowed = True
         audio_input.read_samples(1)  # one overflowed read of 1 sample @ 4Hz
+        clock.value = 2.0  # gap since last read: another 1000ms
         stream.overflowed = True
         audio_input.read_samples(1)  # a second overflowed read
 
         snapshot = audio_input.overflow_snapshot
         assert snapshot.count_last_minute == 2
         assert snapshot.total_count == 2
-        # Each overflow is an upper-bound estimate of one read's expected
-        # duration: 1 sample @ 4Hz = 250ms, so two overflows = 500ms.
-        assert snapshot.estimated_lost_audio_ms_last_minute == 500.0
+        # Each read's expected duration is 250ms (1 sample @ 4Hz); the actual
+        # gap was 1000ms, so each overflow's estimate is max(0, 1000-250) =
+        # 750ms, for 1500ms total.
+        assert snapshot.estimated_lost_audio_ms_last_minute == 1500.0
     finally:
         audio_input.close()
 
 
 def test_audio_capture_pipeline_snapshot_surfaces_mic_overflow_stats() -> None:
-    """AudioCapturePipeline.snapshot() reports the mic input's overflow stats (#190)."""
+    """AudioCapturePipeline.snapshot() reports the mic input's overflow stats (#190).
+
+    Deliberately does NOT call pipeline.start() (#190 review finding: the
+    real reader/processing worker thread(s) would race this test's own
+    direct read_samples() calls, making the exact overflow count and
+    estimated-lost-ms non-deterministic — since each background read also
+    advances _last_read_returned_at and can itself land as a clean or
+    overflowed read depending on scheduling). Driving the mic input directly
+    and only using the pipeline for snapshot()'s duck-typed getattr lookup
+    is enough to prove the plumbing works, deterministically.
+    """
     FakeRawInputStream.created.clear()
     settings = audio_capture_settings_from_config(AudioConfig(source="microphone", sample_rate=4))
     clock = ClockHarness()
@@ -1690,20 +1709,18 @@ def test_audio_capture_pipeline_snapshot_surfaces_mic_overflow_stats() -> None:
     )
     pipeline = AudioCapturePipeline(settings=settings, audio_input=audio_input)
 
-    try:
-        pipeline.start()
-        stream = FakeRawInputStream.created[-1]
-        stream.overflowed = True
-        # Drive one overflowed read directly through the input the pipeline owns
-        # (avoids depending on worker-thread scheduling for this assertion).
-        audio_input.read_samples(1)
+    audio_input.read_samples(1)  # clean read at t=0.0, opens the stream
+    stream = FakeRawInputStream.created[-1]
+    clock.value = 1.0  # 1000ms gap before the overflowed read
+    stream.overflowed = True
+    audio_input.read_samples(1)
 
-        snapshot = pipeline.snapshot()
-        assert snapshot.overflow_count_last_minute == 1
-        assert snapshot.total_overflow_count == 1
-        assert snapshot.estimated_lost_audio_ms_last_minute == 250.0
-    finally:
-        pipeline.stop()
+    snapshot = pipeline.snapshot()
+    assert snapshot.overflow_count_last_minute == 1
+    assert snapshot.total_overflow_count == 1
+    # Expected duration 250ms (1 sample @ 4Hz), actual gap 1000ms:
+    # max(0, 1000-250) = 750ms.
+    assert snapshot.estimated_lost_audio_ms_last_minute == 750.0
 
 
 def test_audio_capture_pipeline_snapshot_zero_overflow_for_non_mic_input() -> None:

@@ -308,8 +308,8 @@ class FirstCrackStatus:
             the trailing 60 seconds, so sustained capture degradation is
             operator-visible here instead of stderr-only warning logs.
         estimated_lost_audio_ms_last_minute: Estimated milliseconds of audio at
-            risk from overflow events in the trailing 60 seconds. An
-            upper-bound estimate — see
+            risk from overflow events in the trailing 60 seconds, derived
+            from the actual inter-read gap — see
             :class:`~coffee_roaster_mcp.audio.OverflowSnapshot`.
         total_overflow_count: Lifetime overflow event count for the current
             capture run.

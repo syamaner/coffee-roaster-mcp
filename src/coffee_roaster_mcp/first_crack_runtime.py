@@ -94,7 +94,7 @@ class FirstCrackRuntimeSnapshot:
         estimated_lost_audio_ms_last_minute: Estimated milliseconds of audio at
             risk from overflow events in the trailing 60 seconds. See
             :class:`~coffee_roaster_mcp.audio.OverflowSnapshot` for the
-            estimation method and its upper-bound caveat.
+            estimation method (derived from the actual inter-read gap).
         total_overflow_count: Lifetime overflow event count for the current
             capture run, for a whole-roast severity view alongside the rolling
             per-minute figures.
@@ -724,6 +724,12 @@ def _stopped_capture_snapshot(snapshot: AudioCaptureSnapshot) -> AudioCaptureSna
     # A stopped capture carries no LIVE mic levels: the meter's last values are
     # stale once capture stops, so drop them (the runtime snapshot also gates the
     # levels on ``audio_running``, so a stale value would never surface anyway).
+    #
+    # Overflow stats (#190 review finding) are the OPPOSITE case — they are
+    # exactly what an operator wants to review right after drop/stop, not a
+    # live-only signal to discard. Carry them through unchanged so fc_status
+    # doesn't silently zero out the roast's overflow history the moment
+    # capture stops, which is precisely when it matters most.
     return AudioCaptureSnapshot(
         running=False,
         queued_window_count=snapshot.queued_window_count,
@@ -732,6 +738,9 @@ def _stopped_capture_snapshot(snapshot: AudioCaptureSnapshot) -> AudioCaptureSna
         latest_error=snapshot.latest_error,
         peak_dbfs=None,
         rms_dbfs=None,
+        overflow_count_last_minute=snapshot.overflow_count_last_minute,
+        estimated_lost_audio_ms_last_minute=snapshot.estimated_lost_audio_ms_last_minute,
+        total_overflow_count=snapshot.total_overflow_count,
     )
 
 

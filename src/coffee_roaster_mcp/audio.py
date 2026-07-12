@@ -142,12 +142,16 @@ class AudioCaptureSnapshot:
             sustained degradation as an operator-visible diagnostic instead of
             stderr-only warning logs.
         estimated_lost_audio_ms_last_minute: Estimated milliseconds of audio at
-            risk from overflow events in the trailing 60 seconds. Each overflow
-            event contributes the requested read's expected duration
-            (``sample_count / sample_rate``) as an UPPER-BOUND estimate: the
-            PortAudio blocking-read overflow flag reports only that input was
-            lost since the previous read, not how many samples, so this is a
-            conservative "at risk" figure, not an exact lost-sample count.
+            risk from overflow events in the trailing 60 seconds. Each
+            overflow event contributes ``max(0, actual_gap - expected_duration)``
+            — the ACTUAL wall-clock gap since the previous read attempt minus
+            what that read's requested sample count should have taken (#190
+            review finding: a fixed single-read-duration estimate can
+            UNDERESTIMATE, not over-, when PortAudio's overflow flag — which
+            covers all loss since the previous read — spans several
+            consecutive overflowed reads during one sustained stall). This is
+            still an estimate, not an exact lost-sample count: PortAudio
+            never reports how many samples were actually dropped.
         total_overflow_count: Lifetime overflow event count for the current
             capture run, for a whole-roast severity view alongside the rolling
             per-minute figures.
@@ -264,7 +268,8 @@ class OverflowSnapshot:
         count_last_minute: Overflow events in the trailing 60 seconds.
         estimated_lost_audio_ms_last_minute: Estimated at-risk audio in the
             trailing 60 seconds; see :class:`AudioCaptureSnapshot` for the
-            estimation method and its upper-bound caveat.
+            estimation method (derived from the actual inter-read gap, not a
+            fixed per-read duration — #190 review finding).
         total_count: Lifetime overflow event count for the capture run.
     """
 
@@ -278,24 +283,32 @@ class _OverflowTracker:
 
     A PortAudio blocking-read overflow (``stream.read()``'s ``overflowed``
     flag) reports only that input was lost since the previous read, never how
-    many samples — so each event's "lost audio" contribution is estimated as
-    the requested read's expected duration (an upper bound, documented on
-    :class:`AudioCaptureSnapshot`). Events older than 60 seconds of WALL-CLOCK
-    time (not roast-elapsed time) are excluded from the rolling figures so
-    they reflect genuinely recent degradation, matching the #190 report's
+    many samples — so each event's "lost audio" contribution is estimated
+    from the ACTUAL wall-clock gap since the previous read attempt (see
+    :class:`AudioCaptureSnapshot` for the estimation method — #190 review
+    finding: a fixed single-read-duration estimate can underestimate a
+    multi-interval stall). Events older than 60 seconds of WALL-CLOCK time
+    (not roast-elapsed time) are excluded from the rolling figures so they
+    reflect genuinely recent degradation, matching the #190 report's
     "per-minute" framing.
 
-    WRITER/READER SPLIT (#190 safety review): ``observe_overflow`` runs only
-    on the audio-input's own read call (the single capture-owning thread) and
-    is the only method that mutates ``_events`` (append + evict). ``snapshot``
-    is read-only — it never mutates ``_events`` — so a reader thread (the
-    processing/detector-integration thread, which drains queued windows
-    concurrently with capture) can call it at any time without a lock and
-    without racing the writer's mutations. ``deque`` append/popleft are each
-    O(1) and GIL-atomic, but a reader mutating the SAME deque the writer
-    appends to would still be an unsynchronized compound operation; keeping
-    mutation single-threaded avoids that entirely rather than relying on the
-    GIL for correctness.
+    WRITER/READER SPLIT (#190 safety review) — CORRECTED: ``observe_overflow``
+    runs only on the audio-input's own read call (the single capture-owning
+    thread); ``snapshot`` is called from other threads (the processing
+    thread's periodic status reads). A first pass at this class reasoned that
+    ``snapshot`` never *mutating* ``_events`` made it safe to read
+    lock-free — but that missed that ``snapshot`` still *iterates* over
+    ``_events`` (to filter the trailing-60s window), and ``deque`` iteration
+    is NOT safe against a concurrent mutation on another thread even when
+    each individual append/popleft is itself atomic: Python explicitly raises
+    ``RuntimeError: deque mutated during iteration`` if a writer's
+    ``popleft()`` lands mid-iteration on the reader thread — a genuine crash
+    risk under exactly the sustained-overflow conditions #190 is about
+    (frequent ``observe_overflow`` calls racing a concurrent ``snapshot``
+    poll). Both methods now hold ``_lock`` for their full body, which is
+    correct AND still cheap: the critical section is a handful of `deque`
+    operations, never I/O or anything GIL-releasing, so contention is brief
+    even under a real overflow storm.
     """
 
     def __init__(self, *, monotonic_now: Callable[[], float] | None = None) -> None:
@@ -307,34 +320,38 @@ class _OverflowTracker:
         self._monotonic_now = monotonic_now or time.monotonic
         self._events: deque[tuple[float, float]] = deque()
         self._total_count = 0
+        self._lock = Lock()
 
     def observe_overflow(self, *, estimated_lost_audio_ms: float) -> None:
         """Record one overflow event with its estimated lost-audio duration.
 
-        The only method that mutates ``_events`` — see the class docstring's
-        writer/reader split. Callers must only invoke this from the single
-        thread that owns audio reads.
+        Thread-safe: holds the tracker's lock for its full body (see the
+        class docstring for why a mutation-only guarantee isn't enough).
         """
         now = self._monotonic_now()
-        self._events.append((now, estimated_lost_audio_ms))
-        self._total_count += 1
-        cutoff = now - 60.0
-        while self._events and self._events[0][0] < cutoff:
-            self._events.popleft()
+        with self._lock:
+            self._events.append((now, estimated_lost_audio_ms))
+            self._total_count += 1
+            cutoff = now - 60.0
+            while self._events and self._events[0][0] < cutoff:
+                self._events.popleft()
 
     def snapshot(self) -> OverflowSnapshot:
         """Return the current rolling and lifetime overflow stats.
 
-        Read-only: filters events newer than the trailing 60 seconds without
-        mutating ``_events``, so this is safe to call from any thread (see the
-        class docstring's writer/reader split).
+        Thread-safe: holds the tracker's lock for its full body — including
+        the iteration over ``_events`` — so this can never race a concurrent
+        ``observe_overflow`` mutation on another thread (see the class
+        docstring).
         """
         cutoff = self._monotonic_now() - 60.0
-        recent = [lost for observed_at, lost in self._events if observed_at >= cutoff]
+        with self._lock:
+            recent = [lost for observed_at, lost in self._events if observed_at >= cutoff]
+            total_count = self._total_count
         return OverflowSnapshot(
             count_last_minute=len(recent),
             estimated_lost_audio_ms_last_minute=round(sum(recent), 3),
-            total_count=self._total_count,
+            total_count=total_count,
         )
 
 
@@ -549,10 +566,19 @@ class MicrophoneAudioInput:
         self._max_consecutive_overflows = max_consecutive_overflows
         self._consecutive_overflows = 0
         self._close_lock = Lock()
+        self._monotonic_now = monotonic_now or time.monotonic
         #: Per-minute overflow diagnostics (#190), read by the capture pipeline
         #: each loop tick and surfaced in AudioCaptureSnapshot / fc_status so
         #: sustained degradation is operator-visible, not just stderr.
         self._overflow_tracker = _OverflowTracker(monotonic_now=monotonic_now)
+        #: Wall-clock instant the previous read_samples() call returned, or
+        #: None before the first read. Used to estimate lost audio from the
+        #: ACTUAL inter-read gap (#190 review finding), not just this read's
+        #: nominal requested duration — PortAudio's overflowed flag can cover
+        #: loss accumulated across MULTIPLE consecutive overflowed reads, so a
+        #: single-read-duration estimate can genuinely underestimate for a
+        #: multi-interval stall (the opposite of "upper bound").
+        self._last_read_returned_at: float | None = None
 
     def _ensure_stream(self) -> Any:
         if self._stream is not None:
@@ -588,17 +614,32 @@ class MicrophoneAudioInput:
         except Exception as exc:  # noqa: BLE001 - backend exceptions vary by platform.
             # A genuine read failure (device gone, backend error) is still fatal.
             raise AudioCaptureError(f"Could not read microphone audio source: {exc}") from exc
+        read_returned_at = self._monotonic_now()
         if overflowed:
             # Transient: the device dropped some input but `raw_data` still holds
             # the samples it captured. Log, count, and keep going rather than
             # killing capture for the whole roast; only a sustained run of
             # consecutive overflows (the device cannot keep up at all) faults.
             self._consecutive_overflows += 1
-            # PortAudio's overflowed flag reports only that input was lost since
-            # the previous read, not a sample count, so the requested read's
-            # expected duration is an UPPER-BOUND estimate of audio at risk
-            # (#190) — see OverflowSnapshot's docstring.
-            estimated_lost_audio_ms = 1000.0 * sample_count / self._settings.sample_rate
+            # PortAudio's overflowed flag reports only that input was lost
+            # SINCE THE PREVIOUS READ, which can span multiple consecutive
+            # overflowed reads during a genuine multi-second stall — so a
+            # single-read-duration estimate can UNDERESTIMATE for a
+            # multi-interval gap (#190 review finding: the prior "upper
+            # bound" framing was backwards). Estimate instead from the
+            # ACTUAL wall-clock gap since the previous read attempt: the
+            # portion of that gap beyond what this read's requested sample
+            # count should have taken is exactly the time PortAudio's ring
+            # buffer was filling unread. Clamped to >= 0 and falls back to
+            # this read's nominal duration when there is no prior read to
+            # compare against (the first read of a run) — see
+            # OverflowSnapshot's docstring for the estimate's honest bounds.
+            expected_duration_ms = 1000.0 * sample_count / self._settings.sample_rate
+            if self._last_read_returned_at is None:
+                estimated_lost_audio_ms = expected_duration_ms
+            else:
+                actual_gap_ms = 1000.0 * (read_returned_at - self._last_read_returned_at)
+                estimated_lost_audio_ms = max(0.0, actual_gap_ms - expected_duration_ms)
             self._overflow_tracker.observe_overflow(estimated_lost_audio_ms=estimated_lost_audio_ms)
             _LOGGER.warning(
                 "Microphone audio input overflowed (%d consecutive); continuing.",
@@ -612,6 +653,10 @@ class MicrophoneAudioInput:
                 )
         else:
             self._consecutive_overflows = 0
+        # Update on EVERY read (overflowed or not) so the next call's gap
+        # estimate is always measured from the most recent read, not a stale
+        # earlier one.
+        self._last_read_returned_at = read_returned_at
         return tuple(float(sample[0]) for sample in struct.iter_unpack("f", bytes(raw_data)))
 
     @property

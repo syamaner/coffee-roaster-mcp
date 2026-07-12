@@ -346,6 +346,46 @@ def test_runtime_mic_levels_are_live_only_and_none_after_stop() -> None:
     assert stopped.mic_rms_dbfs is None
 
 
+def test_runtime_overflow_stats_survive_stop_unlike_live_mic_levels() -> None:
+    """Overflow stats (#190 review finding) are the OPPOSITE of mic levels:
+    they must SURVIVE stop_for_session, not go None/zero. An operator
+    reviewing a roast right after drop/stop is exactly when the roast's
+    overflow history matters most — zeroing it out at the moment it's
+    needed would be a real observability gap.
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    pipeline = FakeAudioPipeline(
+        overflow_count_last_minute=7,
+        estimated_lost_audio_ms_last_minute=700.0,
+        total_overflow_count=42,
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            MockDetectorBackend(()),
+        ),
+    )
+
+    runtime.start_for_session(session)
+    live = runtime.snapshot()
+    assert live.overflow_count_last_minute == 7
+    assert live.estimated_lost_audio_ms_last_minute == 700.0
+    assert live.total_overflow_count == 42
+
+    stopped = runtime.stop_for_session(session.id, reason="roast complete")
+    assert stopped.audio_running is False
+    # Unlike mic_peak_dbfs/mic_rms_dbfs (live-only, correctly None here),
+    # overflow stats carry through unchanged.
+    assert stopped.overflow_count_last_minute == 7
+    assert stopped.estimated_lost_audio_ms_last_minute == 700.0
+    assert stopped.total_overflow_count == 42
+
+
 def test_audio_runtime_can_discard_queued_pre_t0_windows() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
