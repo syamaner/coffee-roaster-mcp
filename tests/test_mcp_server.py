@@ -1350,6 +1350,13 @@ class _QueuedWindowAudioPipeline:
         self._windows.clear()
         return drained
 
+    def discard_pending_audio(self, *, timeout_seconds: float = 1.0) -> None:
+        # This fake models the whole pipeline as one queued-window list (no
+        # separate reader-backlog/sample-buffer stage), so discarding is
+        # equivalent to draining everything (coffee-roaster-mcp#195).
+        self._call_order.append("pipeline.discard_pending_audio")
+        self._windows.clear()
+
     def snapshot(self) -> AudioCaptureSnapshot:
         return AudioCaptureSnapshot(
             running=not self.stopped,
