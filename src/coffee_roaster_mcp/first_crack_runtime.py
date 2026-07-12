@@ -86,6 +86,18 @@ class FirstCrackRuntimeSnapshot:
             silence. Lets a mis-gained / dead mic be caught under real conditions.
         mic_rms_dbfs: Live rolling RMS level of the captured mic stream in dBFS
             (#178), or ``None`` when no audio capture is running.
+        overflow_count_last_minute: Microphone input-overflow events (#190) in
+            the trailing 60 seconds, or ``0`` when no audio capture is running
+            or the input does not report overflows. Surfaces sustained
+            degradation (e.g. under CPU contention) as an operator-visible
+            diagnostic instead of stderr-only warning logs.
+        estimated_lost_audio_ms_last_minute: Estimated milliseconds of audio at
+            risk from overflow events in the trailing 60 seconds. See
+            :class:`~coffee_roaster_mcp.audio.OverflowSnapshot` for the
+            estimation method and its upper-bound caveat.
+        total_overflow_count: Lifetime overflow event count for the current
+            capture run, for a whole-roast severity view alongside the rolling
+            per-minute figures.
     """
 
     status: FirstCrackRuntimeState
@@ -99,6 +111,9 @@ class FirstCrackRuntimeSnapshot:
     processed_window_count: int = 0
     mic_peak_dbfs: float | None = None
     mic_rms_dbfs: float | None = None
+    overflow_count_last_minute: int = 0
+    estimated_lost_audio_ms_last_minute: float = 0.0
+    total_overflow_count: int = 0
 
 
 class FirstCrackSessionRuntime:
@@ -400,6 +415,15 @@ class FirstCrackSessionRuntime:
                 processed_window_count=self._processed_window_count,
                 mic_peak_dbfs=mic_peak_dbfs,
                 mic_rms_dbfs=mic_rms_dbfs,
+                overflow_count_last_minute=0
+                if capture_snapshot is None
+                else capture_snapshot.overflow_count_last_minute,
+                estimated_lost_audio_ms_last_minute=0.0
+                if capture_snapshot is None
+                else capture_snapshot.estimated_lost_audio_ms_last_minute,
+                total_overflow_count=0
+                if capture_snapshot is None
+                else capture_snapshot.total_overflow_count,
             )
 
     def _can_process_locked(self, session: RoastSession) -> bool:

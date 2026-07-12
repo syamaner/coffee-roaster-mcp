@@ -1544,3 +1544,177 @@ def test_rolling_level_meter_levels_is_a_coherent_pair() -> None:
     assert levels == (-6.02, -6.02)
     meter.reset()
     assert meter.levels is None
+
+
+def test_overflow_tracker_accumulates_within_the_trailing_minute() -> None:
+    """Events inside the trailing 60s all count toward the rolling snapshot (#190)."""
+    from coffee_roaster_mcp.audio import _OverflowTracker  # pyright: ignore[reportPrivateUsage]
+
+    clock = ClockHarness()
+    clock.value = 0.0
+    tracker = _OverflowTracker(monotonic_now=lambda: clock.value)
+
+    snapshot = tracker.snapshot()
+    assert snapshot.count_last_minute == 0
+    assert snapshot.estimated_lost_audio_ms_last_minute == 0.0
+    assert snapshot.total_count == 0
+
+    clock.value = 10.0
+    tracker.observe_overflow(estimated_lost_audio_ms=250.0)
+    clock.value = 20.0
+    tracker.observe_overflow(estimated_lost_audio_ms=125.0)
+
+    snapshot = tracker.snapshot()
+    assert snapshot.count_last_minute == 2
+    assert snapshot.estimated_lost_audio_ms_last_minute == 375.0
+    assert snapshot.total_count == 2
+
+
+def test_overflow_tracker_evicts_events_older_than_sixty_seconds() -> None:
+    """Events fall out of the rolling window at 60s, but the lifetime total keeps them (#190)."""
+    from coffee_roaster_mcp.audio import _OverflowTracker  # pyright: ignore[reportPrivateUsage]
+
+    clock = ClockHarness()
+    clock.value = 0.0
+    tracker = _OverflowTracker(monotonic_now=lambda: clock.value)
+
+    tracker.observe_overflow(estimated_lost_audio_ms=100.0)
+    clock.value = 61.0
+    tracker.observe_overflow(estimated_lost_audio_ms=50.0)
+
+    snapshot = tracker.snapshot()
+    # The first event is now 61s old: evicted from the rolling window.
+    assert snapshot.count_last_minute == 1
+    assert snapshot.estimated_lost_audio_ms_last_minute == 50.0
+    # The lifetime total is never evicted.
+    assert snapshot.total_count == 2
+
+    # Even with no new events, calling snapshot() re-filters against "now"
+    # (read-only: it does not mutate _events, see the class docstring).
+    clock.value = 200.0
+    snapshot = tracker.snapshot()
+    assert snapshot.count_last_minute == 0
+    assert snapshot.estimated_lost_audio_ms_last_minute == 0.0
+    assert snapshot.total_count == 2
+
+
+def test_overflow_tracker_snapshot_is_read_only_and_thread_safe() -> None:
+    """A reader thread calling snapshot() never races the writer's mutations (#190).
+
+    snapshot() must never mutate `_events`: only `observe_overflow` does, and
+    it always runs on the single audio-input read thread. This drives a writer
+    thread appending events concurrently with a reader thread repeatedly
+    snapshotting, and asserts no exception surfaces and the lifetime total
+    matches the writer's actual append count exactly — a mutating snapshot()
+    reading/popping the same deque from another thread would risk a missed or
+    duplicated eviction under interleaving, this proves there is none.
+    """
+    from coffee_roaster_mcp.audio import _OverflowTracker  # pyright: ignore[reportPrivateUsage]
+
+    tracker = _OverflowTracker(monotonic_now=time.monotonic)
+    write_count = 500
+    errors: list[BaseException] = []
+
+    def writer() -> None:
+        for _ in range(write_count):
+            tracker.observe_overflow(estimated_lost_audio_ms=1.0)
+
+    def reader() -> None:
+        try:
+            for _ in range(write_count):
+                snapshot = tracker.snapshot()
+                assert snapshot.count_last_minute >= 0
+                assert snapshot.total_count >= 0
+        except BaseException as exc:  # noqa: BLE001 - surfaced via the errors list
+            errors.append(exc)
+
+    writer_thread = Thread(target=writer)
+    reader_thread = Thread(target=reader)
+    reader_thread.start()
+    writer_thread.start()
+    writer_thread.join(timeout=5.0)
+    reader_thread.join(timeout=5.0)
+
+    assert not writer_thread.is_alive()
+    assert not reader_thread.is_alive()
+    assert errors == []
+    assert tracker.snapshot().total_count == write_count
+
+
+def test_microphone_audio_input_overflow_snapshot_tracks_overflows() -> None:
+    """The mic input exposes overflow diagnostics fed by real overflowed reads (#190)."""
+    FakeRawInputStream.created.clear()
+    settings = audio_capture_settings_from_config(AudioConfig(source="microphone", sample_rate=4))
+    clock = ClockHarness()
+    clock.value = 0.0
+    audio_input = MicrophoneAudioInput(
+        settings,
+        sounddevice_module=FakeSoundDeviceModule(),
+        max_consecutive_overflows=10,
+        monotonic_now=lambda: clock.value,
+    )
+
+    try:
+        baseline = audio_input.overflow_snapshot
+        assert baseline.count_last_minute == 0
+        assert baseline.total_count == 0
+
+        audio_input.read_samples(1)  # opens the stream; clean read
+        stream = FakeRawInputStream.created[-1]
+        stream.overflowed = True
+        audio_input.read_samples(1)  # one overflowed read of 1 sample @ 4Hz
+        stream.overflowed = True
+        audio_input.read_samples(1)  # a second overflowed read
+
+        snapshot = audio_input.overflow_snapshot
+        assert snapshot.count_last_minute == 2
+        assert snapshot.total_count == 2
+        # Each overflow is an upper-bound estimate of one read's expected
+        # duration: 1 sample @ 4Hz = 250ms, so two overflows = 500ms.
+        assert snapshot.estimated_lost_audio_ms_last_minute == 500.0
+    finally:
+        audio_input.close()
+
+
+def test_audio_capture_pipeline_snapshot_surfaces_mic_overflow_stats() -> None:
+    """AudioCapturePipeline.snapshot() reports the mic input's overflow stats (#190)."""
+    FakeRawInputStream.created.clear()
+    settings = audio_capture_settings_from_config(AudioConfig(source="microphone", sample_rate=4))
+    clock = ClockHarness()
+    clock.value = 0.0
+    audio_input = MicrophoneAudioInput(
+        settings,
+        sounddevice_module=FakeSoundDeviceModule(),
+        max_consecutive_overflows=10,
+        monotonic_now=lambda: clock.value,
+    )
+    pipeline = AudioCapturePipeline(settings=settings, audio_input=audio_input)
+
+    try:
+        pipeline.start()
+        stream = FakeRawInputStream.created[-1]
+        stream.overflowed = True
+        # Drive one overflowed read directly through the input the pipeline owns
+        # (avoids depending on worker-thread scheduling for this assertion).
+        audio_input.read_samples(1)
+
+        snapshot = pipeline.snapshot()
+        assert snapshot.overflow_count_last_minute == 1
+        assert snapshot.total_overflow_count == 1
+        assert snapshot.estimated_lost_audio_ms_last_minute == 250.0
+    finally:
+        pipeline.stop()
+
+
+def test_audio_capture_pipeline_snapshot_zero_overflow_for_non_mic_input() -> None:
+    """A non-microphone AudioInput (no overflow_snapshot) reports zero stats,
+    not an error (#190)."""
+    audio_input = FiniteAudioInput((0.1, 0.2, 0.3, 0.4))
+    settings = audio_capture_settings_from_config(AudioConfig(sample_rate=4))
+    pipeline = AudioCapturePipeline(settings=settings, audio_input=audio_input)
+
+    snapshot = pipeline.snapshot()
+
+    assert snapshot.overflow_count_last_minute == 0
+    assert snapshot.estimated_lost_audio_ms_last_minute == 0.0
+    assert snapshot.total_overflow_count == 0

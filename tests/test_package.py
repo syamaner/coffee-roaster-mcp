@@ -77,13 +77,16 @@ _EXPECTED_FIRST_CRACK_STATUS_KEYS = {
     "detected_monotonic_seconds",
     "dropped_window_count",
     "emitted_window_count",
+    "estimated_lost_audio_ms_last_minute",
     "mic_peak_dbfs",
     "mic_rms_dbfs",
     "mode",
+    "overflow_count_last_minute",
     "processed_window_count",
     "queued_window_count",
     "reason",
     "status",
+    "total_overflow_count",
 }
 _EXPECTED_T0_STATUS_KEYS = {
     "auto_detection_enabled",

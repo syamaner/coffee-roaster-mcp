@@ -1657,6 +1657,9 @@ class FakeFirstCrackRuntime:
         processed_window_count: int = 0,
         mic_peak_dbfs: float | None = None,
         mic_rms_dbfs: float | None = None,
+        overflow_count_last_minute: int = 0,
+        estimated_lost_audio_ms_last_minute: float = 0.0,
+        total_overflow_count: int = 0,
     ) -> None:
         self.status = status
         self.reason = reason
@@ -1668,6 +1671,9 @@ class FakeFirstCrackRuntime:
         self.processed_window_count = processed_window_count
         self.mic_peak_dbfs = mic_peak_dbfs
         self.mic_rms_dbfs = mic_rms_dbfs
+        self.overflow_count_last_minute = overflow_count_last_minute
+        self.estimated_lost_audio_ms_last_minute = estimated_lost_audio_ms_last_minute
+        self.total_overflow_count = total_overflow_count
         self.active_session_id: str | None = None
         self.started_sessions: list[str] = []
         self.processed_sessions: list[str] = []
@@ -1726,6 +1732,9 @@ class FakeFirstCrackRuntime:
             processed_window_count=self.processed_window_count,
             mic_peak_dbfs=self.mic_peak_dbfs,
             mic_rms_dbfs=self.mic_rms_dbfs,
+            overflow_count_last_minute=self.overflow_count_last_minute,
+            estimated_lost_audio_ms_last_minute=self.estimated_lost_audio_ms_last_minute,
+            total_overflow_count=self.total_overflow_count,
         )
 
 

@@ -53,12 +53,18 @@ class FakeAudioPipeline:
         running_after_stop: bool = False,
         peak_dbfs: float | None = None,
         rms_dbfs: float | None = None,
+        overflow_count_last_minute: int = 0,
+        estimated_lost_audio_ms_last_minute: float = 0.0,
+        total_overflow_count: int = 0,
     ) -> None:
         self._windows = list(windows)
         self.latest_error = latest_error
         self.running_after_stop = running_after_stop
         self.peak_dbfs = peak_dbfs
         self.rms_dbfs = rms_dbfs
+        self.overflow_count_last_minute = overflow_count_last_minute
+        self.estimated_lost_audio_ms_last_minute = estimated_lost_audio_ms_last_minute
+        self.total_overflow_count = total_overflow_count
         self.started = False
         self.stopped = False
         self.stop_reasons: list[float] = []
@@ -95,6 +101,9 @@ class FakeAudioPipeline:
             latest_error=self.latest_error,
             peak_dbfs=self.peak_dbfs,
             rms_dbfs=self.rms_dbfs,
+            overflow_count_last_minute=self.overflow_count_last_minute,
+            estimated_lost_audio_ms_last_minute=self.estimated_lost_audio_ms_last_minute,
+            total_overflow_count=self.total_overflow_count,
         )
 
 

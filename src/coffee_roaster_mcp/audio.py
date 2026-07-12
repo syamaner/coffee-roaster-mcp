@@ -9,6 +9,7 @@ import math
 import struct
 import time
 import wave
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -135,6 +136,21 @@ class AudioCaptureSnapshot:
         rms_dbfs: Rolling RMS level of the captured stream in dBFS over the most
             recent measurement window, or ``None`` before any samples are read
             (#178). ``-inf`` for pure silence.
+        overflow_count_last_minute: Microphone input-overflow events (#190) in
+            the trailing 60 seconds of wall-clock time, or ``0`` when the audio
+            input does not report overflows (e.g. WAV replay). Surfaces
+            sustained degradation as an operator-visible diagnostic instead of
+            stderr-only warning logs.
+        estimated_lost_audio_ms_last_minute: Estimated milliseconds of audio at
+            risk from overflow events in the trailing 60 seconds. Each overflow
+            event contributes the requested read's expected duration
+            (``sample_count / sample_rate``) as an UPPER-BOUND estimate: the
+            PortAudio blocking-read overflow flag reports only that input was
+            lost since the previous read, not how many samples, so this is a
+            conservative "at risk" figure, not an exact lost-sample count.
+        total_overflow_count: Lifetime overflow event count for the current
+            capture run, for a whole-roast severity view alongside the rolling
+            per-minute figures.
     """
 
     running: bool
@@ -144,6 +160,9 @@ class AudioCaptureSnapshot:
     latest_error: str | None
     peak_dbfs: float | None = None
     rms_dbfs: float | None = None
+    overflow_count_last_minute: int = 0
+    estimated_lost_audio_ms_last_minute: float = 0.0
+    total_overflow_count: int = 0
 
 
 def amplitude_to_dbfs(amplitude: float) -> float:
@@ -235,6 +254,88 @@ class _RollingLevelMeter:
         """Clear the retained samples and reported levels for a fresh run."""
         self._samples = np.empty(0, dtype=np.float64)
         self._levels = None
+
+
+@dataclass(frozen=True)
+class OverflowSnapshot:
+    """Rolling and lifetime microphone input-overflow stats (#190).
+
+    Attributes:
+        count_last_minute: Overflow events in the trailing 60 seconds.
+        estimated_lost_audio_ms_last_minute: Estimated at-risk audio in the
+            trailing 60 seconds; see :class:`AudioCaptureSnapshot` for the
+            estimation method and its upper-bound caveat.
+        total_count: Lifetime overflow event count for the capture run.
+    """
+
+    count_last_minute: int
+    estimated_lost_audio_ms_last_minute: float
+    total_count: int
+
+
+class _OverflowTracker:
+    """Track microphone input-overflow events over a trailing 60-second window.
+
+    A PortAudio blocking-read overflow (``stream.read()``'s ``overflowed``
+    flag) reports only that input was lost since the previous read, never how
+    many samples — so each event's "lost audio" contribution is estimated as
+    the requested read's expected duration (an upper bound, documented on
+    :class:`AudioCaptureSnapshot`). Events older than 60 seconds of WALL-CLOCK
+    time (not roast-elapsed time) are excluded from the rolling figures so
+    they reflect genuinely recent degradation, matching the #190 report's
+    "per-minute" framing.
+
+    WRITER/READER SPLIT (#190 safety review): ``observe_overflow`` runs only
+    on the audio-input's own read call (the single capture-owning thread) and
+    is the only method that mutates ``_events`` (append + evict). ``snapshot``
+    is read-only — it never mutates ``_events`` — so a reader thread (the
+    processing/detector-integration thread, which drains queued windows
+    concurrently with capture) can call it at any time without a lock and
+    without racing the writer's mutations. ``deque`` append/popleft are each
+    O(1) and GIL-atomic, but a reader mutating the SAME deque the writer
+    appends to would still be an unsynchronized compound operation; keeping
+    mutation single-threaded avoids that entirely rather than relying on the
+    GIL for correctness.
+    """
+
+    def __init__(self, *, monotonic_now: Callable[[], float] | None = None) -> None:
+        """Configure the tracker.
+
+        Args:
+            monotonic_now: Optional monotonic clock supplier for tests.
+        """
+        self._monotonic_now = monotonic_now or time.monotonic
+        self._events: deque[tuple[float, float]] = deque()
+        self._total_count = 0
+
+    def observe_overflow(self, *, estimated_lost_audio_ms: float) -> None:
+        """Record one overflow event with its estimated lost-audio duration.
+
+        The only method that mutates ``_events`` — see the class docstring's
+        writer/reader split. Callers must only invoke this from the single
+        thread that owns audio reads.
+        """
+        now = self._monotonic_now()
+        self._events.append((now, estimated_lost_audio_ms))
+        self._total_count += 1
+        cutoff = now - 60.0
+        while self._events and self._events[0][0] < cutoff:
+            self._events.popleft()
+
+    def snapshot(self) -> OverflowSnapshot:
+        """Return the current rolling and lifetime overflow stats.
+
+        Read-only: filters events newer than the trailing 60 seconds without
+        mutating ``_events``, so this is safe to call from any thread (see the
+        class docstring's writer/reader split).
+        """
+        cutoff = self._monotonic_now() - 60.0
+        recent = [lost for observed_at, lost in self._events if observed_at >= cutoff]
+        return OverflowSnapshot(
+            count_last_minute=len(recent),
+            estimated_lost_audio_ms_last_minute=round(sum(recent), 3),
+            total_count=self._total_count,
+        )
 
 
 def audio_capture_settings_from_config(
@@ -427,6 +528,7 @@ class MicrophoneAudioInput:
         *,
         sounddevice_module: Any | None = None,
         max_consecutive_overflows: int = _DEFAULT_MAX_CONSECUTIVE_OVERFLOWS,
+        monotonic_now: Callable[[], float] | None = None,
     ) -> None:
         """Configure a microphone input that opens lazily on first read.
 
@@ -437,6 +539,8 @@ class MicrophoneAudioInput:
                 capture faults. A transient overflow is logged and the captured
                 samples are still returned; only a sustained run (the device cannot
                 keep up at all) raises ``AudioCaptureError``.
+            monotonic_now: Optional monotonic clock supplier for tests (#190
+                overflow-tracker rolling window).
         """
         _validate_settings(settings)
         self._settings = settings
@@ -445,6 +549,10 @@ class MicrophoneAudioInput:
         self._max_consecutive_overflows = max_consecutive_overflows
         self._consecutive_overflows = 0
         self._close_lock = Lock()
+        #: Per-minute overflow diagnostics (#190), read by the capture pipeline
+        #: each loop tick and surfaced in AudioCaptureSnapshot / fc_status so
+        #: sustained degradation is operator-visible, not just stderr.
+        self._overflow_tracker = _OverflowTracker(monotonic_now=monotonic_now)
 
     def _ensure_stream(self) -> Any:
         if self._stream is not None:
@@ -486,6 +594,12 @@ class MicrophoneAudioInput:
             # killing capture for the whole roast; only a sustained run of
             # consecutive overflows (the device cannot keep up at all) faults.
             self._consecutive_overflows += 1
+            # PortAudio's overflowed flag reports only that input was lost since
+            # the previous read, not a sample count, so the requested read's
+            # expected duration is an UPPER-BOUND estimate of audio at risk
+            # (#190) — see OverflowSnapshot's docstring.
+            estimated_lost_audio_ms = 1000.0 * sample_count / self._settings.sample_rate
+            self._overflow_tracker.observe_overflow(estimated_lost_audio_ms=estimated_lost_audio_ms)
             _LOGGER.warning(
                 "Microphone audio input overflowed (%d consecutive); continuing.",
                 self._consecutive_overflows,
@@ -499,6 +613,11 @@ class MicrophoneAudioInput:
         else:
             self._consecutive_overflows = 0
         return tuple(float(sample[0]) for sample in struct.iter_unpack("f", bytes(raw_data)))
+
+    @property
+    def overflow_snapshot(self) -> OverflowSnapshot:
+        """Return current rolling and lifetime overflow stats (#190)."""
+        return self._overflow_tracker.snapshot()
 
     def close(self) -> None:
         """Stop and close the microphone stream.
@@ -1582,6 +1701,13 @@ class AudioCapturePipeline:
         # meter is written outside _state_lock by the capture worker, so two
         # separate property reads could tear; one tuple read cannot.
         levels = self._level_meter.levels
+        # Overflow diagnostics (#190) are only reported by microphone inputs;
+        # duck-type the optional property so WAV replay and other AudioInput
+        # implementations (including test doubles) need not carry it.
+        overflow = cast(
+            "OverflowSnapshot | None",
+            getattr(self._audio_input, "overflow_snapshot", None),
+        )
         with self._state_lock:
             return AudioCaptureSnapshot(
                 running=thread is not None and thread.is_alive(),
@@ -1591,6 +1717,11 @@ class AudioCapturePipeline:
                 latest_error=self._latest_error,
                 peak_dbfs=None if levels is None else levels[0],
                 rms_dbfs=None if levels is None else levels[1],
+                overflow_count_last_minute=0 if overflow is None else overflow.count_last_minute,
+                estimated_lost_audio_ms_last_minute=(
+                    0.0 if overflow is None else overflow.estimated_lost_audio_ms_last_minute
+                ),
+                total_overflow_count=0 if overflow is None else overflow.total_count,
             )
 
     def _run_capture_loop(self) -> None:
