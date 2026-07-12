@@ -238,7 +238,12 @@ class FirstCrackDetectorAdapter:
         """
         return self.process_window_observed(window).event
 
-    def process_window_observed(self, window: AudioWindow) -> FirstCrackWindowObservation:
+    def process_window_observed(
+        self,
+        window: AudioWindow,
+        *,
+        earliest_eligible_monotonic_seconds: float | None = None,
+    ) -> FirstCrackWindowObservation:
         """Process one audio window and return per-window observability metadata.
 
         This is the observability-aware entry point (#175): it always reports the
@@ -248,6 +253,19 @@ class FirstCrackDetectorAdapter:
 
         Args:
             window: Audio window to run detection for.
+            earliest_eligible_monotonic_seconds: Optional cutoff (coffee-roaster-mcp#195
+                CI follow-up). When set, a positive window whose
+                `started_at_monotonic_seconds` predates this cutoff is
+                reported accurately but never joins the confirmation-window
+                candidate list. Even with `discard_pending_audio()` clearing
+                every buffered stage at the `beans_added` boundary, the
+                reader thread never pauses — a chunk captured in the
+                wall-clock gap between recording the boundary event and
+                calling the discard can legitimately start a fraction of a
+                millisecond before the boundary and survive the discard by
+                arriving concurrently with or after it. Only bounding
+                candidate ONSET here (not the caller retroactively
+                discarding a specific window) closes that race.
 
         Returns:
             Per-window observation including the confirmed event when present.
@@ -261,7 +279,11 @@ class FirstCrackDetectorAdapter:
         _validate_confirmation_config(self.config)
         confidence = _validate_optional_confidence(output.confidence)
         self._prune_positive_candidates(window.started_at_monotonic_seconds)
-        if not output.confirmed:
+        is_precharge_window = (
+            earliest_eligible_monotonic_seconds is not None
+            and window.started_at_monotonic_seconds < earliest_eligible_monotonic_seconds
+        )
+        if not output.confirmed or is_precharge_window:
             return FirstCrackWindowObservation(
                 window_sequence_number=window.sequence_number,
                 confidence=confidence,
@@ -544,7 +566,23 @@ def integrate_first_crack_window_with_session(
     if not session.active or session.phase != "roasting":
         return None
 
-    observation = adapter.process_window_observed(window)
+    # coffee-roaster-mcp#195 CI follow-up: bound candidate onset on
+    # beans_added, not just the pipeline-side discard at the boundary — the
+    # reader thread never pauses, so a chunk captured in the wall-clock gap
+    # between recording the boundary and calling discard_pending_audio()
+    # can legitimately start a fraction of a millisecond before it and
+    # survive the discard. AudioWindow timestamps are ABSOLUTE monotonic;
+    # session milestones are SESSION-elapsed — rebase before comparing.
+    beans_added_monotonic_seconds = session.beans_added_monotonic_seconds
+    earliest_eligible_absolute = (
+        None
+        if beans_added_monotonic_seconds is None
+        else session.monotonic_start + beans_added_monotonic_seconds
+    )
+    observation = adapter.process_window_observed(
+        window,
+        earliest_eligible_monotonic_seconds=earliest_eligible_absolute,
+    )
     session_store.record_first_crack_window_observation(
         session,
         window_sequence_number=observation.window_sequence_number,

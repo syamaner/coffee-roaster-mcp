@@ -63,6 +63,7 @@ class FakeAudioPipeline:
         self.stopped = False
         self.stop_reasons: list[float] = []
         self.drain_limits: list[int | None] = []
+        self.discard_calls = 0
 
     def start(self) -> AudioCaptureSnapshot:
         self.started = True
@@ -82,6 +83,13 @@ class FakeAudioPipeline:
         drained = tuple(self._windows[:max_windows])
         del self._windows[:max_windows]
         return drained
+
+    def discard_pending_audio(self, *, timeout_seconds: float = 1.0) -> None:
+        # This fake models the whole pipeline as one queued-window list, so
+        # there is no separate reader-backlog/sample-buffer stage to clear —
+        # discarding is equivalent to draining everything.
+        self.discard_calls += 1
+        self._windows.clear()
 
     def add_window(self, window: AudioWindow) -> None:
         self._windows.append(window)
