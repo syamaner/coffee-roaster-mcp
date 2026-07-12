@@ -26,6 +26,13 @@ DEFAULT_AUDIO_WINDOW_SECONDS = 1.0
 DEFAULT_AUDIO_WINDOW_QUEUE_LIMIT = 8
 DEFAULT_AUDIO_IDLE_SLEEP_SECONDS = 0.01
 
+#: Bounded queue between the dedicated reader thread and the processing
+#: thread (#190). ~3s of headroom at the default 100ms reader chunk size —
+#: enough to absorb a genuine processing stall without unbounded memory
+#: growth; a reader that outpaces processing this much for this long
+#: indicates the processing thread itself is starved for a different reason.
+_READER_QUEUE_MAXSIZE = 30
+
 
 class AudioCaptureError(RuntimeError):
     """Raised when audio capture cannot be configured or run."""
@@ -1461,6 +1468,26 @@ class AudioCapturePipeline:
         # is visible under real roasting conditions, where the quiet pre-roast
         # floor differs from the in-roast level.
         self._level_meter = _RollingLevelMeter(window_sample_count=settings.window_sample_count)
+        # Dedicated capture thread (#190): the ONLY job of this thread is
+        # stream.read() + enqueue. Metering, recording (numpy PCM16 encode),
+        # windowing, and detector-queue publish all run on the SEPARATE
+        # processing thread below, draining this queue. Before this split, a
+        # single thread did all of that work between successive read() calls,
+        # and PortAudio's input ring buffer has no slack for that — under CPU
+        # contention (concurrent ONNX inference + dual recording writers) the
+        # gap between reads exceeded the buffer and the OS reported overflow.
+        # A bounded queue here (not unbounded) still lets read() run far more
+        # often than the processing work does, while capping memory if the
+        # processing thread ever falls meaningfully behind.
+        self._raw_reads: Queue[tuple[float, ...] | None] = Queue(maxsize=_READER_QUEUE_MAXSIZE)
+        self._reader_thread: Thread | None = None
+        # Fixed small read chunk (independent of the processing thread's
+        # buffer state) so read() cadence never depends on how much work the
+        # processing thread still has queued up — the two loops are fully
+        # decoupled. ~100ms at the configured sample rate: small enough to
+        # keep PortAudio's buffer well-drained, large enough not to spin on
+        # syscalls.
+        self._reader_chunk_sample_count = max(1, round(settings.sample_rate * 0.1))
 
     @property
     def settings(self) -> AudioCaptureSettings:
@@ -1474,27 +1501,47 @@ class AudioCapturePipeline:
                 raise AudioCaptureError("Audio capture pipeline is already running.")
             self._reset_run_state_locked()
             self._stop_requested.clear()
+            # Two threads (#190): the reader does ONLY stream.read() + enqueue,
+            # so PortAudio's ring buffer is drained on a cadence that never
+            # depends on metering/recording/windowing work. The processing
+            # thread does everything else, pulling from the reader's queue.
+            self._reader_thread = Thread(
+                target=self._run_reader_loop,
+                name="coffee-roaster-audio-reader",
+                daemon=True,
+            )
             self._thread = Thread(
-                target=self._run_capture_loop,
+                target=self._run_processing_loop,
                 name="coffee-roaster-audio-capture",
                 daemon=True,
             )
+            self._reader_thread.start()
             self._thread.start()
         return self.snapshot()
 
     def stop(self, *, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
-        """Request capture stop and wait briefly for the worker to finish.
+        """Request capture stop and wait briefly for both threads to finish.
 
-        The audio input is closed by the worker thread itself once its read loop
-        exits, so its native (PortAudio) stream is never freed while a read is in
-        flight on the worker. This method only closes the input directly as a
-        fallback when no worker thread is (still) running — for example, when
-        ``start`` failed or the worker already finished without closing. Closing
-        from this caller thread while the worker is still alive would free the
-        ring buffer under an in-flight ``read`` and crash the process.
+        The audio input is closed by the READER thread itself once its read
+        loop exits, so its native (PortAudio) stream is never freed while a
+        read is in flight (#190: reading is now the reader thread's ONLY
+        job). This method only closes the input directly as a fallback when
+        no reader thread is (still) running — for example, when ``start``
+        failed before spawning it. Closing from this caller thread while the
+        reader is still alive would free the ring buffer under an in-flight
+        ``read`` and crash the process.
+
+        Join order: the PROCESSING thread first (it is never blocked in a
+        syscall — once it observes the stop signal it drains whatever the
+        reader already enqueued and exits quickly), then the READER thread
+        (which may still be mid-blocking-read and can take up to
+        ``timeout_seconds`` to notice the stop signal on its next loop
+        iteration). Each gets its own ``timeout_seconds`` budget rather than
+        splitting one budget between them, so a slow reader join never
+        starves the processing thread's join of time it needs.
 
         Args:
-            timeout_seconds: Maximum time to wait for the worker thread to exit.
+            timeout_seconds: Maximum time to wait for EACH thread to exit.
 
         Returns:
             The capture status snapshot taken after the stop request.
@@ -1505,31 +1552,38 @@ class AudioCapturePipeline:
         if timeout_seconds < 0:
             raise AudioCaptureError("timeout_seconds must be >= 0.")
         self._stop_requested.set()
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout=timeout_seconds)
+        processing_thread = self._thread
+        reader_thread = self._reader_thread
+        if processing_thread is not None:
+            processing_thread.join(timeout=timeout_seconds)
+        if reader_thread is not None:
+            reader_thread.join(timeout=timeout_seconds)
         snapshot = self.snapshot()
-        if thread is None:
-            # No worker thread ever ran (e.g. start() failed before spawning the
-            # worker): close the input here as a fallback. Whenever a worker DID
-            # run it closes the input itself in its loop finally — on the thread
-            # that owns reads — whether it has already exited or is still draining
-            # a blocking read. So stop() must not also close it: that would double
-            # free / free under an in-flight read. (close() is idempotent anyway,
-            # but correctness here does not depend on that.)
+        if reader_thread is None:
+            # No reader thread ever ran (e.g. start() failed before spawning
+            # it): close the input here as a fallback. Whenever a reader DID
+            # run it closes the input itself in its loop finally — on the
+            # thread that owns reads — whether it has already exited or is
+            # still draining a blocking read. So stop() must not also close
+            # it: that would double free / free under an in-flight read.
+            # (close() is idempotent anyway, but correctness here does not
+            # depend on that.)
             _close_audio_input_if_supported(self._audio_input)
-        elif thread.is_alive():
-            # The worker did not exit within the join timeout — typically blocked
-            # in a read while the detector's first samples are still pending (AST
-            # model load). Its `finally` (which closes the recorder) will not run
-            # before this caller returns, and on process/lifespan shutdown the
-            # daemon worker can be killed before it ever does, leaving the WAV at
-            # 0 bytes and no sidecars (#176 hardware bug 2). Finalise the recorder
-            # HERE as a fallback: the recorder is thread-safe (its writer lock
-            # serialises this close against any in-flight worker write), and
-            # close() is idempotent, so the worker's later close() is a no-op. We
-            # do NOT touch the audio input — only the worker may free its native
-            # ring buffer.
+        if processing_thread is not None and processing_thread.is_alive():
+            # The processing thread did not exit within the join timeout —
+            # e.g. a genuinely slow recorder write (disk contention) still in
+            # flight at the exact moment stop() was called; #190's split
+            # means it is never blocked in stream.read() itself anymore, so
+            # this should now be rare. Its `finally` (which closes the
+            # recorder) will not run before this caller returns, and on
+            # process/lifespan shutdown the daemon thread can be killed
+            # before it ever does, leaving the WAV at 0 bytes and no
+            # sidecars (#176 hardware bug 2). Finalise the recorder HERE as a
+            # fallback: the recorder is thread-safe (its writer lock
+            # serialises this close against any in-flight processing-thread
+            # write), and close() is idempotent, so the processing thread's
+            # later close() is a no-op. We do NOT touch the audio input —
+            # only the reader thread may free its native ring buffer.
             self._finalize_recorder()
         return snapshot
 
@@ -1577,14 +1631,26 @@ class AudioCapturePipeline:
     def snapshot(self) -> AudioCaptureSnapshot:
         """Return a thread-safe capture status snapshot."""
         thread = self._thread
+        reader_thread = self._reader_thread
         # Read the coherent (peak, rms) pair in a single access so the snapshot
         # never mixes a peak and RMS from different meter updates (#178). The
         # meter is written outside _state_lock by the capture worker, so two
         # separate property reads could tear; one tuple read cannot.
         levels = self._level_meter.levels
         with self._state_lock:
+            # Both threads must be alive for capture to be genuinely running
+            # (#190): if the reader thread has died (e.g. a fatal overflow
+            # AudioCaptureError) while the processing thread is still
+            # draining a now-stale queue, reporting running=True would hide
+            # a real capture failure.
+            running = (
+                thread is not None
+                and thread.is_alive()
+                and reader_thread is not None
+                and reader_thread.is_alive()
+            )
             return AudioCaptureSnapshot(
-                running=thread is not None and thread.is_alive(),
+                running=running,
                 queued_window_count=self._windows.qsize(),
                 emitted_window_count=self._emitted_window_count,
                 dropped_window_count=self._dropped_window_count,
@@ -1593,7 +1659,53 @@ class AudioCapturePipeline:
                 rms_dbfs=None if levels is None else levels[1],
             )
 
-    def _run_capture_loop(self) -> None:
+    def _run_reader_loop(self) -> None:
+        """Drain the audio input as fast as possible; do nothing else (#190).
+
+        This thread's ONLY job is ``stream.read()`` + enqueue, so PortAudio's
+        input ring buffer is drained on a cadence independent of whatever the
+        processing thread (metering, recording, windowing) is doing. It is
+        also the thread that owns the audio input's lifecycle: it opens the
+        input implicitly on first read and closes it in ``finally``, exactly
+        preserving the pre-#190 invariant that only the thread performing
+        reads may free the native ring buffer — just moved to this thread
+        instead of the (former, now-processing-only) capture loop.
+        """
+        try:
+            while not self._stop_requested.is_set():
+                raw_samples = self._audio_input.read_samples(self._reader_chunk_sample_count)
+                if not raw_samples:
+                    time.sleep(self._settings.idle_sleep_seconds)
+                    continue
+                samples = _normalize_samples_block(raw_samples)
+                # Blocking put with no timeout is intentional: a full queue
+                # means the processing thread has fallen far behind (30
+                # chunks / ~3s at the default chunk size), at which point
+                # slowing the reader down is correct back-pressure rather
+                # than silently dropping raw audio the recorder/detector
+                # would otherwise never see at all.
+                self._raw_reads.put(samples)
+        except Exception as exc:  # noqa: BLE001 - backend/validation exceptions vary.
+            # Covers both a genuine read failure (device gone, backend error)
+            # and a validation failure (_normalize_sample rejecting a
+            # non-finite sample) — both are fatal to this capture run,
+            # exactly matching the pre-#190 single-loop error handling.
+            with self._state_lock:
+                self._latest_error = str(exc)
+            self._stop_requested.set()
+        finally:
+            # Close the audio input on the same thread that owns its reads —
+            # see the docstring above; this is the load-bearing invariant
+            # #190 must not disturb.
+            _close_audio_input_if_supported(self._audio_input)
+            # Sentinel: wake a processing thread that is blocked waiting for
+            # the next chunk so it notices shutdown promptly even if
+            # _stop_requested was set for a reason other than the caller's
+            # normal stop() (e.g. a read error above).
+            with suppress(Full):
+                self._raw_reads.put_nowait(None)
+
+    def _run_processing_loop(self) -> None:
         # Recording is strictly best-effort: a recorder error (including a
         # recording-START failure here) must NEVER kill detection. begin() runs
         # outside the main try below, so it gets its own fail-soft guard: on
@@ -1606,10 +1718,13 @@ class AudioCapturePipeline:
                 self._disable_recorder()
         try:
             while not self._stop_requested.is_set():
-                samples = self._read_next_samples()
-                if not samples:
-                    time.sleep(self._settings.idle_sleep_seconds)
+                try:
+                    samples = self._raw_reads.get(timeout=self._settings.idle_sleep_seconds)
+                except Empty:
                     continue
+                if samples is None:
+                    # Reader-thread shutdown sentinel (see _run_reader_loop).
+                    break
                 self._sample_buffer.extend(samples)
                 # Update the live mic-levels meter from the SAME samples the
                 # detector consumes (#178). Cheap, vectorised, and never raises;
@@ -1635,11 +1750,9 @@ class AudioCapturePipeline:
                 self._latest_error = str(exc)
             self._stop_requested.set()
         finally:
-            # Close the audio input on the same thread that owns its reads. This
-            # guarantees the underlying PortAudio stream's ring buffer is never
-            # freed while a read is in flight, which would otherwise segfault the
-            # process at end of roast (worker mid-read while the caller closes).
-            _close_audio_input_if_supported(self._audio_input)
+            # Unlike before #190, this thread never reads from the audio
+            # input, so it must NOT close it — only the reader thread may
+            # free the native ring buffer (see _run_reader_loop).
             if self._recorder is not None:
                 with suppress(Exception):
                     self._recorder.close()
@@ -1657,11 +1770,6 @@ class AudioCapturePipeline:
         if recorder is not None:
             with suppress(Exception):
                 recorder.close()
-
-    def _read_next_samples(self) -> tuple[float, ...]:
-        needed_samples = self._settings.window_sample_count - len(self._sample_buffer)
-        raw_samples = self._audio_input.read_samples(max(1, needed_samples))
-        return tuple(_normalize_sample(sample) for sample in raw_samples)
 
     def _emit_complete_windows(self) -> None:
         window_sample_count = self._settings.window_sample_count
@@ -1693,6 +1801,14 @@ class AudioCapturePipeline:
         while True:
             try:
                 self._windows.get_nowait()
+            except Empty:
+                break
+        # Also drain any raw sample blocks left over from a prior run (#190):
+        # a fresh start() must never process stale audio queued before this
+        # restart.
+        while True:
+            try:
+                self._raw_reads.get_nowait()
             except Empty:
                 break
         self._sample_buffer.clear()
@@ -1856,6 +1972,36 @@ def _normalize_sample(sample: float) -> float:
     if not math.isfinite(normalized):
         raise AudioCaptureError("audio samples must be finite numbers.")
     return normalized
+
+
+def _normalize_samples_block(raw_samples: Sequence[float]) -> tuple[float, ...]:
+    """Validate and normalize a full block of samples in one vectorised pass.
+
+    coffee-roaster-mcp#190: the per-sample Python-level ``_normalize_sample``
+    generator this replaces on the reader thread's hot path held the GIL for
+    every sample between successive ``stream.read()`` calls — at 16kHz with a
+    ~100ms reader chunk that is ~1,600 Python function calls per read,
+    exactly the class of per-read overhead that caused the original overflow
+    streaks, just relocated onto the reader thread instead of eliminated.
+    numpy does the finiteness check and float64 cast in C and releases the
+    GIL, so this no longer competes with concurrent inference/recording work
+    for read cadence.
+
+    Args:
+        raw_samples: Raw samples as returned by an ``AudioInput``.
+
+    Returns:
+        The validated samples as a tuple of Python floats.
+
+    Raises:
+        AudioCaptureError: If any sample is not finite.
+    """
+    if not raw_samples:
+        return ()
+    array = np.asarray(raw_samples, dtype=np.float64)
+    if not np.isfinite(array).all():
+        raise AudioCaptureError("audio samples must be finite numbers.")
+    return tuple(array.tolist())
 
 
 def _load_sounddevice() -> Any:

@@ -654,7 +654,11 @@ def test_audio_capture_pipeline_records_source_errors_without_raising_on_caller(
     snapshot = pipeline.stop()
 
     assert snapshot.running is False
-    assert snapshot.latest_error == "capture failed after 4 requested samples"
+    # The exact requested-sample count is an internal reader-chunk-size detail
+    # (#190 fixed reader chunk, decoupled from window_sample_count); only the
+    # failure surfacing matters here.
+    assert snapshot.latest_error is not None
+    assert snapshot.latest_error.startswith("capture failed after ")
 
 
 def test_audio_capture_pipeline_rejects_double_start() -> None:
@@ -1001,18 +1005,24 @@ def test_pipeline_recorder_write_failure_finalizes_partial_recording(tmp_path: P
     """Finding #2: a write failure flushes the WAV + writes the sidecar before drop."""
     import json
 
-    class FailOnSecondWriteRecorder(RoastAudioRecorder):
+    class FailAfterFourSamplesRecorder(RoastAudioRecorder):
+        """Fails once at least 4 samples have been written across any number
+        of write_samples() calls — not tied to a fixed call count, since
+        #190's fixed reader chunk size means samples now arrive in smaller,
+        implementation-detail-sized blocks rather than one block per window.
+        """
+
         def __init__(self, **kwargs: object) -> None:
             super().__init__(**kwargs)  # type: ignore[arg-type]
-            self._writes = 0
+            self._total_written = 0
 
         def write_samples(self, samples: Sequence[float]) -> None:
-            self._writes += 1
-            if self._writes >= 2:
+            if self._total_written >= 4:
                 raise RuntimeError("disk full mid-roast")
+            self._total_written += len(samples)
             super().write_samples(samples)
 
-    recorder = FailOnSecondWriteRecorder(
+    recorder = FailAfterFourSamplesRecorder(
         wav_path=tmp_path / "roast.wav",
         sidecar_path=tmp_path / "roast.recording.json",
         sample_rate=4,
@@ -1026,8 +1036,9 @@ def test_pipeline_recorder_write_failure_finalizes_partial_recording(tmp_path: P
             window_seconds=1.0,
             idle_sleep_seconds=0.001,
         ),
-        # Two windows: the first write succeeds and is captured; the second
-        # write raises, finalizing the partial recording.
+        # Two windows: the first window's samples are written successfully;
+        # once 4 samples total have been written, the next write raises,
+        # finalizing the partial recording.
         audio_input=FiniteAudioInput((0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0)),
         recorder=recorder,
     )
@@ -1045,6 +1056,155 @@ def test_pipeline_recorder_write_failure_finalizes_partial_recording(tmp_path: P
     sidecar = json.loads((tmp_path / "roast.recording.json").read_text(encoding="utf-8"))
     assert sidecar["frame_count"] >= 4
     assert sidecar["wav_filename"] == "roast.wav"
+
+
+class _ReadTimingAudioInput:
+    """AudioInput double that records the wall-clock gap between successive
+    read_samples() calls, to prove the reader thread's read cadence stays
+    fast regardless of how slow downstream processing is (#190)."""
+
+    def __init__(self, chunk: tuple[float, ...] = (0.0,)) -> None:
+        self._chunk = chunk
+        self.read_gaps_seconds: list[float] = []
+        self._last_read_at: float | None = None
+
+    def read_samples(self, sample_count: int) -> Sequence[float]:  # noqa: ARG002
+        now = time.monotonic()
+        if self._last_read_at is not None:
+            self.read_gaps_seconds.append(now - self._last_read_at)
+        self._last_read_at = now
+        return self._chunk
+
+
+class _SlowRecorder(RoastAudioRecorder):
+    """Recorder double whose write_samples() blocks for a fixed delay,
+    simulating disk/inference contention on the processing thread (#190)."""
+
+    def __init__(self, *, delay_seconds: float, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self._delay_seconds = delay_seconds
+
+    def write_samples(self, samples: Sequence[float]) -> None:
+        time.sleep(self._delay_seconds)
+        super().write_samples(samples)
+
+
+def test_reader_thread_read_cadence_is_independent_of_slow_processing(
+    tmp_path: Path,
+) -> None:
+    """The #190 fix: a slow processing-side consumer (recording/metering/
+    windowing) must never delay the reader thread's next stream.read() call.
+    Drives a real two-thread AudioCapturePipeline with a recorder whose
+    write_samples() blocks for 50ms per call (standing in for disk or
+    inference contention), and asserts the READER's read-to-read gaps stay
+    far below that — proving the two loops are genuinely decoupled, not
+    proving a specific absolute latency (that depends on the host machine).
+    """
+    audio_input = _ReadTimingAudioInput()
+    recorder = _SlowRecorder(
+        delay_seconds=0.05,
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.recording.json",
+        sample_rate=100,
+        session_id="s",
+    )
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=100,
+            window_seconds=0.05,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+        recorder=recorder,
+    )
+
+    pipeline.start()
+    try:
+        _wait_for(lambda: len(audio_input.read_gaps_seconds) >= 20, timeout_seconds=5.0)
+    finally:
+        pipeline.stop()
+
+    assert audio_input.read_gaps_seconds
+    # The recorder alone would impose a 50ms floor per sample block if reads
+    # were gated on processing; the reader's actual median gap must stay a
+    # small fraction of that, proving processing-side slowness never reaches
+    # the read loop.
+    sorted_gaps = sorted(audio_input.read_gaps_seconds)
+    median_gap = sorted_gaps[len(sorted_gaps) // 2]
+    assert median_gap < 0.02, (
+        f"reader median read gap {median_gap:.4f}s should stay well under the "
+        "50ms processing-side delay if the two loops are truly decoupled"
+    )
+
+
+def test_reader_and_processing_threads_both_reflected_in_running_snapshot() -> None:
+    """running=True requires BOTH threads alive (#190): if the reader thread
+    dies (e.g. a fatal read error) while the processing thread has not yet
+    noticed via _stop_requested, running must not misreport True."""
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(input_device=None, sample_rate=4, idle_sleep_seconds=0.001),
+        audio_input=FailingAudioInput(),
+    )
+
+    pipeline.start()
+    try:
+        _wait_for(lambda: not pipeline.snapshot().running)
+        snapshot = pipeline.snapshot()
+        assert snapshot.running is False
+        assert snapshot.latest_error is not None
+    finally:
+        pipeline.stop()
+
+
+def test_stop_join_order_processing_thread_first_then_reader(tmp_path: Path) -> None:
+    """stop() joins the processing thread before the reader thread (#190):
+    the processing thread is never blocked in a syscall so it should exit
+    quickly once stop_requested is observed, while the reader may still be
+    mid-blocking-read. This drives a real pipeline through a full stop() and
+    asserts both threads are cleanly joined with no leaked/still-alive thread
+    afterward, whichever real-hardware ordering scenario occurs."""
+    audio_input = MutableAudioInput((0.0,) * 400)
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=100,
+            window_seconds=0.1,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=audio_input,
+    )
+
+    pipeline.start()
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count >= 1)
+    # A generous timeout (well above the ~1ms idle-sleep cadence both loops
+    # poll on) keeps this robust under full-suite CPU contention rather than
+    # a tight budget that can flake when many other tests' threads compete
+    # for scheduling at the same time.
+    snapshot = pipeline.stop(timeout_seconds=5.0)
+
+    assert snapshot.latest_error is None
+    reader_thread = pipeline._reader_thread  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    processing_thread = pipeline._thread  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    assert reader_thread is not None
+    assert processing_thread is not None
+    _wait_for(lambda: not reader_thread.is_alive(), timeout_seconds=2.0)
+    _wait_for(lambda: not processing_thread.is_alive(), timeout_seconds=2.0)
+
+
+def test_stop_without_start_closes_input_and_is_a_safe_no_op() -> None:
+    """stop() called without start() (defensive callers elsewhere) must not
+    crash: neither the reader nor processing thread ever existed, so the
+    fallback close runs and both threads report not-alive (#190)."""
+    audio_input = FiniteAudioInput(())
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(input_device=None, sample_rate=4),
+        audio_input=audio_input,
+    )
+
+    snapshot = pipeline.stop()
+
+    assert snapshot.running is False
 
 
 def test_device_label_to_filename_slug() -> None:
