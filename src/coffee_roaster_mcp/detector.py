@@ -253,19 +253,29 @@ class FirstCrackDetectorAdapter:
 
         Args:
             window: Audio window to run detection for.
-            earliest_eligible_monotonic_seconds: Optional cutoff (coffee-roaster-mcp#195
-                CI follow-up). When set, a positive window whose
-                `started_at_monotonic_seconds` predates this cutoff is
-                reported accurately but never joins the confirmation-window
-                candidate list. Even with `discard_pending_audio()` clearing
-                every buffered stage at the `beans_added` boundary, the
-                reader thread never pauses — a chunk captured in the
-                wall-clock gap between recording the boundary event and
-                calling the discard can legitimately start a fraction of a
-                millisecond before the boundary and survive the discard by
-                arriving concurrently with or after it. Only bounding
-                candidate ONSET here (not the caller retroactively
-                discarding a specific window) closes that race.
+            earliest_eligible_monotonic_seconds: Optional cutoff
+                (coffee-roaster-mcp#192, #195 CI follow-up). When set, a
+                positive window whose `started_at_monotonic_seconds`
+                predates this cutoff is reported accurately but never joins
+                the confirmation-window candidate list — it cannot confirm
+                first crack itself, and it cannot backdate or complete a
+                later window's confirmation either. This bounds candidate
+                onset the same way `process_pending_windows_after_drop`
+                already bounds candidate END against the drop: a window
+                whose capture started before `beans_added` may contain
+                empty-drum rattle or charge-pour clatter (both crack-like
+                transients), which must never seed a recovered milestone
+                even when a later, genuinely post-charge window completes
+                the confirmation count. Also closes a narrower race: even
+                with `discard_pending_audio()` clearing every buffered
+                stage at the `beans_added` boundary, the reader thread
+                never pauses — a chunk captured in the wall-clock gap
+                between recording the boundary and calling the discard can
+                legitimately start a fraction of a millisecond before it
+                and survive the discard by arriving concurrently with or
+                after it. Only bounding candidate ONSET here (not the
+                caller retroactively discarding a specific window) closes
+                that race too.
 
         Returns:
             Per-window observation including the confirmed event when present.
@@ -566,13 +576,25 @@ def integrate_first_crack_window_with_session(
     if not session.active or session.phase != "roasting":
         return None
 
-    # coffee-roaster-mcp#195 CI follow-up: bound candidate onset on
-    # beans_added, not just the pipeline-side discard at the boundary — the
-    # reader thread never pauses, so a chunk captured in the wall-clock gap
-    # between recording the boundary and calling discard_pending_audio()
-    # can legitimately start a fraction of a millisecond before it and
-    # survive the discard. AudioWindow timestamps are ABSOLUTE monotonic;
-    # session milestones are SESSION-elapsed — rebase before comparing.
+    # coffee-roaster-mcp#192: the phase gate above is method-entry-level, so
+    # the FIRST call after beans_added flips phase to "roasting" drains
+    # whatever was still queued from BEFORE the charge (nothing drains while
+    # phase is "pre_roast"). Without this cutoff that stale pre-charge window
+    # would join the adapter's confirmation-window candidates unbounded on
+    # its own start time. `beans_added_monotonic_seconds` is always set once
+    # phase is "roasting" (session.py's beans_added handler sets both in the
+    # same transition), so this is never None here.
+    #
+    # Also bounds a narrower #195 CI-follow-up race: even with
+    # discard_pending_audio() clearing every buffered stage at the boundary,
+    # the reader thread never pauses — a chunk captured in the wall-clock
+    # gap between recording beans_added and calling the discard can
+    # legitimately start a fraction of a millisecond before it and survive
+    # the discard by arriving concurrently with or after it.
+    #
+    # AudioWindow timestamps are ABSOLUTE monotonic (the capture pipeline's
+    # own clock); session milestones are SESSION-elapsed — rebase the same
+    # way process_pending_windows_after_drop rebases its drop cutoff.
     beans_added_monotonic_seconds = session.beans_added_monotonic_seconds
     earliest_eligible_absolute = (
         None

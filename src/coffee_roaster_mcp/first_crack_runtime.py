@@ -455,6 +455,20 @@ class FirstCrackSessionRuntime:
             # transform the session store applies in reverse for FC detection
             # (session.py's _detected_elapsed_seconds).
             drop_cutoff_absolute = session.monotonic_start + drop_monotonic_seconds
+            # coffee-roaster-mcp#192: bound the OTHER end too. A window whose
+            # capture started before beans_added must never join the
+            # adapter's confirmation-window candidates here either — the
+            # live path (integrate_first_crack_window_with_session) applies
+            # the same cutoff, but this drain loop calls the adapter
+            # directly and would otherwise let a pre-charge candidate
+            # (empty-drum rattle, charge pour) seed a recovered milestone
+            # once combined with a genuine post-charge confirming window.
+            beans_added_monotonic_seconds = session.beans_added_monotonic_seconds
+            earliest_eligible_absolute = (
+                None
+                if beans_added_monotonic_seconds is None
+                else session.monotonic_start + beans_added_monotonic_seconds
+            )
 
             try:
                 for window in pipeline.drain_windows():
@@ -472,7 +486,10 @@ class FirstCrackSessionRuntime:
                         # the post-drop exemption.
                         continue
                     self._processed_window_count += 1
-                    observation = adapter.process_window_observed(window)
+                    observation = adapter.process_window_observed(
+                        window,
+                        earliest_eligible_monotonic_seconds=earliest_eligible_absolute,
+                    )
                     session_store.record_first_crack_window_observation(
                         session,
                         window_sequence_number=observation.window_sequence_number,

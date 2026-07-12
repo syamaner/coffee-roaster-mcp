@@ -1146,6 +1146,90 @@ def test_process_pending_windows_after_drop_recovers_holder_and_logs_loudly(
     assert [event.kind for event in session.event_timeline] == ["beans_added", "beans_dropped"]
 
 
+def test_process_pending_windows_after_drop_rejects_a_precharge_candidate() -> None:
+    """A recovered milestone must not be seeded by a pre-charge candidate
+    window (coffee-roaster-mcp#192 follow-up on #191).
+
+    With min_positive_windows > 1, a positive window whose capture STARTED
+    before beans_added can still reach the detector adapter: the live path
+    (process_available_windows) is gated on session.phase == "roasting" at
+    the METHOD level, so nothing drains while phase is still "pre_roast" —
+    but the moment beans_added flips the phase, whatever is still sitting in
+    the pipeline's queue from before the charge is drained for the first
+    time and fed to the adapter, with no check on the window's own start
+    time. That candidate then sits in the adapter's rolling
+    confirmation-window state and can be completed by a SECOND positive
+    window that only gets classified post-drop via
+    process_pending_windows_after_drop (the #191 straggler-drain path),
+    producing a recovered onset that is seeded by pre-charge audio (empty
+    drum rattle, charge pour — both crack-like transients) rather than a
+    real first-crack window.
+    """
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    backend = MockDetectorBackend(
+        (
+            # Window 1: PRE-CHARGE, started at 490.0 — drained only once
+            # beans_added flips phase to "roasting" at 505.0.
+            FirstCrackDetectorOutput(
+                confirmed=True, confidence=0.9, detected_at_monotonic_seconds=491.0
+            ),
+            # Window 2: the genuine #191 straggler — completes but isn't
+            # drained until AFTER the drop.
+            FirstCrackDetectorOutput(
+                confirmed=True, confidence=0.94, detected_at_monotonic_seconds=506.0
+            ),
+        )
+    )
+    pipeline = FakeAudioPipeline(
+        (_audio_window(sequence_number=1, started_at_monotonic_seconds=490.0),)
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0", min_positive_windows=2)
+        ),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+    )
+    runtime.start_for_session(session)
+
+    # Pre-charge: window 1 is queued but the live path is a no-op (phase is
+    # still "pre_roast") — this mirrors
+    # test_audio_runtime_processes_after_beans_added_and_records_once's
+    # pre_t0 assertion.
+    pre_t0 = runtime.process_available_windows(session_store=store, session=session)
+    assert pre_t0.queued_window_count == 1
+
+    # beans_added flips phase to "roasting"; the NEXT call drains window 1
+    # for the first time and feeds it to the adapter as the first positive
+    # candidate, even though its capture started before the charge.
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    after_charge = runtime.process_available_windows(session_store=store, session=session)
+    assert after_charge.status == "pending"  # only 1 of 2 required candidates so far
+
+    # A second, genuinely post-charge positive window is captured but not
+    # drained by the live path before the drop fires (the #191 scenario).
+    pipeline.add_window(_audio_window(sequence_number=2, started_at_monotonic_seconds=505.5))
+    clock.monotonic_value = 520.0
+    store.record_event(session, "beans_dropped")
+
+    result = runtime.process_pending_windows_after_drop(session_store=store, session=session)
+
+    recovered_holder = runtime._recovered_first_crack_holder  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+    assert result.status != "detected", (
+        "a recovered milestone must not be confirmed by a candidate whose "
+        "window started before beans_added"
+    )
+    assert recovered_holder == []
+    assert session.first_crack_monotonic_seconds is None
+
+
 def test_process_pending_windows_after_drop_rejects_a_straddling_window() -> None:
     """A window whose END is at/after the drop is rejected (coffee-roaster-mcp#191):
     the drop's own cascading-beans clatter is acoustically crack-like, so a
