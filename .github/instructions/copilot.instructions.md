@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-RoastPilot is a spec-driven Python MCP server for autonomous coffee roasting. The server will own roaster control, telemetry, first-crack event integration, roast timing, derived metrics, event logging, and export in one local stdio process.
+RoastPilot is a Python MCP server for coffee-roaster telemetry and controlled actuation. The server will own roaster control, telemetry, first-crack event integration, roast timing, derived metrics, event logging, and export in one local stdio process.
 
 Full project rules are in `AGENTS.md` at the repo root.
 
@@ -54,4 +54,3 @@ Full project rules are in `AGENTS.md` at the repo root.
 - Tests live under `tests/`.
 - Avoid production-only fakes created solely for tests.
 - Config tests should cover defaults, YAML overrides, environment overrides, and validation failures.
-
