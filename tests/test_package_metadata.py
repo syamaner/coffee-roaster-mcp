@@ -9,7 +9,7 @@ def test_installed_distribution_metadata_is_complete() -> None:
 
     assert package_metadata["Name"] == "coffee-roaster-mcp"
     assert package_metadata["Summary"] == (
-        "RoastPilot: a spec-driven MCP server for autonomous coffee roasting."
+        "RoastPilot: an MCP server for coffee-roaster telemetry and controlled actuation."
     )
     assert package_metadata["Requires-Python"] == ">=3.11"
     assert package_metadata["Author"] == "Sertan Yamaner"
@@ -17,7 +17,7 @@ def test_installed_distribution_metadata_is_complete() -> None:
 
     keywords = {token.strip() for token in package_metadata["Keywords"].split(",") if token.strip()}
     assert {
-        "autonomous-roasting",
+        "coffee-roaster-control",
         "coffee",
         "coffee-roasting",
         "mcp",

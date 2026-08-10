@@ -28,7 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the RoastPilot command line parser."""
     parser = argparse.ArgumentParser(
         prog="coffee-roaster-mcp",
-        description="RoastPilot: a spec-driven MCP server for autonomous coffee roasting.",
+        description=(
+            "RoastPilot: an MCP server for coffee-roaster telemetry and controlled actuation."
+        ),
     )
     parser.add_argument(
         "--version",

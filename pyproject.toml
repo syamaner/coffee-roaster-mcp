@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "coffee-roaster-mcp"
 dynamic = ["version"]
-description = "RoastPilot: a spec-driven MCP server for autonomous coffee roasting."
+description = "RoastPilot: an MCP server for coffee-roaster telemetry and controlled actuation."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -16,7 +16,7 @@ maintainers = [
   { name = "Sertan Yamaner" }
 ]
 keywords = [
-  "autonomous-roasting",
+  "coffee-roaster-control",
   "coffee",
   "coffee-roasting",
   "mcp",
