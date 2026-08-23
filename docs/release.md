@@ -10,6 +10,18 @@ The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 ## Changelog
 
+### 0.1.16
+
+- Documentation release for #204. Updates the README with the live package and
+  MCP Registry status, the complete MCP tool/configuration surface, and the
+  16 August 2026 integrated RoastPilot evidence boundary.
+- Adds a privacy-safe validation report derived from two completed Hottop
+  roasts, including authority-ledger counts, ambient readings, paired-capture
+  metadata, source hashes, and the current cross-store provenance limitation.
+- Removes the stale statement that end-to-end agent-roast validation is future
+  work.
+- No runtime or hardware-control behaviour changes.
+
 ### 0.1.15
 
 - Fix-forward release for #202 after `v0.1.14` failed before upload because
