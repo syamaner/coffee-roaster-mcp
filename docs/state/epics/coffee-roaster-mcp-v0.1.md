@@ -16,12 +16,12 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: v0.1 complete and live-validated end-to-end (E7-S6 done)
-- Active story: issue #200 is complete in PR #201; merge and publication of
-  the metadata-only `v0.1.14` release remain pending
+- Active story: issue #202 prepares fix-forward `v0.1.15` after the
+  `v0.1.14` PyPI job failed before upload
 - Current target: publish the corrected component-scope package metadata in
-  `v0.1.14`, then verify the live PyPI and MCP Registry records
-- Latest package release: `v0.1.13`; `v0.1.14` is prepared but not yet
-  published
+  `v0.1.15`, then verify the live PyPI and MCP Registry records
+- Latest package release: `v0.1.13`; `v0.1.14` is tagged but unpublished, and
+  `v0.1.15` is the fix-forward candidate
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -73,8 +73,14 @@ The first implementation milestone is a mock vertical slice that requires no roa
   are aligned at `0.1.14`; the package summary describes coffee-roaster
   telemetry and controlled actuation, and the `autonomous-roasting` keyword is
   replaced by `coffee-roaster-control`. Runtime and hardware-control behaviour
-  are unchanged. PyPI and MCP Registry publication remain pending until PR
-  #201 is merged and the release workflow succeeds.
+  are unchanged. PR #201 merged, but the `v0.1.14` workflow failed before
+  upload; publication moves forward through issue #202 and `v0.1.15`.
+- The `v0.1.14` release workflow run `32651985421` passed checks, metadata
+  validation, package build, and built-wheel smoke, but PyPI rejected the
+  wheel before upload because the pinned publishing action did not support
+  Core Metadata 2.5. Issue #202 updates the action to the immutable commit
+  behind upstream v1.14.2, prepares fix-forward `v0.1.15`, and leaves runtime
+  and hardware-control behaviour unchanged.
 - `E7-S5a` is inserted before the final release checklist to close the
   first-crack MCP validation gap without requiring Hottop hardware or live
   microphone input. It uses the mock roaster, released Hugging Face first-crack
@@ -998,8 +1004,18 @@ Goal: prove the package works from install through mock roast, MCP client calls,
     them to PyPI. This follow-up aligns the package and MCP Registry versions
     at `0.1.14` and records the metadata-only release boundary.
   - No runtime or hardware-control behaviour changes.
-  - Live PyPI and MCP Registry publication remain pending until PR #201 is
-    merged and the release workflow succeeds.
+  - PR #201 merged, but the `v0.1.14` workflow failed before upload. Live PyPI
+    and MCP Registry publication move forward through issue #202 and
+    `v0.1.15`.
+
+- [x] Maintenance issue #202: support Core Metadata 2.5 and prepare
+  fix-forward `v0.1.15`.
+  - Update the pinned PyPI publishing action to upstream v1.14.2 commit
+    `dc37677b2e1c63e2034f94d8a5b11f265b73ba33`, which supports Core Metadata
+    2.5 through Twine 7.
+  - Align package and MCP Registry versions at `0.1.15` and carry forward the
+    corrected metadata from the unpublished `v0.1.14` artifacts.
+  - No runtime or hardware-control behaviour changes.
 
 ### Epic Acceptance Criteria
 
@@ -1058,6 +1074,24 @@ After completing a story:
 
 ## Validation Notes
 
+- Validation run for issue #202:
+  - Confirmed failed release run `32651985421` stopped before upload with
+    `InvalidDistribution: Invalid distribution metadata: '2.5' is not a valid
+    metadata version`; MCP Registry publishing was skipped.
+  - Confirmed upstream `pypa/gh-action-pypi-publish` v1.14.2 explicitly adds
+    Core Metadata 2.5 upload support through Twine 7 and pinned its immutable
+    commit `dc37677b2e1c63e2034f94d8a5b11f265b73ba33`.
+  - Ran `./.venv/bin/python -m pytest`: 559 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed after formatting
+    the new release-workflow assertion.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Built `coffee_roaster_mcp-0.1.15.tar.gz` and
+    `coffee_roaster_mcp-0.1.15-py3-none-any.whl`; built-wheel smoke returned
+    `mock disabled int8` and `coffee-roaster-mcp 0.1.15`.
+  - Confirmed the wheel retains `Metadata-Version: 2.5`, carries the corrected
+    summary and keywords, and therefore exercises the compatibility boundary
+    fixed by the updated publishing action.
 - Validation run for issue #200:
   - Confirmed the built wheel reports version `0.1.14`, summary `RoastPilot: an
     MCP server for coffee-roaster telemetry and controlled actuation.`, and the

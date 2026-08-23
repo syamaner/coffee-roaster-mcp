@@ -8,6 +8,7 @@ import yaml
 
 WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml"
 PINNED_ACTION_REF = re.compile(r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}$")
+PYPI_PUBLISH_ACTION = "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
 
 
 def test_release_workflow_runs_on_tags_and_manual_dry_run() -> None:
@@ -51,6 +52,7 @@ def test_release_workflow_uses_trusted_publishing_and_release_environment() -> N
     assert pypi_job["environment"] == "release"
     assert pypi_job["permissions"] == {"contents": "read", "id-token": "write"}
     assert _step_uses_pinned_action(pypi_job, "pypa/gh-action-pypi-publish")
+    assert any(step.get("uses") == PYPI_PUBLISH_ACTION for step in pypi_job["steps"])
 
     assert registry_job["environment"] == "release"
     assert registry_job["permissions"] == {"contents": "read", "id-token": "write"}
