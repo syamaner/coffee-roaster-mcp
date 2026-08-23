@@ -20,11 +20,14 @@
 
 ## Active Context
 
-Issue #202 is preparing fix-forward `v0.1.15`. The `v0.1.14` workflow built and
-smoke-tested the package but failed before upload because its pinned PyPI action
-rejected Core Metadata 2.5. The fix updates that action to upstream v1.14.2,
-aligns the package and MCP Registry versions at `0.1.15`, and carries forward
-the corrected component-scope metadata from #200. Runtime and hardware-control
+Issue #204 prepares documentation release `v0.1.16`. PyPI 0.1.15 and the MCP
+Registry entry are live, but the README still omitted the released recording,
+microphone observability, ambient-sensor, and recording-metadata surfaces and
+ended with a stale future-validation statement. The update records two
+completed 16 August 2026 agent-controlled Hottop roasts from the authority
+ledger and session/capture evidence while preserving the provenance boundary:
+the agent rows and MCP sessions are correlated by log-directory session id and
+aligned start time, not a persisted foreign key. Runtime and hardware-control
 behaviour are unchanged.
 
 RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.

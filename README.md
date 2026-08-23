@@ -13,7 +13,28 @@ RoastPilot provides one local MCP runtime for roaster control, telemetry, first-
 
 ## Status
 
-✅ **v0.1 complete — verified end-to-end on real hardware (2026-06-07).**
+✅ **v0.1 component scope complete, published on PyPI and in the MCP Registry,
+and exercised in supervised agent-controlled hardware roasts through
+2026-08-16.**
+
+The latest integrated evidence is two completed Hottop roasts on 2026-08-16.
+Together they exercised live telemetry and control, automatic T0, first-crack
+handling, post-first-crack decisions, safety evaluation, advisor-triggered
+drop, operator-controlled cooling completion, ambient sensing, log export, and
+paired-microphone capture. The agent ledger recorded 19 successful advisor
+decisions, each linked to an `allow` safety evaluation; both advisor-proposed
+drops were executed, with no failed command events or safety alerts in either
+completed run.
+
+Those roasts used the pinned `coffee-roaster-mcp` 0.1.13 runtime. Versions
+0.1.14 and 0.1.15 changed package metadata and release plumbing only; this
+0.1.16 update changes documentation and release metadata only. Runtime
+behaviour is unchanged. See the
+[2026-08-16 agent-roast validation report](https://github.com/syamaner/coffee-roaster-mcp/blob/main/docs/session-summaries/2026-08-16-agent-roast-validation.md)
+for the authority-ledger, session, ambient, and capture evidence, including its
+provenance limits.
+
+The original published-package baseline remains the 2026-06-07 validation:
 
 The published `coffee-roaster-mcp` 0.1.3 package, installed through the MCP
 Registry `uvx` path into the Warp agent, ran two complete supervised roasts
@@ -58,7 +79,9 @@ server, conservative hardware boundaries, and releaseable package metadata.
 
 ## What RoastPilot Is
 
-RoastPilot is the human-facing product name. `coffee-roaster-mcp` is the infrastructure and packaging name used for the repository, Python package, and future distribution.
+RoastPilot is the human-facing product name. `coffee-roaster-mcp` is the
+infrastructure and packaging name used for the repository, Python package, and
+published distribution.
 
 The v0.1 scope is one local stdio MCP server that owns:
 
@@ -68,9 +91,9 @@ The v0.1 scope is one local stdio MCP server that owns:
 - derived roast metrics
 - roast log export
 
-All v0.1 epics are complete and live-validated. The package scaffold, config
-loading, local development commands, pull-request CI, stdio MCP entrypoint,
-roast-session tool surface, Hottop driver, audio first-crack runtime,
+All MCP-component v0.1 epics are complete and live-validated. The package
+scaffold, config loading, local development commands, pull-request CI, stdio
+MCP entrypoint, roast-session tool surface, Hottop driver, audio first-crack runtime,
 automatic T0 path, metrics/log export, release workflow, and MCP Registry
 metadata are in place, and the full end-to-end path has been verified on
 connected Hottop hardware with a real microphone through the published
@@ -143,6 +166,22 @@ coffee-roaster-mcp --help
 coffee-roaster-mcp --version
 ```
 
+### Hardware And Audio Checks
+
+Two explicit pre-roast checks cover the configured microphone and independent
+multi-device recording paths without starting a roast:
+
+```bash
+coffee-roaster-mcp mic-check --config coffee-roaster-mcp.yaml
+coffee-roaster-mcp record-check --config coffee-roaster-mcp.yaml
+```
+
+`mic-check` reports whether the selected input contains a real signal and can
+write a small JSON evidence record. `record-check` captures each configured
+recording device into a temporary or explicit output directory and reports the
+result. The resulting audio may contain ambient conversation and must not be
+committed.
+
 ## Local Mock Run
 
 The default local path is intentionally mock-safe:
@@ -180,10 +219,16 @@ The current MCP tool surface includes:
 - `stop_cooling`
 - `export_roast_log`
 - `emergency_stop`
+- `set_recording_metadata`
 
 `export_roast_log` writes `roast.jsonl`, `roast.csv`, and `summary.json` files
 for the current in-process session. Runtime events and sampled telemetry are
 also appended to `roast.jsonl` during the roast.
+
+Before a recorded roast, `set_recording_metadata` stores the bean-origin slug
+and roast number used for capture filenames and the session sidecar. It sends
+no hardware command and does not expose a generic file-write or tool-execution
+surface.
 
 ### Operational MCP Flow
 
@@ -221,6 +266,20 @@ records `beans_added` when the current bean temperature drops from that max by
 `session.auto_t0_drop_threshold_c`. `get_roast_state.t0_status` exposes the
 configured threshold, tracked charge temperature, current drop, and detected
 bean temperature when automatic T0 records the event.
+
+Optional ambient sensing and roast recording are also disabled by default.
+When enabled deliberately, `get_roast_state` exposes fail-soft Yoctopuce
+ambient readings and live microphone/overflow status, while the recording
+runtime can capture one or more independent microphone streams into a
+session-scoped directory. Recording uses the audio first-crack capture runtime;
+it therefore requires `first_crack.mode: audio`. A live roast recording also
+requires `audio.source: microphone`, with `recording.enabled` and
+`recording.autocapture` both set to `true`. When `recording.devices` is set,
+its first entry must match `audio.input_device`: that stream is captured by the
+detector and teed into the first WAV rather than opened independently. Any
+additional entries are opened as independent recording streams. These paths
+have been exercised together during the August 2026 hardware roasts described
+in the current validation report.
 
 `get_roast_state.first_crack_status.status` is one of:
 
@@ -353,6 +412,21 @@ audio:
   overlap: 0.0
   hop_seconds: null
 
+ambient:
+  mode: disabled
+  device: null
+  poll_interval_seconds: 30.0
+
+recording:
+  # Recording runs through the audio first-crack capture runtime.
+  # Live capture also requires first_crack.mode: audio and audio.source: microphone.
+  enabled: false
+  autocapture: false
+  export_location: null
+  sample_rate: null
+  # When set, the first entry must match audio.input_device.
+  devices: null
+
 logging:
   log_dir: ./logs
   sample_interval_seconds: 5.0
@@ -391,6 +465,14 @@ Supported environment overrides:
 - `COFFEE_AUDIO_WINDOW_SECONDS`
 - `COFFEE_AUDIO_OVERLAP`
 - `COFFEE_AUDIO_HOP_SECONDS`
+- `COFFEE_AMBIENT_MODE`
+- `COFFEE_AMBIENT_DEVICE`
+- `COFFEE_AMBIENT_POLL_INTERVAL_SECONDS`
+- `COFFEE_RECORDING_ENABLED`
+- `COFFEE_RECORDING_AUTOCAPTURE`
+- `COFFEE_RECORDING_EXPORT_LOCATION`
+- `COFFEE_RECORDING_SAMPLE_RATE`
+- `COFFEE_RECORDING_DEVICES`
 - `COFFEE_ROAST_LOG_DIR`
 - `COFFEE_AUTO_T0_DROP_THRESHOLD_C`
 - `HF_HOME`
@@ -503,5 +585,7 @@ Current export files:
   metrics, roaster driver, and first-crack model metadata
 - output under `logs/roasts/{session_id}/`
 
-Cross-format log schema completeness tests are in place. Broad release
-validation and end-to-end agent roast validation land in later stories.
+Cross-format log schema completeness tests are in place. The June 2026
+published-package baseline and August 2026 integrated agent-roast report record
+the current live-validation boundary; new hardware configurations still require
+their own supervised validation.
