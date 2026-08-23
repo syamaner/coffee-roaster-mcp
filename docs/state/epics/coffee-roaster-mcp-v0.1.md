@@ -16,12 +16,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: v0.1 complete and live-validated end-to-end (E7-S6 done)
-- Active story: issue #202 prepares fix-forward `v0.1.15` after the
-  `v0.1.14` PyPI job failed before upload
-- Current target: publish the corrected component-scope package metadata in
-  `v0.1.15`, then verify the live PyPI and MCP Registry records
-- Latest package release: `v0.1.13`; `v0.1.14` is tagged but unpublished, and
-  `v0.1.15` is the fix-forward candidate
+- Active story: issue #204 prepares documentation release `v0.1.16`
+- Current target: publish the current live-roast evidence boundary and complete
+  README tool/configuration surface, then update the PyPI long description
+- Latest package release: `v0.1.15`; PyPI and MCP Registry publication verified
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -81,6 +79,17 @@ The first implementation milestone is a mock vertical slice that requires no roa
   Core Metadata 2.5. Issue #202 updates the action to the immutable commit
   behind upstream v1.14.2, prepares fix-forward `v0.1.15`, and leaves runtime
   and hardware-control behaviour unchanged.
+- `v0.1.15` is published on production PyPI and in the MCP Registry. Release
+  workflow run `32652660041` passed metadata validation, checks, package build,
+  PyPI publishing, and MCP Registry publishing; a clean `uvx` smoke reported
+  `coffee-roaster-mcp 0.1.15`, and the registry marks it latest.
+- Issue #204 prepares `v0.1.16` as a documentation release. It adds a
+  privacy-safe report for two completed 16 August 2026 agent-controlled Hottop
+  roasts, updates the README with recording and ambient surfaces already
+  released by 0.1.13, and removes a stale future-validation statement. The
+  August roasts used the pinned 0.1.13 runtime; 0.1.14 and 0.1.15 changed
+  metadata/release plumbing only. No runtime or hardware-control behaviour
+  changes in 0.1.16.
 - `E7-S5a` is inserted before the final release checklist to close the
   first-crack MCP validation gap without requiring Hottop hardware or live
   microphone input. It uses the mock roaster, released Hugging Face first-crack
@@ -1017,6 +1026,16 @@ Goal: prove the package works from install through mock roast, MCP client calls,
     corrected metadata from the unpublished `v0.1.14` artifacts.
   - No runtime or hardware-control behaviour changes.
 
+- [x] Maintenance issue #204: publish current live-roast status and complete
+  the README surface in `v0.1.16`.
+  - Add a privacy-safe evidence report derived from the agent authority ledger,
+    MCP session exports, ambient readings, and paired capture manifests.
+  - Document the released recording, microphone observability, ambient, and
+    recording-metadata surfaces and remove the stale future-validation claim.
+  - Align package and MCP Registry versions at `0.1.16` so the corrected long
+    description reaches PyPI.
+  - No runtime or hardware-control behaviour changes.
+
 ### Epic Acceptance Criteria
 
 - Full mock roast works from install to exported logs.
@@ -1074,6 +1093,24 @@ After completing a story:
 
 ## Validation Notes
 
+- Validation run for issue #204:
+  - Queried the live RoastPilot SQLite store read-only and matched the two
+    completed 16 August agent runs to MCP session exports by the session id in
+    `log_dir` and start timestamps aligned within 50 ms. Recorded the null
+    `mcp_session_id` provenance limit explicitly.
+  - Verified 19/19 advisor decisions were `ok` and linked to `allow` safety
+    evaluations; both advisor-proposed drops were executed, and the two runs
+    contained zero failed-command and zero safety-alert events.
+  - Verified ambient readings and two independent 16 kHz microphone streams
+    in both capture manifests; recorded source hashes without committing raw
+    audio, roast logs, the SQLite store, or local paths.
+  - Ran `./.venv/bin/python -m pytest`: 559 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright` under Python 3.11: 0 errors.
+  - Built `coffee_roaster_mcp-0.1.16.tar.gz` and
+    `coffee_roaster_mcp-0.1.16-py3-none-any.whl`; built-wheel smoke returned
+    `mock disabled int8` and `coffee-roaster-mcp 0.1.16`.
 - Validation run for issue #202:
   - Confirmed failed release run `32651985421` stopped before upload with
     `InvalidDistribution: Invalid distribution metadata: '2.5' is not a valid
