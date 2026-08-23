@@ -16,14 +16,12 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current phase: v0.1 complete and live-validated end-to-end (E7-S6 done)
-- Active story: none — all v0.1 stories complete
-- Current target: post-validation follow-ups — ship the `server.json`
-  `packageArguments: serve` fix in the next release, and extend
-  `get_runtime_config` (`RuntimeConfigSnapshot`) with detector-profile,
-  model-revision, and audio capture fields so MCP clients can verify the
-  active first-crack configuration through the tool surface
-- Latest package release: `v0.1.3` (used for the E7-S6 live validation
-  roasts)
+- Active story: issue #200 is complete in PR #201; merge and publication of
+  the metadata-only `v0.1.14` release remain pending
+- Current target: publish the corrected component-scope package metadata in
+  `v0.1.14`, then verify the live PyPI and MCP Registry records
+- Latest package release: `v0.1.13`; `v0.1.14` is prepared but not yet
+  published
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -70,6 +68,13 @@ The first implementation milestone is a mock vertical slice that requires no roa
   published PyPI and MCP Registry metadata, and published-package smoke with
   `uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.1.2 coffee-roaster-mcp --version`
   returned `coffee-roaster-mcp 0.1.2`.
+- Issue #200 prepares `v0.1.14` as a metadata-only release of the
+  component-scope wording merged in PR #198. Package and MCP Registry versions
+  are aligned at `0.1.14`; the package summary describes coffee-roaster
+  telemetry and controlled actuation, and the `autonomous-roasting` keyword is
+  replaced by `coffee-roaster-control`. Runtime and hardware-control behaviour
+  are unchanged. PyPI and MCP Registry publication remain pending until PR
+  #201 is merged and the release workflow succeeds.
 - `E7-S5a` is inserted before the final release checklist to close the
   first-crack MCP validation gap without requiring Hottop hardware or live
   microphone input. It uses the mock roaster, released Hugging Face first-crack
@@ -988,6 +993,14 @@ Goal: prove the package works from install through mock roast, MCP client calls,
     repo for the next release), and `get_runtime_config` does not yet expose
     detector-profile/audio fields (follow-up).
 
+- [x] Maintenance issue #200: prepare corrected package metadata for release.
+  - PR #198 corrected the source description and keywords but did not publish
+    them to PyPI. This follow-up aligns the package and MCP Registry versions
+    at `0.1.14` and records the metadata-only release boundary.
+  - No runtime or hardware-control behaviour changes.
+  - Live PyPI and MCP Registry publication remain pending until PR #201 is
+    merged and the release workflow succeeds.
+
 ### Epic Acceptance Criteria
 
 - Full mock roast works from install to exported logs.
@@ -1045,6 +1058,19 @@ After completing a story:
 
 ## Validation Notes
 
+- Validation run for issue #200:
+  - Confirmed the built wheel reports version `0.1.14`, summary `RoastPilot: an
+    MCP server for coffee-roaster telemetry and controlled actuation.`, and the
+    `coffee-roaster-control` keyword without `autonomous-roasting`.
+  - Ran `./.venv/bin/python -m pytest`: 559 passed.
+  - Ran `./.venv/bin/python -m ruff check .`: passed.
+  - Ran `./.venv/bin/python -m ruff format --check .`: passed.
+  - Ran `./.venv/bin/python -m pyright`: 0 errors.
+  - Ran CLI help and version smoke checks: passed; version output was
+    `coffee-roaster-mcp 0.1.14`.
+  - Built the sdist and wheel and ran the built-wheel smoke test: passed.
+  - Live PyPI and MCP Registry publication were not performed in this story
+    branch and remain release-workflow follow-up work.
 - E1-S1 created durable state docs and the copied overall plan.
 - E1-S2 added the initial Python package scaffold, console entrypoint declaration, package module, CLI module, and package smoke tests.
 - E1-S3 added CLI help/version behavior and smoke coverage.

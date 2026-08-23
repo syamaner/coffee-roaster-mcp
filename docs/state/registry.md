@@ -20,6 +20,11 @@
 
 ## Active Context
 
+Issue #200 is preparing a metadata-only `v0.1.14` release. PR #198 already
+corrected the source package description and keywords; this slice aligns the
+package and MCP Registry versions so the corrected metadata can reach PyPI.
+Runtime and hardware-control behaviour are unchanged.
+
 RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.
 
 The `v0.1.1` fix-forward release is published for the post-E7-S4 recovery

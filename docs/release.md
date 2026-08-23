@@ -10,6 +10,15 @@ The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 ## Changelog
 
+### 0.1.14
+
+- Metadata-only release for #200. Publishes the component-scope description
+  merged in PR #198: coffee-roaster telemetry and controlled actuation, without
+  the previous autonomous-roasting claim.
+- Replaces the published `autonomous-roasting` keyword with
+  `coffee-roaster-control`.
+- No runtime or hardware-control behaviour changes.
+
 ### 0.1.13
 
 - #190 audio-overflow arc: dedicated capture reader thread (blocking-read
