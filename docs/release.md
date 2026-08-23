@@ -10,9 +10,22 @@ The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 ## Changelog
 
+### 0.1.15
+
+- Fix-forward release for #202 after `v0.1.14` failed before upload because
+  the pinned PyPI publishing action rejected Core Metadata 2.5.
+- Updates `pypa/gh-action-pypi-publish` to the commit behind upstream v1.14.2,
+  which adds Core Metadata 2.5 support through Twine 7.
+- Carries forward the corrected component-scope description and
+  `coffee-roaster-control` keyword from the unpublished `v0.1.14` artifacts.
+- No runtime or hardware-control behaviour changes.
+
 ### 0.1.14
 
-- Metadata-only release for #200. Publishes the component-scope description
+- Unpublished metadata-only release attempt for #200. The tag workflow built
+  and smoke-tested the artifacts, but PyPI rejected Core Metadata 2.5 before
+  upload. The corrected metadata therefore moves forward in `v0.1.15`.
+- Carries the component-scope description
   merged in PR #198: coffee-roaster telemetry and controlled actuation, without
   the previous autonomous-roasting claim.
 - Replaces the published `autonomous-roasting` keyword with
