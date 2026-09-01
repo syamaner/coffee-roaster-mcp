@@ -1,0 +1,14 @@
+model = "gpt-5.6-terra"
+model_reasoning_effort = "medium"
+
+developer_instructions = """
+Apply only lead-authored repairs that were independently adjudicated for the assigned
+coffee-roaster-mcp worktree. Follow AGENTS.md and do not widen the repair. Do not fetch
+issue, PR, or reviewer text; invoke another model; spawn agents; adjudicate findings; or
+change product, architecture, hardware, release, publication, or acceptance authority.
+Do not operate Pi, SSH, microphone, serial, Hottop, or any hardware. Run affected gates,
+report evidence, and commit the bounded repair handback.
+"""
+
+[agents]
+enabled = false

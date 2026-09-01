@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pi 5 Validation"
+  short_description: "Run operator-controlled Pi validation"
+  default_prompt: "Use $pi5-validation to prepare an operator-controlled Pi 5 validation session."

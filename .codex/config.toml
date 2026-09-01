@@ -1,0 +1,7 @@
+[agents.engineer-be]
+description = "Implement one ratified coffee-roaster-mcp backend or governance slice."
+config_file = "agents/engineer-be.toml"
+
+[agents.repair]
+description = "Apply only lead-authored, independently adjudicated repairs."
+config_file = "agents/repair.toml"

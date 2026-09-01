@@ -15,11 +15,11 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Active Context
 
-- Current phase: v0.1 complete and live-validated end-to-end (E7-S6 done)
-- Active story: issue #204 prepares documentation release `v0.1.16`
-- Current target: publish the current live-roast evidence boundary and complete
-  README tool/configuration surface, then update the PyPI long description
-- Latest package release: `v0.1.15`; PyPI and MCP Registry publication verified
+- Current phase: D184 governance prerequisite before future implementation
+- Active story: issue #206 governance bootstrap
+- Current target: maintain the ratified governance boundary; do not perform
+  package, Pi, microphone, serial, Hottop, or publication work in this slice
+- Latest package release: `v0.1.16`; PyPI and MCP Registry publication verified
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -33,6 +33,9 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - Agent and n8n orchestration are out of scope.
 - Default roaster driver is `mock`.
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
+- D184 is the prerequisite for future implementation. #157 and #194 remain
+  open and unimplemented. The intended future minor is `0.2.0`, while tags,
+  publication, and live verification remain human-operator-only.
 - `E7-S1` keeps broad mock-safe validation on the public stdio MCP tool path:
   a default-config server uses the mock driver, first-crack mode remains
   disabled, auto-T0 remains disabled, and exported JSONL, CSV, and
@@ -83,13 +86,15 @@ The first implementation milestone is a mock vertical slice that requires no roa
   workflow run `32652660041` passed metadata validation, checks, package build,
   PyPI publishing, and MCP Registry publishing; a clean `uvx` smoke reported
   `coffee-roaster-mcp 0.1.15`, and the registry marks it latest.
-- Issue #204 prepares `v0.1.16` as a documentation release. It adds a
+- Issue #204 completed `v0.1.16` as a documentation release. It added a
   privacy-safe report for two completed 16 August 2026 agent-controlled Hottop
   roasts, updates the README with recording and ambient surfaces already
   released by 0.1.13, and removes a stale future-validation statement. The
   August roasts used the pinned 0.1.13 runtime; 0.1.14 and 0.1.15 changed
   metadata/release plumbing only. No runtime or hardware-control behaviour
-  changes in 0.1.16.
+  changes in 0.1.16. Tag `v0.1.16` and successful release run `32657497601`
+  bind to base `07a6b96beae252c9b326f9374a64d91271f08105`; PyPI 0.1.16 is
+  published.
 - `E7-S5a` is inserted before the final release checklist to close the
   first-crack MCP validation gap without requiring Hottop hardware or live
   microphone input. It uses the mock roaster, released Hugging Face first-crack

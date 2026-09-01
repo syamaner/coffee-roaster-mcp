@@ -6,7 +6,19 @@ This runbook documents the operator prerequisites and CI release path for
 The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 - Manual dry run through `workflow_dispatch` with `dry_run: true`.
-- Live release through a pushed version tag such as `v0.1.3`.
+- Live release through a human-operator-pushed version tag.
+
+## Current Release Authority
+
+`v0.1.16` is the current published PyPI and MCP Registry release. Its tag and
+successful release run `32657497601` bind to base
+`07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance is the current
+prerequisite for future implementation; #157 and #194 remain open and
+unimplemented. The intended future minor is `0.2.0`.
+
+Only the human release operator may create or push tags, approve the release
+environment, publish packages, or verify live PyPI and MCP Registry artefacts.
+This governance slice neither authorises nor performs those actions.
 
 ## Changelog
 
@@ -147,8 +159,8 @@ The dry run:
 
 ## v0.1 Release Checklist
 
-Use this checklist for the next v0.1 release candidate from updated `main`.
-The current published package and registry metadata are `0.1.2`; the latest
+Use this checklist for a future release candidate from updated `main`.
+The current published package and registry metadata are `0.1.16`; the latest
 E7-S5a first-crack replay evidence uses released Hugging Face INT8 artifacts
 from `syamaner/coffee-first-crack-detection` pinned to revision
 `b349a919c34b6130472da97c01817be404e4f629`.
@@ -204,9 +216,9 @@ Before tagging, confirm these values all match the release version:
 - the pushed tag name, using `v{version}`
 - installed CLI output from `coffee-roaster-mcp --version`
 
-The current release candidate aligns all package and registry metadata at
-`0.1.6`. A later release candidate must update all three checked-in version
-fields in the same PR before tagging.
+Confirm the candidate version is aligned across all package and registry
+metadata. A later release candidate must update all three checked-in version
+fields in the same PR before the human operator tags it.
 
 ### Hugging Face First-Crack Artifact Pin
 
@@ -239,8 +251,8 @@ model cards, and dataset cards remain in `coffee-first-crack-detection`.
 4. Create and push the matching protected version tag:
 
    ```bash
-   git tag v0.1.3
-   git push origin v0.1.3
+   git tag v{version}
+   git push origin v{version}
    ```
 
 5. Approve the GitHub `release` environment deployment for `Publish PyPI`.
@@ -249,11 +261,10 @@ model cards, and dataset cards remain in `coffee-first-crack-detection`.
 7. Run a published-package smoke after the package index exposes the version:
 
    ```bash
-   uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.1.3 coffee-roaster-mcp --version
+   uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp=={version} coffee-roaster-mcp --version
    ```
 
-Use the actual candidate version in tag and smoke commands. The `0.1.3`
-commands above document the next release candidate.
+Use the actual candidate version in tag and smoke commands.
 
 ### MCP Registry Publish Steps
 
@@ -297,7 +308,7 @@ alone.
 
 A release may be described as mock-safe when default install, package smoke,
 MCP client, and mock roast validation pass without hardware or model download.
-The current `v0.1.2` state is mock-safe by default and includes E7-S5a
+The current `v0.1.16` state is mock-safe by default and includes E7-S5a
 labelled WAV replay evidence for the released first-crack artifact pin.
 
 A release may be described as hardware-validated only when the release
@@ -326,8 +337,8 @@ After all prerequisites are confirmed:
 2. Push the matching version tag:
 
    ```bash
-   git tag v0.1.2
-   git push origin v0.1.2
+   git tag v{version}
+   git push origin v{version}
    ```
 
 3. Approve the `release` environment deployment in GitHub Actions.
