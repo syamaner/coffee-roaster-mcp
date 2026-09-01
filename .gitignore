@@ -54,6 +54,11 @@ cover/
 logs/
 *.wav
 *.flac
+*.mp3
+*.m4a
+*.ogg
+*.aiff
+*.aif
 *.sqlite
 *.sqlite3
 *.db
@@ -62,6 +67,9 @@ validation-evidence/
 serial-captures/
 *.serial
 *.serialcap
+roast.jsonl
+roast.csv
+summary.json
 
 # Translations
 *.mo
@@ -161,6 +169,7 @@ activemq-data/
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
 env/

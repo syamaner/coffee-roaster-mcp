@@ -8,6 +8,11 @@ description: Set up the RoastPilot development environment and run current hardw
 Use this skill for local development setup and hardware-free validation. Root
 `AGENTS.md` is the current gate authority.
 
+The top-level parent alone performs venv/dependency installation, build, and
+clean-wheel smoke where network or dependency resolution is needed.
+Write-capable leaves return affected offline-gate evidence and never request
+network or sandbox relaxation.
+
 ## Setup
 
 ```bash

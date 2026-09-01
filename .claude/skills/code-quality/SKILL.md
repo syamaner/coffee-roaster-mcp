@@ -14,6 +14,11 @@ is the current gate authority.
 - Use Python 3.11+.
 - Dependencies must be installed from project metadata:
 
+  The top-level parent alone performs venv/dependency installation where
+  network or dependency resolution is needed. Write-capable leaves return
+  affected offline-gate evidence and never request network or sandbox
+  relaxation.
+
 ```bash
 python -m pip install -e . --group dev
 ```
@@ -32,6 +37,10 @@ coffee-roaster-mcp --version
 python -m build
 python .github/scripts/smoke_install_built_wheel.py
 ```
+
+The top-level parent alone runs build and clean-wheel smoke where dependency
+resolution or network access is needed; leaves return affected offline-gate
+evidence without requesting network or sandbox relaxation.
 
 ## Acceptance
 
