@@ -1090,10 +1090,11 @@ lifecycle under root `AGENTS.md`.
 
 ## Validation Notes
 
-- Governance issue #206: [x] Complete. D184 established the MCP-specific
-  Codex-led topology, shared Pi validation skill, hosted-Claude retirement, and
-  refreshed `v0.1.16`/current authority. No `src/` change, #157/#194
-  implementation, hardware operation, or publication occurred.
+- Governance issue #206: [~] delivery baseline prepared; issue completion is
+  recorded only after PR merge. D184 establishes the MCP-specific Codex-led
+  topology, shared Pi validation skill, hosted-Claude retirement, and refreshed
+  `v0.1.16`/current authority. No `src/` change, #157/#194 implementation,
+  hardware operation, or publication occurred.
 - Validation run for issue #206:
   - Bound plan SHA `8f83dee9ffcc1abd60a5cbeab4c1d14b803c4e99` and MCP base
     `07a6b96beae252c9b326f9374a64d91271f08105`.
@@ -1103,6 +1104,11 @@ lifecycle under root `AGENTS.md`.
     passed after parent-adjudicated repairs.
   - Hosted Claude workflows were disabled live and their files removed. No
     production source, hardware/Pi operation, or publication occurred.
+  - Live `main` protection observed on 1 September 2026: required `Checks` and
+    `Build Package`; strict/current-branch mode; required conversation
+    resolution; administrator enforcement; force-push and deletion disabled;
+    and zero required approving reviews. This is platform configuration, not
+    evidence that #206 has merged.
 
 - Validation run for issue #204:
   - Queried the live RoastPilot SQLite store read-only and matched the two

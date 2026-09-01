@@ -24,11 +24,17 @@
 
 `v0.1.16` is published on PyPI and in the MCP Registry. Tag `v0.1.16` and
 successful release run `32657497601` bind to base
-`07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance baseline is
-complete through issue #206. No implementation story is active; issues #157
-and #194 remain open, unstarted, and require later ratified contracts. The
-intended future minor is `0.2.0`; tag creation,
+`07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance delivery is
+prepared through issue #206 pending PR merge. No implementation story is
+active; issues #157 and #194 remain open, unstarted, and require later ratified
+contracts. The intended future minor is `0.2.0`; tag creation,
 publication, and live verification remain human-operator-only actions.
+
+## Historical Narrative (Superseded For Current Delivery)
+
+The narrative below preserves prior evidence and release history. It is not
+current delivery authority; use the Active Context, active epic, and root
+`AGENTS.md` for current governance.
 
 RoastPilot is a standalone Python MCP server that owns roaster control,
 first-crack detection integration, roast timing, metrics, and log export in one
