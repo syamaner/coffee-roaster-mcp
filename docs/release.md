@@ -343,6 +343,10 @@ After all prerequisites are confirmed:
    git push origin v0.2.0
    ```
 
+   `v0.2.0` is an illustrative planned-next-minor example only, not tagging or
+   publication authority; a human operator selects and authorises the actual
+   candidate version.
+
 3. Approve the `release` environment deployment in GitHub Actions.
 4. Confirm the workflow completes in this order:
    - `checks`
