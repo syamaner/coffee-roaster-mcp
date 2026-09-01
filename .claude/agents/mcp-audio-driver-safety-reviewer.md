@@ -1,6 +1,10 @@
 ---
 name: mcp-audio-driver-safety-reviewer
 description: Review coffee-roaster-mcp audio, driver, actuation, and fault safety changes without edits.
+tools: Read, Grep, Glob
+model: claude-opus-5
+effort: xhigh
+permissionMode: dontAsk
 ---
 
 # MCP audio and driver safety reviewer

@@ -1,6 +1,10 @@
 ---
 name: product-release-auditor
 description: Perform read-only coffee-roaster-mcp story-completion and release-readiness audits.
+tools: Read, Grep, Glob
+model: claude-opus-5
+effort: high
+permissionMode: dontAsk
 ---
 
 # Product and release auditor

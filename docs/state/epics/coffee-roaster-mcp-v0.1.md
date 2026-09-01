@@ -15,10 +15,11 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Active Context
 
-- Current phase: D184 governance prerequisite before future implementation
-- Active story: issue #206 governance bootstrap
-- Current target: maintain the ratified governance boundary; do not perform
-  package, Pi, microphone, serial, Hottop, or publication work in this slice
+- Current phase: D184 governance baseline active and complete through issue #206
+- Active story: none; #157 and #194 remain unstarted and require later
+  ratified contracts
+- Current target: no implementation slice is active; do not infer package, Pi,
+  microphone, serial, Hottop, or publication authority
 - Latest package release: `v0.1.16`; PyPI and MCP Registry publication verified
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
@@ -33,9 +34,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - Agent and n8n orchestration are out of scope.
 - Default roaster driver is `mock`.
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
-- D184 is the prerequisite for future implementation. #157 and #194 remain
-  open and unimplemented. The intended future minor is `0.2.0`, while tags,
-  publication, and live verification remain human-operator-only.
+- D184 governance baseline is complete through issue #206. #157 and #194
+  remain open and unstarted; each requires a later ratified contract. The
+  intended future minor is `0.2.0`, while tags, publication, and live
+  verification remain human-operator-only.
 - `E7-S1` keeps broad mock-safe validation on the public stdio MCP tool path:
   a default-config server uses the mock driver, first-crack mode remains
   disabled, auto-T0 remains disabled, and exported JSONL, CSV, and

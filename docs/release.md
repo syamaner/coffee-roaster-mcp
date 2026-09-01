@@ -213,7 +213,7 @@ Before tagging, confirm these values all match the release version:
 - `src/coffee_roaster_mcp/__init__.py` `__version__`
 - `server.json.version`
 - `server.json.packages[0].version`
-- the pushed tag name, using `v{version}`
+- the pushed tag name, illustrated as `v0.2.0` only
 - installed CLI output from `coffee-roaster-mcp --version`
 
 Confirm the candidate version is aligned across all package and registry
@@ -251,8 +251,8 @@ model cards, and dataset cards remain in `coffee-first-crack-detection`.
 4. Create and push the matching protected version tag:
 
    ```bash
-   git tag v{version}
-   git push origin v{version}
+   git tag v0.2.0
+   git push origin v0.2.0
    ```
 
 5. Approve the GitHub `release` environment deployment for `Publish PyPI`.
@@ -261,10 +261,12 @@ model cards, and dataset cards remain in `coffee-first-crack-detection`.
 7. Run a published-package smoke after the package index exposes the version:
 
    ```bash
-   uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp=={version} coffee-roaster-mcp --version
+   uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.2.0 coffee-roaster-mcp --version
    ```
 
-Use the actual candidate version in tag and smoke commands.
+`v0.2.0` / `0.2.0` are illustrative planned-next-minor examples only, not
+tagging or publication authority; a human operator selects and authorises the
+actual candidate version.
 
 ### MCP Registry Publish Steps
 
@@ -337,8 +339,8 @@ After all prerequisites are confirmed:
 2. Push the matching version tag:
 
    ```bash
-   git tag v{version}
-   git push origin v{version}
+   git tag v0.2.0
+   git push origin v0.2.0
    ```
 
 3. Approve the `release` environment deployment in GitHub Actions.

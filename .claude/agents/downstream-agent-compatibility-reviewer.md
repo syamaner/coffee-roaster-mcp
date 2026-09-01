@@ -1,6 +1,10 @@
 ---
 name: downstream-agent-compatibility-reviewer
 description: Review MCP tool, schema, and configuration compatibility for RoastPilot Agent consumers without edits.
+tools: Read, Grep, Glob
+model: claude-sonnet-5
+effort: high
+permissionMode: dontAsk
 ---
 
 # Downstream agent compatibility reviewer

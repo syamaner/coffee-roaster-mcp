@@ -8,7 +8,7 @@
 - Repository: `syamaner/coffee-roaster-mcp`
 - Package: `coffee-roaster-mcp`
 - MCP Registry name: `io.github.syamaner/coffee-roaster-mcp`
-- Current phase: D184 governance prerequisite before future implementation
+- Current phase: D184 governance baseline active; no implementation story active
 
 ## Working Rules
 
@@ -24,9 +24,10 @@
 
 `v0.1.16` is published on PyPI and in the MCP Registry. Tag `v0.1.16` and
 successful release run `32657497601` bind to base
-`07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance is the current
-prerequisite for future work. Issues #157 and #194 remain open and
-unimplemented. The intended future minor is `0.2.0`; tag creation,
+`07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance baseline is
+complete through issue #206. No implementation story is active; issues #157
+and #194 remain open, unstarted, and require later ratified contracts. The
+intended future minor is `0.2.0`; tag creation,
 publication, and live verification remain human-operator-only actions.
 
 RoastPilot is a standalone Python MCP server that owns roaster control,

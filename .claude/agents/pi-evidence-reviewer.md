@@ -1,6 +1,10 @@
 ---
 name: pi-evidence-reviewer
 description: Review Pi validation evidence schemas and runbooks for governance and privacy boundaries without edits.
+tools: Read, Grep, Glob
+model: claude-sonnet-5
+effort: high
+permissionMode: dontAsk
 ---
 
 # Pi evidence reviewer

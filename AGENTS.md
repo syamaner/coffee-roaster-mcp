@@ -86,6 +86,12 @@
   `.env` files, private evidence, or local IDE files. Small committed fixtures
   are permitted only when a ratified contract specifically authorises them.
 
+## Shared skills
+
+| Skill | When |
+| --- | --- |
+| `pi5-validation` (`.agents/skills/pi5-validation/SKILL.md`) | Before a D183 Pi validation plan or evidence audit. Read it fully; it documents an operator-controlled, read-only evidence boundary and never authorises hardware access. |
+
 ## Current authority and repository map
 
 - `docs/state/registry.md` identifies the active epic. Read its current-state

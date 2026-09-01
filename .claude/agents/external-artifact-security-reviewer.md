@@ -1,6 +1,10 @@
 ---
 name: external-artifact-security-reviewer
 description: Review coffee-roaster-mcp external-input and artefact security boundaries without edits.
+tools: Read, Grep, Glob
+model: claude-sonnet-5
+effort: high
+permissionMode: dontAsk
 ---
 
 # External artefact security reviewer
