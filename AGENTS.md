@@ -35,9 +35,9 @@
   diffs over 600 lines require `qa` review.
 - Before opening a PR, run deterministic gates, inspect the branch diff and
   current-state authority, and obtain the contract-required independent local
-  review. Reviewers report findings; the parent or independent `pr-triage`
-  equivalent decides dispositions. Authors fix confirmed findings but never
-  self-dismiss them.
+  review. Reviewers report findings; the top-level parent or a separately
+  assigned independent adjudicator who is not the author decides dispositions.
+  Authors fix confirmed findings but never self-dismiss them.
 - Current PR checks are `Checks` and `Build Package`; all conversations must be
   resolved. Do not import a coverage-upload gate or hosted-Claude approval
   bridge from RoastPilot Agent.
@@ -77,11 +77,12 @@
   python .github/scripts/smoke_install_built_wheel.py
   ```
 
-- Run the relevant shared-skill validator after changing a shared skill. Tests
-  and local validation use the mock driver, disabled first-crack mode, fakes,
-  or recorded fixtures. Do not run Pi, microphone, serial, Hottop, package
-  publication, or network-dependent runtime validation unless a human-owned
-  contract explicitly authorises it.
+- After changing `pi5-validation`, run the external shared-tooling validator:
+  `.venv/bin/python /Users/sertanyamaner/.codex/skills/.system/skill-creator/scripts/quick_validate.py .agents/skills/pi5-validation`.
+  Missing validator tooling fails closed. Tests and local validation use the
+  mock driver, disabled first-crack mode, fakes, or recorded fixtures. Do not
+  run Pi, microphone, serial, Hottop, package publication, or network-dependent
+  runtime validation unless a human-owned contract explicitly authorises it.
 - Do not commit model weights, audio, roast logs, serial captures, databases,
   `.env` files, private evidence, or local IDE files. Small committed fixtures
   are permitted only when a ratified contract specifically authorises them.
@@ -90,6 +91,11 @@
 
 | Skill | When |
 | --- | --- |
+| `code-quality` (`.claude/skills/code-quality/SKILL.md`) | Before implementation handback or PR opening; root AGENTS gate authority supersedes stale skill text. |
+| `mcp-dev` (`.claude/skills/mcp-dev/SKILL.md`) | For local MCP setup and hardware-free validation; root AGENTS gate authority supersedes stale skill text. |
+| `mock-roast` (`.claude/skills/mock-roast/SKILL.md`) | For mock-only roast planning or audit. |
+| `hottop-validation` (`.claude/skills/hottop-validation/SKILL.md`) | For agent planning or audit of a human-owned Hottop validation; hardware commands remain human-operator-only. |
+| `release-registry` (`.claude/skills/release-registry/SKILL.md`) | For read-only release preparation or audit; root AGENTS and `docs/release.md` authority supersede stale skill text. |
 | `pi5-validation` (`.agents/skills/pi5-validation/SKILL.md`) | Before a D183 Pi validation plan or evidence audit. Read it fully; it documents an operator-controlled, read-only evidence boundary and never authorises hardware access. |
 
 ## Current authority and repository map

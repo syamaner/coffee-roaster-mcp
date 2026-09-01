@@ -5,7 +5,8 @@ description: Run RoastPilot quality gates for tests, linting, formatting, type c
 
 # Code Quality - RoastPilot
 
-Use this skill before marking implementation work complete.
+Use this skill before marking implementation work complete. Root `AGENTS.md`
+is the current gate authority.
 
 ## Prerequisites
 
@@ -22,21 +23,24 @@ python -m pip install -e . --group dev
 Run:
 
 ```bash
-python -m pytest
+python -m pytest --cov=coffee_roaster_mcp --cov-branch --cov-report=term-missing
 python -m ruff check .
 python -m ruff format --check .
 python -m pyright
 coffee-roaster-mcp --help
 coffee-roaster-mcp --version
+python -m build
+python .github/scripts/smoke_install_built_wheel.py
 ```
 
 ## Acceptance
 
-- `pytest` passes.
+- Coverage-and-branch `pytest` passes.
 - `ruff check .` passes.
 - `ruff format --check .` passes.
 - `pyright` reports 0 errors.
 - CLI help and version commands exit successfully.
+- Package build and clean-wheel smoke pass.
 
 ## If The Environment Is Incomplete
 
@@ -50,4 +54,4 @@ coffee-roaster-mcp --version
 - Add production test fakes to make tests easier.
 - Install dependencies without declaring them in `pyproject.toml`.
 - Mark hardware stories complete from unit tests alone.
-
+- Run hardware validation without a separate human-owned contract.

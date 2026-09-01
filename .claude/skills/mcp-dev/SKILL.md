@@ -1,11 +1,12 @@
 ---
 name: mcp-dev
-description: Set up the RoastPilot development environment and run current scaffold-level validation commands. Use when bootstrapping local development or validating early MCP scaffold work.
+description: Set up the RoastPilot development environment and run current hardware-free validation commands.
 ---
 
 # MCP Dev - RoastPilot
 
-Use this skill for local development setup and scaffold validation.
+Use this skill for local development setup and hardware-free validation. Root
+`AGENTS.md` is the current gate authority.
 
 ## Setup
 
@@ -19,13 +20,14 @@ python -m pip install -e . --group dev
 ## Current Validation
 
 ```bash
-python -m pytest
+python -m pytest --cov=coffee_roaster_mcp --cov-branch --cov-report=term-missing
 python -m ruff check .
 python -m ruff format --check .
 python -m pyright
 coffee-roaster-mcp --help
 coffee-roaster-mcp --version
-coffee-roaster-mcp serve
+python -m build
+python .github/scripts/smoke_install_built_wheel.py
 ```
 
 ## Mock-Safe Bootstrap Smoke
@@ -44,5 +46,5 @@ mock disabled int8
 
 ## Notes
 
-- `E2-S1` adds the first stdio MCP server entrypoint with bootstrap-safe introspection tools only.
-- The full mock roast flow is still pending later Epic 2 stories.
+- All validation remains hardware-free unless a separate human-owned contract
+  authorises otherwise.

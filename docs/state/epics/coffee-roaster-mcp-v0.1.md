@@ -1081,24 +1081,28 @@ Goal: prove the package works from install through mock roast, MCP client calls,
 
 ## Story Workflow
 
-Before starting a story:
-
-1. Read `docs/state/registry.md`.
-2. Read this active epic.
-3. Read the linked GitHub issue.
-4. Confirm acceptance criteria and current risks.
-5. Create branch `feature/{issue-number}-{slug}`.
-
-After completing a story:
-
-1. Run required checks.
-2. Update story status in this epic.
-3. Update Active Context and Current Decisions if behavior changed.
-4. Add validation notes.
-5. Comment on the GitHub issue with what changed and how it was tested.
-6. Open a PR referencing the issue.
+Root `AGENTS.md` governs delivery. The top-level parent reads untrusted issue
+and review text, ratifies the MCP-specific contract, and plans one PR per
+coherent slice/branch. The implementer receives only that contract and does
+not fetch GitHub text; an independent adjudicator disposes of findings. Run the
+required gates, update state and validation evidence, then complete the PR
+lifecycle under root `AGENTS.md`.
 
 ## Validation Notes
+
+- Governance issue #206: [x] Complete. D184 established the MCP-specific
+  Codex-led topology, shared Pi validation skill, hosted-Claude retirement, and
+  refreshed `v0.1.16`/current authority. No `src/` change, #157/#194
+  implementation, hardware operation, or publication occurred.
+- Validation run for issue #206:
+  - Bound plan SHA `8f83dee9ffcc1abd60a5cbeab4c1d14b803c4e99` and MCP base
+    `07a6b96beae252c9b326f9374a64d91271f08105`.
+  - Full gate: 559 tests, 91.22% coverage; Ruff check and format, Pyright,
+    CLI `0.1.16`, build, and clean-wheel smoke all passed.
+  - Shared Pi-skill validation passed. An independent local security review
+    passed after parent-adjudicated repairs.
+  - Hosted Claude workflows were disabled live and their files removed. No
+    production source, hardware/Pi operation, or publication occurred.
 
 - Validation run for issue #204:
   - Queried the live RoastPilot SQLite store read-only and matched the two

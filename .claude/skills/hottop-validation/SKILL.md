@@ -5,7 +5,10 @@ description: Review the guarded manual validation path for Hottop hardware work.
 
 # Hottop Validation - RoastPilot
 
-Use this skill for Hottop-facing work and release-readiness review.
+Agents use this skill only to prepare or audit a human-owned plan or evidence.
+Only a named human operator may execute commands or touch a Pi, serial device,
+microphone, or Hottop. Agents must never execute commands or recommend
+proceeding autonomously.
 
 ## Current Scope
 
@@ -19,7 +22,8 @@ Use this skill for Hottop-facing work and release-readiness review.
 
 ## Pre-Validation Gates
 
-Complete these gates in order before any Hottop hardware session.
+The named human operator completes these gates before any Hottop hardware
+session; an agent may only audit the plan or resulting evidence.
 
 ### 1. Story And Source Readiness
 
@@ -42,7 +46,7 @@ Complete these gates in order before any Hottop hardware session.
 - Proceed to `--include-drop` only when the roaster is ready for an actual drop check.
 - Proceed to `--include-emergency-stop` only when the operator is ready to verify the safety action.
 
-Confirm these source artifacts before running hardware:
+The human operator confirms these source artifacts before running hardware:
 
 - `src/coffee_roaster_mcp/drivers.py`: `HottopRoasterDriver`, command-loop lifecycle, command state, packet build/parse, status read, temperature normalization, and emergency stop.
 - `src/coffee_roaster_mcp/hottop_validation.py`: guarded `hottop-validate` runner, JSON evidence shape, skipped-step behavior, and release-label decision.
@@ -72,7 +76,11 @@ Abort procedure:
 
 ## Guarded Validation Command
 
-Use a local config file with an explicit Hottop driver and serial port:
+Agents stop at plan/evidence preparation here. Only the named human operator
+may run the following guarded hardware commands or touch the connected devices.
+
+The human operator uses a local config file with an explicit Hottop driver and
+serial port:
 
 ```yaml
 roaster:
@@ -83,7 +91,7 @@ roaster:
   command_interval_seconds: 0.3
 ```
 
-Run the non-destructive portion first:
+The human operator runs the non-destructive portion first:
 
 ```bash
 coffee-roaster-mcp hottop-validate \
@@ -92,7 +100,8 @@ coffee-roaster-mcp hottop-validate \
   --i-understand-this-controls-hardware
 ```
 
-Run the full validation only when the roaster is supervised and ready for drop and emergency-stop checks:
+The human operator runs the full validation only when the roaster is supervised
+and ready for drop and emergency-stop checks:
 
 ```bash
 coffee-roaster-mcp hottop-validate \
@@ -107,7 +116,8 @@ Do not commit generated validation JSON unless the file is sanitized to remove s
 
 ## Pass/Fail Criteria
 
-Use this table with the JSON evidence from `hottop-validate` plus direct operator observation.
+The human operator uses this table with the JSON evidence from
+`hottop-validate` plus direct observation; agents audit supplied evidence only.
 
 | Area | Pass | Needs Review Or Skipped | Fail |
 | --- | --- | --- | --- |

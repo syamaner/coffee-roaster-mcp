@@ -117,8 +117,8 @@ Before enabling a live release, the release owner must confirm:
 - The GitHub environment named `release` exists and requires manual approval by
   the release owner before deployment jobs can run.
 - Protected tag rules block unapproved creation or update of `v*` tags.
-- The release tag matches the package version exactly, for example package
-  version `0.1.3` must use tag `v0.1.3`.
+- The release tag matches the package version exactly: package version `X.Y.Z`
+  uses tag `vX.Y.Z`.
 - No model weights, audio files, roast logs, serial captures, `.env` files, or
   local IDE folders are included in the release artifact.
 
@@ -167,15 +167,17 @@ from `syamaner/coffee-first-crack-detection` pinned to revision
 
 ### Required Tests And Checks
 
-Run the normal local gate before tagging:
+Run the complete hardware-free gate from root `AGENTS.md` before tagging:
 
 ```bash
-python -m pytest
+python -m pytest --cov=coffee_roaster_mcp --cov-branch --cov-report=term-missing
 python -m ruff check .
 python -m ruff format --check .
 python -m pyright
 coffee-roaster-mcp --help
 coffee-roaster-mcp --version
+python -m build
+python .github/scripts/smoke_install_built_wheel.py
 ```
 
 Confirm CI passes on the release-candidate PR:
@@ -369,7 +371,7 @@ github-oidc`, and then publishes `server.json`.
 
 ## MCP Registry Verification
 
-The MCP Registry is preview. Before a live v0.1 release, use the current
+The MCP Registry is preview. Before a future live release, use the current
 official registry docs and schema, then repeat the non-destructive checks below:
 
 1. Confirm `server.json` uses the current schema URI:
@@ -421,7 +423,7 @@ after PyPI succeeds leaves PyPI live without Registry discoverability and should
 be retried only after checking Registry status and confirming no partial
 version entry was created.
 
-## v0.1.1 Release Prep
+## v0.1.1 Release Prep (Historical, Complete)
 
 The `v0.1.1` release is the fix-forward package release for the E7-S4 Warp
 manual Hottop validation recovery fixes. It should be tagged only after the
@@ -492,7 +494,7 @@ Confirmed outcomes:
   bypass as `v0.1.0`; keep tag protection and release environment ownership
   under review before the next release.
 
-## v0.1.2 Release Prep
+## v0.1.2 Release Prep (Historical, Complete)
 
 The `v0.1.2` release is a metadata-only package release to expose related
 project resources on PyPI and through the README reached from the MCP Registry

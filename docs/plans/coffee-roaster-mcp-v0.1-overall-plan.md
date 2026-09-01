@@ -2,6 +2,11 @@
 
 ## Summary
 
+Delivery-workflow notice: D184 at plan SHA
+`8f83dee9ffcc1abd60a5cbeab4c1d14b803c4e99` supersedes only this document's
+old story-level issue/branch/PR workflow. Root `AGENTS.md` governs current
+delivery; this product and runtime plan remains historical authority otherwise.
+
 Build `RoastPilot`, a standalone Python MCP server published as `coffee-roaster-mcp`, that replaces the current two-MCP plus n8n POC with one local process that owns roaster control, telemetry, microphone first-crack detection, roast timing, derived metrics, event logging, and export.
 
 The model repo remains the source of truth for training, ONNX export, Hugging Face publishing, model cards, and dataset cards. This MCP only consumes released Hugging Face artifacts from `syamaner/coffee-first-crack-detection`.
@@ -274,19 +279,9 @@ Add a root `AGENTS.md` that defines:
 
 Required pre-task workflow:
 
-1. Read `docs/state/registry.md`.
-2. Open the active epic file.
-3. Read the GitHub issue for the story.
-4. Confirm acceptance criteria and current risks.
-5. Work on a branch named `feature/{issue-number}-{slug}`.
-
-Required post-task workflow:
-
-1. Run the required checks.
-2. Update the story status in the active epic file.
-3. Update active context and decision notes if behavior changed.
-4. Comment on the GitHub issue with what was built and how it was tested.
-5. Open a PR referencing the story issue.
+This historical story-level delivery workflow is superseded by D184 at plan SHA
+`8f83dee9ffcc1abd60a5cbeab4c1d14b803c4e99`; follow root `AGENTS.md` for
+current contract-first, slice-based delivery.
 
 ### Durable Epic State
 
