@@ -2,7 +2,6 @@ model = "gpt-5.6-terra"
 model_reasoning_effort = "medium"
 sandbox_mode = "workspace-write"
 approval_policy = "never"
-network_access = false
 
 developer_instructions = """
 Apply only lead-authored repairs that were independently adjudicated for the assigned
@@ -12,6 +11,9 @@ change product, architecture, hardware, release, publication, or acceptance auth
 Do not operate Pi, SSH, microphone, serial, Hottop, or any hardware. Run affected gates,
 report evidence, and commit the bounded repair handback.
 """
+
+[sandbox_workspace_write]
+network_access = false
 
 [agents]
 enabled = false
