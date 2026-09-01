@@ -10,6 +10,9 @@ Only a named human operator may execute commands or touch a Pi, serial device,
 microphone, or Hottop. Agents must never execute commands or recommend
 proceeding autonomously.
 
+Root `AGENTS.md` is the current hardware-free gate authority and supersedes any
+stale gate wording in this skill.
+
 ## Current Scope
 
 - Hottop lifecycle, command-loop streaming, packet build/parse, control command state, and temperature-unit handling exist behind the `HottopRoasterDriver` boundary.
@@ -206,11 +209,8 @@ Use this structure in issue comments, PR descriptions, or durable validation not
 
 - Branch/commit:
 - E3-S4 through E3-S8 marked complete in epic state: yes/no
-- Required tests before hardware run:
-  - pytest:
-  - ruff check:
-  - ruff format --check:
-  - pyright:
+- Complete current root `AGENTS.md` hardware-free gate before the run, with
+  each command and result recorded here:
 
 ## Results
 

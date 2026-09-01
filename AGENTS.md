@@ -112,7 +112,7 @@
 | `code-quality` (`.claude/skills/code-quality/SKILL.md`) | Before implementation handback or PR opening; root AGENTS gate authority supersedes stale skill text. |
 | `mcp-dev` (`.claude/skills/mcp-dev/SKILL.md`) | For local MCP setup and hardware-free validation; root AGENTS gate authority supersedes stale skill text. |
 | `mock-roast` (`.claude/skills/mock-roast/SKILL.md`) | For mock-only roast planning or audit. |
-| `hottop-validation` (`.claude/skills/hottop-validation/SKILL.md`) | For agent planning or audit of a human-owned Hottop validation; hardware commands remain human-operator-only. |
+| `hottop-validation` (`.claude/skills/hottop-validation/SKILL.md`) | For agent planning or audit of a human-owned Hottop validation; hardware commands remain human-operator-only and root AGENTS gate authority supersedes stale skill text. |
 | `release-registry` (`.claude/skills/release-registry/SKILL.md`) | For read-only release preparation or audit; root AGENTS and `docs/release.md` authority supersede stale skill text. |
 | `pi5-validation` (`.agents/skills/pi5-validation/SKILL.md`) | Before a D183 Pi validation plan or evidence audit. Read it fully; it documents an operator-controlled, read-only evidence boundary and never authorises hardware access. |
 
