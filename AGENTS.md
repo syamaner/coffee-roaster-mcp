@@ -85,7 +85,9 @@
   runtime validation unless a human-owned contract explicitly authorises it.
 - Do not commit model weights, audio, roast logs, serial captures, databases,
   `.env` files, private evidence, or local IDE files. Small committed fixtures
-  are permitted only when a ratified contract specifically authorises them.
+  are permitted only when a ratified contract specifically authorises them. The
+  existing E7-S5a `tests/fixtures/audio/` replay fixture is an authorised
+  retained exception; any new audio fixture still requires a ratified contract.
 
 ## Shared skills
 
@@ -115,8 +117,7 @@ src/coffee_roaster_mcp/
   config.py                - typed defaults, YAML, and environment loading
   mcp_server.py            - FastMCP stdio tools and runtime assembly
   session.py               - authoritative roast lifecycle, events, telemetry, and logs
-  drivers.py               - RoasterDriver abstraction and mock driver
-  hottop_driver.py         - guarded Hottop driver boundary
+  drivers.py               - RoasterDriver abstraction, mock driver, and guarded Hottop driver
   audio.py                 - capture sources and bounded audio pipeline
   detector.py              - detector adapter and first-crack candidates
   first_crack_runtime.py   - session-owned first-crack runtime

@@ -8,6 +8,9 @@ description: Prepare or audit an operator-controlled Raspberry Pi 5 validation s
 Prepare a human-owned D183 plan or audit supplied evidence. This skill never
 operates a Pi, recording device, microphone, Hottop, serial device, or MCP
 server: the collector is read-only and no hardware action is authorised.
+Multi-stream Pi capture is out of #157/#194 and requires a later decision. Any
+collector alarm requires human-operator action; the collector and this skill do
+not actuate or direct a response.
 
 ## Characterise before accepting
 
