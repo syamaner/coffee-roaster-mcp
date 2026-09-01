@@ -52,6 +52,16 @@ coverage.xml
 .pytest_cache/
 cover/
 logs/
+*.wav
+*.flac
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+validation-evidence/
+serial-captures/
+*.serial
+*.serialcap
 
 # Translations
 *.mo

@@ -1,6 +1,6 @@
 ---
 name: hottop-validation
-description: Review the guarded manual validation path for Hottop hardware work. Use when planning or verifying hardware-facing changes without overstating what the repo can currently run.
+description: Human-only Hottop execution; agents prepare or audit a guarded manual validation plan and evidence without operating hardware.
 ---
 
 # Hottop Validation - RoastPilot
@@ -27,24 +27,31 @@ session; an agent may only audit the plan or resulting evidence.
 
 ### 1. Story And Source Readiness
 
-- Confirm E3-S4 through E3-S8 are complete in `docs/state/epics/coffee-roaster-mcp-v0.1.md`.
-- Confirm the current Hottop validation story or release-readiness task is active, not a broader driver redesign.
-- Confirm unit and integration coverage exists in `tests/test_drivers.py` and `tests/test_hottop_validation.py`.
-- Confirm fail-closed behavior in `src/coffee_roaster_mcp/drivers.py`.
+- The named human operator confirms durable E3 history in
+  `docs/state/epics/coffee-roaster-mcp-v0.1.md` and the current human-owned
+  validation task; no E3 story is implied active.
+- The named human operator confirms unit and integration coverage exists in
+  `tests/test_drivers.py` and `tests/test_hottop_validation.py`.
+- The named human operator confirms fail-closed behavior in
+  `src/coffee_roaster_mcp/drivers.py`.
 
 ### 2. Operator And Hardware Readiness
 
-- Confirm the roaster is supervised for the full run.
-- Confirm the operator understands emergency stop, bean drop, cooling, and physical power-off expectations.
-- Confirm the serial port is known.
-- Confirm the config file explicitly sets `roaster.driver: hottop_kn8828b_2k_plus`.
-- Confirm the operator accepts that `--include-drop` is irreversible for loaded beans.
+- The named human operator confirms the roaster is supervised for the full run.
+- The named human operator confirms understanding of emergency stop, bean drop,
+  cooling, and physical power-off expectations.
+- The named human operator confirms the serial port is known and the config
+  explicitly sets `roaster.driver: hottop_kn8828b_2k_plus`.
+- The named human operator confirms that `--include-drop` is irreversible for
+  loaded beans.
 
 ### 3. Run Readiness
 
-- Run the non-destructive validation before any full validation.
-- Proceed to `--include-drop` only when the roaster is ready for an actual drop check.
-- Proceed to `--include-emergency-stop` only when the operator is ready to verify the safety action.
+- The named human operator runs non-destructive validation before any full
+  validation.
+- The named human operator proceeds to `--include-drop` only when the roaster
+  is ready for an actual drop check, and to `--include-emergency-stop` only when
+  ready to verify that safety action.
 
 The human operator confirms these source artifacts before running hardware:
 
@@ -55,7 +62,8 @@ The human operator confirms these source artifacts before running hardware:
 
 ## Hard Abort Conditions
 
-Stop the validation session immediately if any of these occur:
+The named human operator stops the validation session immediately if any of
+these occur:
 
 - The serial port cannot be identified confidently or opens the wrong device.
 - The command reports repeated serial write, read, checksum, or command-loop errors.
@@ -66,13 +74,15 @@ Stop the validation session immediately if any of these occur:
 - The operator loses direct supervision of the roaster.
 - Smoke, electrical smell, uncontrolled heat, jammed drop, or unexpected mechanical behavior appears.
 
-Abort procedure:
+Human-operator abort procedure:
 
-1. Run or trigger emergency stop if it is safe to do so.
-2. Physically power off the roaster if software control is uncertain.
-3. Preserve the JSON evidence file and terminal output.
-4. Do not continue to later steps in the same run.
-5. Record the failed step, observed behavior, and whether the roaster was physically powered off.
+1. The named human operator runs or triggers emergency stop if safe.
+2. The named human operator physically powers off the roaster if software
+   control is uncertain.
+3. The named human operator preserves the JSON evidence file and terminal output.
+4. The named human operator does not continue to later steps in the same run.
+5. The named human operator records the failed step, observed behaviour, and
+   whether the roaster was physically powered off.
 
 ## Guarded Validation Command
 
@@ -112,7 +122,8 @@ coffee-roaster-mcp hottop-validate \
   --include-emergency-stop
 ```
 
-Do not commit generated validation JSON unless the file is sanitized to remove sensitive data and formatted for long-term storage. Never commit raw serial captures.
+The named human operator does not commit generated validation JSON unless it is
+sanitised for long-term storage, and never commits raw serial captures.
 
 ## Pass/Fail Criteria
 
@@ -135,34 +146,42 @@ The human operator uses this table with the JSON evidence from
 
 ### Serial Connection Fails
 
-- Check the port with `ls /dev/cu.*` before and after plugging in the USB adapter.
-- Confirm the config uses that exact `roaster.port`.
-- Confirm no other process has the serial port open.
-- Re-run only the non-destructive command until connection and cleanup pass.
+- The named human operator checks the port with `ls /dev/cu.*` before and after
+  plugging in the USB adapter, confirms the exact `roaster.port`, and confirms
+  no other process has it open.
+- The named human operator re-runs only the non-destructive command until
+  connection and cleanup pass.
 
 ### Command Loop Or Write Counters Do Not Advance
 
-- Check `raw.command_loop_running`, `raw.command_loop_iterations`, `raw.command_send_attempts`, `raw.command_write_count`, `raw.command_loop_error_count`, and `raw.last_command_write_size`.
-- Treat repeated errors or partial writes as a hard abort.
-- Review `HottopRoasterDriver._send_command_frame` and disconnect/write review notes in the active epic before changing code.
+- The named human operator checks `raw.command_loop_running`,
+  `raw.command_loop_iterations`, `raw.command_send_attempts`,
+  `raw.command_write_count`, `raw.command_loop_error_count`, and
+  `raw.last_command_write_size`.
+- The named human operator treats repeated errors or partial writes as a hard
+  abort and reviews the durable epic history before any later code task.
 
 ### Packet Or Temperature Problems
 
-- Check `raw.status_packet_count`, `raw.ignored_temperature_packet_count`, `raw.status_read_error_count`, `raw.raw_bean_temperature`, `raw.raw_env_temperature`, and `raw.resolved_temperature_unit`.
-- If readings are zero during startup but later become plausible, record it as acceptable warmup behavior.
-- If values are consistently implausible, stop and review packet offsets, checksum behavior, and configured `temperature_unit`.
+- The named human operator checks `raw.status_packet_count`,
+  `raw.ignored_temperature_packet_count`, `raw.status_read_error_count`,
+  `raw.raw_bean_temperature`, `raw.raw_env_temperature`, and
+  `raw.resolved_temperature_unit`.
+- The named human operator records plausible post-startup readings as acceptable
+  warmup behaviour; for consistently implausible values, stops and reviews the
+  packet offsets, checksum behaviour, and configured `temperature_unit`.
 
 ### Drop Or Cooling Problems
 
-- Stop immediately if drop, solenoid, cooling, or fan behavior differs from the expected compound state.
-- Do not retry full validation until the physical state is understood and the roaster is safe.
-- Record whether the mismatch was software state only, physical behavior only, or both.
+- The named human operator stops immediately if drop, solenoid, cooling, or fan
+  behaviour differs from the expected compound state; does not retry until the
+  physical state is understood and safe; and records the mismatch scope.
 
 ### Emergency Stop Problems
 
-- Physically power off the roaster if emergency stop does not force heat off.
-- Preserve evidence and do not continue the run.
-- Treat this as release-blocking until fixed and revalidated.
+- The named human operator physically powers off the roaster if emergency stop
+  does not force heat off, preserves evidence, does not continue the run, and
+  treats the result as release-blocking until fixed and revalidated.
 
 ## Report Template
 
@@ -233,7 +252,9 @@ For every manual validation run, record:
 
 ## Do Not
 
-- Do not mark Hottop stories complete from mock-only validation.
-- Do not improvise control commands against real hardware.
-- Do not run the full validation flags unless the operator intends to exercise drop and emergency stop on the connected roaster.
-- Do not add training, ONNX export, or Hugging Face sync steps here. Those stay in `coffee-first-crack-detection`.
+- Agents do not mark Hottop stories complete from mock-only validation or
+  improvise control commands against real hardware.
+- The named human operator does not run full-validation flags unless intending
+  to exercise drop and emergency stop on the connected roaster.
+- Agents do not add training, ONNX export, or Hugging Face sync steps here;
+  those stay in `coffee-first-crack-detection`.

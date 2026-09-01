@@ -1,5 +1,8 @@
 model = "gpt-5.6-terra"
 model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"
+approval_policy = "never"
+network_access = false
 
 developer_instructions = """
 Implement exactly one maintainer-ratified coffee-roaster-mcp backend or governance slice.

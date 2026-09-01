@@ -18,11 +18,18 @@
 - Codex implementation leaves are `engineer-be` and `repair`. They work only
   in their assigned worktree, cannot spawn agents or invoke another model, do
   not adjudicate their own findings, and commit their handback. `repair` applies
-  only independently adjudicated, lead-authored repairs.
+  only independently adjudicated, lead-authored repairs. Their leaf files set
+  `sandbox_mode = "workspace-write"`, `approval_policy = "never"`, and network
+  disabled; `[agents] enabled = false` disables leaf nesting. Parent launch and
+  runtime overrides must be equally or more restrictive, or delivery fails
+  closed. One leaf runs at a time.
 - Local Claude roles are read-only planning or assurance roles only. They never
   edit, implement, operate hardware, access Pi/SSH/devices, publish packages,
   read secrets or private evidence, or change scope. Hosted Claude workflows
   are retired and are not a delivery or merge dependency.
+- A local Claude bounded launch may receive only the repository worktree and
+  parent-approved bounded `--add-dir` roots, runs with `dontAsk`, and excludes
+  secrets, private evidence, audio, roast logs, and all hardware access.
 
 ## Slice and review policy
 
@@ -77,12 +84,14 @@
   python .github/scripts/smoke_install_built_wheel.py
   ```
 
-- After changing `pi5-validation`, run the external shared-tooling validator:
-  `.venv/bin/python /Users/sertanyamaner/.codex/skills/.system/skill-creator/scripts/quick_validate.py .agents/skills/pi5-validation`.
-  Missing validator tooling fails closed. Tests and local validation use the
-  mock driver, disabled first-crack mode, fakes, or recorded fixtures. Do not
-  run Pi, microphone, serial, Hottop, package publication, or network-dependent
-  runtime validation unless a human-owned contract explicitly authorises it.
+- After changing `pi5-validation`, the top-level parent discovers this session's
+  skill-creator `quick_validate.py`, runs it against the skill, and records the
+  resolved script path and SHA-256 with gate evidence. Missing tooling fails
+  closed; do not vendor or copy the external validator. Tests and local
+  validation use the mock driver, disabled first-crack mode, fakes, or recorded
+  fixtures. Do not run Pi, microphone, serial, Hottop, package publication, or
+  network-dependent runtime validation unless a human-owned contract explicitly
+  authorises it.
 - Do not commit model weights, audio, roast logs, serial captures, databases,
   `.env` files, private evidence, or local IDE files. Small committed fixtures
   are permitted only when a ratified contract specifically authorises them. The
