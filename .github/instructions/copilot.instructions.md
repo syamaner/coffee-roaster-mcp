@@ -49,7 +49,8 @@ Full project rules are in `AGENTS.md` at the repo root.
 ### Generated And Local Files
 
 - Do not commit model weights, ONNX files, audio recordings, roast logs, serial captures, `.env` files, or IDE folders.
-- Generated roast logs will belong under ignored log directories once logging lands.
+- Generated roast logs belong under ignored log directories and must not be
+  committed.
 
 ### Testing
 

@@ -41,7 +41,8 @@ mock disabled int8
 
 ## Do Not Claim Here
 
-- Do not claim final end-to-end release readiness before `E7-S1`.
+- Mock checks never establish hardware readiness or replace human-owned
+  hardware validation.
 - Do not add model download, model export, or Hugging Face sync steps here. Those stay in `coffee-first-crack-detection`.
 
 For current MCP tool and mock-roast behaviour, consult root `AGENTS.md`, the
