@@ -57,8 +57,9 @@ do not infer partial acceptance.
 
 ## Private evidence and retention
 
-Keep full evidence private, SHA-256-manifested, and copy it after the session
-to `/Users/sertanyamaner/Documents/RoastPilot/validation-evidence/pi5/<run-id>/`.
+The named human operator keeps full evidence private, SHA-256-manifested, and
+copies it after the session to
+`/Users/sertanyamaner/Documents/RoastPilot/validation-evidence/pi5/<run-id>/`.
 Keep the Pi copy until laptop verification; auto-delete neither. Retain both
 through #157/#194 closure, verified MCP minor release, and
 roastpilot-agent#137 completion. Git may contain only a sanitised report and

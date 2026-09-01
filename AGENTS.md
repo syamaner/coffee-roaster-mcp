@@ -19,10 +19,12 @@
   in their assigned worktree, cannot spawn agents or invoke another model, do
   not adjudicate their own findings, and commit their handback. `repair` applies
   only independently adjudicated, lead-authored repairs. Their leaf files set
-  `sandbox_mode = "workspace-write"`, `approval_policy = "never"`, and network
-  disabled; `[agents] enabled = false` disables leaf nesting. Parent launch and
-  runtime overrides must be equally or more restrictive, or delivery fails
-  closed. One leaf runs at a time.
+  `sandbox_mode = "workspace-write"`, `approval_policy = "never"`, disabled
+  network and web search; `[agents] enabled = false` disables leaf nesting.
+  Leaves never read or copy secrets, credentials, `.env`, roast logs, audio, or
+  private validation evidence inside or outside the worktree. Parent launch and
+  runtime overrides must be equally or more restrictive, including disabled web
+  search, or delivery fails closed. One leaf runs at a time.
 - Local Claude roles are read-only planning or assurance roles only. They never
   edit, implement, operate hardware, access Pi/SSH/devices, publish packages,
   read secrets or private evidence, or change scope. Hosted Claude workflows
@@ -83,6 +85,11 @@
   python -m build
   python .github/scripts/smoke_install_built_wheel.py
   ```
+
+  The top-level parent, never a write-capable leaf, runs `python -m build` and
+  `python .github/scripts/smoke_install_built_wheel.py` when dependency
+  resolution or network access is needed; leaves return affected offline-gate
+  evidence. Never relax leaf network disablement for a gate.
 
 - After changing `pi5-validation`, the top-level parent discovers this session's
   skill-creator `quick_validate.py`, runs it against the skill, and records the

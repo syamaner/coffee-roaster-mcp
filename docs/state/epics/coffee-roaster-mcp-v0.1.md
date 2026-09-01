@@ -1103,8 +1103,12 @@ lifecycle under root `AGENTS.md`.
     CLI `0.1.16`, build, and clean-wheel smoke all passed.
   - Shared Pi-skill validation passed. An independent local security review
     passed after parent-adjudicated repairs.
-  - Hosted Claude workflows were disabled live and their files removed. No
-    production source, hardware/Pi operation, or publication occurred.
+  - Hosted Claude workflows were disabled live and their files removed.
+    Deletion or revocation of any now-unused `CLAUDE_CODE_OAUTH_TOKEN`
+    repository secret was not authorised or performed; it remains a
+    human-operator credential-hygiene action. This does not assert the secret
+    exists. No production source, hardware/Pi operation, or publication
+    occurred.
   - Live `main` protection observed on 1 September 2026: required `Checks` and
     `Build Package`; strict/current-branch mode; required conversation
     resolution; administrator enforcement; force-push and deletion disabled;
