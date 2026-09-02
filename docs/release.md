@@ -14,14 +14,30 @@ The release workflow is `.github/workflows/release.yml`. It supports two paths:
 successful release run `32657497601` bind to base
 `07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance is the current
 prerequisite for future implementation; #157 remains open after software
-integration and local package readiness, while #194 remains open and unstarted.
-The intended future minor is `0.2.0`.
+integration and local package readiness, and #194's software instrumentation
+slice is implemented while #194 remains open for later operator
+characterisation and acceptance. The intended future minor is `0.2.0`.
 
 Only the human release operator may create or push tags, approve the release
 environment, publish packages, or verify live PyPI and MCP Registry artefacts.
 This governance slice neither authorises nor performs those actions.
 
 ## Changelog
+
+### Unreleased software-readiness instrumentation
+
+- The implemented #194 software instrumentation slice adds additive
+  `fc_status` fields: `max_consecutive_overflow_count` is the per-capture-run
+  maximum consecutive overflow streak across independent inputs (maximum
+  aggregation, not a sum); `last_inference_duration_ms` and
+  `max_inference_duration_ms` are the latest and per-session maximum
+  single-attempt inference durations in milliseconds; and
+  `inference_overrun_count` counts per-session attempts at or beyond the
+  effective audio hop. Stop/fault snapshots retain these values across repeated
+  reads; only the existing trailing-60-second rolling overflow count and
+  lost-audio estimate decay. This is software-readiness work only: it is not a
+  release, does not change `v0.1.16` as the current release, and grants no
+  release authority.
 
 ### 0.1.16
 
@@ -64,15 +80,7 @@ This governance slice neither authorises nor performs those actions.
   (block START), drain-on-stop, restart guards (PR #195).
 - fc_status overflow diagnostics: overflow_count_last_minute,
   estimated_lost_audio_ms_last_minute, total_overflow_count — additive
-  (PR #193). The software-readiness fields max_consecutive_overflow_count,
-  last_inference_duration_ms, max_inference_duration_ms, and
-  inference_overrun_count are also additive: the first is the per-capture-run
-  maximum consecutive overflow streak across inputs (maximum aggregation, not
-  a sum); the next two are the latest and per-session maximum single-attempt
-  inference durations in milliseconds; and the last counts per-session
-  attempts at or beyond the effective audio hop. Stop/fault snapshots retain
-  these values across repeated reads; only the existing trailing-60-second
-  rolling overflow count and lost-audio estimate decay.
+  (PR #193).
 - #191 milestone recovery: a pre-drop first-crack window queued at drop time
   is recovered into the recording sidecar milestone, end-time bounded; the
   session event log stays causally clean (PR #192). Fixes null
