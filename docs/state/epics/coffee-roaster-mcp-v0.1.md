@@ -17,10 +17,12 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 - Current phase: D184 governance baseline active; #206 completed through PR
   #207, squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`
-- Active story: #157 in progress through completed standalone frontend slice #210;
-  #194 remains unstarted and requires a later ratified contract
-- Current target: standalone frontend slice #210 complete; do not infer detector
-  integration, Pi, microphone, serial, Hottop, or publication authority
+- Active story: #157 in progress through completed standalone frontend and
+  software-integration slices #210 and #212; #194 remains unstarted and requires
+  a later ratified contract
+- Current target: #212 software integration complete; #157 remains open for Pi
+  and combined acceptance. Do not infer microphone, serial, Hottop, or
+  publication authority
 - Latest package release: `v0.1.16`; PyPI and MCP Registry publication verified
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
@@ -37,10 +39,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
 - D184 governance baseline is active. Issue #206 completed through PR #207,
   squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`.
-  #157 is in progress through completed standalone frontend slice #210; #194
-  remains open and unstarted and requires a later ratified contract. The intended
-  future minor is `0.2.0`, while tags, publication, and
-  live verification remain human-operator-only.
+  #157 is in progress through completed standalone frontend and software-
+  integration slices #210 and #212; #194 remains open and unstarted and requires
+  a later ratified contract. The intended future minor is `0.2.0`, while tags,
+  publication, and live verification remain human-operator-only.
 - `E7-S1` keeps broad mock-safe validation on the public stdio MCP tool path:
   a default-config server uses the mock driver, first-crack mode remains
   disabled, auto-T0 remains disabled, and exported JSONL, CSV, and
@@ -279,13 +281,18 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E4.1-S3` adds the released-artifact ONNX first-crack detector backend
   without starting any session-owned detector loop. `first_crack.mode: audio`
   can now resolve the configured precision-specific Hugging Face artifacts,
-  load `onnx/{precision}/preprocessor_config.json` through
-  `transformers.ASTFeatureExtractor`, create an ONNX Runtime CPU session for the
-  resolved ONNX model using configured thread limits, and adapt model logits
-  into existing detector outputs with first-crack confidence. Tests use fake
-  artifact paths, fake feature extraction, and fake ONNX sessions so normal CI
-  remains mock-safe and requires no model download, microphone, Hottop hardware,
-  or network.
+  configure the MCP-owned `MelFrontend` from
+  `onnx/{precision}/preprocessor_config.json`, create an ONNX Runtime CPU
+  session for the resolved ONNX model using configured thread limits, and adapt
+  model logits into existing detector outputs with first-crack confidence. Tests
+  use fake artifact paths, MCP-owned frontend inputs, and fake ONNX sessions so
+  normal CI remains mock-safe and requires no model download, microphone,
+  Hottop hardware, or network.
+- Issue #212 completed the current software integration slice: the detector uses
+  the MCP-owned mel frontend and the acceptance path verifies a clean installed
+  wheel without Torch, Torchaudio, or Transformers. #157 remains open for Pi and
+  combined acceptance; #194 remains open and unstarted. This does not assert
+  hardware or release readiness.
 - `E4.1-S4` adds the session-owned first-crack runtime. In
   `first_crack.mode: audio`, `start_roast_session` prepares the configured
   audio capture pipeline and released-artifact ONNX detector adapter without
@@ -1093,6 +1100,29 @@ lifecycle under root `AGENTS.md`.
 
 ## Validation Notes
 
+- Validation run for #212:
+  - At `1007cfafd8baabb45da69e0c0e104df2da70cef1`, D185/D186 authority
+    `27823eef6a872901add29a8f251429641680402b`, the dedicated clean-wheel
+    acceptance passed for `coffee_roaster_mcp-0.1.16-py3-none-any.whl` with
+    `syamaner/coffee-first-crack-detection` revision
+    `b349a919c34b6130472da97c01817be404e4f629`.
+  - Confirming-window confidence was `0.9845320744703858` from
+    `fc_window_confirmed_row` sequence `2`, one confirmed row among three
+    current-session rows (minimum `0.6`). Onset-candidate payload and summary
+    confidence both `0.8032823849602806` are diagnostic-only. Confirmation
+    after beans added was `16.019406124966203`, inside
+    `3.82710390663442..21.0` and strictly below `20.017`; observed onset
+    `0.019406124966204197`, historical `10.017558290999885`, and historical
+    `0.7762153826546956` confidence are print-only and ungated.
+  - Replay metrics were 3 emitted, 3 processed, and 0 dropped windows. Wheel
+    metadata banned requirements and installed banned distributions were empty;
+    Torch, Torchaudio, and Transformers import specs were false. Focused tests
+    passed 48; full branch coverage passed 670 at `92.06%` (required `90%`);
+    Ruff, Pyright (0), CLI `0.1.16`, source/wheel build, ordinary clean-wheel
+    smoke, and dedicated acceptance passed.
+  - This is hardware-free package/software readiness only. #157 remains open
+    for Pi and combined acceptance, #194 remains open and unstarted, and no
+    Pi, hardware, threshold, release, or publication acceptance is claimed.
 - Governance issue #206: [x] delivery baseline completed through PR #207,
   squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`.
   D184 establishes the MCP-specific Codex-led topology, shared Pi validation

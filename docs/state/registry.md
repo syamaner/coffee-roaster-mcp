@@ -8,8 +8,8 @@
 - Repository: `syamaner/coffee-roaster-mcp`
 - Package: `coffee-roaster-mcp`
 - MCP Registry name: `io.github.syamaner/coffee-roaster-mcp`
-- Current phase: #157 in progress through completed standalone frontend slice #210;
-  #194 remains unstarted
+- Current phase: #157 in progress through completed standalone frontend and software-integration
+  slices #210 and #212; #194 remains unstarted
 
 ## Working Rules
 
@@ -28,7 +28,8 @@ successful release run `32657497601` bind to base
 `07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance issue #206
 completed through PR #207, squash-merged to `main` at
 `2c854d34bdb43f587db438436202b97e1dd01468`. Issue #157 is in progress through
-completed standalone frontend slice #210; #194 remains open and unstarted. The
+completed standalone frontend and software-integration slices #210 and #212;
+#194 remains open and unstarted. The
 intended future minor is `0.2.0`; tag creation,
 publication, and live verification remain human-operator-only actions.
 
@@ -190,6 +191,12 @@ opened through an ONNX Runtime CPU session using configured thread limits.
 Backend output is adapted into the existing detector confidence metadata path.
 Normal CI remains mock-safe through fake artifact paths, fake feature
 extraction, and fake ONNX sessions.
+
+Issue #212 completed the current frontend integration software slice: the
+detector now uses the MCP-owned mel frontend and package acceptance checks the
+Torch/Torchaudio/Transformers-free installed wheel. This is software and
+package-readiness work only; #157 remains open for Pi and combined acceptance,
+and #194 remains open and unstarted.
 
 E4.1-S4 starts and stops a session-owned first-crack runtime when
 `first_crack.mode: audio` is configured. Starting a roast session now prepares

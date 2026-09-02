@@ -404,8 +404,8 @@ def test_batch_contract_sampling_rate_and_empty_batch() -> None:
     assert output["input_values"].flags.c_contiguous
 
 
-def test_import_isolation_and_no_existing_production_import() -> None:
-    """The standalone module must not pull Torch/Transformers or be integrated yet."""
+def test_import_isolation_and_detector_only_frontend_integration() -> None:
+    """The frontend remains Torch-free and only the detector imports it."""
     module_name = "coffee_roaster_mcp.mel_frontend"
     sys.modules.pop(module_name, None)
     sys.modules.pop("torch", None)
@@ -415,21 +415,36 @@ def test_import_isolation_and_no_existing_production_import() -> None:
     assert "transformers" not in sys.modules
 
     source_directory = Path(__file__).parents[1] / "src" / "coffee_roaster_mcp"
+    frontend_importers: list[str] = []
     for source_path in source_directory.glob("*.py"):
-        if source_path.name == "mel_frontend.py":
-            continue
         parsed = ast.parse(source_path.read_text(encoding="utf-8"))
         imports = [
             node for node in ast.walk(parsed) if isinstance(node, (ast.Import, ast.ImportFrom))
         ]
-        assert all(
-            not (
-                isinstance(node, ast.ImportFrom)
-                and node.module == "coffee_roaster_mcp.mel_frontend"
-            )
-            and not (
+        if source_path.name != "mel_frontend.py" and any(
+            (isinstance(node, ast.ImportFrom) and node.module == "coffee_roaster_mcp.mel_frontend")
+            or (
                 isinstance(node, ast.Import)
                 and any(alias.name == "coffee_roaster_mcp.mel_frontend" for alias in node.names)
             )
             for node in imports
-        ), source_path.name
+        ):
+            frontend_importers.append(source_path.name)
+        forbidden_imports = [
+            node
+            for node in imports
+            if (
+                isinstance(node, ast.Import)
+                and any(
+                    alias.name.split(".")[0] in {"torch", "transformers"} for alias in node.names
+                )
+            )
+            or (
+                isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and node.module.split(".")[0] in {"torch", "transformers"}
+            )
+        ]
+        assert forbidden_imports == [], source_path.name
+
+    assert frontend_importers == ["detector.py"]

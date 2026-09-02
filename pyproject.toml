@@ -48,7 +48,6 @@ dependencies = [
   "PyYAML>=6.0.2",
   "scipy>=1.11,<2",
   "sounddevice>=0.5,<1",
-  "transformers>=4.40,<5",
   "yoctopuce>=2.0,<3"
 ]
 
