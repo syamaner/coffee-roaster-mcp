@@ -546,15 +546,6 @@ def _finite_number(mapping: Mapping[str, object], field: str, context: str) -> f
     return numeric
 
 
-def _optional_finite_number(
-    mapping: Mapping[str, object], field: str, context: str
-) -> float | None:
-    """Return an optional finite numeric field without accepting invalid values."""
-    if field not in mapping or mapping[field] is None:
-        return None
-    return _finite_number(mapping, field, context)
-
-
 async def _call(awaitable: Any) -> Any:
     return await asyncio.wait_for(awaitable, timeout=30.0)
 
