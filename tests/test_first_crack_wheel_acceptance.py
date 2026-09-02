@@ -93,6 +93,53 @@ def test_sanitized_child_environment_strips_external_authority(
     }
 
 
+def test_installed_replay_invocation_isolated_to_acceptance_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The fresh-wheel replay child receives only the acceptance-owned environment."""
+    module = _module()
+    monkeypatch.setattr(
+        module.os,
+        "environ",
+        {
+            "PATH": "/usr/bin",
+            "HF_TOKEN": "secret",
+            "HF_ENDPOINT": "unsafe",
+            "PIP_INDEX_URL": "unsafe",
+        },
+    )
+    cache = tmp_path / "acceptance" / "huggingface-cache"
+    command, environment = module._installed_replay_invocation(  # type: ignore[attr-defined]
+        tmp_path / "venv" / "bin" / "python", tmp_path / "model", tmp_path / "replay", cache
+    )
+
+    assert command[-2:] == ["--huggingface-cache", cache]
+    assert environment == {
+        "PATH": "/usr/bin",
+        "HF_HOME": str(cache),
+        "HF_HUB_CACHE": str(cache / "hub"),
+    }
+    assert Path(environment["HF_HOME"]).is_relative_to(tmp_path)
+    assert Path(environment["HF_HUB_CACHE"]).is_relative_to(tmp_path)
+
+
+def test_parent_run_without_environment_keeps_ambient_process_behavior(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Build/install-style parent commands do not gain a sanitised child environment."""
+    module = _module()
+    captured: dict[str, object] = {}
+
+    def complete(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.update(kwargs)
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(module.subprocess, "run", complete)
+    module._run(["parent-command"], tmp_path)  # type: ignore[attr-defined]
+
+    assert captured["env"] is None
+
+
 def test_run_reports_failed_command_and_output(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -204,12 +251,14 @@ def _confirmation_rows(
     absolute_onset: object = 500.0,
     absolute_confirmation: object = 510.0,
     payload: Mapping[str, object] | None = None,
+    confirming_confidence: object = 0.6,
+    confirmed: object = True,
 ) -> list[dict[str, object]]:
     """Return valid session events whose confirmation is 15 seconds after beans added."""
     first_crack_payload = payload or {
         "detected_at_monotonic_seconds": absolute_onset,
         "confirmed_at_monotonic_seconds": absolute_confirmation,
-        "confidence": 0.7,
+        "confidence": 0.6,
     }
     return [
         {
@@ -224,6 +273,13 @@ def _confirmation_rows(
             "kind": "first_crack_detected",
             "monotonic_seconds": exported_onset,
             "payload": first_crack_payload,
+        },
+        {
+            "session_id": "current",
+            "type": "fc_window",
+            "confirmed": confirmed,
+            "confidence": confirming_confidence,
+            "window_sequence_number": 3,
         },
     ]
 
@@ -243,6 +299,13 @@ def test_confirmation_evidence_uses_session_formula_and_filters_rows(tmp_path: P
             "type": "event",
             "kind": "first_crack_detected",
             "monotonic_seconds": 1.0,
+        },
+        {
+            "session_id": "other",
+            "type": "fc_window",
+            "confirmed": True,
+            "confidence": 0.1,
+            "window_sequence_number": 1,
         },
         *_confirmation_rows(),
     ]
@@ -271,8 +334,14 @@ def test_confirmation_evidence_uses_session_formula_and_filters_rows(tmp_path: P
     }
     assert evidence["confidence"] == {
         "confirming_confidence": 0.6,
+        "source": "fc_window_confirmed_row",
+        "confirming_window_sequence_number": 3.0,
+        "current_session_fc_window_count": 1,
+        "confirmed_fc_window_count": 1,
         "minimum": 0.6,
-        "payload_confidence": 0.7,
+        "onset_candidate_payload_confidence": 0.6,
+        "onset_candidate_summary_confidence": 0.6,
+        "onset_candidate_confidence_diagnostic_only": True,
     }
     assert evidence["observed_onset_after_t0"] == 5.0
 
@@ -309,9 +378,102 @@ def test_confirmation_evidence_accepts_exact_minimum_confidence(tmp_path: Path) 
 
     assert evidence["confidence"] == {
         "confirming_confidence": 0.6,
+        "source": "fc_window_confirmed_row",
+        "confirming_window_sequence_number": 3.0,
+        "current_session_fc_window_count": 1,
+        "confirmed_fc_window_count": 1,
         "minimum": 0.6,
-        "payload_confidence": 0.7,
+        "onset_candidate_payload_confidence": 0.6,
+        "onset_candidate_summary_confidence": 0.6,
+        "onset_candidate_confidence_diagnostic_only": True,
     }
+
+
+def test_confirmation_evidence_gates_confirming_window_not_onset_candidate(tmp_path: Path) -> None:
+    """A low diagnostic onset candidate does not fail a passing confirming window."""
+    rows = _confirmation_rows(
+        payload={
+            "detected_at_monotonic_seconds": 500.0,
+            "confirmed_at_monotonic_seconds": 510.0,
+            "confidence": 0.1,
+        }
+    )
+
+    evidence = _confirmation_evidence(_module(), tmp_path, rows, confidence=0.1)
+
+    confidence = cast(dict[str, object], evidence["confidence"])
+    assert confidence["confirming_confidence"] == 0.6
+    assert confidence["onset_candidate_payload_confidence"] == 0.1
+    assert confidence["onset_candidate_summary_confidence"] == 0.1
+
+
+def test_confirmation_evidence_rejects_low_confirming_window_despite_strong_onset(
+    tmp_path: Path,
+) -> None:
+    """Only the confirmed first-crack window confidence is threshold-gated."""
+    with pytest.raises(RuntimeError, match="confirming confidence"):
+        _confirmation_evidence(
+            _module(),
+            tmp_path,
+            _confirmation_rows(
+                payload={
+                    "detected_at_monotonic_seconds": 500.0,
+                    "confirmed_at_monotonic_seconds": 510.0,
+                    "confidence": 0.9,
+                },
+                confirming_confidence=0.599,
+            ),
+            confidence=0.9,
+        )
+
+
+@pytest.mark.parametrize("confirmed", [None, 1, "true"])
+def test_confirmation_evidence_rejects_non_boolean_confirmed(
+    tmp_path: Path, confirmed: object
+) -> None:
+    """Every current-session first-crack window must use a JSON boolean confirmed flag."""
+    with pytest.raises(RuntimeError, match="line 3"):
+        _confirmation_evidence(_module(), tmp_path, _confirmation_rows(confirmed=confirmed))
+
+
+def test_confirmation_evidence_rejects_absent_or_duplicate_confirming_windows(
+    tmp_path: Path,
+) -> None:
+    """The current session must have exactly one confirmed first-crack window."""
+    rows = _confirmation_rows(confirmed=False)
+    with pytest.raises(RuntimeError, match="exactly one confirmed"):
+        _confirmation_evidence(_module(), tmp_path, rows)
+    rows = _confirmation_rows()
+    rows.append(dict(rows[-1]))
+    with pytest.raises(RuntimeError, match="exactly one confirmed"):
+        _confirmation_evidence(_module(), tmp_path, rows)
+
+
+@pytest.mark.parametrize("value", [None, "0.6", True, float("nan"), float("inf")])
+def test_confirmation_evidence_rejects_invalid_confirming_confidence(
+    tmp_path: Path, value: object
+) -> None:
+    """Confirming-window confidence must be finite numeric data, not a stand-in."""
+    with pytest.raises(RuntimeError, match="confirmed fc_window.confidence"):
+        _confirmation_evidence(_module(), tmp_path, _confirmation_rows(confirming_confidence=value))
+
+
+def test_confirmation_evidence_rejects_missing_confirming_window_fields(tmp_path: Path) -> None:
+    """Required confirmation fields fail clearly when omitted from the window row."""
+    rows = _confirmation_rows()
+    del rows[-1]["confirmed"]
+    with pytest.raises(RuntimeError, match="line 3"):
+        _confirmation_evidence(_module(), tmp_path, rows)
+    rows = _confirmation_rows()
+    del rows[-1]["confidence"]
+    with pytest.raises(RuntimeError, match="confirmed fc_window.confidence"):
+        _confirmation_evidence(_module(), tmp_path, rows)
+
+
+def test_confirmation_evidence_rejects_onset_candidate_confidence_mismatch(tmp_path: Path) -> None:
+    """The two diagnostic onset-candidate confidence copies must exactly agree."""
+    with pytest.raises(RuntimeError, match="payload and summary confidence differ"):
+        _confirmation_evidence(_module(), tmp_path, confidence=0.7)
 
 
 @pytest.mark.parametrize("kind", ["beans_added", "first_crack_detected"])
@@ -321,11 +483,11 @@ def test_confirmation_evidence_rejects_missing_or_duplicate_events(
     """Each required event must occur exactly once for the current session."""
     module = _module()
     rows = _confirmation_rows()
-    rows = [row for row in rows if row["kind"] != kind]
+    rows = [row for row in rows if row.get("kind") != kind]
     with pytest.raises(RuntimeError, match=kind):
         _confirmation_evidence(module, tmp_path, rows)
     rows = _confirmation_rows()
-    rows.append(dict(next(row for row in rows if row["kind"] == kind)))
+    rows.append(dict(next(row for row in rows if row.get("kind") == kind)))
     with pytest.raises(RuntimeError, match=kind):
         _confirmation_evidence(module, tmp_path, rows)
 

@@ -1973,10 +1973,11 @@ lifecycle under root `AGENTS.md`.
     `preprocessor_config.json`, construct an ONNX Runtime CPU session for the
     resolved ONNX model, and feed output through the existing detector adapter
     metadata path.
-  - Added lazy, clearly failing runtime dependency boundaries for `onnxruntime`;
-    default mock configuration still does not import or start it.
+  - Added lazy, clearly failing runtime dependency boundaries for
+    `onnxruntime` and `transformers.ASTFeatureExtractor`; default mock
+    configuration still does not import or start either dependency.
   - Added fake-backed tests for INT8/FP32 artifact resolution, ONNX session
-    construction, MCP-owned mel frontend construction, confidence parsing,
+    construction, AST feature-extractor construction, confidence parsing,
     sample-rate validation, missing/invalid preprocessor config, missing model
     inputs, empty outputs, and dependency failures without requiring model
     downloads, real ONNX files, microphone input, Hottop hardware, or network.

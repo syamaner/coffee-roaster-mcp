@@ -76,6 +76,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--installed-replay", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--model-root", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--work-dir", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--huggingface-cache", type=Path, default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -93,25 +94,18 @@ def _clean_wheel_acceptance(args: argparse.Namespace) -> int:
         _run([executable, "-m", "pip", "install", str(wheel)], root)
         _run([executable, "-m", "pip", "check"], root)
         dependencies = _assert_installed_dependency_isolation(executable, root)
+        huggingface_cache = temporary_root / "huggingface-cache"
         resolved = _resolve_with_installed_wheel(
             executable,
             root,
             args.local_model_dir,
-            _sanitized_child_environment(temporary_root / "huggingface-cache"),
+            _sanitized_child_environment(huggingface_cache),
         )
         model_root = _stage_model_tree(resolved, temporary_root)
-        replay = _run(
-            [
-                executable,
-                str(Path(__file__).resolve()),
-                "--installed-replay",
-                "--model-root",
-                str(model_root),
-                "--work-dir",
-                str(temporary_root / "replay"),
-            ],
-            root,
+        replay_command, replay_environment = _installed_replay_invocation(
+            executable, model_root, temporary_root / "replay", huggingface_cache
         )
+        replay = _run(replay_command, root, environment=replay_environment)
         print(
             json.dumps(
                 {
@@ -213,6 +207,26 @@ def _resolve_with_installed_wheel(
     return cast(dict[str, str], json.loads(_run(command, root, environment=environment).stdout))
 
 
+def _installed_replay_invocation(
+    executable: Path, model_root: Path, work_dir: Path, huggingface_cache: Path
+) -> tuple[list[Path | str], dict[str, str]]:
+    """Build the isolated installed-replay child invocation."""
+    return (
+        [
+            executable,
+            Path(__file__).resolve(),
+            "--installed-replay",
+            "--model-root",
+            model_root,
+            "--work-dir",
+            work_dir,
+            "--huggingface-cache",
+            huggingface_cache,
+        ],
+        _sanitized_child_environment(huggingface_cache),
+    )
+
+
 def _resolve_artifacts(args: argparse.Namespace) -> int:
     """Resolve and verify artifacts using the installed production resolver only."""
     from coffee_roaster_mcp.artifacts import resolve_first_crack_detector_artifacts
@@ -279,10 +293,11 @@ async def _installed_replay(args: argparse.Namespace) -> int:
     args.work_dir.mkdir(parents=True, exist_ok=True)
     config = args.work_dir / "coffee-roaster-mcp.yaml"
     _write_replay_config(config, args.model_root, args.work_dir / "logs", fixture)
+    huggingface_cache = args.huggingface_cache or args.work_dir / "huggingface-cache"
     parameters = StdioServerParameters(
         command=sys.executable,
         args=["-m", "coffee_roaster_mcp.cli", "serve", "--config", str(config)],
-        env=_sanitized_child_environment(args.work_dir / "huggingface-cache"),
+        env=_sanitized_child_environment(huggingface_cache),
         cwd=args.work_dir,
     )
     started = time.monotonic()
@@ -374,9 +389,12 @@ def _confirmation_evidence(
     summary: Mapping[str, object],
 ) -> dict[str, object]:
     """Validate and report session-based first-crack confirmation evidence."""
-    events = _session_event_rows(jsonl_path, session_id)
+    current_session_rows = _current_session_rows(jsonl_path, session_id)
+    events = [row for _line_number, row in current_session_rows if row.get("type") == "event"]
+    windows = [entry for entry in current_session_rows if entry[1].get("type") == "fc_window"]
     beans_added, beans_added_count = _single_session_event(events, "beans_added")
     first_crack, first_crack_count = _single_session_event(events, "first_crack_detected")
+    confirming_window, confirmed_window_count = _confirming_window(windows)
 
     beans_added_time = _finite_number(beans_added, "monotonic_seconds", "beans_added")
     exported_onset = _finite_number(first_crack, "monotonic_seconds", "first_crack_detected")
@@ -389,9 +407,19 @@ def _confirmation_evidence(
     )
     state_onset = _finite_number(state, "first_crack_monotonic_seconds", "final state")
     model = _mapping_field(summary, "first_crack_model", "summary")
-    confidence = _finite_number(model, "confidence", "summary first_crack_model")
-    payload_confidence = _optional_finite_number(
+    onset_candidate_payload_confidence = _finite_number(
         payload, "confidence", "first_crack_detected payload"
+    )
+    onset_candidate_summary_confidence = _finite_number(
+        model, "confidence", "summary first_crack_model"
+    )
+    if onset_candidate_payload_confidence != onset_candidate_summary_confidence:
+        _fail("onset-candidate payload and summary confidence differ")
+    confirming_confidence = _finite_number(confirming_window, "confidence", "confirmed fc_window")
+    if confirming_confidence < 0.6:
+        _fail(f"confirming confidence was below threshold: {confirming_confidence}")
+    confirming_sequence_number = _finite_number(
+        confirming_window, "window_sequence_number", "confirmed fc_window"
     )
 
     onset_to_confirmation = absolute_confirmation - absolute_onset
@@ -416,9 +444,6 @@ def _confirmation_evidence(
         _fail(f"confirmation after beans added failed inclusive bounds: {confirmation_after_t0}")
     if confirmation_after_t0 >= 20.017:
         _fail(f"confirmation after beans added failed strict maximum: {confirmation_after_t0}")
-    if confidence < 0.6:
-        _fail(f"confirming confidence was below threshold: {confidence}")
-
     return {
         "confirmation": {
             "beans_added_monotonic_seconds": beans_added_time,
@@ -441,17 +466,23 @@ def _confirmation_evidence(
             "onset_is_not_latency_gate": True,
         },
         "confidence": {
-            "confirming_confidence": confidence,
+            "confirming_confidence": confirming_confidence,
+            "source": "fc_window_confirmed_row",
+            "confirming_window_sequence_number": confirming_sequence_number,
+            "current_session_fc_window_count": len(windows),
+            "confirmed_fc_window_count": confirmed_window_count,
             "minimum": 0.6,
-            "payload_confidence": payload_confidence,
+            "onset_candidate_payload_confidence": onset_candidate_payload_confidence,
+            "onset_candidate_summary_confidence": onset_candidate_summary_confidence,
+            "onset_candidate_confidence_diagnostic_only": True,
         },
         "observed_onset_after_t0": onset_after_t0,
     }
 
 
-def _session_event_rows(jsonl_path: Path, session_id: str) -> list[dict[str, object]]:
-    """Return event rows for the requested session from an exported JSONL file."""
-    rows: list[dict[str, object]] = []
+def _current_session_rows(jsonl_path: Path, session_id: str) -> list[tuple[int, dict[str, object]]]:
+    """Return line-numbered rows for the requested session from exported JSONL."""
+    rows: list[tuple[int, dict[str, object]]] = []
     lines = jsonl_path.read_text(encoding="utf-8").splitlines()
     for line_number, line in enumerate(lines, start=1):
         try:
@@ -460,9 +491,28 @@ def _session_event_rows(jsonl_path: Path, session_id: str) -> list[dict[str, obj
             _fail(f"malformed JSON at line {line_number}: {error.msg}")
         if not isinstance(row, dict):
             _fail(f"JSONL row at line {line_number} must be an object")
-        if row.get("session_id") == session_id and row.get("type") == "event":
-            rows.append(cast(dict[str, object], row))
+        if row.get("session_id") == session_id:
+            rows.append((line_number, cast(dict[str, object], row)))
     return rows
+
+
+def _confirming_window(
+    windows: list[tuple[int, dict[str, object]]],
+) -> tuple[dict[str, object], int]:
+    """Return the sole confirmed current-session first-crack window."""
+    confirmed_windows: list[dict[str, object]] = []
+    for line_number, window in windows:
+        confirmed = window.get("confirmed")
+        if not isinstance(confirmed, bool):
+            _fail(
+                "missing or non-boolean confirmed on current-session fc_window "
+                f"at line {line_number}"
+            )
+        if confirmed:
+            confirmed_windows.append(window)
+    if len(confirmed_windows) != 1:
+        _fail(f"expected exactly one confirmed fc_window, found {len(confirmed_windows)}")
+    return confirmed_windows[0], len(confirmed_windows)
 
 
 def _single_session_event(
