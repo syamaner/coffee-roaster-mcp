@@ -1333,12 +1333,14 @@ def test_process_pending_windows_after_drop_recovers_holder_and_logs_loudly(
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
     session = store.start_session()
-    backend = MockDetectorBackend(
+    backend = TimedDetectorBackend(
         (
             FirstCrackDetectorOutput(
                 confirmed=True, confidence=0.94, detected_at_monotonic_seconds=506.0
             ),
-        )
+        ),
+        clock=clock,
+        durations_seconds=(0.25,),
     )
     # The window's end (505.0 + 1.0 = 506.0) is strictly before the drop at
     # session-elapsed 20.0 (absolute 520.0) — a genuinely complete pre-drop
@@ -1347,13 +1349,17 @@ def test_process_pending_windows_after_drop_recovers_holder_and_logs_loudly(
         (_audio_window(sequence_number=1, started_at_monotonic_seconds=505.0),)
     )
     runtime = FirstCrackSessionRuntime(
-        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        config=AppConfig(
+            audio=AudioConfig(sample_rate=100, hop_seconds=0.25),
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+        ),
         audio_pipeline_factory=lambda _: pipeline,
         detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
             config,
             _resolved_detector_artifacts(),
             backend,
         ),
+        monotonic_now=clock.monotonic_now,
     )
     runtime.start_for_session(session)
     clock.monotonic_value = 505.0
@@ -1366,6 +1372,9 @@ def test_process_pending_windows_after_drop_recovers_holder_and_logs_loudly(
         result = runtime.process_pending_windows_after_drop(session_store=store, session=session)
 
     assert result.status == "detected"
+    assert result.last_inference_duration_ms == pytest.approx(250.0)
+    assert result.max_inference_duration_ms == pytest.approx(250.0)
+    assert result.inference_overrun_count == 1
     assert any(
         "recovered" in record.message and "coffee-roaster-mcp#191" in record.message
         for record in caplog.records

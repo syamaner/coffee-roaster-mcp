@@ -2596,6 +2596,15 @@ def test_microphone_audio_input_overflow_snapshot_tracks_overflows() -> None:
         # A clean read resets the CURRENT streak only. The capture-run maximum
         # remains available for later diagnostics.
         assert audio_input.overflow_snapshot.max_consecutive_count == 2
+
+        # A strictly larger later streak in the SAME capture run grows the
+        # observed maximum even though the current streak was reset by the
+        # clean read above.
+        stream.overflowed = True
+        for clock_value in (4.0, 5.0, 6.0):
+            clock.value = clock_value
+            audio_input.read_samples(1)
+        assert audio_input.overflow_snapshot.max_consecutive_count == 3
     finally:
         audio_input.close()
 
