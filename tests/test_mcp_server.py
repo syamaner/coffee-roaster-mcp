@@ -779,6 +779,10 @@ def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
     )
     assert manual_state.first_crack_status.status == "manual"
     assert manual_state.first_crack_status.allow_manual_override is True
+    assert manual_state.first_crack_status.max_consecutive_overflow_count == 0
+    assert manual_state.first_crack_status.last_inference_duration_ms == 0.0
+    assert manual_state.first_crack_status.max_inference_duration_ms == 0.0
+    assert manual_state.first_crack_status.inference_overrun_count == 0
 
     manual_unavailable_config_path = tmp_path / "manual-unavailable.yaml"
     manual_unavailable_config_path.write_text(
@@ -812,6 +816,10 @@ def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
         manual_unavailable_state.first_crack_status.reason
         == "Manual first-crack mode is configured, but manual override is disabled."
     )
+    assert manual_unavailable_state.first_crack_status.max_consecutive_overflow_count == 0
+    assert manual_unavailable_state.first_crack_status.last_inference_duration_ms == 0.0
+    assert manual_unavailable_state.first_crack_status.max_inference_duration_ms == 0.0
+    assert manual_unavailable_state.first_crack_status.inference_overrun_count == 0
 
     audio_config_path = tmp_path / "audio.yaml"
     audio_config_path.write_text(
@@ -1062,6 +1070,10 @@ def test_get_roast_state_scopes_runtime_metrics_to_requested_session(tmp_path: P
             processed_window_count=5,
             mic_peak_dbfs=-6.02,
             mic_rms_dbfs=-9.03,
+            max_consecutive_overflow_count=8,
+            last_inference_duration_ms=125.0,
+            max_inference_duration_ms=250.0,
+            inference_overrun_count=3,
         ),
     )
     server = create_mcp_server(config_path=config_path)
@@ -1107,6 +1119,17 @@ def test_get_roast_state_scopes_runtime_metrics_to_requested_session(tmp_path: P
     # or dead mic is visible under real conditions.
     assert second_state.first_crack_status.mic_peak_dbfs == -6.02
     assert second_state.first_crack_status.mic_rms_dbfs == -9.03
+    assert second_state.first_crack_status.max_consecutive_overflow_count == 8
+    assert second_state.first_crack_status.last_inference_duration_ms == 125.0
+    assert second_state.first_crack_status.max_inference_duration_ms == 250.0
+    assert second_state.first_crack_status.inference_overrun_count == 3
+
+    # Runtime-bearing paths retain the additive fields; inactive/manual
+    # defaults remain wire-compatible zero values.
+    assert first_state.first_crack_status.max_consecutive_overflow_count == 0
+    assert first_state.first_crack_status.last_inference_duration_ms == 0.0
+    assert first_state.first_crack_status.max_inference_duration_ms == 0.0
+    assert first_state.first_crack_status.inference_overrun_count == 0
 
 
 def test_driver_command_failure_does_not_mutate_session_state(tmp_path: Path) -> None:
@@ -1882,6 +1905,10 @@ class FakeFirstCrackRuntime:
         overflow_count_last_minute: int = 0,
         estimated_lost_audio_ms_last_minute: float = 0.0,
         total_overflow_count: int = 0,
+        max_consecutive_overflow_count: int = 0,
+        last_inference_duration_ms: float = 0.0,
+        max_inference_duration_ms: float = 0.0,
+        inference_overrun_count: int = 0,
     ) -> None:
         self.status = status
         self.reason = reason
@@ -1896,6 +1923,10 @@ class FakeFirstCrackRuntime:
         self.overflow_count_last_minute = overflow_count_last_minute
         self.estimated_lost_audio_ms_last_minute = estimated_lost_audio_ms_last_minute
         self.total_overflow_count = total_overflow_count
+        self.max_consecutive_overflow_count = max_consecutive_overflow_count
+        self.last_inference_duration_ms = last_inference_duration_ms
+        self.max_inference_duration_ms = max_inference_duration_ms
+        self.inference_overrun_count = inference_overrun_count
         self.active_session_id: str | None = None
         self.started_sessions: list[str] = []
         self.processed_sessions: list[str] = []
@@ -1974,6 +2005,10 @@ class FakeFirstCrackRuntime:
             overflow_count_last_minute=self.overflow_count_last_minute,
             estimated_lost_audio_ms_last_minute=self.estimated_lost_audio_ms_last_minute,
             total_overflow_count=self.total_overflow_count,
+            max_consecutive_overflow_count=self.max_consecutive_overflow_count,
+            last_inference_duration_ms=self.last_inference_duration_ms,
+            max_inference_duration_ms=self.max_inference_duration_ms,
+            inference_overrun_count=self.inference_overrun_count,
         )
 
 

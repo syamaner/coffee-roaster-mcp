@@ -342,6 +342,7 @@ def test_microphone_audio_input_tolerates_transient_overflow() -> None:
         # The third consecutive overflow trips the sustained-failure backstop.
         with pytest.raises(AudioCaptureError, match="consecutive"):
             audio_input.read_samples(1)
+        assert audio_input.overflow_snapshot.max_consecutive_count == 3
     finally:
         audio_input.close()
 
@@ -677,6 +678,7 @@ def test_audio_capture_pipeline_resets_overflow_tracking_on_restart() -> None:
     assert fresh_snapshot.total_count == 0
     assert fresh_snapshot.count_last_minute == 0
     assert fresh_snapshot.estimated_lost_audio_ms_last_minute == 0.0
+    assert fresh_snapshot.max_consecutive_count == 0
 
 
 def test_reset_overflow_tracking_clears_the_inter_read_clock_too() -> None:
@@ -1883,7 +1885,8 @@ def test_multi_device_recorder_aggregates_overflow_across_additional_streams(
     """coffee-roaster-mcp#193 review finding: each additional device has its
     OWN overflow tracker, previously invisible to any diagnostic —
     MultiDeviceRoastRecorder.overflow_snapshot must aggregate them
-    additively (count/estimated-ms/lifetime-total all sum across streams).
+    additively (count/estimated-ms/lifetime-total all sum across streams),
+    while the longest consecutive streak remains a maximum.
     """
     import time
 
@@ -1897,8 +1900,20 @@ def test_multi_device_recorder_aggregates_overflow_across_additional_streams(
                 count_last_minute=2, estimated_lost_audio_ms_last_minute=200.0, total_count=5
             )
             if device.device_label == "MIC-A"
-            else OverflowSnapshot(
-                count_last_minute=3, estimated_lost_audio_ms_last_minute=150.0, total_count=1
+            else (
+                OverflowSnapshot(
+                    count_last_minute=3,
+                    estimated_lost_audio_ms_last_minute=150.0,
+                    total_count=1,
+                    max_consecutive_count=7,
+                )
+                if device.device_label == "MIC-B"
+                else OverflowSnapshot(
+                    count_last_minute=4,
+                    estimated_lost_audio_ms_last_minute=75.0,
+                    total_count=2,
+                    max_consecutive_count=5,
+                )
             )
         )
         created = _BoundedInputWithFixedOverflow(amplitude=0.5, reads=4, overflow=overflow)
@@ -1914,6 +1929,7 @@ def test_multi_device_recorder_aggregates_overflow_across_additional_streams(
         additional_devices=[
             AdditionalRecordingDevice("MIC-A", tmp_path / "roast.mic-a.wav", 4),
             AdditionalRecordingDevice("MIC-B", tmp_path / "roast.mic-b.wav", 4),
+            AdditionalRecordingDevice("MIC-C", tmp_path / "roast.mic-c.wav", 4),
         ],
         additional_input_factory=factory,
         additional_read_seconds=0.25,
@@ -1927,9 +1943,10 @@ def test_multi_device_recorder_aggregates_overflow_across_additional_streams(
 
     overflow = recorder.overflow_snapshot
     assert overflow is not None
-    assert overflow.count_last_minute == 5  # 2 + 3
-    assert overflow.estimated_lost_audio_ms_last_minute == 350.0  # 200.0 + 150.0
-    assert overflow.total_count == 6  # 5 + 1
+    assert overflow.count_last_minute == 9  # 2 + 3 + 4
+    assert overflow.estimated_lost_audio_ms_last_minute == 425.0  # 200.0 + 150.0 + 75.0
+    assert overflow.total_count == 8  # 5 + 1 + 2
+    assert overflow.max_consecutive_count == 7
 
 
 def test_multi_device_recorder_overflow_snapshot_is_none_without_reporting_streams(
@@ -1960,7 +1977,10 @@ def test_pipeline_snapshot_folds_in_recorder_overflow_additively() -> None:
 
     class _RecorderWithOverflow:
         overflow_snapshot = OverflowSnapshot(
-            count_last_minute=3, estimated_lost_audio_ms_last_minute=300.0, total_count=9
+            count_last_minute=3,
+            estimated_lost_audio_ms_last_minute=300.0,
+            total_count=9,
+            max_consecutive_count=6,
         )
 
         @property
@@ -2003,6 +2023,7 @@ def test_pipeline_snapshot_folds_in_recorder_overflow_additively() -> None:
     assert snapshot.overflow_count_last_minute == 4
     assert snapshot.estimated_lost_audio_ms_last_minute == 1050.0
     assert snapshot.total_overflow_count == 10
+    assert snapshot.max_consecutive_overflow_count == 6
 
 
 def test_multi_device_recorder_drops_only_failing_stream(tmp_path: Path) -> None:
@@ -2556,6 +2577,14 @@ def test_microphone_audio_input_overflow_snapshot_tracks_overflows() -> None:
         # gap was 1000ms, so each overflow's estimate is max(0, 1000-250) =
         # 750ms, for 1500ms total.
         assert snapshot.estimated_lost_audio_ms_last_minute == 1500.0
+        assert snapshot.max_consecutive_count == 2
+
+        stream.overflowed = False
+        clock.value = 3.0
+        audio_input.read_samples(1)
+        # A clean read resets the CURRENT streak only. The capture-run maximum
+        # remains available for later diagnostics.
+        assert audio_input.overflow_snapshot.max_consecutive_count == 2
     finally:
         audio_input.close()
 
@@ -2610,3 +2639,53 @@ def test_audio_capture_pipeline_snapshot_zero_overflow_for_non_mic_input() -> No
     assert snapshot.overflow_count_last_minute == 0
     assert snapshot.estimated_lost_audio_ms_last_minute == 0.0
     assert snapshot.total_overflow_count == 0
+    assert snapshot.max_consecutive_overflow_count == 0
+
+
+def test_merge_overflow_snapshots_uses_maximum_streak_and_preserves_none_paths() -> None:
+    """Independent-stream streak maxima do not sum, while None paths pass through."""
+    primary = OverflowSnapshot(
+        count_last_minute=2,
+        estimated_lost_audio_ms_last_minute=125.0,
+        total_count=4,
+        max_consecutive_count=3,
+    )
+    secondary = OverflowSnapshot(
+        count_last_minute=5,
+        estimated_lost_audio_ms_last_minute=250.0,
+        total_count=6,
+        max_consecutive_count=11,
+    )
+
+    merged = audio_module._merge_overflow_snapshots(  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+        primary,
+        secondary,
+    )
+
+    assert merged == OverflowSnapshot(
+        count_last_minute=7,
+        estimated_lost_audio_ms_last_minute=375.0,
+        total_count=10,
+        max_consecutive_count=11,
+    )
+    assert (
+        audio_module._merge_overflow_snapshots(  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+            None,
+            primary,
+        )
+        is primary
+    )
+    assert (
+        audio_module._merge_overflow_snapshots(  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+            secondary,
+            None,
+        )
+        is secondary
+    )
+    assert (
+        audio_module._merge_overflow_snapshots(  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+            None,
+            None,
+        )
+        is None
+    )

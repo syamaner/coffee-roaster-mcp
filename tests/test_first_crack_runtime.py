@@ -44,6 +44,29 @@ class MockDetectorBackend:
         return self._outputs.pop(0)
 
 
+class TimedDetectorBackend(MockDetectorBackend):
+    """Deterministic detector backend that advances the injected runtime clock."""
+
+    def __init__(
+        self,
+        outputs: Sequence[FirstCrackDetectorOutput],
+        *,
+        clock: ClockHarness,
+        durations_seconds: Sequence[float],
+        failure: str | None = None,
+    ) -> None:
+        super().__init__(outputs)
+        self._clock = clock
+        self._durations_seconds = list(durations_seconds)
+        self._failure = failure
+
+    def detect(self, window: AudioWindow) -> FirstCrackDetectorOutput:
+        self._clock.monotonic_value += self._durations_seconds.pop(0)
+        if self._failure is not None:
+            raise RuntimeError(self._failure)
+        return super().detect(window)
+
+
 class FakeAudioPipeline:
     def __init__(
         self,
@@ -56,6 +79,7 @@ class FakeAudioPipeline:
         overflow_count_last_minute: int = 0,
         estimated_lost_audio_ms_last_minute: float = 0.0,
         total_overflow_count: int = 0,
+        max_consecutive_overflow_count: int = 0,
     ) -> None:
         self._windows = list(windows)
         self.latest_error = latest_error
@@ -65,6 +89,7 @@ class FakeAudioPipeline:
         self.overflow_count_last_minute = overflow_count_last_minute
         self.estimated_lost_audio_ms_last_minute = estimated_lost_audio_ms_last_minute
         self.total_overflow_count = total_overflow_count
+        self.max_consecutive_overflow_count = max_consecutive_overflow_count
         self.started = False
         self.stopped = False
         self.stop_reasons: list[float] = []
@@ -112,6 +137,7 @@ class FakeAudioPipeline:
             overflow_count_last_minute=self.overflow_count_last_minute,
             estimated_lost_audio_ms_last_minute=self.estimated_lost_audio_ms_last_minute,
             total_overflow_count=self.total_overflow_count,
+            max_consecutive_overflow_count=self.max_consecutive_overflow_count,
         )
 
 
@@ -214,6 +240,178 @@ def test_audio_runtime_processes_after_beans_added_and_records_once() -> None:
     assert pipeline.stopped is True
     assert stopped.active is False
     assert stopped.audio_running is False
+
+
+def test_inference_timing_tracks_successful_attempts_and_explicit_hop_overruns() -> None:
+    """Successful inference records latest/max durations and explicit-hop overruns."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    pipeline = FakeAudioPipeline(
+        (
+            _audio_window(sequence_number=1, started_at_monotonic_seconds=500.0),
+            _audio_window(sequence_number=2, started_at_monotonic_seconds=500.25),
+        )
+    )
+    backend = TimedDetectorBackend(
+        (
+            FirstCrackDetectorOutput(confirmed=False),
+            FirstCrackDetectorOutput(confirmed=True, confidence=0.94),
+        ),
+        clock=clock,
+        durations_seconds=(0.25, 0.125),
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            audio=AudioConfig(sample_rate=100, hop_seconds=0.25),
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+        ),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+        monotonic_now=clock.monotonic_now,
+    )
+
+    runtime.start_for_session(session)
+    snapshot = runtime.process_available_windows(session_store=store, session=session)
+
+    assert snapshot.status == "detected"
+    assert snapshot.last_inference_duration_ms == pytest.approx(125.0)
+    assert snapshot.max_inference_duration_ms == pytest.approx(250.0)
+    assert snapshot.inference_overrun_count == 1
+
+    runtime.stop_for_session(session.id, reason="first session complete")
+    store.stop_session()
+    next_session = store.start_session()
+    reset = runtime.start_for_session(next_session)
+
+    assert reset.last_inference_duration_ms == 0.0
+    assert reset.max_inference_duration_ms == 0.0
+    assert reset.inference_overrun_count == 0
+
+
+def test_inference_timing_records_no_result_and_derived_hop_boundary() -> None:
+    """No-result inference is timed; derived hop treats equality as an overrun."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    pipeline = FakeAudioPipeline(
+        (_audio_window(sequence_number=1, started_at_monotonic_seconds=500.0),)
+    )
+    backend = TimedDetectorBackend(
+        (FirstCrackDetectorOutput(confirmed=False),),
+        clock=clock,
+        durations_seconds=(0.25,),
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            audio=AudioConfig(sample_rate=100, window_seconds=0.5, overlap=0.5),
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+        ),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+        monotonic_now=clock.monotonic_now,
+    )
+
+    runtime.start_for_session(session)
+    snapshot = runtime.process_available_windows(session_store=store, session=session)
+
+    assert snapshot.status == "pending"
+    assert snapshot.last_inference_duration_ms == pytest.approx(250.0)
+    assert snapshot.max_inference_duration_ms == pytest.approx(250.0)
+    assert snapshot.inference_overrun_count == 1
+
+
+def test_normal_inference_failure_records_timing_before_preserving_fault() -> None:
+    """An integration failure still records its duration before existing fault handling."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    pipeline = FakeAudioPipeline(
+        (_audio_window(sequence_number=1, started_at_monotonic_seconds=500.0),)
+    )
+    backend = TimedDetectorBackend(
+        (FirstCrackDetectorOutput(confirmed=False),),
+        clock=clock,
+        durations_seconds=(0.25,),
+        failure="normal inference failed",
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            audio=AudioConfig(sample_rate=100, hop_seconds=0.25),
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+        ),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+        monotonic_now=clock.monotonic_now,
+    )
+
+    runtime.start_for_session(session)
+    snapshot = runtime.process_available_windows(session_store=store, session=session)
+
+    assert snapshot.status == "faulted"
+    assert snapshot.reason == "First-crack detection failed: RuntimeError: normal inference failed"
+    assert snapshot.last_inference_duration_ms == pytest.approx(250.0)
+    assert snapshot.max_inference_duration_ms == pytest.approx(250.0)
+    assert snapshot.inference_overrun_count == 1
+
+
+def test_post_drop_inference_failure_records_timing_before_preserving_fault() -> None:
+    """Post-drop recovery inference records timing without changing its fault path."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    pipeline = FakeAudioPipeline(
+        (_audio_window(sequence_number=1, started_at_monotonic_seconds=505.0),)
+    )
+    backend = TimedDetectorBackend(
+        (FirstCrackDetectorOutput(confirmed=False),),
+        clock=clock,
+        durations_seconds=(0.25,),
+        failure="post-drop inference failed",
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            audio=AudioConfig(sample_rate=100, window_seconds=0.5, overlap=0.5),
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+        ),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+        monotonic_now=clock.monotonic_now,
+    )
+
+    runtime.start_for_session(session)
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 520.0
+    store.record_event(session, "beans_dropped")
+    snapshot = runtime.process_pending_windows_after_drop(session_store=store, session=session)
+
+    assert snapshot.status == "faulted"
+    assert (
+        snapshot.reason == "First-crack detection failed: RuntimeError: post-drop inference failed"
+    )
+    assert snapshot.last_inference_duration_ms == pytest.approx(250.0)
+    assert snapshot.max_inference_duration_ms == pytest.approx(250.0)
+    assert snapshot.inference_overrun_count == 1
 
 
 def test_detector_paced_audio_runtime_drains_one_window_per_processing_tick() -> None:
@@ -368,6 +566,7 @@ def test_runtime_overflow_stats_survive_stop_unlike_live_mic_levels() -> None:
         overflow_count_last_minute=7,
         estimated_lost_audio_ms_last_minute=700.0,
         total_overflow_count=42,
+        max_consecutive_overflow_count=9,
     )
     runtime = FirstCrackSessionRuntime(
         config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
@@ -384,6 +583,7 @@ def test_runtime_overflow_stats_survive_stop_unlike_live_mic_levels() -> None:
     assert live.overflow_count_last_minute == 7
     assert live.estimated_lost_audio_ms_last_minute == 700.0
     assert live.total_overflow_count == 42
+    assert live.max_consecutive_overflow_count == 9
 
     stopped = runtime.stop_for_session(session.id, reason="roast complete")
     assert stopped.audio_running is False
@@ -392,6 +592,7 @@ def test_runtime_overflow_stats_survive_stop_unlike_live_mic_levels() -> None:
     assert stopped.overflow_count_last_minute == 7
     assert stopped.estimated_lost_audio_ms_last_minute == 700.0
     assert stopped.total_overflow_count == 42
+    assert stopped.max_consecutive_overflow_count == 9
 
 
 def test_runtime_overflow_rolling_fields_decay_60s_after_stop() -> None:
@@ -411,6 +612,7 @@ def test_runtime_overflow_rolling_fields_decay_60s_after_stop() -> None:
         overflow_count_last_minute=7,
         estimated_lost_audio_ms_last_minute=700.0,
         total_overflow_count=42,
+        max_consecutive_overflow_count=9,
     )
     runtime = FirstCrackSessionRuntime(
         config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
@@ -432,6 +634,7 @@ def test_runtime_overflow_rolling_fields_decay_60s_after_stop() -> None:
     assert soon_after_stop.overflow_count_last_minute == 7
     assert soon_after_stop.estimated_lost_audio_ms_last_minute == 700.0
     assert soon_after_stop.total_overflow_count == 42
+    assert soon_after_stop.max_consecutive_overflow_count == 9
 
     # A poll 60+ seconds after stop must see the rolling fields decayed —
     # the lifetime total is untouched.
@@ -440,6 +643,7 @@ def test_runtime_overflow_rolling_fields_decay_60s_after_stop() -> None:
     assert long_after_stop.overflow_count_last_minute == 0
     assert long_after_stop.estimated_lost_audio_ms_last_minute == 0.0
     assert long_after_stop.total_overflow_count == 42
+    assert long_after_stop.max_consecutive_overflow_count == 9
 
 
 def test_runtime_overflow_rolling_fields_decay_from_last_live_poll_when_stop_itself_fails() -> None:

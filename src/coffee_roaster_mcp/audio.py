@@ -189,6 +189,8 @@ class AudioCaptureSnapshot:
         total_overflow_count: Lifetime overflow event count for the current
             capture run, for a whole-roast severity view alongside the rolling
             per-minute figures.
+        max_consecutive_overflow_count: Largest consecutive-overflow streak
+            observed by any active input during the current capture run.
     """
 
     running: bool
@@ -201,6 +203,7 @@ class AudioCaptureSnapshot:
     overflow_count_last_minute: int = 0
     estimated_lost_audio_ms_last_minute: float = 0.0
     total_overflow_count: int = 0
+    max_consecutive_overflow_count: int = 0
 
 
 def amplitude_to_dbfs(amplitude: float) -> float:
@@ -305,24 +308,29 @@ class OverflowSnapshot:
             estimation method (derived from the actual inter-read gap, not a
             fixed per-read duration — #190 review finding).
         total_count: Lifetime overflow event count for the capture run.
+        max_consecutive_count: Largest consecutive-overflow streak observed
+            during the capture run.
     """
 
     count_last_minute: int
     estimated_lost_audio_ms_last_minute: float
     total_count: int
+    max_consecutive_count: int = 0
 
 
 def _merge_overflow_snapshots(
     primary: OverflowSnapshot | None,
     secondary: OverflowSnapshot | None,
 ) -> OverflowSnapshot | None:
-    """Additively combine two overflow snapshots from independent streams.
+    """Combine overflow snapshots from independent streams.
 
     coffee-roaster-mcp#193 review finding: the detector device's own
     overflow tracker and an additional-device aggregate (from
     `MultiDeviceRoastRecorder`) are two INDEPENDENT streams — neither
     double-counts the other's events, so their counts/estimated-ms/lifetime
-    totals simply sum. `None` when neither side has anything to report,
+    totals simply sum. Consecutive-overflow streaks belong to individual
+    streams, so the aggregate retains the largest one rather than summing
+    independent maxima. `None` when neither side has anything to report,
     matching the existing "no overflow-capable input" convention.
     """
     if primary is None:
@@ -337,6 +345,10 @@ def _merge_overflow_snapshots(
             3,
         ),
         total_count=primary.total_count + secondary.total_count,
+        max_consecutive_count=max(
+            primary.max_consecutive_count,
+            secondary.max_consecutive_count,
+        ),
     )
 
 
@@ -644,6 +656,7 @@ class MicrophoneAudioInput:
         self._stream: Any | None = None
         self._max_consecutive_overflows = max_consecutive_overflows
         self._consecutive_overflows = 0
+        self._max_consecutive_overflow_streak = 0
         self._close_lock = Lock()
         self._monotonic_now = monotonic_now or time.monotonic
         #: Per-minute overflow diagnostics (#190), read by the capture pipeline
@@ -700,6 +713,10 @@ class MicrophoneAudioInput:
             # killing capture for the whole roast; only a sustained run of
             # consecutive overflows (the device cannot keep up at all) faults.
             self._consecutive_overflows += 1
+            self._max_consecutive_overflow_streak = max(
+                self._max_consecutive_overflow_streak,
+                self._consecutive_overflows,
+            )
             # PortAudio's overflowed flag reports only that input was lost
             # SINCE THE PREVIOUS READ, which can span multiple consecutive
             # overflowed reads during a genuine multi-second stall — so a
@@ -741,7 +758,15 @@ class MicrophoneAudioInput:
     @property
     def overflow_snapshot(self) -> OverflowSnapshot:
         """Return current rolling and lifetime overflow stats (#190)."""
-        return self._overflow_tracker.snapshot()
+        tracker_snapshot = self._overflow_tracker.snapshot()
+        return OverflowSnapshot(
+            count_last_minute=tracker_snapshot.count_last_minute,
+            estimated_lost_audio_ms_last_minute=(
+                tracker_snapshot.estimated_lost_audio_ms_last_minute
+            ),
+            total_count=tracker_snapshot.total_count,
+            max_consecutive_count=self._max_consecutive_overflow_streak,
+        )
 
     def reset_overflow_tracking(self) -> None:
         """Clear overflow history so a reused input starts each run fresh.
@@ -762,6 +787,8 @@ class MicrophoneAudioInput:
         falls back to the read's own nominal duration for that first
         estimate, exactly like a freshly-constructed input would.
         """
+        self._consecutive_overflows = 0
+        self._max_consecutive_overflow_streak = 0
         self._overflow_tracker.reset()
         self._last_read_returned_at = None
 
@@ -1527,6 +1554,7 @@ class MultiDeviceRoastRecorder:
                 sum(snapshot.estimated_lost_audio_ms_last_minute for snapshot in snapshots), 3
             ),
             total_count=sum(snapshot.total_count for snapshot in snapshots),
+            max_consecutive_count=max(snapshot.max_consecutive_count for snapshot in snapshots),
         )
 
     @property
@@ -2125,6 +2153,9 @@ class AudioCapturePipeline:
                     0.0 if overflow is None else overflow.estimated_lost_audio_ms_last_minute
                 ),
                 total_overflow_count=0 if overflow is None else overflow.total_count,
+                max_consecutive_overflow_count=(
+                    0 if overflow is None else overflow.max_consecutive_count
+                ),
             )
 
     def _run_reader_loop(self) -> None:

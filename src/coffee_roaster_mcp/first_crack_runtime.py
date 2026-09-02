@@ -22,6 +22,7 @@ from coffee_roaster_mcp.audio import (
     MultiDeviceRoastRecorder,
     RoastAudioRecorder,
     RoastRecorder,
+    audio_capture_settings_from_config,
     build_audio_capture_pipeline,
 )
 from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig
@@ -104,6 +105,14 @@ class FirstCrackRuntimeSnapshot:
         total_overflow_count: Lifetime overflow event count for the current
             capture run, for a whole-roast severity view alongside the rolling
             per-minute figures.
+        max_consecutive_overflow_count: Largest consecutive-overflow streak
+            observed by any active input during the current capture run.
+        last_inference_duration_ms: Elapsed duration of the latest inference
+            attempt in milliseconds.
+        max_inference_duration_ms: Largest inference-attempt duration during
+            the current session in milliseconds.
+        inference_overrun_count: Inference attempts at or beyond the effective
+            configured audio hop during the current session.
     """
 
     status: FirstCrackRuntimeState
@@ -120,6 +129,10 @@ class FirstCrackRuntimeSnapshot:
     overflow_count_last_minute: int = 0
     estimated_lost_audio_ms_last_minute: float = 0.0
     total_overflow_count: int = 0
+    max_consecutive_overflow_count: int = 0
+    last_inference_duration_ms: float = 0.0
+    max_inference_duration_ms: float = 0.0
+    inference_overrun_count: int = 0
 
 
 class FirstCrackSessionRuntime:
@@ -159,6 +172,9 @@ class FirstCrackSessionRuntime:
         self._status: FirstCrackRuntimeState = _initial_status(config.first_crack)
         self._reason: str | None = _initial_reason(config.first_crack)
         self._processed_window_count = 0
+        self._last_inference_duration_ms = 0.0
+        self._max_inference_duration_ms = 0.0
+        self._inference_overrun_count = 0
         self._last_capture_snapshot: AudioCaptureSnapshot | None = None
         #: Wall-clock instant `_last_capture_snapshot` was captured from a
         #: LIVE poll (#193 review finding, round 2 — NOT the stop instant:
@@ -257,6 +273,9 @@ class FirstCrackSessionRuntime:
             self._stop_locked(reason="new roast session")
             self._active_session_id = session.id
             self._processed_window_count = 0
+            self._last_inference_duration_ms = 0.0
+            self._max_inference_duration_ms = 0.0
+            self._inference_overrun_count = 0
             self._inference_stopped = False
             self._last_capture_snapshot = None
             self._last_capture_snapshot_as_of_monotonic_seconds = None
@@ -341,14 +360,20 @@ class FirstCrackSessionRuntime:
             try:
                 for window in pipeline.drain_windows(max_windows=drain_limit):
                     self._processed_window_count += 1
-                    result = integrate_first_crack_window_with_session(
-                        config=self._config.first_crack,
-                        adapter=adapter,
-                        session_store=session_store,
-                        session=session,
-                        window=window,
-                        allow_future_timeline=_uses_detector_paced_wav_replay(self._config.audio),
-                    )
+                    inference_started_at = self._monotonic_now()
+                    try:
+                        result = integrate_first_crack_window_with_session(
+                            config=self._config.first_crack,
+                            adapter=adapter,
+                            session_store=session_store,
+                            session=session,
+                            window=window,
+                            allow_future_timeline=_uses_detector_paced_wav_replay(
+                                self._config.audio
+                            ),
+                        )
+                    finally:
+                        self._record_inference_duration_locked(inference_started_at)
                     if result is not None:
                         self._status = "detected"
                         self._reason = "First crack was recorded by audio detection."
@@ -486,10 +511,14 @@ class FirstCrackSessionRuntime:
                         # the post-drop exemption.
                         continue
                     self._processed_window_count += 1
-                    observation = adapter.process_window_observed(
-                        window,
-                        earliest_eligible_monotonic_seconds=earliest_eligible_absolute,
-                    )
+                    inference_started_at = self._monotonic_now()
+                    try:
+                        observation = adapter.process_window_observed(
+                            window,
+                            earliest_eligible_monotonic_seconds=earliest_eligible_absolute,
+                        )
+                    finally:
+                        self._record_inference_duration_locked(inference_started_at)
                     session_store.record_first_crack_window_observation(
                         session,
                         window_sequence_number=observation.window_sequence_number,
@@ -679,7 +708,24 @@ class FirstCrackSessionRuntime:
                 total_overflow_count=0
                 if capture_snapshot is None
                 else capture_snapshot.total_overflow_count,
+                max_consecutive_overflow_count=0
+                if capture_snapshot is None
+                else capture_snapshot.max_consecutive_overflow_count,
+                last_inference_duration_ms=self._last_inference_duration_ms,
+                max_inference_duration_ms=self._max_inference_duration_ms,
+                inference_overrun_count=self._inference_overrun_count,
             )
+
+    def _record_inference_duration_locked(self, started_at: float) -> None:
+        """Record one inference attempt's duration and effective-hop overrun."""
+        elapsed_ms = (self._monotonic_now() - started_at) * 1000.0
+        self._last_inference_duration_ms = elapsed_ms
+        self._max_inference_duration_ms = max(self._max_inference_duration_ms, elapsed_ms)
+        effective_hop_ms = (
+            audio_capture_settings_from_config(self._config.audio).effective_hop_seconds * 1000.0
+        )
+        if elapsed_ms >= effective_hop_ms:
+            self._inference_overrun_count += 1
 
     def _can_process_locked(self, session: RoastSession) -> bool:
         if self._config.first_crack.mode != "audio":
@@ -1058,6 +1104,7 @@ def _stopped_capture_snapshot(snapshot: AudioCaptureSnapshot) -> AudioCaptureSna
         overflow_count_last_minute=snapshot.overflow_count_last_minute,
         estimated_lost_audio_ms_last_minute=snapshot.estimated_lost_audio_ms_last_minute,
         total_overflow_count=snapshot.total_overflow_count,
+        max_consecutive_overflow_count=snapshot.max_consecutive_overflow_count,
     )
 
 

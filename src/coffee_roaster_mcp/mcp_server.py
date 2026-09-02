@@ -313,6 +313,14 @@ class FirstCrackStatus:
             :class:`~coffee_roaster_mcp.audio.OverflowSnapshot`.
         total_overflow_count: Lifetime overflow event count for the current
             capture run.
+        max_consecutive_overflow_count: Largest consecutive-overflow streak
+            observed by any active input during the current capture run.
+        last_inference_duration_ms: Elapsed duration of the latest inference
+            attempt in milliseconds.
+        max_inference_duration_ms: Largest inference-attempt duration during
+            the current session in milliseconds.
+        inference_overrun_count: Inference attempts at or beyond the effective
+            configured audio hop during the current session.
     """
 
     mode: FirstCrackMode
@@ -331,6 +339,10 @@ class FirstCrackStatus:
     overflow_count_last_minute: int = 0
     estimated_lost_audio_ms_last_minute: float = 0.0
     total_overflow_count: int = 0
+    max_consecutive_overflow_count: int = 0
+    last_inference_duration_ms: float = 0.0
+    max_inference_duration_ms: float = 0.0
+    inference_overrun_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1508,6 +1520,10 @@ def _serialize_first_crack_status(
             overflow_count_last_minute=runtime.overflow_count_last_minute,
             estimated_lost_audio_ms_last_minute=runtime.estimated_lost_audio_ms_last_minute,
             total_overflow_count=runtime.total_overflow_count,
+            max_consecutive_overflow_count=runtime.max_consecutive_overflow_count,
+            last_inference_duration_ms=runtime.last_inference_duration_ms,
+            max_inference_duration_ms=runtime.max_inference_duration_ms,
+            inference_overrun_count=runtime.inference_overrun_count,
         )
     if session.faulted_at_utc is not None:
         runtime = _runtime_metrics(
@@ -1531,6 +1547,10 @@ def _serialize_first_crack_status(
             overflow_count_last_minute=runtime.overflow_count_last_minute,
             estimated_lost_audio_ms_last_minute=runtime.estimated_lost_audio_ms_last_minute,
             total_overflow_count=runtime.total_overflow_count,
+            max_consecutive_overflow_count=runtime.max_consecutive_overflow_count,
+            last_inference_duration_ms=runtime.last_inference_duration_ms,
+            max_inference_duration_ms=runtime.max_inference_duration_ms,
+            inference_overrun_count=runtime.inference_overrun_count,
         )
     if config.first_crack.mode == "disabled":
         return FirstCrackStatus(
@@ -1586,6 +1606,10 @@ def _serialize_first_crack_status(
             overflow_count_last_minute=runtime.overflow_count_last_minute,
             estimated_lost_audio_ms_last_minute=runtime.estimated_lost_audio_ms_last_minute,
             total_overflow_count=runtime.total_overflow_count,
+            max_consecutive_overflow_count=runtime.max_consecutive_overflow_count,
+            last_inference_duration_ms=runtime.last_inference_duration_ms,
+            max_inference_duration_ms=runtime.max_inference_duration_ms,
+            inference_overrun_count=runtime.inference_overrun_count,
         )
     reason = "Audio first-crack detection has not recorded first crack for this session."
     if (
@@ -1616,6 +1640,10 @@ def _serialize_first_crack_status(
         overflow_count_last_minute=runtime.overflow_count_last_minute,
         estimated_lost_audio_ms_last_minute=runtime.estimated_lost_audio_ms_last_minute,
         total_overflow_count=runtime.total_overflow_count,
+        max_consecutive_overflow_count=runtime.max_consecutive_overflow_count,
+        last_inference_duration_ms=runtime.last_inference_duration_ms,
+        max_inference_duration_ms=runtime.max_inference_duration_ms,
+        inference_overrun_count=runtime.inference_overrun_count,
     )
 
 
