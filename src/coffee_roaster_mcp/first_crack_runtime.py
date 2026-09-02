@@ -367,9 +367,7 @@ class FirstCrackSessionRuntime:
                         session_store=session_store,
                         session=session,
                         window=window,
-                        allow_future_timeline=_uses_detector_paced_wav_replay(
-                            self._config.audio
-                        ),
+                        allow_future_timeline=_uses_detector_paced_wav_replay(self._config.audio),
                         adapter_call_observer=self._time_adapter_call_locked,
                     )
                     if result is not None:

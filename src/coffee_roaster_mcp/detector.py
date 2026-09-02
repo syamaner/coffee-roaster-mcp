@@ -613,6 +613,7 @@ def integrate_first_crack_window_with_session(
         if beans_added_monotonic_seconds is None
         else session.monotonic_start + beans_added_monotonic_seconds
     )
+
     def process_observation() -> FirstCrackWindowObservation:
         return adapter.process_window_observed(
             window,
