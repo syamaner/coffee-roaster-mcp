@@ -29,6 +29,7 @@ from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig
 from coffee_roaster_mcp.detector import (
     FirstCrackDetectorAdapter,
     FirstCrackDetectorError,
+    FirstCrackWindowObservation,
     build_released_onnx_first_crack_detector_adapter,
     integrate_first_crack_window_with_session,
 )
@@ -360,20 +361,17 @@ class FirstCrackSessionRuntime:
             try:
                 for window in pipeline.drain_windows(max_windows=drain_limit):
                     self._processed_window_count += 1
-                    inference_started_at = self._monotonic_now()
-                    try:
-                        result = integrate_first_crack_window_with_session(
-                            config=self._config.first_crack,
-                            adapter=adapter,
-                            session_store=session_store,
-                            session=session,
-                            window=window,
-                            allow_future_timeline=_uses_detector_paced_wav_replay(
-                                self._config.audio
-                            ),
-                        )
-                    finally:
-                        self._record_inference_duration_locked(inference_started_at)
+                    result = integrate_first_crack_window_with_session(
+                        config=self._config.first_crack,
+                        adapter=adapter,
+                        session_store=session_store,
+                        session=session,
+                        window=window,
+                        allow_future_timeline=_uses_detector_paced_wav_replay(
+                            self._config.audio
+                        ),
+                        adapter_call_observer=self._time_adapter_call_locked,
+                    )
                     if result is not None:
                         self._status = "detected"
                         self._reason = "First crack was recorded by audio detection."
@@ -511,14 +509,12 @@ class FirstCrackSessionRuntime:
                         # the post-drop exemption.
                         continue
                     self._processed_window_count += 1
-                    inference_started_at = self._monotonic_now()
-                    try:
-                        observation = adapter.process_window_observed(
+                    observation = self._time_adapter_call_locked(
+                        lambda: adapter.process_window_observed(
                             window,
                             earliest_eligible_monotonic_seconds=earliest_eligible_absolute,
                         )
-                    finally:
-                        self._record_inference_duration_locked(inference_started_at)
+                    )
                     session_store.record_first_crack_window_observation(
                         session,
                         window_sequence_number=observation.window_sequence_number,
@@ -726,6 +722,17 @@ class FirstCrackSessionRuntime:
         )
         if elapsed_ms >= effective_hop_ms:
             self._inference_overrun_count += 1
+
+    def _time_adapter_call_locked(
+        self,
+        adapter_call: Callable[[], FirstCrackWindowObservation],
+    ) -> FirstCrackWindowObservation:
+        """Run one adapter call and retain its elapsed inference metrics."""
+        inference_started_at = self._monotonic_now()
+        try:
+            return adapter_call()
+        finally:
+            self._record_inference_duration_locked(inference_started_at)
 
     def _can_process_locked(self, session: RoastSession) -> bool:
         if self._config.first_crack.mode != "audio":

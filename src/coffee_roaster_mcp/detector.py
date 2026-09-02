@@ -22,6 +22,9 @@ from coffee_roaster_mcp.session import RoastEvent, RoastSession, RoastSessionSto
 
 FirstCrackDetectorEventKind = Literal["first_crack_detected"]
 DEFAULT_FIRST_CRACK_CONFIDENCE_THRESHOLD = 0.9
+_AdapterCallObserver = Callable[
+    [Callable[[], "FirstCrackWindowObservation"]], "FirstCrackWindowObservation"
+]
 
 
 class FirstCrackDetectorError(RuntimeError):
@@ -551,6 +554,7 @@ def integrate_first_crack_window_with_session(
     window: AudioWindow,
     max_future_seconds: float | None = None,
     allow_future_timeline: bool = False,
+    adapter_call_observer: _AdapterCallObserver | None = None,
 ) -> FirstCrackTimelineIntegrationResult | None:
     """Process one detector window and write one first-crack event if confirmed.
 
@@ -572,6 +576,8 @@ def integrate_first_crack_window_with_session(
         allow_future_timeline: Whether to preserve detector timestamps that are
             ahead of wall-clock elapsed time. This is only intended for
             detector-paced replay of recorded source audio.
+        adapter_call_observer: Optional wrapper invoked only around the adapter
+            call after the mode and session gates pass.
 
     Returns:
         Timeline integration result for confirmed output, or `None` when the
@@ -607,9 +613,16 @@ def integrate_first_crack_window_with_session(
         if beans_added_monotonic_seconds is None
         else session.monotonic_start + beans_added_monotonic_seconds
     )
-    observation = adapter.process_window_observed(
-        window,
-        earliest_eligible_monotonic_seconds=earliest_eligible_absolute,
+    def process_observation() -> FirstCrackWindowObservation:
+        return adapter.process_window_observed(
+            window,
+            earliest_eligible_monotonic_seconds=earliest_eligible_absolute,
+        )
+
+    observation = (
+        process_observation()
+        if adapter_call_observer is None
+        else adapter_call_observer(process_observation)
     )
     session_store.record_first_crack_window_observation(
         session,

@@ -1,4 +1,4 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -22,7 +22,9 @@ from coffee_roaster_mcp.detector import (
     build_first_crack_detector_adapter,
     build_released_onnx_first_crack_detector_adapter,
     build_released_onnx_first_crack_detector_backend,
+    integrate_first_crack_window_with_session,
 )
+from coffee_roaster_mcp.session import RoastSessionStore
 
 
 class MockDetectorBackend:
@@ -33,6 +35,39 @@ class MockDetectorBackend:
     def detect(self, window: AudioWindow) -> FirstCrackDetectorOutput:
         self.windows.append(window)
         return self._outputs.pop(0)
+
+
+def test_integration_early_return_skips_adapter_observer() -> None:
+    """Mode/session gates return before wrapping or invoking the adapter."""
+    backend = MockDetectorBackend((FirstCrackDetectorOutput(confirmed=False),))
+    adapter = build_first_crack_detector_adapter(
+        FirstCrackConfig(mode="audio"),
+        _resolved_detector_artifacts(),
+        backend,
+    )
+    store = RoastSessionStore()
+    session = store.start_session()
+    observer_calls = 0
+
+    def observe(
+        adapter_call: Callable[[], FirstCrackWindowObservation],
+    ) -> FirstCrackWindowObservation:
+        nonlocal observer_calls
+        observer_calls += 1
+        return adapter_call()
+
+    result = integrate_first_crack_window_with_session(
+        config=FirstCrackConfig(mode="audio"),
+        adapter=adapter,
+        session_store=store,
+        session=session,
+        window=_audio_window(),
+        adapter_call_observer=observe,
+    )
+
+    assert result is None
+    assert observer_calls == 0
+    assert backend.windows == []
 
 
 class BadConfirmationBackend:

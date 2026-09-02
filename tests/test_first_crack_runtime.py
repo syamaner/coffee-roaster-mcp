@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -242,8 +243,10 @@ def test_audio_runtime_processes_after_beans_added_and_records_once() -> None:
     assert stopped.audio_running is False
 
 
-def test_inference_timing_tracks_successful_attempts_and_explicit_hop_overruns() -> None:
-    """Successful inference records latest/max durations and explicit-hop overruns."""
+def test_inference_timing_excludes_store_work_and_tracks_explicit_hop_overruns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful adapter calls exclude delayed store work and track overruns."""
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
     session = store.start_session()
@@ -275,6 +278,20 @@ def test_inference_timing_tracks_successful_attempts_and_explicit_hop_overruns()
         ),
         monotonic_now=clock.monotonic_now,
     )
+
+    original_record_observation = store.record_first_crack_window_observation
+    original_record_detection = store.record_first_crack_detection_snapshot
+
+    def delayed_record_observation(*args: Any, **kwargs: Any) -> None:
+        clock.monotonic_value += 10.0
+        original_record_observation(*args, **kwargs)
+
+    def delayed_record_detection(*args: Any, **kwargs: Any) -> Any:
+        clock.monotonic_value += 10.0
+        return original_record_detection(*args, **kwargs)
+
+    monkeypatch.setattr(store, "record_first_crack_window_observation", delayed_record_observation)
+    monkeypatch.setattr(store, "record_first_crack_detection_snapshot", delayed_record_detection)
 
     runtime.start_for_session(session)
     snapshot = runtime.process_available_windows(session_store=store, session=session)
