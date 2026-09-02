@@ -11,8 +11,7 @@ Milestone: `v0.1`
 - #200: complete.
 - #202: complete.
 - #204: complete.
-- #206: D184 governance slice is prepared for PR delivery; completion follows
-  merge.
+- #206: complete.
 
 ## Epics
 
