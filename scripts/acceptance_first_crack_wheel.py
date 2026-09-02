@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -289,13 +290,9 @@ async def _installed_replay(args: argparse.Namespace) -> int:
         await _call(session.initialize())
         started_session = await _call(session.call_tool("start_roast_session", {}))
         session_id = cast(str, started_session.structuredContent["session"]["session_id"])
-        beans_added = await _call(session.call_tool("mark_beans_added", {}))
-        beans_added_time = float(beans_added.structuredContent["event"]["monotonic_seconds"])
+        await _call(session.call_tool("mark_beans_added", {}))
         state = await _wait_for_detection(session, session_id)
         export = await _call(session.call_tool("export_roast_log", {"session_id": session_id}))
-    detected = float(state["first_crack_monotonic_seconds"]) - beans_added_time
-    if not 3.82710390663442 <= detected <= 21.0 or detected >= 20.017:
-        _fail(f"first-crack time failed replay bounds: {detected}")
     metrics = cast(dict[str, Any], state["first_crack_status"])
     expected_metrics = {
         "emitted_window_count": 3,
@@ -312,17 +309,24 @@ async def _installed_replay(args: argparse.Namespace) -> int:
         "int8",
     ):
         _fail(f"exported model metadata differs from the immutable pin: {model}")
-    if float(model["confidence"]) < 0.6:
-        _fail(f"confirming confidence was below threshold: {model}")
+    confirmation = _confirmation_evidence(
+        Path(cast(str, export.structuredContent["jsonl_path"])),
+        session_id,
+        state,
+        summary,
+    )
     print(
         json.dumps(
             {
                 "status": "passed",
-                "detected_seconds_after_t0": detected,
+                "confirmation": confirmation["confirmation"],
+                "onset": confirmation["onset"],
+                "confidence": confirmation["confidence"],
                 "runtime_metrics": expected_metrics,
                 "comparison_values_not_gated": {
                     "recorded_detected_seconds_after_t0": 10.017558290999885,
                     "recorded_confidence": 0.7762153826546956,
+                    "observed_onset_after_t0": confirmation["observed_onset_after_t0"],
                 },
                 "wall_seconds_elapsed": time.monotonic() - started,
             },
@@ -357,13 +361,143 @@ def _assert_export(export: Mapping[str, object], work_dir: Path) -> dict[str, An
     summary = Path(cast(str, export["summary_path"]))
     if not jsonl.is_relative_to(work_dir) or not summary.is_relative_to(work_dir):
         _fail("export escaped temporary acceptance directory")
-    rows = [json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines()]
-    if (
-        sum(row.get("kind") == "first_crack_detected" for row in rows if row.get("type") == "event")
-        != 1
-    ):
-        _fail("expected exactly one first_crack_detected export event")
     return cast(dict[str, Any], json.loads(summary.read_text(encoding="utf-8")))
+
+
+def _confirmation_evidence(
+    jsonl_path: Path,
+    session_id: str,
+    state: Mapping[str, object],
+    summary: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate and report session-based first-crack confirmation evidence."""
+    events = _session_event_rows(jsonl_path, session_id)
+    beans_added, beans_added_count = _single_session_event(events, "beans_added")
+    first_crack, first_crack_count = _single_session_event(events, "first_crack_detected")
+
+    beans_added_time = _finite_number(beans_added, "monotonic_seconds", "beans_added")
+    exported_onset = _finite_number(first_crack, "monotonic_seconds", "first_crack_detected")
+    payload = _mapping_field(first_crack, "payload", "first_crack_detected")
+    absolute_onset = _finite_number(
+        payload, "detected_at_monotonic_seconds", "first_crack_detected payload"
+    )
+    absolute_confirmation = _finite_number(
+        payload, "confirmed_at_monotonic_seconds", "first_crack_detected payload"
+    )
+    state_onset = _finite_number(state, "first_crack_monotonic_seconds", "final state")
+    model = _mapping_field(summary, "first_crack_model", "summary")
+    confidence = _finite_number(model, "confidence", "summary first_crack_model")
+    payload_confidence = _optional_finite_number(
+        payload, "confidence", "first_crack_detected payload"
+    )
+
+    onset_to_confirmation = absolute_confirmation - absolute_onset
+    confirmation_session_time = exported_onset + onset_to_confirmation
+    onset_after_t0 = exported_onset - beans_added_time
+    confirmation_after_t0 = confirmation_session_time - beans_added_time
+    for name, value in {
+        "onset_to_confirmation": onset_to_confirmation,
+        "confirmation_session_time": confirmation_session_time,
+        "onset_after_t0": onset_after_t0,
+        "confirmation_after_t0": confirmation_after_t0,
+    }.items():
+        if not math.isfinite(value):
+            _fail(f"non-finite derived {name}")
+    if onset_to_confirmation < 0.0 or absolute_onset > absolute_confirmation:
+        _fail("first-crack onset is after confirmation")
+    if onset_after_t0 < 0.0:
+        _fail("first-crack onset is before beans added")
+    if exported_onset != state_onset:
+        _fail("exported first-crack onset differs from final state")
+    if not 3.82710390663442 <= confirmation_after_t0 <= 21.0:
+        _fail(f"confirmation after beans added failed inclusive bounds: {confirmation_after_t0}")
+    if confirmation_after_t0 >= 20.017:
+        _fail(f"confirmation after beans added failed strict maximum: {confirmation_after_t0}")
+    if confidence < 0.6:
+        _fail(f"confirming confidence was below threshold: {confidence}")
+
+    return {
+        "confirmation": {
+            "beans_added_monotonic_seconds": beans_added_time,
+            "confirmation_session_monotonic_seconds": confirmation_session_time,
+            "detected_at_monotonic_seconds": absolute_onset,
+            "confirmed_at_monotonic_seconds": absolute_confirmation,
+            "onset_to_confirmation_seconds": onset_to_confirmation,
+            "confirmation_seconds_after_beans_added": confirmation_after_t0,
+            "minimum_seconds_after_beans_added": 3.82710390663442,
+            "maximum_seconds_after_beans_added": 21.0,
+            "strict_maximum_seconds_after_beans_added": 20.017,
+        },
+        "onset": {
+            "beans_added_event_count": beans_added_count,
+            "first_crack_detected_event_count": first_crack_count,
+            "exported_monotonic_seconds": exported_onset,
+            "state_monotonic_seconds": state_onset,
+            "onset_not_after_confirmation": absolute_onset <= absolute_confirmation,
+            "export_state_consistent": exported_onset == state_onset,
+            "onset_is_not_latency_gate": True,
+        },
+        "confidence": {
+            "confirming_confidence": confidence,
+            "minimum": 0.6,
+            "payload_confidence": payload_confidence,
+        },
+        "observed_onset_after_t0": onset_after_t0,
+    }
+
+
+def _session_event_rows(jsonl_path: Path, session_id: str) -> list[dict[str, object]]:
+    """Return event rows for the requested session from an exported JSONL file."""
+    rows: list[dict[str, object]] = []
+    lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            _fail(f"malformed JSON at line {line_number}: {error.msg}")
+        if not isinstance(row, dict):
+            _fail(f"JSONL row at line {line_number} must be an object")
+        if row.get("session_id") == session_id and row.get("type") == "event":
+            rows.append(cast(dict[str, object], row))
+    return rows
+
+
+def _single_session_event(
+    events: list[dict[str, object]], kind: str
+) -> tuple[dict[str, object], int]:
+    """Return exactly one requested event and its session-scoped count."""
+    matching = [event for event in events if event.get("kind") == kind]
+    if len(matching) != 1:
+        _fail(f"expected exactly one {kind} event for current session, found {len(matching)}")
+    return matching[0], len(matching)
+
+
+def _mapping_field(mapping: Mapping[str, object], field: str, context: str) -> Mapping[str, object]:
+    """Return a required object field with a clear acceptance failure."""
+    value = mapping.get(field)
+    if not isinstance(value, dict):
+        _fail(f"missing or invalid {context}.{field}")
+    return cast(Mapping[str, object], value)
+
+
+def _finite_number(mapping: Mapping[str, object], field: str, context: str) -> float:
+    """Return a required finite numeric field without accepting booleans."""
+    value = mapping.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _fail(f"missing or non-numeric {context}.{field}")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        _fail(f"non-finite {context}.{field}")
+    return numeric
+
+
+def _optional_finite_number(
+    mapping: Mapping[str, object], field: str, context: str
+) -> float | None:
+    """Return an optional finite numeric field without accepting invalid values."""
+    if field not in mapping or mapping[field] is None:
+        return None
+    return _finite_number(mapping, field, context)
 
 
 async def _call(awaitable: Any) -> Any:
