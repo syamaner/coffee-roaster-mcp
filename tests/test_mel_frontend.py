@@ -254,6 +254,15 @@ def test_config_translates_oversized_json_integer_overflow(tmp_path: Path) -> No
         )
 
 
+def test_config_translates_json_integer_digit_limit(tmp_path: Path) -> None:
+    """JSON parser numeric limits must remain within the configuration error boundary."""
+    oversized_integer = "9" * 5000
+    with pytest.raises(MelFrontendConfigError, match="invalid numeric content"):
+        MelFrontend.from_config(
+            _write_config(tmp_path, f'{{"mean": {oversized_integer}, "std": 1.0}}')
+        )
+
+
 @pytest.mark.parametrize(
     ("content", "message"),
     [

@@ -311,6 +311,10 @@ class MelFrontend:
             raise MelFrontendConfigError("preprocessor_config.json contains invalid UTF-8") from exc
         except json.JSONDecodeError as exc:
             raise MelFrontendConfigError("preprocessor_config.json contains invalid JSON") from exc
+        except ValueError as exc:
+            raise MelFrontendConfigError(
+                "preprocessor_config.json contains invalid numeric content"
+            ) from exc
         except OSError as exc:
             raise MelFrontendConfigError("preprocessor_config.json could not be read") from exc
         if not isinstance(loaded, dict):
