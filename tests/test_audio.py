@@ -683,7 +683,9 @@ def test_audio_capture_pipeline_resets_overflow_tracking_on_restart() -> None:
     # The reset also clears the CURRENT fatal streak. A new-run first
     # overflow must not fault as though run 1's overflow remained in the
     # streak; the unchanged within-run limit still faults on overflow two.
-    fresh_stream = audio_input._ensure_stream()  # noqa: SLF001
+    fresh_stream = (
+        audio_input._ensure_stream()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    )
     fresh_stream.overflowed = True
     audio_input.read_samples(1)
     with pytest.raises(AudioCaptureError, match="consecutive"):

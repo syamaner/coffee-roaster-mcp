@@ -30,7 +30,7 @@ from coffee_roaster_mcp.first_crack_runtime import (
 from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
     ServerContext,
-    _serialize_first_crack_status,
+    _serialize_first_crack_status,  # pyright: ignore[reportPrivateUsage]
     build_server_context,
     create_mcp_server,
     quiet_sdk_per_request_log,
