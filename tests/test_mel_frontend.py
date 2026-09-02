@@ -252,6 +252,8 @@ def test_config_rejects_invalid_consumed_values(tmp_path: Path, content: str, me
         {"mean": 1.0, "std": 1.0, "min_frequency": 19.0},
         {"mean": 1e308, "std": 1.0},
         {"mean": 0.0, "std": 1e-308},
+        {"mean": 0.0, "std": 1e-40},
+        {"mean": 1e38, "std": 0.001},
     ],
 )
 def test_constructor_rejects_invalid_contract_values(kwargs: dict[str, object]) -> None:
@@ -260,26 +262,20 @@ def test_constructor_rejects_invalid_contract_values(kwargs: dict[str, object]) 
         MelFrontend(**kwargs)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "message"),
-    [
-        ({"frame_length": 800}, "at least 800 samples"),
-        ({"frame_length": 0}, "frame_length must be a positive integer"),
-        ({"hop_length": 0}, "hop_length must be a positive integer"),
-    ],
-)
-def test_extract_mel_rejects_invalid_analysis_dimensions(
-    kwargs: dict[str, int], message: str
+def test_extract_rejects_input_dependent_normalisation_overflow(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Analysis dimensions must fail before frame allocation or arithmetic."""
-    frontend = _frontend()
-    with pytest.raises(ValueError, match=message):
-        extract_mel(
-            np.zeros(400, dtype=np.float32),
-            frontend._mel_filters,  # noqa: SLF001  # type: ignore[reportPrivateUsage]
-            frontend._window,  # noqa: SLF001  # type: ignore[reportPrivateUsage]
-            **kwargs,
-        )
+    """Accepted settings must not silently return non-finite float32 features."""
+    frontend = MelFrontend(mean=-float(np.finfo(np.float32).max), std=1.0)
+
+    def max_log_mel(*args: object, **kwargs: object) -> np.ndarray:
+        """Return a valid-shape finite feature array at the float32 bound."""
+        del args, kwargs
+        return np.full((1024, 128), np.finfo(np.float32).max, dtype=np.float32)
+
+    monkeypatch.setattr("coffee_roaster_mcp.mel_frontend.extract_mel", max_log_mel)
+    with pytest.raises(MelFrontendConfigError, match="normalised features"):
+        frontend.extract(np.zeros(400, dtype=np.float32))
 
 
 @pytest.mark.parametrize(

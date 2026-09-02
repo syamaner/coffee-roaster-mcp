@@ -32,6 +32,7 @@ _DEFAULT_SAMPLING_RATE = 16000
 _DEFAULT_MAX_LENGTH = 1024
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
 _FLOAT32_MIN_SUBNORMAL = float(np.nextafter(np.float32(0), np.float32(1)))
+_NORMALISATION_REFERENCE_VALUES = (float(np.float32(math.log(_MEL_FLOOR))), 0.0)
 
 
 class MelFrontendConfigError(ValueError):
@@ -152,24 +153,23 @@ def _require_real(value: object, name: str) -> float:
     return converted
 
 
-def _require_float32_normalisation_value(value: float, name: str) -> float:
-    """Validate a normalisation value can be represented as finite float32.
+def _validate_normalisation_parameters(mean: float, std: float) -> None:
+    """Validate normalisation parameters against known finite feature values.
 
     Args:
-        value: Finite normalisation value.
-        name: Field name used in the bounded error message.
-
-    Returns:
-        The validated value.
+        mean: Global normalisation mean.
+        std: Positive global normalisation standard deviation.
 
     Raises:
-        MelFrontendConfigError: If the value cannot be represented safely.
+        MelFrontendConfigError: If normalisation cannot safely produce float32 output.
     """
-    if abs(value) > _FLOAT32_MAX:
-        raise MelFrontendConfigError(f"{name} must be representable as finite float32")
-    if name == "std" and value < _FLOAT32_MIN_SUBNORMAL:
-        raise MelFrontendConfigError("std must not underflow float32 normalisation")
-    return value
+    if abs(mean) > _FLOAT32_MAX or std > _FLOAT32_MAX or std < _FLOAT32_MIN_SUBNORMAL:
+        raise MelFrontendConfigError("mean and std must be representable as finite float32")
+    scale = std * 2.0
+    for value in _NORMALISATION_REFERENCE_VALUES:
+        normalised = (value - mean) / scale
+        if not math.isfinite(normalised) or abs(normalised) > _FLOAT32_MAX:
+            raise MelFrontendConfigError("mean and std must produce finite float32 normalisation")
 
 
 def _require_fixed_integer(value: object, name: str, expected: int) -> int:
@@ -198,11 +198,6 @@ def extract_mel(
     mel_filters: np.ndarray,
     window: np.ndarray,
     max_length: int = _DEFAULT_MAX_LENGTH,
-    frame_length: int = _FRAME_LENGTH,
-    hop_length: int = _HOP_LENGTH,
-    fft_length: int = _FFT_LENGTH,
-    preemphasis: float = _PREEMPHASIS,
-    mel_floor: float = _MEL_FLOOR,
 ) -> np.ndarray:
     """Compute an unnormalised Kaldi-compatible log-mel spectrogram.
 
@@ -211,36 +206,25 @@ def extract_mel(
         mel_filters: Kaldi mel filter matrix.
         window: Symmetric Hann window.
         max_length: Output frame count after padding or truncation.
-        frame_length: Analysis frame length.
-        hop_length: Analysis hop length.
-        fft_length: FFT length.
-        preemphasis: Per-frame pre-emphasis coefficient.
-        mel_floor: Minimum mel value before the natural logarithm.
 
     Returns:
         A float32 ``(max_length, num_mel_filters)`` log-mel array.
     """
-    if type(frame_length) is not int or frame_length <= 0:
-        raise ValueError("frame_length must be a positive integer")
-    if type(hop_length) is not int or hop_length <= 0:
-        raise ValueError("hop_length must be a positive integer")
     samples = _validated_waveform(waveform)
-    if len(samples) < frame_length:
-        raise ValueError(f"waveform must contain at least {frame_length} samples")
-    frame_count = 1 + (len(samples) - frame_length) // hop_length
-    frames = np.zeros((frame_count, frame_length), dtype=np.float64)
+    frame_count = 1 + (len(samples) - _FRAME_LENGTH) // _HOP_LENGTH
+    frames = np.zeros((frame_count, _FRAME_LENGTH), dtype=np.float64)
     for index in range(frame_count):
-        start = index * hop_length
-        frames[index] = samples[start : start + frame_length]
+        start = index * _HOP_LENGTH
+        frames[index] = samples[start : start + _FRAME_LENGTH]
 
     frames -= frames.mean(axis=1, keepdims=True)
-    frames[:, 1:] -= preemphasis * frames[:, :-1]
-    frames[:, 0] *= 1.0 - preemphasis
+    frames[:, 1:] -= _PREEMPHASIS * frames[:, :-1]
+    frames[:, 0] *= 1.0 - _PREEMPHASIS
     frames *= window[np.newaxis, :].astype(np.float64)
-    fft_output = np.fft.rfft(frames, n=fft_length, axis=1)
+    fft_output = np.fft.rfft(frames, n=_FFT_LENGTH, axis=1)
     power = fft_output.real**2 + fft_output.imag**2
     mel_spectrum = np.dot(power, mel_filters.astype(np.float64))
-    log_mel = np.log(np.maximum(mel_spectrum, mel_floor)).astype(np.float32)
+    log_mel = np.log(np.maximum(mel_spectrum, _MEL_FLOOR)).astype(np.float32)
 
     difference = max_length - log_mel.shape[0]
     if difference > 0:
@@ -276,8 +260,7 @@ class MelFrontend:
         self.std = _require_real(std, "std")
         if self.std <= 0:
             raise MelFrontendConfigError("std must be strictly positive")
-        self.mean = _require_float32_normalisation_value(self.mean, "mean")
-        self.std = _require_float32_normalisation_value(self.std, "std")
+        _validate_normalisation_parameters(self.mean, self.std)
         self.num_mel_bins = _require_fixed_integer(
             num_mel_bins, "num_mel_bins", _DEFAULT_NUM_MEL_BINS
         )
@@ -350,7 +333,11 @@ class MelFrontend:
             A C-contiguous float32 array of shape ``(1024, 128)``.
         """
         log_mel = extract_mel(waveform, self._mel_filters, self._window, self.max_length)
-        return np.ascontiguousarray((log_mel - self.mean) / (self.std * 2), dtype=np.float32)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            normalised = (log_mel - self.mean) / (self.std * 2)
+        if not np.isfinite(normalised).all() or np.abs(normalised).max() > _FLOAT32_MAX:
+            raise MelFrontendConfigError("normalised features must be finite float32 values")
+        return np.ascontiguousarray(normalised, dtype=np.float32)
 
     def __call__(
         self,
