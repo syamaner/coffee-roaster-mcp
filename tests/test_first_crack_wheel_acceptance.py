@@ -251,7 +251,7 @@ def _confirmation_rows(
     absolute_onset: object = 500.0,
     absolute_confirmation: object = 510.0,
     payload: Mapping[str, object] | None = None,
-    confirming_confidence: object = 0.6,
+    confirming_confidence: object = 0.72,
     confirmed: object = True,
 ) -> list[dict[str, object]]:
     """Return valid session events whose confirmation is 15 seconds after beans added."""
@@ -348,7 +348,7 @@ def test_confirmation_evidence_uses_session_formula_and_filters_rows(tmp_path: P
         "onset_is_not_latency_gate": True,
     }
     assert evidence["confidence"] == {
-        "confirming_confidence": 0.6,
+        "confirming_confidence": 0.72,
         "confirming_confidence_source": "fc_window_confirmed_row",
         "confirming_window_sequence_number": 3,
         "current_session_fc_window_row_count": 3,
@@ -389,7 +389,9 @@ def test_confirmation_evidence_accepts_inclusive_minimum_and_strict_maximum_marg
 
 def test_confirmation_evidence_accepts_exact_minimum_confidence(tmp_path: Path) -> None:
     """The confirmation confidence gate accepts exactly 0.6."""
-    evidence = _confirmation_evidence(_module(), tmp_path, confidence=0.6)
+    evidence = _confirmation_evidence(
+        _module(), tmp_path, _confirmation_rows(confirming_confidence=0.6), confidence=0.6
+    )
 
     assert evidence["confidence"] == {
         "confirming_confidence": 0.6,
@@ -417,7 +419,7 @@ def test_confirmation_evidence_gates_confirming_window_not_onset_candidate(tmp_p
     evidence = _confirmation_evidence(_module(), tmp_path, rows, confidence=0.1)
 
     confidence = cast(dict[str, object], evidence["confidence"])
-    assert confidence["confirming_confidence"] == 0.6
+    assert confidence["confirming_confidence"] == 0.72
     assert confidence["onset_candidate_payload_confidence"] == 0.1
     assert confidence["onset_candidate_summary_confidence"] == 0.1
 
