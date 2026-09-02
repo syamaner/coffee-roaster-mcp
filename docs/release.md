@@ -64,7 +64,15 @@ This governance slice neither authorises nor performs those actions.
   (block START), drain-on-stop, restart guards (PR #195).
 - fc_status overflow diagnostics: overflow_count_last_minute,
   estimated_lost_audio_ms_last_minute, total_overflow_count — additive
-  (PR #193).
+  (PR #193). The software-readiness fields max_consecutive_overflow_count,
+  last_inference_duration_ms, max_inference_duration_ms, and
+  inference_overrun_count are also additive: the first is the per-capture-run
+  maximum consecutive overflow streak across inputs (maximum aggregation, not
+  a sum); the next two are the latest and per-session maximum single-attempt
+  inference durations in milliseconds; and the last counts per-session
+  attempts at or beyond the effective audio hop. Stop/fault snapshots retain
+  these values across repeated reads; only the existing trailing-60-second
+  rolling overflow count and lost-audio estimate decay.
 - #191 milestone recovery: a pre-drop first-crack window queued at drop time
   is recovered into the recording sidecar milestone, end-time bounded; the
   session event log stays causally clean (PR #192). Fixes null

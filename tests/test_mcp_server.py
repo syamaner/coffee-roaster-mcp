@@ -30,6 +30,7 @@ from coffee_roaster_mcp.first_crack_runtime import (
 from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
     ServerContext,
+    _serialize_first_crack_status,
     build_server_context,
     create_mcp_server,
     quiet_sdk_per_request_log,
@@ -1130,6 +1131,74 @@ def test_get_roast_state_scopes_runtime_metrics_to_requested_session(tmp_path: P
     assert first_state.first_crack_status.last_inference_duration_ms == 0.0
     assert first_state.first_crack_status.max_inference_duration_ms == 0.0
     assert first_state.first_crack_status.inference_overrun_count == 0
+
+
+@pytest.mark.parametrize("runtime_status", ["faulted", "unavailable"])
+def test_first_crack_status_runtime_branches_preserve_instrumentation_sentinels(
+    runtime_status: FirstCrackRuntimeState,
+) -> None:
+    """Every runtime-bearing status branch propagates non-default sentinels."""
+    config = AppConfig(first_crack=FirstCrackConfig(mode="audio"))
+    max_consecutive_overflow_count = 17
+    last_inference_duration_ms = 123.5
+    max_inference_duration_ms = 456.75
+    inference_overrun_count = 8
+
+    def runtime_for(
+        session_id: str,
+        *,
+        status: FirstCrackRuntimeState,
+    ) -> FirstCrackRuntimeSnapshot:
+        return FirstCrackRuntimeSnapshot(
+            status=status,
+            active_session_id=session_id,
+            active=True,
+            max_consecutive_overflow_count=max_consecutive_overflow_count,
+            last_inference_duration_ms=last_inference_duration_ms,
+            max_inference_duration_ms=max_inference_duration_ms,
+            inference_overrun_count=inference_overrun_count,
+        )
+
+    detected_store = RoastSessionStore()
+    detected_session = detected_store.start_session()
+    detected_store.record_event(detected_session, "beans_added")
+    detected_store.record_event(detected_session, "first_crack_detected")
+    detected = _serialize_first_crack_status(
+        detected_session,
+        config=config,
+        first_crack_runtime=runtime_for(detected_session.id, status="detected"),
+    )
+
+    session_fault_store = RoastSessionStore()
+    session_fault = session_fault_store.start_session()
+    session_fault_store.record_event(session_fault, "fault", payload={"reason": "test"})
+    faulted_before_fc = _serialize_first_crack_status(
+        session_fault,
+        config=config,
+        first_crack_runtime=runtime_for(session_fault.id, status="pending"),
+    )
+
+    runtime_fault_store = RoastSessionStore()
+    runtime_fault = runtime_fault_store.start_session()
+    runtime_faulted = _serialize_first_crack_status(
+        runtime_fault,
+        config=config,
+        first_crack_runtime=runtime_for(runtime_fault.id, status=runtime_status),
+    )
+
+    pending_store = RoastSessionStore()
+    pending_session = pending_store.start_session()
+    pending = _serialize_first_crack_status(
+        pending_session,
+        config=config,
+        first_crack_runtime=runtime_for(pending_session.id, status="pending"),
+    )
+
+    for status in (detected, faulted_before_fc, runtime_faulted, pending):
+        assert status.max_consecutive_overflow_count == max_consecutive_overflow_count
+        assert status.last_inference_duration_ms == last_inference_duration_ms
+        assert status.max_inference_duration_ms == max_inference_duration_ms
+        assert status.inference_overrun_count == inference_overrun_count
 
 
 def test_driver_command_failure_does_not_mutate_session_state(tmp_path: Path) -> None:

@@ -284,7 +284,14 @@ def test_inference_timing_tracks_successful_attempts_and_explicit_hop_overruns()
     assert snapshot.max_inference_duration_ms == pytest.approx(250.0)
     assert snapshot.inference_overrun_count == 1
 
-    runtime.stop_for_session(session.id, reason="first session complete")
+    stopped = runtime.stop_for_session(session.id, reason="first session complete")
+    assert stopped.last_inference_duration_ms == pytest.approx(125.0)
+    assert stopped.max_inference_duration_ms == pytest.approx(250.0)
+    assert stopped.inference_overrun_count == 1
+    repeated_stopped = runtime.snapshot()
+    assert repeated_stopped.last_inference_duration_ms == pytest.approx(125.0)
+    assert repeated_stopped.max_inference_duration_ms == pytest.approx(250.0)
+    assert repeated_stopped.inference_overrun_count == 1
     store.stop_session()
     next_session = store.start_session()
     reset = runtime.start_for_session(next_session)
@@ -338,7 +345,11 @@ def test_normal_inference_failure_records_timing_before_preserving_fault() -> No
     session = store.start_session()
     store.record_event(session, "beans_added")
     pipeline = FakeAudioPipeline(
-        (_audio_window(sequence_number=1, started_at_monotonic_seconds=500.0),)
+        (_audio_window(sequence_number=1, started_at_monotonic_seconds=500.0),),
+        overflow_count_last_minute=7,
+        estimated_lost_audio_ms_last_minute=700.0,
+        total_overflow_count=42,
+        max_consecutive_overflow_count=9,
     )
     backend = TimedDetectorBackend(
         (FirstCrackDetectorOutput(confirmed=False),),
@@ -368,6 +379,24 @@ def test_normal_inference_failure_records_timing_before_preserving_fault() -> No
     assert snapshot.last_inference_duration_ms == pytest.approx(250.0)
     assert snapshot.max_inference_duration_ms == pytest.approx(250.0)
     assert snapshot.inference_overrun_count == 1
+
+    # Fault freezes capture and inference evidence. Repeated reads retain the
+    # same runtime metrics while the existing 60-second rolling-overflow decay
+    # still applies only to rolling fields.
+    repeated = runtime.snapshot()
+    assert repeated.last_inference_duration_ms == pytest.approx(250.0)
+    assert repeated.max_inference_duration_ms == pytest.approx(250.0)
+    assert repeated.inference_overrun_count == 1
+    assert repeated.max_consecutive_overflow_count == 9
+    clock.monotonic_value += 61.0
+    decayed = runtime.snapshot()
+    assert decayed.overflow_count_last_minute == 0
+    assert decayed.estimated_lost_audio_ms_last_minute == 0.0
+    assert decayed.total_overflow_count == 42
+    assert decayed.max_consecutive_overflow_count == 9
+    assert decayed.last_inference_duration_ms == pytest.approx(250.0)
+    assert decayed.max_inference_duration_ms == pytest.approx(250.0)
+    assert decayed.inference_overrun_count == 1
 
 
 def test_post_drop_inference_failure_records_timing_before_preserving_fault() -> None:

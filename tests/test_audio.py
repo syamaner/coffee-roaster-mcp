@@ -647,7 +647,7 @@ def test_audio_capture_pipeline_resets_overflow_tracking_on_restart() -> None:
     audio_input = MicrophoneAudioInput(
         settings,
         sounddevice_module=FakeSoundDeviceModule(),
-        max_consecutive_overflows=10,
+        max_consecutive_overflows=2,
         monotonic_now=lambda: clock.value,
     )
     pipeline = AudioCapturePipeline(settings=settings, audio_input=audio_input)
@@ -679,6 +679,15 @@ def test_audio_capture_pipeline_resets_overflow_tracking_on_restart() -> None:
     assert fresh_snapshot.count_last_minute == 0
     assert fresh_snapshot.estimated_lost_audio_ms_last_minute == 0.0
     assert fresh_snapshot.max_consecutive_count == 0
+
+    # The reset also clears the CURRENT fatal streak. A new-run first
+    # overflow must not fault as though run 1's overflow remained in the
+    # streak; the unchanged within-run limit still faults on overflow two.
+    fresh_stream = audio_input._ensure_stream()  # noqa: SLF001
+    fresh_stream.overflowed = True
+    audio_input.read_samples(1)
+    with pytest.raises(AudioCaptureError, match="consecutive"):
+        audio_input.read_samples(1)
 
 
 def test_reset_overflow_tracking_clears_the_inter_read_clock_too() -> None:
