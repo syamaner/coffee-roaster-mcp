@@ -510,7 +510,7 @@ class FirstCrackSessionRuntime:
                         continue
                     self._processed_window_count += 1
                     observation = self._time_adapter_call_locked(
-                        lambda: adapter.process_window_observed(
+                        lambda window=window: adapter.process_window_observed(
                             window,
                             earliest_eligible_monotonic_seconds=earliest_eligible_absolute,
                         )
