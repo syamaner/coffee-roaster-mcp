@@ -1539,6 +1539,49 @@ def test_process_pending_windows_after_drop_rejects_a_straddling_window() -> Non
     assert recovered_holder == []
     assert session.first_crack_monotonic_seconds is None
     assert backend.windows == []  # the detector was never even invoked
+    assert result.last_inference_duration_ms == 0.0
+    assert result.max_inference_duration_ms == 0.0
+    assert result.inference_overrun_count == 0
+
+
+def test_process_pending_windows_after_drop_times_no_detection_result() -> None:
+    """An eligible post-drop adapter call records a no-result duration."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    backend = TimedDetectorBackend(
+        (FirstCrackDetectorOutput(confirmed=False),),
+        clock=clock,
+        durations_seconds=(0.125,),
+    )
+    pipeline = FakeAudioPipeline(
+        (_audio_window(sequence_number=1, started_at_monotonic_seconds=505.0),)
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            audio=AudioConfig(sample_rate=100, hop_seconds=0.25),
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+        ),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config,
+            _resolved_detector_artifacts(),
+            backend,
+        ),
+        monotonic_now=clock.monotonic_now,
+    )
+    runtime.start_for_session(session)
+    clock.monotonic_value = 505.0
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 520.0
+    store.record_event(session, "beans_dropped")
+
+    result = runtime.process_pending_windows_after_drop(session_store=store, session=session)
+
+    assert result.status == "pending"
+    assert result.last_inference_duration_ms == pytest.approx(125.0)
+    assert result.max_inference_duration_ms == pytest.approx(125.0)
+    assert result.inference_overrun_count == 0
 
 
 def test_process_pending_windows_after_drop_skips_detector_paced_wav_replay() -> None:
