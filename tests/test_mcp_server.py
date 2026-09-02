@@ -30,6 +30,7 @@ from coffee_roaster_mcp.first_crack_runtime import (
 from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
     ServerContext,
+    _serialize_first_crack_status,  # pyright: ignore[reportPrivateUsage]
     build_server_context,
     create_mcp_server,
     quiet_sdk_per_request_log,
@@ -779,6 +780,10 @@ def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
     )
     assert manual_state.first_crack_status.status == "manual"
     assert manual_state.first_crack_status.allow_manual_override is True
+    assert manual_state.first_crack_status.max_consecutive_overflow_count == 0
+    assert manual_state.first_crack_status.last_inference_duration_ms == 0.0
+    assert manual_state.first_crack_status.max_inference_duration_ms == 0.0
+    assert manual_state.first_crack_status.inference_overrun_count == 0
 
     manual_unavailable_config_path = tmp_path / "manual-unavailable.yaml"
     manual_unavailable_config_path.write_text(
@@ -812,6 +817,10 @@ def test_get_roast_state_exposes_first_crack_statuses(tmp_path: Path) -> None:
         manual_unavailable_state.first_crack_status.reason
         == "Manual first-crack mode is configured, but manual override is disabled."
     )
+    assert manual_unavailable_state.first_crack_status.max_consecutive_overflow_count == 0
+    assert manual_unavailable_state.first_crack_status.last_inference_duration_ms == 0.0
+    assert manual_unavailable_state.first_crack_status.max_inference_duration_ms == 0.0
+    assert manual_unavailable_state.first_crack_status.inference_overrun_count == 0
 
     audio_config_path = tmp_path / "audio.yaml"
     audio_config_path.write_text(
@@ -1062,6 +1071,10 @@ def test_get_roast_state_scopes_runtime_metrics_to_requested_session(tmp_path: P
             processed_window_count=5,
             mic_peak_dbfs=-6.02,
             mic_rms_dbfs=-9.03,
+            max_consecutive_overflow_count=8,
+            last_inference_duration_ms=125.0,
+            max_inference_duration_ms=250.0,
+            inference_overrun_count=3,
         ),
     )
     server = create_mcp_server(config_path=config_path)
@@ -1107,6 +1120,85 @@ def test_get_roast_state_scopes_runtime_metrics_to_requested_session(tmp_path: P
     # or dead mic is visible under real conditions.
     assert second_state.first_crack_status.mic_peak_dbfs == -6.02
     assert second_state.first_crack_status.mic_rms_dbfs == -9.03
+    assert second_state.first_crack_status.max_consecutive_overflow_count == 8
+    assert second_state.first_crack_status.last_inference_duration_ms == 125.0
+    assert second_state.first_crack_status.max_inference_duration_ms == 250.0
+    assert second_state.first_crack_status.inference_overrun_count == 3
+
+    # Runtime-bearing paths retain the additive fields; inactive/manual
+    # defaults remain wire-compatible zero values.
+    assert first_state.first_crack_status.max_consecutive_overflow_count == 0
+    assert first_state.first_crack_status.last_inference_duration_ms == 0.0
+    assert first_state.first_crack_status.max_inference_duration_ms == 0.0
+    assert first_state.first_crack_status.inference_overrun_count == 0
+
+
+@pytest.mark.parametrize("runtime_status", ["faulted", "unavailable"])
+def test_first_crack_status_runtime_branches_preserve_instrumentation_sentinels(
+    runtime_status: FirstCrackRuntimeState,
+) -> None:
+    """Every runtime-bearing status branch propagates non-default sentinels."""
+    config = AppConfig(first_crack=FirstCrackConfig(mode="audio"))
+    max_consecutive_overflow_count = 17
+    last_inference_duration_ms = 123.5
+    max_inference_duration_ms = 456.75
+    inference_overrun_count = 8
+
+    def runtime_for(
+        session_id: str,
+        *,
+        status: FirstCrackRuntimeState,
+    ) -> FirstCrackRuntimeSnapshot:
+        return FirstCrackRuntimeSnapshot(
+            status=status,
+            active_session_id=session_id,
+            active=True,
+            max_consecutive_overflow_count=max_consecutive_overflow_count,
+            last_inference_duration_ms=last_inference_duration_ms,
+            max_inference_duration_ms=max_inference_duration_ms,
+            inference_overrun_count=inference_overrun_count,
+        )
+
+    detected_store = RoastSessionStore()
+    detected_session = detected_store.start_session()
+    detected_store.record_event(detected_session, "beans_added")
+    detected_store.record_event(detected_session, "first_crack_detected")
+    detected = _serialize_first_crack_status(
+        detected_session,
+        config=config,
+        first_crack_runtime=runtime_for(detected_session.id, status="detected"),
+    )
+
+    session_fault_store = RoastSessionStore()
+    session_fault = session_fault_store.start_session()
+    session_fault_store.record_event(session_fault, "fault", payload={"reason": "test"})
+    faulted_before_fc = _serialize_first_crack_status(
+        session_fault,
+        config=config,
+        first_crack_runtime=runtime_for(session_fault.id, status="pending"),
+    )
+
+    runtime_fault_store = RoastSessionStore()
+    runtime_fault = runtime_fault_store.start_session()
+    runtime_faulted = _serialize_first_crack_status(
+        runtime_fault,
+        config=config,
+        first_crack_runtime=runtime_for(runtime_fault.id, status=runtime_status),
+    )
+
+    pending_store = RoastSessionStore()
+    pending_session = pending_store.start_session()
+    pending = _serialize_first_crack_status(
+        pending_session,
+        config=config,
+        first_crack_runtime=runtime_for(pending_session.id, status="pending"),
+    )
+
+    for status in (detected, faulted_before_fc, runtime_faulted, pending):
+        assert status.max_consecutive_overflow_count == max_consecutive_overflow_count
+        assert status.last_inference_duration_ms == last_inference_duration_ms
+        assert status.max_inference_duration_ms == max_inference_duration_ms
+        assert status.inference_overrun_count == inference_overrun_count
 
 
 def test_driver_command_failure_does_not_mutate_session_state(tmp_path: Path) -> None:
@@ -1882,6 +1974,10 @@ class FakeFirstCrackRuntime:
         overflow_count_last_minute: int = 0,
         estimated_lost_audio_ms_last_minute: float = 0.0,
         total_overflow_count: int = 0,
+        max_consecutive_overflow_count: int = 0,
+        last_inference_duration_ms: float = 0.0,
+        max_inference_duration_ms: float = 0.0,
+        inference_overrun_count: int = 0,
     ) -> None:
         self.status = status
         self.reason = reason
@@ -1896,6 +1992,10 @@ class FakeFirstCrackRuntime:
         self.overflow_count_last_minute = overflow_count_last_minute
         self.estimated_lost_audio_ms_last_minute = estimated_lost_audio_ms_last_minute
         self.total_overflow_count = total_overflow_count
+        self.max_consecutive_overflow_count = max_consecutive_overflow_count
+        self.last_inference_duration_ms = last_inference_duration_ms
+        self.max_inference_duration_ms = max_inference_duration_ms
+        self.inference_overrun_count = inference_overrun_count
         self.active_session_id: str | None = None
         self.started_sessions: list[str] = []
         self.processed_sessions: list[str] = []
@@ -1974,6 +2074,10 @@ class FakeFirstCrackRuntime:
             overflow_count_last_minute=self.overflow_count_last_minute,
             estimated_lost_audio_ms_last_minute=self.estimated_lost_audio_ms_last_minute,
             total_overflow_count=self.total_overflow_count,
+            max_consecutive_overflow_count=self.max_consecutive_overflow_count,
+            last_inference_duration_ms=self.last_inference_duration_ms,
+            max_inference_duration_ms=self.max_inference_duration_ms,
+            inference_overrun_count=self.inference_overrun_count,
         )
 
 

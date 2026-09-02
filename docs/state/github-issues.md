@@ -9,7 +9,8 @@ Milestone: `v0.1`
 - #157: in progress; standalone frontend and software-integration slices #210 and #212 are complete.
 - #210: complete; standalone Torch-free NumPy/SciPy mel frontend parity slice.
 - #212: complete; MCP-owned frontend integration and local package readiness slice.
-- #194: open and unstarted; no implementation progress.
+- #194: instrumentation software slice implemented; remains open for later
+  operator characterisation and supervised acceptance, with no readiness claim.
 - #200: complete.
 - #202: complete.
 - #204: complete.
