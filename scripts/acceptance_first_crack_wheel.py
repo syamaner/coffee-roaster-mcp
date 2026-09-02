@@ -359,7 +359,10 @@ async def _wait_for_detection(session: Any, session_id: str) -> dict[str, Any]:
 def _assert_export(export: Mapping[str, object], work_dir: Path) -> dict[str, Any]:
     jsonl = Path(cast(str, export["jsonl_path"]))
     summary = Path(cast(str, export["summary_path"]))
-    if not jsonl.is_relative_to(work_dir) or not summary.is_relative_to(work_dir):
+    canonical_work_dir = work_dir.resolve()
+    jsonl_is_contained = jsonl.resolve().is_relative_to(canonical_work_dir)
+    summary_is_contained = summary.resolve().is_relative_to(canonical_work_dir)
+    if not jsonl_is_contained or not summary_is_contained:
         _fail("export escaped temporary acceptance directory")
     return cast(dict[str, Any], json.loads(summary.read_text(encoding="utf-8")))
 

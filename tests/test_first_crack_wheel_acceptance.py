@@ -139,6 +139,43 @@ def test_artifact_preflight_rejects_changed_hash(tmp_path: Path) -> None:
         module._verify_artifacts(paths)  # type: ignore[attr-defined]
 
 
+def test_export_containment_accepts_canonical_path_through_symlink_alias(tmp_path: Path) -> None:
+    """Canonical exported paths remain inside a symlinked temporary work directory."""
+    module = _module()
+    canonical_work_dir = tmp_path / "canonical-work"
+    canonical_work_dir.mkdir()
+    alias = tmp_path / "work-alias"
+    alias.symlink_to(canonical_work_dir, target_is_directory=True)
+    jsonl = canonical_work_dir / "roast.jsonl"
+    summary = canonical_work_dir / "summary.json"
+    jsonl.write_text("", encoding="utf-8")
+    summary.write_text('{"first_crack_model": {}}', encoding="utf-8")
+
+    result = module._assert_export(  # type: ignore[attr-defined]
+        {"jsonl_path": str(jsonl), "summary_path": str(summary)}, alias
+    )
+
+    assert result == {"first_crack_model": {}}
+
+
+def test_export_containment_rejects_real_escape(tmp_path: Path) -> None:
+    """Canonical containment still rejects an exported file outside the work directory."""
+    module = _module()
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    jsonl = outside / "roast.jsonl"
+    summary = outside / "summary.json"
+    jsonl.write_text("", encoding="utf-8")
+    summary.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="escaped"):
+        module._assert_export(  # type: ignore[attr-defined]
+            {"jsonl_path": str(jsonl), "summary_path": str(summary)}, work_dir
+        )
+
+
 def _confirmation_evidence(
     module: ModuleType,
     tmp_path: Path,
