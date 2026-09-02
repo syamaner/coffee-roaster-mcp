@@ -15,8 +15,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Active Context
 
-- Current phase: D184 governance baseline prepared through issue #206 pending
-  PR merge
+- Current phase: D184 governance baseline active; #206 completed through PR
+  #207, squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`
 - Active story: none; #157 and #194 remain unstarted and require later
   ratified contracts
 - Current target: no implementation slice is active; do not infer package, Pi,
@@ -35,7 +35,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - Agent and n8n orchestration are out of scope.
 - Default roaster driver is `mock`.
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
-- D184 governance baseline is prepared through issue #206 pending PR merge.
+- D184 governance baseline is active. Issue #206 completed through PR #207,
+  squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`.
   #157 and #194 remain open and unstarted; each requires a later ratified
   contract. The intended future minor is `0.2.0`, while tags, publication, and
   live verification remain human-operator-only.
@@ -1091,11 +1092,12 @@ lifecycle under root `AGENTS.md`.
 
 ## Validation Notes
 
-- Governance issue #206: [~] delivery baseline prepared; issue completion is
-  recorded only after PR merge. D184 establishes the MCP-specific Codex-led
-  topology, shared Pi validation skill, hosted-Claude retirement, and refreshed
-  `v0.1.16`/current authority. No `src/` change, #157/#194 implementation,
-  hardware operation, or publication occurred.
+- Governance issue #206: [x] delivery baseline completed through PR #207,
+  squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`.
+  D184 establishes the MCP-specific Codex-led topology, shared Pi validation
+  skill, hosted-Claude retirement, and refreshed `v0.1.16`/current authority.
+  No `src/` change, #157/#194 implementation, hardware operation, or
+  publication occurred.
 - Validation run for issue #206:
   - Bound plan SHA `8f83dee9ffcc1abd60a5cbeab4c1d14b803c4e99` and MCP base
     `07a6b96beae252c9b326f9374a64d91271f08105`.
