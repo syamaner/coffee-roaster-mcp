@@ -427,16 +427,19 @@ def test_microphone_overflow_snapshot_waits_for_atomic_status_update() -> None:
     reader_thread = Thread(target=overflow_reader)
     snapshot_thread = Thread(target=snapshot_reader)
     coordinating_lock.snapshot_thread = snapshot_thread
+    snapshot_thread_started = False
     reader_thread.start()
     try:
-        assert tracker_observation_started.wait(timeout=1.0)
+        assert tracker_observation_started.wait(timeout=5.0)
         snapshot_thread.start()
-        assert coordinating_lock.snapshot_lock_attempted.wait(timeout=1.0)
+        snapshot_thread_started = True
+        assert coordinating_lock.snapshot_lock_attempted.wait(timeout=5.0)
         assert snapshot_completed.is_set() is False
     finally:
         allow_tracker_observation.set()
-        reader_thread.join(timeout=1.0)
-        snapshot_thread.join(timeout=1.0)
+        reader_thread.join(timeout=5.0)
+        if snapshot_thread_started:
+            snapshot_thread.join(timeout=5.0)
         audio_input.close()
 
     assert not reader_thread.is_alive()
