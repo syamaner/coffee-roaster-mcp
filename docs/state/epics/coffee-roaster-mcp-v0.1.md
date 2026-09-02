@@ -1100,6 +1100,29 @@ lifecycle under root `AGENTS.md`.
 
 ## Validation Notes
 
+- Validation run for #212:
+  - At `1007cfafd8baabb45da69e0c0e104df2da70cef1`, D185/D186 authority
+    `27823eef6a872901add29a8f251429641680402b`, the dedicated clean-wheel
+    acceptance passed for `coffee_roaster_mcp-0.1.16-py3-none-any.whl` with
+    `syamaner/coffee-first-crack-detection` revision
+    `b349a919c34b6130472da97c01817be404e4f629`.
+  - Confirming-window confidence was `0.9845320744703858` from
+    `fc_window_confirmed_row` sequence `2`, one confirmed row among three
+    current-session rows (minimum `0.6`). Onset-candidate payload and summary
+    confidence both `0.8032823849602806` are diagnostic-only. Confirmation
+    after beans added was `16.019406124966203`, inside
+    `3.82710390663442..21.0` and strictly below `20.017`; observed onset
+    `0.019406124966204197`, historical `10.017558290999885`, and historical
+    `0.7762153826546956` confidence are print-only and ungated.
+  - Replay metrics were 3 emitted, 3 processed, and 0 dropped windows. Wheel
+    metadata banned requirements and installed banned distributions were empty;
+    Torch, Torchaudio, and Transformers import specs were false. Focused tests
+    passed 48; full branch coverage passed 670 at `92.06%` (required `90%`);
+    Ruff, Pyright (0), CLI `0.1.16`, source/wheel build, ordinary clean-wheel
+    smoke, and dedicated acceptance passed.
+  - This is hardware-free package/software readiness only. #157 remains open
+    for Pi and combined acceptance, #194 remains open and unstarted, and no
+    Pi, hardware, threshold, release, or publication acceptance is claimed.
 - Governance issue #206: [x] delivery baseline completed through PR #207,
   squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`.
   D184 establishes the MCP-specific Codex-led topology, shared Pi validation
