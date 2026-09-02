@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -36,6 +37,25 @@ MODEL_ARTIFACTS = {
 }
 _BANNED = {"torch", "torchaudio", "transformers"}
 _NAME = re.compile(r"^[A-Za-z0-9_.-]+")
+_CHILD_ENVIRONMENT_KEYS = {
+    "COMSPEC",
+    "CURL_CA_BUNDLE",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "PATH",
+    "PATHEXT",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "WINDIR",
+}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -63,14 +83,21 @@ def _clean_wheel_acceptance(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory(prefix="coffee-roaster-mcp-wheel-") as temporary:
         temporary_root = Path(temporary)
         wheel = _build_one_wheel(root, temporary_root)
-        _assert_no_banned_requirements(_wheel_metadata(wheel).get_all("Requires-Dist") or [])
+        wheel_banned_requirements = _assert_no_banned_requirements(
+            _wheel_metadata(wheel).get_all("Requires-Dist") or []
+        )
         venv_root = temporary_root / "venv"
         venv.EnvBuilder(with_pip=True, clear=True).create(venv_root)
         executable = _venv_python(venv_root)
         _run([executable, "-m", "pip", "install", str(wheel)], root)
         _run([executable, "-m", "pip", "check"], root)
         dependencies = _assert_installed_dependency_isolation(executable, root)
-        resolved = _resolve_with_installed_wheel(executable, root, args.local_model_dir)
+        resolved = _resolve_with_installed_wheel(
+            executable,
+            root,
+            args.local_model_dir,
+            _sanitized_child_environment(temporary_root / "huggingface-cache"),
+        )
         model_root = _stage_model_tree(resolved, temporary_root)
         replay = _run(
             [
@@ -90,7 +117,10 @@ def _clean_wheel_acceptance(args: argparse.Namespace) -> int:
                     "status": "passed",
                     "wheel": wheel.name,
                     "metadata_checked_before_install": True,
-                    "dependency_isolation": dependencies,
+                    "dependency_isolation": {
+                        "wheel_metadata_banned_requirements": wheel_banned_requirements,
+                        "installed_state": dependencies,
+                    },
                     "replay": json.loads(replay.stdout),
                     "model_repository": MODEL_REPOSITORY,
                     "model_revision": MODEL_REVISION,
@@ -119,10 +149,11 @@ def _wheel_metadata(wheel: Path) -> Any:
         return message_from_bytes(archive.read(members[0]))
 
 
-def _assert_no_banned_requirements(requirements: list[str]) -> None:
+def _assert_no_banned_requirements(requirements: list[str]) -> list[str]:
     banned = sorted(item for item in requirements if _requirement_name(item) in _BANNED)
     if banned:
         _fail(f"requirements reintroduced banned packages: {banned}")
+    return banned
 
 
 def _requirement_name(requirement: str) -> str:
@@ -144,27 +175,41 @@ import re
 banned = {'torch', 'torchaudio', 'transformers'}
 distributions = [((item.metadata['Name'] or '').lower(), item.requires or [])
                  for item in metadata.distributions()]
-requirements = {requirement for _, items in distributions for requirement in items
-                if (re.match(r'[A-Za-z0-9_.-]+', requirement.strip()) or [''])[0]
-                .lower().replace('_', '-').replace('.', '-') in banned}
 installed = sorted(name for name, _ in distributions if name in banned)
 specs = {name: importlib.util.find_spec(name) is not None for name in sorted(banned)}
 print(json.dumps({'banned_distributions': installed,
-                  'banned_requirements': sorted(requirements),
                   'import_specs': specs}, sort_keys=True))
-raise SystemExit(bool(installed or requirements or any(specs.values())))
 """
     completed = _run([executable, "-c", code], root)
-    return cast(dict[str, object], json.loads(completed.stdout))
+    state = cast(dict[str, object], json.loads(completed.stdout))
+    banned_distributions = cast(list[str], state["banned_distributions"])
+    import_specs = cast(dict[str, bool], state["import_specs"])
+    evidence = _installed_dependency_evidence(banned_distributions, import_specs)
+    if evidence["banned_distributions"] or any(evidence["import_specs"].values()):
+        _fail(f"installed state reintroduced banned packages: {evidence}")
+    return evidence
+
+
+def _installed_dependency_evidence(
+    banned_distributions: list[str], import_specs: Mapping[str, bool]
+) -> dict[str, object]:
+    """Return dependency-isolation evidence from active installed state only."""
+    return {
+        "banned_distributions": sorted(banned_distributions),
+        "import_specs": {name: bool(import_specs.get(name, False)) for name in sorted(_BANNED)},
+    }
 
 
 def _resolve_with_installed_wheel(
-    executable: Path, root: Path, local_model_dir: Path | None
+    executable: Path,
+    root: Path,
+    local_model_dir: Path | None,
+    environment: Mapping[str, str],
 ) -> dict[str, str]:
     command: list[Path | str] = [executable, Path(__file__).resolve(), "--resolve-artifacts"]
     if local_model_dir is not None:
         command.extend(("--local-model-dir", local_model_dir.resolve()))
-    return cast(dict[str, str], json.loads(_run(command, root).stdout))
+    return cast(dict[str, str], json.loads(_run(command, root, environment=environment).stdout))
 
 
 def _resolve_artifacts(args: argparse.Namespace) -> int:
@@ -236,7 +281,7 @@ async def _installed_replay(args: argparse.Namespace) -> int:
     parameters = StdioServerParameters(
         command=sys.executable,
         args=["-m", "coffee_roaster_mcp.cli", "serve", "--config", str(config)],
-        env=_server_environment(),
+        env=_sanitized_child_environment(args.work_dir / "huggingface-cache"),
         cwd=args.work_dir,
     )
     started = time.monotonic()
@@ -362,23 +407,46 @@ def _write_replay_config(config: Path, model_root: Path, log_dir: Path, fixture:
     )
 
 
-def _server_environment() -> dict[str, str]:
-    environment = dict(os.environ)
-    environment.pop("PYTHONPATH", None)
-    for key in tuple(environment):
-        if key.startswith("COFFEE_"):
-            del environment[key]
+def _sanitized_child_environment(huggingface_cache: Path) -> dict[str, str]:
+    """Return the minimal acceptance-owned environment for child processes."""
+    huggingface_cache.mkdir(parents=True, exist_ok=True)
+    environment = {
+        key: value for key, value in os.environ.items() if key in _CHILD_ENVIRONMENT_KEYS
+    }
+    environment["HF_HOME"] = str(huggingface_cache)
+    environment["HF_HUB_CACHE"] = str(huggingface_cache / "hub")
     return environment
 
 
-def _run(command: list[Path | str], root: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [str(item) for item in command],
-        cwd=root,
-        check=True,
-        text=True,
-        capture_output=True,
-    )
+def _run(
+    command: list[Path | str], root: Path, *, environment: Mapping[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    rendered_command = [str(item) for item in command]
+    try:
+        return subprocess.run(
+            rendered_command,
+            cwd=root,
+            env=environment,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as error:
+        _fail(
+            "command failed "
+            f"(exit status {error.returncode}): {shlex.join(rendered_command)}\n"
+            f"stdout:\n{_bounded_output(error.stdout)}\n"
+            f"stderr:\n{_bounded_output(error.stderr)}"
+        )
+
+
+def _bounded_output(output: str | None, *, limit: int = 4_000) -> str:
+    """Return enough subprocess output to diagnose failures without unbounded logs."""
+    if output is None:
+        return ""
+    if len(output) <= limit:
+        return output
+    return f"{output[:limit]}\n... output truncated ..."
 
 
 def _fail(message: str) -> NoReturn:

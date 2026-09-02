@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 
 import coffee_roaster_mcp.detector as detector_module
@@ -570,9 +571,10 @@ def test_released_onnx_backend_default_frontend_produces_onnx_input(tmp_path: Pa
 
     model_input = session.input_feed[0]["input_values"]
     assert isinstance(model_input, np.ndarray)
-    assert model_input.shape == (1, 1024, 128)
-    assert model_input.dtype == np.float32
-    assert model_input.flags.c_contiguous
+    typed_model_input = cast(npt.NDArray[np.float32], model_input)
+    assert typed_model_input.shape == (1, 1024, 128)
+    assert typed_model_input.dtype == np.float32
+    assert typed_model_input.flags.c_contiguous
     assert output.confirmed is True
     assert output.confidence == pytest.approx(0.6224593312018546)
 
@@ -686,7 +688,7 @@ def test_released_onnx_backend_rejects_invalid_preprocessor_config(tmp_path: Pat
 
 @pytest.mark.parametrize(
     "preprocessor_config",
-    ("{", "[]", '{"mean": -4.0, "std": 2.0, "sampling_rate": 8_000}'),
+    ("{", "[]", '{"mean": -4.0, "std": 2.0, "sampling_rate": 8000}'),
 )
 def test_released_onnx_backend_default_frontend_names_invalid_config_path(
     tmp_path: Path,

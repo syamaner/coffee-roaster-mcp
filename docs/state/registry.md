@@ -185,12 +185,18 @@ E4.1-S3 added the released-artifact ONNX first-crack detector backend without
 starting any session-owned detector lifecycle. `first_crack.mode: audio` can
 now construct an ONNX detector adapter from the existing released-artifact
 resolver boundary: configured INT8/FP32 artifacts resolve from Hugging Face or
-`local_model_dir`, the precision-specific `preprocessor_config.json` configures
-the MCP-owned NumPy/SciPy `MelFrontend`, and the resolved ONNX model is
+`local_model_dir`, the precision-specific `preprocessor_config.json` is loaded
+through `transformers.ASTFeatureExtractor`, and the resolved ONNX model is
 opened through an ONNX Runtime CPU session using configured thread limits.
 Backend output is adapted into the existing detector confidence metadata path.
 Normal CI remains mock-safe through fake artifact paths, fake feature
 extraction, and fake ONNX sessions.
+
+Issue #212 completed the current frontend integration software slice: the
+detector now uses the MCP-owned mel frontend and package acceptance checks the
+Torch/Torchaudio/Transformers-free installed wheel. This is software and
+package-readiness work only; #157 remains open for Pi and combined acceptance,
+and #194 remains open and unstarted.
 
 E4.1-S4 starts and stops a session-owned first-crack runtime when
 `first_crack.mode: audio` is configured. Starting a roast session now prepares
