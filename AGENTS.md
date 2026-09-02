@@ -120,7 +120,9 @@
 
 - `docs/state/registry.md` identifies the active epic. Read its current-state
   head before work. Governance decision D184 is a prerequisite for future
-  implementation; issues #157 and #194 remain open and unimplemented.
+  implementation; #157 is in progress through the standalone frontend/parity slice #210,
+  while its detector integration, dependency removal, and package-acceptance work remain
+  unimplemented, and #194 remains open and unimplemented.
 - `v0.1.16` is the current published package and MCP Registry line. Tagging,
   publication, release-environment approval, and live artefact verification are
   human-operator actions. The intended future minor is `0.2.0`, not an

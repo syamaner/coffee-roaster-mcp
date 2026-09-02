@@ -1,0 +1,10 @@
+This product includes a modified mel frontend adapted from
+coffee-first-crack-detection commit 749c9330b01c93fa153cca2e290ebfbd6c1d986c,
+src/coffee_first_crack/mel_frontend.py
+(SHA-256 4332e0e210e841af76b6f8692990f7576fac46d9a09882b35737102c8015d47a),
+licensed under Apache-2.0 (reference LICENSE SHA-256
+c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4).
+
+MCP modifications: package relocation; narrow defensive validation and error
+handling; typing and docstring adjustments; and no detector integration in this
+slice.

@@ -8,7 +8,8 @@
 - Repository: `syamaner/coffee-roaster-mcp`
 - Package: `coffee-roaster-mcp`
 - MCP Registry name: `io.github.syamaner/coffee-roaster-mcp`
-- Current phase: D184 governance baseline active; no implementation story active
+- Current phase: #157 in progress through completed standalone frontend slice #210;
+  #194 remains unstarted
 
 ## Working Rules
 
@@ -26,9 +27,9 @@
 successful release run `32657497601` bind to base
 `07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance issue #206
 completed through PR #207, squash-merged to `main` at
-`2c854d34bdb43f587db438436202b97e1dd01468`. No implementation story is
-active; issues #157 and #194 remain open, unstarted, and require later ratified
-contracts. The intended future minor is `0.2.0`; tag creation,
+`2c854d34bdb43f587db438436202b97e1dd01468`. Issue #157 is in progress through
+completed standalone frontend slice #210; #194 remains open and unstarted. The
+intended future minor is `0.2.0`; tag creation,
 publication, and live verification remain human-operator-only actions.
 
 ## Historical Narrative (Superseded For Current Delivery)

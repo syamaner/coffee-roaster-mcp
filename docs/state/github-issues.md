@@ -6,7 +6,8 @@ Milestone: `v0.1`
 
 ## Current Stories
 
-- #157: open and unstarted; no implementation progress.
+- #157: in progress; standalone frontend slice #210 is complete.
+- #210: complete; standalone Torch-free NumPy/SciPy mel frontend parity slice.
 - #194: open and unstarted; no implementation progress.
 - #200: complete.
 - #202: complete.
