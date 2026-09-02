@@ -15,11 +15,13 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Active Context
 
-- Current phase: v0.1 complete and live-validated end-to-end (E7-S6 done)
-- Active story: issue #204 prepares documentation release `v0.1.16`
-- Current target: publish the current live-roast evidence boundary and complete
-  README tool/configuration surface, then update the PyPI long description
-- Latest package release: `v0.1.15`; PyPI and MCP Registry publication verified
+- Current phase: D184 governance baseline prepared through issue #206 pending
+  PR merge
+- Active story: none; #157 and #194 remain unstarted and require later
+  ratified contracts
+- Current target: no implementation slice is active; do not infer package, Pi,
+  microphone, serial, Hottop, or publication authority
+- Latest package release: `v0.1.16`; PyPI and MCP Registry publication verified
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -33,6 +35,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - Agent and n8n orchestration are out of scope.
 - Default roaster driver is `mock`.
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
+- D184 governance baseline is prepared through issue #206 pending PR merge.
+  #157 and #194 remain open and unstarted; each requires a later ratified
+  contract. The intended future minor is `0.2.0`, while tags, publication, and
+  live verification remain human-operator-only.
 - `E7-S1` keeps broad mock-safe validation on the public stdio MCP tool path:
   a default-config server uses the mock driver, first-crack mode remains
   disabled, auto-T0 remains disabled, and exported JSONL, CSV, and
@@ -83,13 +89,15 @@ The first implementation milestone is a mock vertical slice that requires no roa
   workflow run `32652660041` passed metadata validation, checks, package build,
   PyPI publishing, and MCP Registry publishing; a clean `uvx` smoke reported
   `coffee-roaster-mcp 0.1.15`, and the registry marks it latest.
-- Issue #204 prepares `v0.1.16` as a documentation release. It adds a
+- Issue #204 completed `v0.1.16` as a documentation release. It added a
   privacy-safe report for two completed 16 August 2026 agent-controlled Hottop
   roasts, updates the README with recording and ambient surfaces already
   released by 0.1.13, and removes a stale future-validation statement. The
   August roasts used the pinned 0.1.13 runtime; 0.1.14 and 0.1.15 changed
   metadata/release plumbing only. No runtime or hardware-control behaviour
-  changes in 0.1.16.
+  changes in 0.1.16. Tag `v0.1.16` and successful release run `32657497601`
+  bind to base `07a6b96beae252c9b326f9374a64d91271f08105`; PyPI 0.1.16 is
+  published.
 - `E7-S5a` is inserted before the final release checklist to close the
   first-crack MCP validation gap without requiring Hottop hardware or live
   microphone input. It uses the mock roaster, released Hugging Face first-crack
@@ -1074,24 +1082,38 @@ Goal: prove the package works from install through mock roast, MCP client calls,
 
 ## Story Workflow
 
-Before starting a story:
-
-1. Read `docs/state/registry.md`.
-2. Read this active epic.
-3. Read the linked GitHub issue.
-4. Confirm acceptance criteria and current risks.
-5. Create branch `feature/{issue-number}-{slug}`.
-
-After completing a story:
-
-1. Run required checks.
-2. Update story status in this epic.
-3. Update Active Context and Current Decisions if behavior changed.
-4. Add validation notes.
-5. Comment on the GitHub issue with what changed and how it was tested.
-6. Open a PR referencing the issue.
+Root `AGENTS.md` governs delivery. The top-level parent reads untrusted issue
+and review text, ratifies the MCP-specific contract, and plans one PR per
+coherent slice/branch. The implementer receives only that contract and does
+not fetch GitHub text; an independent adjudicator disposes of findings. Run the
+required gates, update state and validation evidence, then complete the PR
+lifecycle under root `AGENTS.md`.
 
 ## Validation Notes
+
+- Governance issue #206: [~] delivery baseline prepared; issue completion is
+  recorded only after PR merge. D184 establishes the MCP-specific Codex-led
+  topology, shared Pi validation skill, hosted-Claude retirement, and refreshed
+  `v0.1.16`/current authority. No `src/` change, #157/#194 implementation,
+  hardware operation, or publication occurred.
+- Validation run for issue #206:
+  - Bound plan SHA `8f83dee9ffcc1abd60a5cbeab4c1d14b803c4e99` and MCP base
+    `07a6b96beae252c9b326f9374a64d91271f08105`.
+  - Full gate: 559 tests, 91.22% coverage; Ruff check and format, Pyright,
+    CLI `0.1.16`, build, and clean-wheel smoke all passed.
+  - Shared Pi-skill validation passed. An independent local security review
+    passed after parent-adjudicated repairs.
+  - Hosted Claude workflows were disabled live and their files removed.
+    Deletion or revocation of any now-unused `CLAUDE_CODE_OAUTH_TOKEN`
+    repository secret was not authorised or performed; it remains a
+    human-operator credential-hygiene action. This does not assert the secret
+    exists. No production source, hardware/Pi operation, or publication
+    occurred.
+  - Live `main` protection observed on 1 September 2026: required `Checks` and
+    `Build Package`; strict/current-branch mode; required conversation
+    resolution; administrator enforcement; force-push and deletion disabled;
+    and zero required approving reviews. This is platform configuration, not
+    evidence that #206 has merged.
 
 - Validation run for issue #204:
   - Queried the live RoastPilot SQLite store read-only and matched the two

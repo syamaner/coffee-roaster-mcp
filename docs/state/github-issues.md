@@ -4,6 +4,16 @@ Repository: `syamaner/coffee-roaster-mcp`
 
 Milestone: `v0.1`
 
+## Current Stories
+
+- #157: open and unstarted; no implementation progress.
+- #194: open and unstarted; no implementation progress.
+- #200: complete.
+- #202: complete.
+- #204: complete.
+- #206: D184 governance slice is prepared for PR delivery; completion follows
+  merge.
+
 ## Epics
 
 - #1 Epic 1: Repo, Packaging, And Developer Workflow

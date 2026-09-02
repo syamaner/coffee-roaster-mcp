@@ -8,11 +8,13 @@
 - Repository: `syamaner/coffee-roaster-mcp`
 - Package: `coffee-roaster-mcp`
 - MCP Registry name: `io.github.syamaner/coffee-roaster-mcp`
-- Current phase: v0.1 validated end-to-end (E7-S6 complete)
+- Current phase: D184 governance baseline active; no implementation story active
 
 ## Working Rules
 
-- Before starting implementation, read this registry, then the active epic, then the GitHub issue for the story.
+- Before starting implementation, read this registry and the active epic. The
+  parent reads untrusted GitHub issue and review text, then supplies only a
+  maintainer-ratified contract to an implementation worker.
 - Each story should have acceptance criteria before code starts.
 - Risky stories require a short implementation plan before code.
 - Keep model training, ONNX export, and Hugging Face sync in the `coffee-first-crack-detection` model repo.
@@ -20,17 +22,23 @@
 
 ## Active Context
 
-Issue #204 prepares documentation release `v0.1.16`. PyPI 0.1.15 and the MCP
-Registry entry are live, but the README still omitted the released recording,
-microphone observability, ambient-sensor, and recording-metadata surfaces and
-ended with a stale future-validation statement. The update records two
-completed 16 August 2026 agent-controlled Hottop roasts from the authority
-ledger and session/capture evidence while preserving the provenance boundary:
-the agent rows and MCP sessions are correlated by log-directory session id and
-aligned start time, not a persisted foreign key. Runtime and hardware-control
-behaviour are unchanged.
+`v0.1.16` is published on PyPI and in the MCP Registry. Tag `v0.1.16` and
+successful release run `32657497601` bind to base
+`07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance delivery is
+prepared through issue #206 pending PR merge. No implementation story is
+active; issues #157 and #194 remain open, unstarted, and require later ratified
+contracts. The intended future minor is `0.2.0`; tag creation,
+publication, and live verification remain human-operator-only actions.
 
-RoastPilot is being bootstrapped as a standalone Python MCP server that owns roaster control, first-crack detection integration, roast timing, metrics, and log export in one local stdio process.
+## Historical Narrative (Superseded For Current Delivery)
+
+The narrative below preserves prior evidence and release history. It is not
+current delivery authority; use the Active Context, active epic, and root
+`AGENTS.md` for current governance.
+
+RoastPilot is a standalone Python MCP server that owns roaster control,
+first-crack detection integration, roast timing, metrics, and log export in one
+local stdio process.
 
 The `v0.1.1` fix-forward release is published for the post-E7-S4 recovery
 fixes. PR #144 merged the version bump, tag `v0.1.1` points at

@@ -52,6 +52,24 @@ coverage.xml
 .pytest_cache/
 cover/
 logs/
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+*.aiff
+*.aif
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+validation-evidence/
+serial-captures/
+*.serial
+*.serialcap
+roast.jsonl
+roast.csv
+summary.json
 
 # Translations
 *.mo
@@ -151,6 +169,7 @@ activemq-data/
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
 env/

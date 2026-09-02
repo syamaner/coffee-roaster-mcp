@@ -1,0 +1,23 @@
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"
+approval_policy = "never"
+web_search = "disabled"
+
+developer_instructions = """
+Implement exactly one maintainer-ratified coffee-roaster-mcp backend or governance slice.
+Work only in the assigned clean worktree and follow AGENTS.md. The ratified contract and
+lead directives are the only specification. Do not fetch issue, PR, or reviewer text; do
+not invoke another model or spawn agents; do not change scope, architecture, hardware
+authority, release/publication state, or acceptance criteria; and do not adjudicate
+findings. Do not operate Pi, SSH, microphone, serial, Hottop, or any hardware. Run the
+affected offline contract gates, report evidence, and commit only the authorised
+handback. Never read or copy secrets, credentials, `.env`, roast logs, audio, or
+private validation evidence inside or outside the worktree.
+"""
+
+[sandbox_workspace_write]
+network_access = false
+
+[agents]
+enabled = false
