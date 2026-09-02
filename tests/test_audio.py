@@ -372,6 +372,82 @@ def test_microphone_audio_input_resets_overflow_streak_on_clean_read() -> None:
         audio_input.close()
 
 
+def test_microphone_overflow_snapshot_waits_for_atomic_status_update() -> None:
+    """A snapshot cannot observe a streak update before its tracker event."""
+
+    class _SnapshotCoordinatingLock:
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self.snapshot_thread: Thread | None = None
+            self.snapshot_lock_attempted = Event()
+
+        def __enter__(self) -> _SnapshotCoordinatingLock:
+            if current_thread() is self.snapshot_thread:
+                self.snapshot_lock_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            self._lock.release()
+
+    FakeRawInputStream.created.clear()
+    settings = audio_capture_settings_from_config(AudioConfig(source="microphone", sample_rate=4))
+    audio_input = MicrophoneAudioInput(settings, sounddevice_module=FakeSoundDeviceModule())
+    audio_input.read_samples(1)
+    stream = FakeRawInputStream.created[-1]
+    stream.overflowed = True
+
+    coordinating_lock = _SnapshotCoordinatingLock()
+    object.__setattr__(audio_input, "_overflow_state_lock", coordinating_lock)
+    tracker = audio_input._overflow_tracker  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    original_observe = tracker.observe_overflow
+    tracker_observation_started = Event()
+    allow_tracker_observation = Event()
+    read_errors: list[BaseException] = []
+    snapshots: list[OverflowSnapshot] = []
+    snapshot_completed = Event()
+
+    def blocked_observe(*, estimated_lost_audio_ms: float) -> None:
+        tracker_observation_started.set()
+        assert allow_tracker_observation.wait(timeout=1.0)
+        original_observe(estimated_lost_audio_ms=estimated_lost_audio_ms)
+
+    object.__setattr__(tracker, "observe_overflow", blocked_observe)
+
+    def overflow_reader() -> None:
+        try:
+            audio_input.read_samples(1)
+        except BaseException as exc:  # noqa: BLE001 - surfaced in the test thread.
+            read_errors.append(exc)
+
+    def snapshot_reader() -> None:
+        snapshots.append(audio_input.overflow_snapshot)
+        snapshot_completed.set()
+
+    reader_thread = Thread(target=overflow_reader)
+    snapshot_thread = Thread(target=snapshot_reader)
+    coordinating_lock.snapshot_thread = snapshot_thread
+    reader_thread.start()
+    try:
+        assert tracker_observation_started.wait(timeout=1.0)
+        snapshot_thread.start()
+        assert coordinating_lock.snapshot_lock_attempted.wait(timeout=1.0)
+        assert snapshot_completed.is_set() is False
+    finally:
+        allow_tracker_observation.set()
+        reader_thread.join(timeout=1.0)
+        snapshot_thread.join(timeout=1.0)
+        audio_input.close()
+
+    assert not reader_thread.is_alive()
+    assert not snapshot_thread.is_alive()
+    assert read_errors == []
+    assert len(snapshots) == 1
+    assert snapshots[0].count_last_minute == 1
+    assert snapshots[0].total_count == 1
+    assert snapshots[0].max_consecutive_count == 1
+
+
 def test_microphone_audio_input_closes_stream_when_start_fails() -> None:
     FakeRawInputStream.created.clear()
     settings = audio_capture_settings_from_config(

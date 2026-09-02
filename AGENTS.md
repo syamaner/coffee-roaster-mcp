@@ -122,7 +122,8 @@
   head before work. Governance decision D184 is a prerequisite for future
   implementation; standalone frontend/parity #210 and software-integration/
   package-readiness #212 are complete. #157 remains open for Pi and combined
-  acceptance, and #194 remains open and unstarted.
+  acceptance, and #194's instrumentation software slice is implemented while
+  #194 remains open for later operator characterisation and supervised acceptance.
 - `v0.1.16` is the current published package and MCP Registry line. Tagging,
   publication, release-environment approval, and live artefact verification are
   human-operator actions. The intended future minor is `0.2.0`, not an

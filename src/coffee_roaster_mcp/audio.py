@@ -657,6 +657,7 @@ class MicrophoneAudioInput:
         self._max_consecutive_overflows = max_consecutive_overflows
         self._consecutive_overflows = 0
         self._max_consecutive_overflow_streak = 0
+        self._overflow_state_lock = Lock()
         self._close_lock = Lock()
         self._monotonic_now = monotonic_now or time.monotonic
         #: Per-minute overflow diagnostics (#190), read by the capture pipeline
@@ -712,11 +713,6 @@ class MicrophoneAudioInput:
             # the samples it captured. Log, count, and keep going rather than
             # killing capture for the whole roast; only a sustained run of
             # consecutive overflows (the device cannot keep up at all) faults.
-            self._consecutive_overflows += 1
-            self._max_consecutive_overflow_streak = max(
-                self._max_consecutive_overflow_streak,
-                self._consecutive_overflows,
-            )
             # PortAudio's overflowed flag reports only that input was lost
             # SINCE THE PREVIOUS READ, which can span multiple consecutive
             # overflowed reads during a genuine multi-second stall — so a
@@ -730,43 +726,55 @@ class MicrophoneAudioInput:
             # this read's nominal duration when there is no prior read to
             # compare against (the first read of a run) — see
             # OverflowSnapshot's docstring for the estimate's honest bounds.
-            expected_duration_ms = 1000.0 * sample_count / self._settings.sample_rate
-            if self._last_read_returned_at is None:
-                estimated_lost_audio_ms = expected_duration_ms
-            else:
-                actual_gap_ms = 1000.0 * (read_returned_at - self._last_read_returned_at)
-                estimated_lost_audio_ms = max(0.0, actual_gap_ms - expected_duration_ms)
-            self._overflow_tracker.observe_overflow(estimated_lost_audio_ms=estimated_lost_audio_ms)
+            with self._overflow_state_lock:
+                self._consecutive_overflows += 1
+                self._max_consecutive_overflow_streak = max(
+                    self._max_consecutive_overflow_streak,
+                    self._consecutive_overflows,
+                )
+                expected_duration_ms = 1000.0 * sample_count / self._settings.sample_rate
+                if self._last_read_returned_at is None:
+                    estimated_lost_audio_ms = expected_duration_ms
+                else:
+                    actual_gap_ms = 1000.0 * (read_returned_at - self._last_read_returned_at)
+                    estimated_lost_audio_ms = max(0.0, actual_gap_ms - expected_duration_ms)
+                self._overflow_tracker.observe_overflow(
+                    estimated_lost_audio_ms=estimated_lost_audio_ms
+                )
+                consecutive_overflows = self._consecutive_overflows
+                self._last_read_returned_at = read_returned_at
             _LOGGER.warning(
                 "Microphone audio input overflowed (%d consecutive); continuing.",
-                self._consecutive_overflows,
+                consecutive_overflows,
             )
-            if self._consecutive_overflows >= self._max_consecutive_overflows:
+            if consecutive_overflows >= self._max_consecutive_overflows:
                 raise AudioCaptureError(
                     "Microphone audio input overflowed on "
-                    f"{self._consecutive_overflows} consecutive reads; the device "
+                    f"{consecutive_overflows} consecutive reads; the device "
                     "cannot keep up with the configured sample rate."
                 )
         else:
-            self._consecutive_overflows = 0
-        # Update on EVERY read (overflowed or not) so the next call's gap
-        # estimate is always measured from the most recent read, not a stale
-        # earlier one.
-        self._last_read_returned_at = read_returned_at
+            with self._overflow_state_lock:
+                self._consecutive_overflows = 0
+                # Update on EVERY read (overflowed or not) so the next call's
+                # gap estimate is always measured from the most recent read,
+                # not a stale earlier one.
+                self._last_read_returned_at = read_returned_at
         return tuple(float(sample[0]) for sample in struct.iter_unpack("f", bytes(raw_data)))
 
     @property
     def overflow_snapshot(self) -> OverflowSnapshot:
         """Return current rolling and lifetime overflow stats (#190)."""
-        tracker_snapshot = self._overflow_tracker.snapshot()
-        return OverflowSnapshot(
-            count_last_minute=tracker_snapshot.count_last_minute,
-            estimated_lost_audio_ms_last_minute=(
-                tracker_snapshot.estimated_lost_audio_ms_last_minute
-            ),
-            total_count=tracker_snapshot.total_count,
-            max_consecutive_count=self._max_consecutive_overflow_streak,
-        )
+        with self._overflow_state_lock:
+            tracker_snapshot = self._overflow_tracker.snapshot()
+            return OverflowSnapshot(
+                count_last_minute=tracker_snapshot.count_last_minute,
+                estimated_lost_audio_ms_last_minute=(
+                    tracker_snapshot.estimated_lost_audio_ms_last_minute
+                ),
+                total_count=tracker_snapshot.total_count,
+                max_consecutive_count=self._max_consecutive_overflow_streak,
+            )
 
     def reset_overflow_tracking(self) -> None:
         """Clear overflow history so a reused input starts each run fresh.
@@ -787,10 +795,11 @@ class MicrophoneAudioInput:
         falls back to the read's own nominal duration for that first
         estimate, exactly like a freshly-constructed input would.
         """
-        self._consecutive_overflows = 0
-        self._max_consecutive_overflow_streak = 0
-        self._overflow_tracker.reset()
-        self._last_read_returned_at = None
+        with self._overflow_state_lock:
+            self._consecutive_overflows = 0
+            self._max_consecutive_overflow_streak = 0
+            self._overflow_tracker.reset()
+            self._last_read_returned_at = None
 
     def close(self) -> None:
         """Stop and close the microphone stream.
