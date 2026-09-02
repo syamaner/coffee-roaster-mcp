@@ -1,0 +1,54 @@
+{
+  "fixture_id": "analytic-10s-v1",
+  "source": {
+    "repository": "coffee-first-crack-detection",
+    "commit": "749c9330b01c93fa153cca2e290ebfbd6c1d986c",
+    "path": "src/coffee_first_crack/mel_frontend.py",
+    "sha256": "4332e0e210e841af76b6f8692990f7576fac46d9a09882b35737102c8015d47a"
+  },
+  "reference_test": {
+    "path": "tests/test_mel_frontend.py",
+    "sha256": "090fb759aa0b1f82e6761d21e04cee0cf0a6bcfea48abb6b80f779332573b516"
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  "config": {
+    "mean": -4.2677393,
+    "std": 4.5689974,
+    "num_mel_bins": 128,
+    "sampling_rate": 16000,
+    "max_length": 1024
+  },
+  "waveform_recipe": {
+    "sample_count": 160000,
+    "dtype": "float32",
+    "time": "np.arange(sample_count, dtype=np.float64) / sampling_rate",
+    "envelope": "0.55 + 0.25 * sin(2*pi*0.31*time)",
+    "segment": "1.0 for time < 3.25; 0.62 for 3.25 <= time < 6.75; 0.88 otherwise",
+    "carrier": "0.19*sin(2*pi*173*time) + 0.11*sin(2*pi*701*time + 0.4) + 0.07*sin(2*pi*2261*time - 0.2)",
+    "output": "(segment * envelope * carrier + 0.0125).astype(np.float32)"
+  },
+  "expected": {
+    "file": "analytic-10s.npz",
+    "key": "input_values",
+    "dtype": "float32",
+    "shape": [1024, 128],
+    "sha256": "e07d9cc6a7a6435157fdf83b8625f76f25ec38faf9ff7e0cfcdbdd4c5c983fe1",
+    "bytes": 235581
+  },
+  "generator_environment": {
+    "python": "3.11.14",
+    "numpy": "2.4.4",
+    "scipy": "1.17.1",
+    "platform": "macOS-26.5.2-arm64-arm-64bit"
+  },
+  "comparison": {
+    "max_abs_diff_operator": "<",
+    "atol": 0.0001,
+    "rtol": 0,
+    "reference_measured_context": 0.0000271,
+    "reference_measured_context_note": "Contextual result from the bound reference test description; not this fixture observed result."
+  }
+}

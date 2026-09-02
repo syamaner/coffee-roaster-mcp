@@ -17,10 +17,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 - Current phase: D184 governance baseline active; #206 completed through PR
   #207, squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`
-- Active story: none; #157 and #194 remain unstarted and require later
-  ratified contracts
-- Current target: no implementation slice is active; do not infer package, Pi,
-  microphone, serial, Hottop, or publication authority
+- Active story: #157 in progress through completed standalone frontend slice #210;
+  #194 remains unstarted and requires a later ratified contract
+- Current target: standalone frontend slice #210 complete; do not infer detector
+  integration, Pi, microphone, serial, Hottop, or publication authority
 - Latest package release: `v0.1.16`; PyPI and MCP Registry publication verified
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
@@ -37,8 +37,9 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
 - D184 governance baseline is active. Issue #206 completed through PR #207,
   squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`.
-  #157 and #194 remain open and unstarted; each requires a later ratified
-  contract. The intended future minor is `0.2.0`, while tags, publication, and
+  #157 is in progress through completed standalone frontend slice #210; #194
+  remains open and unstarted and requires a later ratified contract. The intended
+  future minor is `0.2.0`, while tags, publication, and
   live verification remain human-operator-only.
 - `E7-S1` keeps broad mock-safe validation on the public stdio MCP tool path:
   a default-config server uses the mock driver, first-crack mode remains
