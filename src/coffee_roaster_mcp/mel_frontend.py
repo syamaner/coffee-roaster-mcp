@@ -122,7 +122,7 @@ def _validated_waveform(waveform: object) -> np.ndarray:
         raise ValueError("waveform must be one-dimensional")
     if array.size == 0:
         raise ValueError("waveform must not be empty")
-    if array.dtype.kind not in "biuf":
+    if array.dtype.kind not in "iuf":
         raise ValueError("waveform must contain real numeric values")
     if array.size < _FRAME_LENGTH:
         raise ValueError(f"waveform must contain at least {_FRAME_LENGTH} samples")

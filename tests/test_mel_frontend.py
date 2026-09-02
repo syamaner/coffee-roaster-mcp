@@ -334,6 +334,7 @@ def test_extract_rejects_input_dependent_normalisation_overflow(
         np.zeros((400, 1), dtype=np.float32),
         np.array([], dtype=np.float32),
         np.zeros(399, dtype=np.float32),
+        np.zeros(400, dtype=np.bool_),
         np.array(["x"] * 400),
         np.array([1 + 1j] * 400),
         np.full(400, np.nan, dtype=np.float32),
