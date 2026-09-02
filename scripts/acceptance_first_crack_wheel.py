@@ -394,7 +394,6 @@ def _confirmation_evidence(
     windows = [entry for entry in current_session_rows if entry[1].get("type") == "fc_window"]
     beans_added, beans_added_count = _single_session_event(events, "beans_added")
     first_crack, first_crack_count = _single_session_event(events, "first_crack_detected")
-    confirming_window, confirmed_window_count = _confirming_window(windows)
 
     beans_added_time = _finite_number(beans_added, "monotonic_seconds", "beans_added")
     exported_onset = _finite_number(first_crack, "monotonic_seconds", "first_crack_detected")
@@ -407,20 +406,6 @@ def _confirmation_evidence(
     )
     state_onset = _finite_number(state, "first_crack_monotonic_seconds", "final state")
     model = _mapping_field(summary, "first_crack_model", "summary")
-    onset_candidate_payload_confidence = _finite_number(
-        payload, "confidence", "first_crack_detected payload"
-    )
-    onset_candidate_summary_confidence = _finite_number(
-        model, "confidence", "summary first_crack_model"
-    )
-    if onset_candidate_payload_confidence != onset_candidate_summary_confidence:
-        _fail("onset-candidate payload and summary confidence differ")
-    confirming_confidence = _finite_number(confirming_window, "confidence", "confirmed fc_window")
-    if confirming_confidence < 0.6:
-        _fail(f"confirming confidence was below threshold: {confirming_confidence}")
-    confirming_sequence_number = _finite_number(
-        confirming_window, "window_sequence_number", "confirmed fc_window"
-    )
 
     onset_to_confirmation = absolute_confirmation - absolute_onset
     confirmation_session_time = exported_onset + onset_to_confirmation
@@ -444,6 +429,23 @@ def _confirmation_evidence(
         _fail(f"confirmation after beans added failed inclusive bounds: {confirmation_after_t0}")
     if confirmation_after_t0 >= 20.017:
         _fail(f"confirmation after beans added failed strict maximum: {confirmation_after_t0}")
+
+    confirming_window, confirmed_window_count = _confirming_window(windows)
+    confirming_confidence = _finite_number(confirming_window, "confidence", "confirmed fc_window")
+    onset_candidate_payload_confidence = _finite_number(
+        payload, "confidence", "first_crack_detected payload"
+    )
+    onset_candidate_summary_confidence = _finite_number(
+        model, "confidence", "summary first_crack_model"
+    )
+    if onset_candidate_payload_confidence != onset_candidate_summary_confidence:
+        _fail(
+            "onset-candidate payload and summary confidence differ: "
+            f"{onset_candidate_payload_confidence} != {onset_candidate_summary_confidence}"
+        )
+    if confirming_confidence < 0.6:
+        _fail(f"confirming window confidence was below threshold: {confirming_confidence}")
+
     return {
         "confirmation": {
             "beans_added_monotonic_seconds": beans_added_time,
@@ -467,14 +469,14 @@ def _confirmation_evidence(
         },
         "confidence": {
             "confirming_confidence": confirming_confidence,
-            "source": "fc_window_confirmed_row",
-            "confirming_window_sequence_number": confirming_sequence_number,
-            "current_session_fc_window_count": len(windows),
-            "confirmed_fc_window_count": confirmed_window_count,
+            "confirming_confidence_source": "fc_window_confirmed_row",
+            "confirming_window_sequence_number": confirming_window.get("window_sequence_number"),
+            "current_session_fc_window_row_count": len(windows),
+            "confirmed_fc_window_row_count": confirmed_window_count,
             "minimum": 0.6,
             "onset_candidate_payload_confidence": onset_candidate_payload_confidence,
             "onset_candidate_summary_confidence": onset_candidate_summary_confidence,
-            "onset_candidate_confidence_diagnostic_only": True,
+            "onset_candidate_confidence_is_diagnostic": True,
         },
         "observed_onset_after_t0": onset_after_t0,
     }
@@ -504,14 +506,14 @@ def _confirming_window(
     for line_number, window in windows:
         confirmed = window.get("confirmed")
         if not isinstance(confirmed, bool):
-            _fail(
-                "missing or non-boolean confirmed on current-session fc_window "
-                f"at line {line_number}"
-            )
+            _fail(f"non-boolean fc_window.confirmed at line {line_number}")
         if confirmed:
             confirmed_windows.append(window)
     if len(confirmed_windows) != 1:
-        _fail(f"expected exactly one confirmed fc_window, found {len(confirmed_windows)}")
+        _fail(
+            "expected exactly one confirmed fc_window row for current session, "
+            f"found {len(confirmed_windows)}"
+        )
     return confirmed_windows[0], len(confirmed_windows)
 
 

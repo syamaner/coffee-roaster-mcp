@@ -277,6 +277,20 @@ def _confirmation_rows(
         {
             "session_id": "current",
             "type": "fc_window",
+            "confirmed": False,
+            "confidence": 0.31,
+            "window_sequence_number": 1,
+        },
+        {
+            "session_id": "current",
+            "type": "fc_window",
+            "confirmed": False,
+            "confidence": 0.44,
+            "window_sequence_number": 2,
+        },
+        {
+            "session_id": "current",
+            "type": "fc_window",
             "confirmed": confirmed,
             "confidence": confirming_confidence,
             "window_sequence_number": 3,
@@ -293,6 +307,7 @@ def test_confirmation_evidence_uses_session_formula_and_filters_rows(tmp_path: P
             "type": "telemetry",
             "kind": "beans_added",
             "monotonic_seconds": 1.0,
+            "confirmed": True,
         },
         {
             "session_id": "other",
@@ -334,14 +349,14 @@ def test_confirmation_evidence_uses_session_formula_and_filters_rows(tmp_path: P
     }
     assert evidence["confidence"] == {
         "confirming_confidence": 0.6,
-        "source": "fc_window_confirmed_row",
-        "confirming_window_sequence_number": 3.0,
-        "current_session_fc_window_count": 1,
-        "confirmed_fc_window_count": 1,
+        "confirming_confidence_source": "fc_window_confirmed_row",
+        "confirming_window_sequence_number": 3,
+        "current_session_fc_window_row_count": 3,
+        "confirmed_fc_window_row_count": 1,
         "minimum": 0.6,
         "onset_candidate_payload_confidence": 0.6,
         "onset_candidate_summary_confidence": 0.6,
-        "onset_candidate_confidence_diagnostic_only": True,
+        "onset_candidate_confidence_is_diagnostic": True,
     }
     assert evidence["observed_onset_after_t0"] == 5.0
 
@@ -378,14 +393,14 @@ def test_confirmation_evidence_accepts_exact_minimum_confidence(tmp_path: Path) 
 
     assert evidence["confidence"] == {
         "confirming_confidence": 0.6,
-        "source": "fc_window_confirmed_row",
-        "confirming_window_sequence_number": 3.0,
-        "current_session_fc_window_count": 1,
-        "confirmed_fc_window_count": 1,
+        "confirming_confidence_source": "fc_window_confirmed_row",
+        "confirming_window_sequence_number": 3,
+        "current_session_fc_window_row_count": 3,
+        "confirmed_fc_window_row_count": 1,
         "minimum": 0.6,
         "onset_candidate_payload_confidence": 0.6,
         "onset_candidate_summary_confidence": 0.6,
-        "onset_candidate_confidence_diagnostic_only": True,
+        "onset_candidate_confidence_is_diagnostic": True,
     }
 
 
@@ -411,7 +426,7 @@ def test_confirmation_evidence_rejects_low_confirming_window_despite_strong_onse
     tmp_path: Path,
 ) -> None:
     """Only the confirmed first-crack window confidence is threshold-gated."""
-    with pytest.raises(RuntimeError, match="confirming confidence"):
+    with pytest.raises(RuntimeError, match="confirming window confidence"):
         _confirmation_evidence(
             _module(),
             tmp_path,
@@ -427,12 +442,12 @@ def test_confirmation_evidence_rejects_low_confirming_window_despite_strong_onse
         )
 
 
-@pytest.mark.parametrize("confirmed", [None, 1, "true"])
+@pytest.mark.parametrize("confirmed", [None, 1, 0, "true"])
 def test_confirmation_evidence_rejects_non_boolean_confirmed(
     tmp_path: Path, confirmed: object
 ) -> None:
     """Every current-session first-crack window must use a JSON boolean confirmed flag."""
-    with pytest.raises(RuntimeError, match="line 3"):
+    with pytest.raises(RuntimeError, match="line 5"):
         _confirmation_evidence(_module(), tmp_path, _confirmation_rows(confirmed=confirmed))
 
 
@@ -449,6 +464,15 @@ def test_confirmation_evidence_rejects_absent_or_duplicate_confirming_windows(
         _confirmation_evidence(_module(), tmp_path, rows)
 
 
+def test_confirmation_evidence_rejects_malformed_non_confirming_window(tmp_path: Path) -> None:
+    """A malformed false window is not ignored while searching for the true window."""
+    rows = _confirmation_rows()
+    rows[2]["confirmed"] = "false"
+
+    with pytest.raises(RuntimeError, match="line 3"):
+        _confirmation_evidence(_module(), tmp_path, rows)
+
+
 @pytest.mark.parametrize("value", [None, "0.6", True, float("nan"), float("inf")])
 def test_confirmation_evidence_rejects_invalid_confirming_confidence(
     tmp_path: Path, value: object
@@ -462,7 +486,7 @@ def test_confirmation_evidence_rejects_missing_confirming_window_fields(tmp_path
     """Required confirmation fields fail clearly when omitted from the window row."""
     rows = _confirmation_rows()
     del rows[-1]["confirmed"]
-    with pytest.raises(RuntimeError, match="line 3"):
+    with pytest.raises(RuntimeError, match="line 5"):
         _confirmation_evidence(_module(), tmp_path, rows)
     rows = _confirmation_rows()
     del rows[-1]["confidence"]
@@ -474,6 +498,28 @@ def test_confirmation_evidence_rejects_onset_candidate_confidence_mismatch(tmp_p
     """The two diagnostic onset-candidate confidence copies must exactly agree."""
     with pytest.raises(RuntimeError, match="payload and summary confidence differ"):
         _confirmation_evidence(_module(), tmp_path, confidence=0.7)
+
+
+def test_confirmation_evidence_preserves_event_validation_precedence(tmp_path: Path) -> None:
+    """An existing timing failure wins before malformed first-crack window data."""
+    rows = _confirmation_rows(absolute_confirmation=499.0)
+    rows[-1]["confirmed"] = "true"
+
+    with pytest.raises(RuntimeError, match="onset is after confirmation"):
+        _confirmation_evidence(_module(), tmp_path, rows)
+
+
+def test_confirmation_evidence_treats_window_sequence_as_optional_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """Window sequence metadata is reported when present and never acceptance-gated."""
+    rows = _confirmation_rows()
+    del rows[-1]["window_sequence_number"]
+
+    evidence = _confirmation_evidence(_module(), tmp_path, rows)
+
+    confidence = cast(dict[str, object], evidence["confidence"])
+    assert confidence["confirming_window_sequence_number"] is None
 
 
 @pytest.mark.parametrize("kind", ["beans_added", "first_crack_detected"])
