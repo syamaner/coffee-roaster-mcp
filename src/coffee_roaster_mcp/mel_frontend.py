@@ -30,6 +30,8 @@ _MIN_FREQUENCY = 20.0
 _DEFAULT_NUM_MEL_BINS = 128
 _DEFAULT_SAMPLING_RATE = 16000
 _DEFAULT_MAX_LENGTH = 1024
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
+_FLOAT32_MIN_SUBNORMAL = float(np.nextafter(np.float32(0), np.float32(1)))
 
 
 class MelFrontendConfigError(ValueError):
@@ -150,6 +152,26 @@ def _require_real(value: object, name: str) -> float:
     return converted
 
 
+def _require_float32_normalisation_value(value: float, name: str) -> float:
+    """Validate a normalisation value can be represented as finite float32.
+
+    Args:
+        value: Finite normalisation value.
+        name: Field name used in the bounded error message.
+
+    Returns:
+        The validated value.
+
+    Raises:
+        MelFrontendConfigError: If the value cannot be represented safely.
+    """
+    if abs(value) > _FLOAT32_MAX:
+        raise MelFrontendConfigError(f"{name} must be representable as finite float32")
+    if name == "std" and value < _FLOAT32_MIN_SUBNORMAL:
+        raise MelFrontendConfigError("std must not underflow float32 normalisation")
+    return value
+
+
 def _require_fixed_integer(value: object, name: str, expected: int) -> int:
     """Validate an exactly fixed, non-boolean integer configuration value.
 
@@ -198,7 +220,13 @@ def extract_mel(
     Returns:
         A float32 ``(max_length, num_mel_filters)`` log-mel array.
     """
+    if type(frame_length) is not int or frame_length <= 0:
+        raise ValueError("frame_length must be a positive integer")
+    if type(hop_length) is not int or hop_length <= 0:
+        raise ValueError("hop_length must be a positive integer")
     samples = _validated_waveform(waveform)
+    if len(samples) < frame_length:
+        raise ValueError(f"waveform must contain at least {frame_length} samples")
     frame_count = 1 + (len(samples) - frame_length) // hop_length
     frames = np.zeros((frame_count, frame_length), dtype=np.float64)
     for index in range(frame_count):
@@ -248,6 +276,8 @@ class MelFrontend:
         self.std = _require_real(std, "std")
         if self.std <= 0:
             raise MelFrontendConfigError("std must be strictly positive")
+        self.mean = _require_float32_normalisation_value(self.mean, "mean")
+        self.std = _require_float32_normalisation_value(self.std, "std")
         self.num_mel_bins = _require_fixed_integer(
             num_mel_bins, "num_mel_bins", _DEFAULT_NUM_MEL_BINS
         )
@@ -289,6 +319,8 @@ class MelFrontend:
         try:
             with config_path.open(encoding="utf-8") as file_handle:
                 loaded: object = json.load(file_handle)
+        except UnicodeDecodeError as exc:
+            raise MelFrontendConfigError("preprocessor_config.json contains invalid UTF-8") from exc
         except json.JSONDecodeError as exc:
             raise MelFrontendConfigError("preprocessor_config.json contains invalid JSON") from exc
         except OSError as exc:

@@ -206,6 +206,13 @@ def test_config_missing_file_malformed_non_object_and_unreadable(
         MelFrontend.from_config(directory)
 
 
+def test_config_invalid_utf8_is_a_bounded_configuration_error(tmp_path: Path) -> None:
+    """Invalid UTF-8 in the configuration must not leak a decoding error."""
+    (tmp_path / "preprocessor_config.json").write_bytes(b"\xff")
+    with pytest.raises(MelFrontendConfigError, match="invalid UTF-8"):
+        MelFrontend.from_config(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("content", "message"),
     [
@@ -243,12 +250,36 @@ def test_config_rejects_invalid_consumed_values(tmp_path: Path, content: str, me
         {"mean": 1.0, "std": 1.0, "sampling_rate": 8000},
         {"mean": 1.0, "std": 1.0, "max_length": 1000},
         {"mean": 1.0, "std": 1.0, "min_frequency": 19.0},
+        {"mean": 1e308, "std": 1.0},
+        {"mean": 0.0, "std": 1e-308},
     ],
 )
 def test_constructor_rejects_invalid_contract_values(kwargs: dict[str, object]) -> None:
     """Direct construction enforces the same finite fixed configuration rules."""
     with pytest.raises(MelFrontendConfigError):
         MelFrontend(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"frame_length": 800}, "at least 800 samples"),
+        ({"frame_length": 0}, "frame_length must be a positive integer"),
+        ({"hop_length": 0}, "hop_length must be a positive integer"),
+    ],
+)
+def test_extract_mel_rejects_invalid_analysis_dimensions(
+    kwargs: dict[str, int], message: str
+) -> None:
+    """Analysis dimensions must fail before frame allocation or arithmetic."""
+    frontend = _frontend()
+    with pytest.raises(ValueError, match=message):
+        extract_mel(
+            np.zeros(400, dtype=np.float32),
+            frontend._mel_filters,  # noqa: SLF001  # type: ignore[reportPrivateUsage]
+            frontend._window,  # noqa: SLF001  # type: ignore[reportPrivateUsage]
+            **kwargs,
+        )
 
 
 @pytest.mark.parametrize(
