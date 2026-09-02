@@ -213,6 +213,15 @@ def test_config_invalid_utf8_is_a_bounded_configuration_error(tmp_path: Path) ->
         MelFrontend.from_config(tmp_path)
 
 
+def test_config_translates_oversized_json_integer_overflow(tmp_path: Path) -> None:
+    """An oversized JSON integer must remain within the configuration error boundary."""
+    oversized_integer = "9" * 401
+    with pytest.raises(MelFrontendConfigError, match="mean must be finite"):
+        MelFrontend.from_config(
+            _write_config(tmp_path, f'{{"mean": {oversized_integer}, "std": 1.0}}')
+        )
+
+
 @pytest.mark.parametrize(
     ("content", "message"),
     [

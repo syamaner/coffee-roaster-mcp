@@ -147,7 +147,10 @@ def _require_real(value: object, name: str) -> float:
     """
     if isinstance(value, (bool, complex)) or not isinstance(value, (int, float)):
         raise MelFrontendConfigError(f"{name} must be a finite JSON number")
-    converted = float(value)
+    try:
+        converted = float(value)
+    except OverflowError as exc:
+        raise MelFrontendConfigError(f"{name} must be finite") from exc
     if not math.isfinite(converted):
         raise MelFrontendConfigError(f"{name} must be finite")
     return converted
