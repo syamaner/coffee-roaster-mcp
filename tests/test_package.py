@@ -78,6 +78,10 @@ _EXPECTED_FIRST_CRACK_STATUS_KEYS = {
     "dropped_window_count",
     "emitted_window_count",
     "estimated_lost_audio_ms_last_minute",
+    "inference_overrun_count",
+    "last_inference_duration_ms",
+    "max_consecutive_overflow_count",
+    "max_inference_duration_ms",
     "mic_peak_dbfs",
     "mic_rms_dbfs",
     "mode",
@@ -439,6 +443,10 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         )
         assert first_crack_status["allow_manual_override"] is True
         assert first_crack_status["reason"] is None
+        assert first_crack_status["max_consecutive_overflow_count"] == 0
+        assert first_crack_status["last_inference_duration_ms"] == 0.0
+        assert first_crack_status["max_inference_duration_ms"] == 0.0
+        assert first_crack_status["inference_overrun_count"] == 0
 
         t0_status = state_content["t0_status"]
         assert set(t0_status) == _EXPECTED_T0_STATUS_KEYS
