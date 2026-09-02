@@ -6,5 +6,5 @@ licensed under Apache-2.0 (reference LICENSE SHA-256
 c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4).
 
 MCP modifications: package relocation; narrow defensive validation and error
-handling; typing and docstring adjustments; and no detector integration in this
-slice.
+handling; typing and docstring adjustments; and detector integration through the
+released ONNX backend.

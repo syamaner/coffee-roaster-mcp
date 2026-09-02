@@ -12,8 +12,8 @@ Pi and combined acceptance, while #194 remains open and unstarted. The intended
 
 ## Exact-head clean-wheel acceptance
 
-At head `180cc6fec2fd6d7833d09072c9fce9342b7ad284`, under D185 plan authority
-`7e4faa2d7b2a851578d971db004dedcbaf62d4ef`, the parent ran:
+At final head `3a39c23bb0ac8bb5be5b92dd6f39eb7f61ddad48` at that time, under D185
+plan authority `7e4faa2d7b2a851578d971db004dedcbaf62d4ef`, the parent ran:
 
 ```bash
 ./.venv/bin/python scripts/acceptance_first_crack_wheel.py --local-model-dir /private/tmp/coffee-roaster-mcp-157-artifacts
@@ -22,10 +22,10 @@ At head `180cc6fec2fd6d7833d09072c9fce9342b7ad284`, under D185 plan authority
 It passed for `coffee_roaster_mcp-0.1.16-py3-none-any.whl`, using
 `syamaner/coffee-first-crack-detection` at pinned revision
 `b349a919c34b6130472da97c01817be404e4f629`. Confirmation after beans added
-was `16.01871283299795`, inside the inclusive
+was `16.018183083101214`, inside the inclusive
 `3.82710390663442..21.0` interval and strictly below `20.017`. Confirming and
 payload confidence were both `0.8032823849602806` (minimum `0.6`); observed
-onset `0.018712832997947904` is print-only and non-gating. Replay metrics were
+onset `0.01818308310121297` is print-only and non-gating. Replay metrics were
 three emitted, three processed, and zero dropped windows. Wheel metadata had no
 banned requirements; installed banned distributions were empty, and Torch,
 Torchaudio, and Transformers import specs were all false.

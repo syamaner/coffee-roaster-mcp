@@ -185,12 +185,12 @@ E4.1-S3 added the released-artifact ONNX first-crack detector backend without
 starting any session-owned detector lifecycle. `first_crack.mode: audio` can
 now construct an ONNX detector adapter from the existing released-artifact
 resolver boundary: configured INT8/FP32 artifacts resolve from Hugging Face or
-`local_model_dir`, the precision-specific `preprocessor_config.json` configures
-the MCP-owned `MelFrontend`, and the resolved ONNX model is opened through an
-ONNX Runtime CPU session using configured thread limits. Backend output is
-adapted into the existing detector confidence metadata path. Normal CI remains
-mock-safe through fake artifact paths, MCP-owned frontend inputs, and fake ONNX
-sessions.
+`local_model_dir`, the precision-specific `preprocessor_config.json` is loaded
+through `transformers.ASTFeatureExtractor`, and the resolved ONNX model is
+opened through an ONNX Runtime CPU session using configured thread limits.
+Backend output is adapted into the existing detector confidence metadata path.
+Normal CI remains mock-safe through fake artifact paths, fake feature
+extraction, and fake ONNX sessions.
 
 Issue #212 completed the current frontend integration software slice: the
 detector now uses the MCP-owned mel frontend and package acceptance checks the
