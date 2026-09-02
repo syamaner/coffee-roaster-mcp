@@ -281,13 +281,13 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E4.1-S3` adds the released-artifact ONNX first-crack detector backend
   without starting any session-owned detector loop. `first_crack.mode: audio`
   can now resolve the configured precision-specific Hugging Face artifacts,
-  load `onnx/{precision}/preprocessor_config.json` through
-  `transformers.ASTFeatureExtractor`, create an ONNX Runtime CPU session for the
-  resolved ONNX model using configured thread limits, and adapt model logits
-  into existing detector outputs with first-crack confidence. Tests use fake
-  artifact paths, fake feature extraction, and fake ONNX sessions so normal CI
-  remains mock-safe and requires no model download, microphone, Hottop hardware,
-  or network.
+  configure the MCP-owned `MelFrontend` from
+  `onnx/{precision}/preprocessor_config.json`, create an ONNX Runtime CPU
+  session for the resolved ONNX model using configured thread limits, and adapt
+  model logits into existing detector outputs with first-crack confidence. Tests
+  use fake artifact paths, MCP-owned frontend inputs, and fake ONNX sessions so
+  normal CI remains mock-safe and requires no model download, microphone,
+  Hottop hardware, or network.
 - Issue #212 completed the current software integration slice: the detector uses
   the MCP-owned mel frontend and the acceptance path verifies a clean installed
   wheel without Torch, Torchaudio, or Transformers. #157 remains open for Pi and
@@ -1976,7 +1976,7 @@ lifecycle under root `AGENTS.md`.
   - Added lazy, clearly failing runtime dependency boundaries for `onnxruntime`;
     default mock configuration still does not import or start it.
   - Added fake-backed tests for INT8/FP32 artifact resolution, ONNX session
-    construction, AST feature-extractor construction, confidence parsing,
+    construction, MCP-owned mel frontend construction, confidence parsing,
     sample-rate validation, missing/invalid preprocessor config, missing model
     inputs, empty outputs, and dependency failures without requiring model
     downloads, real ONNX files, microphone input, Hottop hardware, or network.
