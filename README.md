@@ -554,7 +554,7 @@ That default keeps local setup free from Hugging Face network access until
 audio mode is deliberately configured.
 When `first_crack.mode: audio` is deliberately configured, RoastPilot consumes
 the released ONNX artifacts with ONNX Runtime and the released AST preprocessor
-config with `transformers.ASTFeatureExtractor`; model training, export, and Hub
+config through the MCP-owned NumPy/SciPy `MelFrontend`; model training, export, and Hub
 publishing remain outside this repository.
 
 In audio mode, starting a roast session prepares the configured audio capture

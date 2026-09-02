@@ -279,8 +279,8 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - `E4.1-S3` adds the released-artifact ONNX first-crack detector backend
   without starting any session-owned detector loop. `first_crack.mode: audio`
   can now resolve the configured precision-specific Hugging Face artifacts,
-  load `onnx/{precision}/preprocessor_config.json` through
-  `transformers.ASTFeatureExtractor`, create an ONNX Runtime CPU session for the
+  configure the MCP-owned NumPy/SciPy `MelFrontend` from
+  `onnx/{precision}/preprocessor_config.json`, create an ONNX Runtime CPU session for the
   resolved ONNX model using configured thread limits, and adapt model logits
   into existing detector outputs with first-crack confidence. Tests use fake
   artifact paths, fake feature extraction, and fake ONNX sessions so normal CI
@@ -1966,9 +1966,8 @@ lifecycle under root `AGENTS.md`.
     `preprocessor_config.json`, construct an ONNX Runtime CPU session for the
     resolved ONNX model, and feed output through the existing detector adapter
     metadata path.
-  - Added lazy, clearly failing runtime dependency boundaries for
-    `onnxruntime` and `transformers.ASTFeatureExtractor`; default mock
-    configuration still does not import or start either dependency.
+  - Added lazy, clearly failing runtime dependency boundaries for `onnxruntime`;
+    default mock configuration still does not import or start it.
   - Added fake-backed tests for INT8/FP32 artifact resolution, ONNX session
     construction, AST feature-extractor construction, confidence parsing,
     sample-rate validation, missing/invalid preprocessor config, missing model

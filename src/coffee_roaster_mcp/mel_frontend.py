@@ -5,8 +5,8 @@ Adapted and modified from ``coffee-first-crack-detection`` commit
 ``src/coffee_first_crack/mel_frontend.py`` (SHA-256
 ``4332e0e210e841af76b6f8692990f7576fac46d9a09882b35737102c8015d47a``),
 under Apache-2.0. MCP modifications are package relocation, narrow defensive
-validation and error handling, typing/docstring adjustments, and no detector
-integration in this slice.
+validation and error handling, typing/docstring adjustments, and detector
+integration through the released ONNX backend.
 """
 
 from __future__ import annotations

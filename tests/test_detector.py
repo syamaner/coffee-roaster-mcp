@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import numpy as np
 import pytest
 
 import coffee_roaster_mcp.detector as detector_module
@@ -546,6 +547,36 @@ def test_released_onnx_backend_builds_from_resolved_artifacts(tmp_path: Path) ->
     assert session.input_feed == [{"input_values": (("features",),)}]
 
 
+def test_released_onnx_backend_default_frontend_produces_onnx_input(tmp_path: Path) -> None:
+    """The production frontend supplies contiguous float32 AST-shaped model input."""
+    artifacts = _resolved_detector_artifacts_with_files(
+        tmp_path,
+        preprocessor_config='{"mean": -4.2677393, "std": 4.5689974, "sampling_rate": 16000}',
+    )
+    session = FakeOnnxSession(((0.0, 0.5),))
+    backend = build_released_onnx_first_crack_detector_backend(
+        FirstCrackConfig(mode="audio", confidence_threshold=0.6),
+        artifacts,
+        session_factory=lambda _path, _threads: session,
+    )
+
+    output = backend.detect(
+        _audio_window(
+            sample_rate=16_000,
+            duration_seconds=10.0,
+            samples=tuple(float(sample) for sample in np.zeros(160_000, dtype=np.float32)),
+        )
+    )
+
+    model_input = session.input_feed[0]["input_values"]
+    assert isinstance(model_input, np.ndarray)
+    assert model_input.shape == (1, 1024, 128)
+    assert model_input.dtype == np.float32
+    assert model_input.flags.c_contiguous
+    assert output.confirmed is True
+    assert output.confidence == pytest.approx(0.6224593312018546)
+
+
 def test_released_onnx_adapter_resolves_artifacts_before_backend(tmp_path: Path) -> None:
     artifacts = _resolved_detector_artifacts_with_files(tmp_path)
     calls: list[dict[str, str | None]] = []
@@ -653,16 +684,43 @@ def test_released_onnx_backend_rejects_invalid_preprocessor_config(tmp_path: Pat
         )
 
 
-def test_released_onnx_backend_rejects_missing_preprocessor_config(tmp_path: Path) -> None:
-    artifacts = _resolved_detector_artifacts_with_files(tmp_path)
-    artifacts.feature_extractor_config.local_path.unlink()
+@pytest.mark.parametrize(
+    "preprocessor_config",
+    ("{", "[]", '{"mean": -4.0, "std": 2.0, "sampling_rate": 8_000}'),
+)
+def test_released_onnx_backend_default_frontend_names_invalid_config_path(
+    tmp_path: Path,
+    preprocessor_config: str,
+) -> None:
+    """Default frontend configuration failures identify the resolved config path."""
+    artifacts = _resolved_detector_artifacts_with_files(
+        tmp_path,
+        preprocessor_config=preprocessor_config,
+    )
 
-    with pytest.raises(FirstCrackDetectorError, match="Could not read"):
+    with pytest.raises(
+        FirstCrackDetectorError,
+        match=str(artifacts.feature_extractor_config.local_path),
+    ):
         build_released_onnx_first_crack_detector_backend(
             FirstCrackConfig(mode="audio"),
             artifacts,
             session_factory=lambda _path, _threads: FakeOnnxSession(),
-            feature_extractor_factory=lambda _path: FakeFeatureExtractor(),
+        )
+
+
+def test_released_onnx_backend_rejects_missing_preprocessor_config(tmp_path: Path) -> None:
+    artifacts = _resolved_detector_artifacts_with_files(tmp_path)
+    artifacts.feature_extractor_config.local_path.unlink()
+
+    with pytest.raises(
+        FirstCrackDetectorError,
+        match=str(artifacts.feature_extractor_config.local_path),
+    ):
+        build_released_onnx_first_crack_detector_backend(
+            FirstCrackConfig(mode="audio"),
+            artifacts,
+            session_factory=lambda _path, _threads: FakeOnnxSession(),
         )
 
 
@@ -825,31 +883,13 @@ def test_released_onnx_backend_fails_clearly_when_onnxruntime_missing(
         )
 
 
-def test_released_onnx_backend_fails_clearly_when_transformers_missing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def missing_transformers(name: str, package: str | None = None) -> object:
-        if name == "transformers":
-            raise ImportError(name)
-        return __import__(name)
-
-    monkeypatch.setattr(detector_module, "import_module", missing_transformers)
-
-    with pytest.raises(FirstCrackDetectorError, match="ASTFeatureExtractor"):
-        build_released_onnx_first_crack_detector_backend(
-            FirstCrackConfig(mode="audio"),
-            _resolved_detector_artifacts_with_files(tmp_path),
-            session_factory=lambda _path, _threads: FakeOnnxSession(),
-        )
-
-
 def _audio_window(
     *,
     sequence_number: int = 3,
     started_at_monotonic_seconds: float = 10.0,
     duration_seconds: float = 1.0,
     sample_rate: int = 4,
+    samples: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4),
 ) -> AudioWindow:
     return AudioWindow(
         sequence_number=sequence_number,
@@ -857,7 +897,7 @@ def _audio_window(
         sample_rate=sample_rate,
         started_at_monotonic_seconds=started_at_monotonic_seconds,
         duration_seconds=duration_seconds,
-        samples=(0.1, 0.2, 0.3, 0.4),
+        samples=samples,
     )
 
 
@@ -887,7 +927,7 @@ def _resolved_detector_artifacts(
 def _resolved_detector_artifacts_with_files(
     tmp_path: Path,
     *,
-    preprocessor_config: str = '{"sampling_rate": 16000}',
+    preprocessor_config: str = '{"mean": -4.2677393, "std": 4.5689974, "sampling_rate": 16000}',
 ) -> ResolvedDetectorArtifacts:
     model_path = tmp_path / "onnx" / "int8" / "model_quantized.onnx"
     preprocessor_path = tmp_path / "onnx" / "int8" / "preprocessor_config.json"

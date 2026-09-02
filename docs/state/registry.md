@@ -8,8 +8,8 @@
 - Repository: `syamaner/coffee-roaster-mcp`
 - Package: `coffee-roaster-mcp`
 - MCP Registry name: `io.github.syamaner/coffee-roaster-mcp`
-- Current phase: #157 in progress through completed standalone frontend slice #210;
-  #194 remains unstarted
+- Current phase: #157 in progress through completed standalone frontend and software-integration
+  slices #210 and #212; #194 remains unstarted
 
 ## Working Rules
 
@@ -28,7 +28,8 @@ successful release run `32657497601` bind to base
 `07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance issue #206
 completed through PR #207, squash-merged to `main` at
 `2c854d34bdb43f587db438436202b97e1dd01468`. Issue #157 is in progress through
-completed standalone frontend slice #210; #194 remains open and unstarted. The
+completed standalone frontend and software-integration slices #210 and #212;
+#194 remains open and unstarted. The
 intended future minor is `0.2.0`; tag creation,
 publication, and live verification remain human-operator-only actions.
 
@@ -184,8 +185,8 @@ E4.1-S3 added the released-artifact ONNX first-crack detector backend without
 starting any session-owned detector lifecycle. `first_crack.mode: audio` can
 now construct an ONNX detector adapter from the existing released-artifact
 resolver boundary: configured INT8/FP32 artifacts resolve from Hugging Face or
-`local_model_dir`, the precision-specific `preprocessor_config.json` is loaded
-through `transformers.ASTFeatureExtractor`, and the resolved ONNX model is
+`local_model_dir`, the precision-specific `preprocessor_config.json` configures
+the MCP-owned NumPy/SciPy `MelFrontend`, and the resolved ONNX model is
 opened through an ONNX Runtime CPU session using configured thread limits.
 Backend output is adapted into the existing detector confidence metadata path.
 Normal CI remains mock-safe through fake artifact paths, fake feature

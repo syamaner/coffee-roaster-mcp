@@ -8,8 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from importlib import import_module
 from pathlib import Path
-from types import MethodType
-from typing import Any, Literal, Protocol, cast
+from typing import Literal, Protocol, cast
 
 from coffee_roaster_mcp.artifacts import (
     HuggingFaceDownloader,
@@ -18,6 +17,7 @@ from coffee_roaster_mcp.artifacts import (
 )
 from coffee_roaster_mcp.audio import AudioWindow
 from coffee_roaster_mcp.config import FirstCrackConfig, ModelPrecision
+from coffee_roaster_mcp.mel_frontend import MelFrontend, MelFrontendConfigError
 from coffee_roaster_mcp.session import RoastEvent, RoastSession, RoastSessionStore
 
 FirstCrackDetectorEventKind = Literal["first_crack_detected"]
@@ -494,14 +494,20 @@ def build_released_onnx_first_crack_detector_backend(
     if config.onnx_threads <= 0:
         raise FirstCrackDetectorError("first_crack.onnx_threads must be greater than 0.")
 
-    preprocessor_config = _load_onnx_preprocessor_config(
-        artifacts.feature_extractor_config.local_path
-    )
     create_session = session_factory or _build_onnx_runtime_session
-    create_feature_extractor = feature_extractor_factory or _build_ast_feature_extractor
+    if feature_extractor_factory is None:
+        feature_extractor = _build_mel_feature_extractor(
+            artifacts.feature_extractor_config.local_path
+        )
+        preprocessor_config = OnnxPreprocessorConfig(sampling_rate=feature_extractor.sampling_rate)
+    else:
+        preprocessor_config = _load_onnx_preprocessor_config(
+            artifacts.feature_extractor_config.local_path
+        )
+        feature_extractor = feature_extractor_factory(artifacts.feature_extractor_config.local_path)
     return OnnxFirstCrackDetectorBackend(
         session=create_session(artifacts.onnx_model.local_path, config.onnx_threads),
-        feature_extractor=create_feature_extractor(artifacts.feature_extractor_config.local_path),
+        feature_extractor=feature_extractor,
         preprocessor_config=preprocessor_config,
         confidence_threshold=config.confidence_threshold,
     )
@@ -748,79 +754,25 @@ def _build_onnx_runtime_session(model_path: Path, onnx_threads: int) -> OnnxInfe
     return cast(OnnxInferenceSession, session)
 
 
-def _build_ast_feature_extractor(preprocessor_config_path: Path) -> OnnxFeatureExtractor:
-    try:
-        transformers_module = import_module("transformers")
-        extractor_type = transformers_module.ASTFeatureExtractor
-    except (AttributeError, ImportError) as exc:
-        raise FirstCrackDetectorError(
-            "first_crack.mode 'audio' requires transformers.ASTFeatureExtractor to load "
-            "the released preprocessor config."
-        ) from exc
+def _build_mel_feature_extractor(preprocessor_config_path: Path) -> MelFrontend:
+    """Build the MCP-owned frontend from one resolved preprocessor config.
 
+    Args:
+        preprocessor_config_path: Resolved precision-specific config file.
+
+    Returns:
+        The configured MCP-owned mel frontend.
+
+    Raises:
+        FirstCrackDetectorError: If the frontend configuration is unavailable or invalid.
+    """
     try:
-        extractor = extractor_type.from_pretrained(str(preprocessor_config_path.parent))
-    except Exception as exc:
+        return MelFrontend.from_config(preprocessor_config_path.parent)
+    except (FileNotFoundError, MelFrontendConfigError, OSError) as exc:
         raise FirstCrackDetectorError(
-            "Could not initialize first-crack AST feature extractor from "
+            "Could not construct MCP-owned first-crack mel frontend from "
             f"{preprocessor_config_path}: {exc}"
         ) from exc
-    _patch_ast_feature_extractor_for_numpy_only_runtime(extractor)
-    return cast(OnnxFeatureExtractor, extractor)
-
-
-def _patch_ast_feature_extractor_for_numpy_only_runtime(extractor: Any) -> None:
-    extractor_module = import_module(extractor.__class__.__module__)
-    if _ast_speech_backend_available(extractor_module):
-        return
-
-    try:
-        numpy_module = import_module("numpy")
-        spectrogram: Any = extractor_module.spectrogram
-    except (AttributeError, ImportError) as exc:
-        raise FirstCrackDetectorError(
-            "Could not configure AST feature extraction for ONNX-only runtime."
-        ) from exc
-    if not callable(spectrogram):
-        raise FirstCrackDetectorError(
-            "Could not configure AST feature extraction for ONNX-only runtime."
-        )
-    spectrogram_fn = cast(Any, spectrogram)
-
-    def extract_fbank_features(self: Any, waveform: Any, max_length: int) -> Any:
-        squeezed = numpy_module.squeeze(waveform)
-        spectrogram_output: Any = spectrogram_fn(
-            squeezed,
-            self.window,
-            frame_length=400,
-            hop_length=160,
-            fft_length=512,
-            power=2.0,
-            center=False,
-            preemphasis=0.97,
-            mel_filters=self.mel_filters,
-            log_mel="log",
-            mel_floor=1.192092955078125e-07,
-            remove_dc_offset=True,
-        )
-        fbank: Any = spectrogram_output.T
-
-        frame_count = int(fbank.shape[0])
-        difference = max_length - frame_count
-        if difference > 0:
-            fbank = numpy_module.pad(fbank, ((0, difference), (0, 0)), mode="constant")
-        elif difference < 0:
-            fbank = fbank[0:max_length, :]
-        return fbank
-
-    extractor._extract_fbank_features = MethodType(extract_fbank_features, extractor)
-
-
-def _ast_speech_backend_available(extractor_module: Any) -> bool:
-    is_speech_available = getattr(extractor_module, "is_speech_available", None)
-    if callable(is_speech_available):
-        return bool(is_speech_available())
-    return False
 
 
 def _first_crack_confidence(outputs: Sequence[object]) -> float:

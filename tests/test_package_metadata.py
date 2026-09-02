@@ -1,6 +1,8 @@
 """Package metadata coverage for RoastPilot distributions."""
 
+import tomllib
 from importlib import metadata, resources
+from pathlib import Path
 
 
 def test_installed_distribution_metadata_is_complete() -> None:
@@ -66,3 +68,15 @@ def test_console_entrypoint_metadata_targets_cli_main() -> None:
     entrypoint = scripts["coffee-roaster-mcp"]
 
     assert entrypoint.value == "coffee_roaster_mcp.cli:main"
+
+
+def test_project_dependency_metadata_excludes_torch_frontend_packages() -> None:
+    """The declared runtime dependencies retain the NumPy/SciPy frontend boundary."""
+    project_path = Path(__file__).parents[1] / "pyproject.toml"
+    project = tomllib.loads(project_path.read_text(encoding="utf-8"))
+    dependencies = project["project"]["dependencies"]
+
+    assert all(
+        not dependency.lower().startswith(("torch", "torchaudio", "transformers"))
+        for dependency in dependencies
+    )
