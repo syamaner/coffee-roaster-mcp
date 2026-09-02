@@ -130,7 +130,7 @@ def test_padding_truncation_and_normalisation_semantics() -> None:
     )
     actual = frontend.extract(waveform)
     np.testing.assert_array_equal(
-        actual, ((raw - frontend.mean) / (frontend.std * 2)).astype(np.float32)
+        actual, ((raw.astype(np.float64) - frontend.mean) / (frontend.std * 2)).astype(np.float32)
     )
     assert np.array_equal(raw[998:], np.zeros((26, 128), dtype=np.float32))
     long = np.tile(waveform, 2)
@@ -152,6 +152,30 @@ def test_padding_truncation_and_normalisation_semantics() -> None:
         frontend._window,  # noqa: SLF001  # type: ignore[reportPrivateUsage]
     )
     assert exact.shape == (1024, 128)
+
+
+@pytest.mark.parametrize("max_length", [0, -1, True, 1.0])
+def test_extract_mel_rejects_invalid_max_length(max_length: object) -> None:
+    """Only positive non-boolean integer output lengths are supported."""
+    frontend = _frontend()
+    with pytest.raises(ValueError, match="max_length must be a positive integer"):
+        extract_mel(
+            np.zeros(400, dtype=np.float32),
+            frontend._mel_filters,  # noqa: SLF001  # type: ignore[reportPrivateUsage]
+            frontend._window,  # noqa: SLF001  # type: ignore[reportPrivateUsage]
+            max_length=max_length,  # type: ignore[arg-type]
+        )
+
+
+def test_normalisation_uses_float64_before_final_float32_cast() -> None:
+    """Large accepted parameters must preserve the explicit float64 result."""
+    frontend = MelFrontend(mean=-3.4e38, std=3.4e38)
+    waveform = np.zeros(400, dtype=np.float32)
+    raw = extract_mel(waveform, frontend._mel_filters, frontend._window)  # type: ignore[reportPrivateUsage]
+    expected = ((raw.astype(np.float64) - frontend.mean) / (frontend.std * 2)).astype(np.float32)
+    actual = frontend.extract(waveform)
+    np.testing.assert_array_equal(actual, expected)
+    assert not np.array_equal(actual, np.zeros_like(actual))
 
 
 def test_config_loads_required_values_and_ignores_unrelated_keys(tmp_path: Path) -> None:
@@ -182,6 +206,14 @@ def test_config_defaults_optional_consumed_values(tmp_path: Path) -> None:
         16000,
         1024,
     )
+
+
+def test_config_rejects_disabled_normalisation(tmp_path: Path) -> None:
+    """The fixed frontend must reject a configuration that disables normalisation."""
+    with pytest.raises(MelFrontendConfigError, match="do_normalize"):
+        MelFrontend.from_config(
+            _write_config(tmp_path, '{"mean": -4.0, "std": 2.0, "do_normalize": false}')
+        )
 
 
 def test_config_missing_file_malformed_non_object_and_unreadable(
@@ -275,7 +307,7 @@ def test_extract_rejects_input_dependent_normalisation_overflow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Accepted settings must not silently return non-finite float32 features."""
-    frontend = MelFrontend(mean=-float(np.finfo(np.float32).max), std=1.0)
+    frontend = MelFrontend(mean=-float(np.finfo(np.float32).max), std=0.5)
 
     def max_log_mel(*args: object, **kwargs: object) -> np.ndarray:
         """Return a valid-shape finite feature array at the float32 bound."""

@@ -213,6 +213,8 @@ def extract_mel(
     Returns:
         A float32 ``(max_length, num_mel_filters)`` log-mel array.
     """
+    if type(max_length) is not int or max_length <= 0:
+        raise ValueError("max_length must be a positive integer")
     samples = _validated_waveform(waveform)
     frame_count = 1 + (len(samples) - _FRAME_LENGTH) // _HOP_LENGTH
     frames = np.zeros((frame_count, _FRAME_LENGTH), dtype=np.float64)
@@ -318,6 +320,8 @@ class MelFrontend:
         if "std" not in loaded:
             raise MelFrontendConfigError("preprocessor_config.json is missing std")
         config = cast(dict[str, object], loaded)
+        if config.get("do_normalize", True) is not True:
+            raise MelFrontendConfigError("do_normalize must be true when present")
         return cls(
             mean=config["mean"],
             std=config["std"],
@@ -337,7 +341,7 @@ class MelFrontend:
         """
         log_mel = extract_mel(waveform, self._mel_filters, self._window, self.max_length)
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            normalised = (log_mel - self.mean) / (self.std * 2)
+            normalised = (log_mel.astype(np.float64) - self.mean) / (self.std * 2)
         if not np.isfinite(normalised).all() or np.abs(normalised).max() > _FLOAT32_MAX:
             raise MelFrontendConfigError("normalised features must be finite float32 values")
         return np.ascontiguousarray(normalised, dtype=np.float32)
