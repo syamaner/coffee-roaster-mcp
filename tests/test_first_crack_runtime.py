@@ -319,7 +319,7 @@ def test_inference_timing_excludes_store_work_and_tracks_explicit_hop_overruns(
 
 
 def test_inference_timing_records_no_result_and_derived_hop_boundary() -> None:
-    """No-result inference is timed; derived hop treats equality as an overrun."""
+    """No-result inference uses the rounded effective hop for an overrun."""
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
     session = store.start_session()
@@ -334,7 +334,8 @@ def test_inference_timing_records_no_result_and_derived_hop_boundary() -> None:
     )
     runtime = FirstCrackSessionRuntime(
         config=AppConfig(
-            audio=AudioConfig(sample_rate=100, window_seconds=0.5, overlap=0.5),
+            # The nominal 300 ms hop is 1.2 samples and rounds down to 1 sample / 250 ms.
+            audio=AudioConfig(sample_rate=4, window_seconds=0.5, overlap=0.4),
             first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
         ),
         audio_pipeline_factory=lambda _: pipeline,
