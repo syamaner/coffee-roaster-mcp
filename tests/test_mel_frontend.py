@@ -20,6 +20,9 @@ _MANIFEST_PATH = _FIXTURE_DIRECTORY / "analytic-10s.manifest.json"
 _REFERENCE_SOURCE_SHA = "4332e0e210e841af76b6f8692990f7576fac46d9a09882b35737102c8015d47a"
 _REFERENCE_TEST_SHA = "090fb759aa0b1f82e6761d21e04cee0cf0a6bcfea48abb6b80f779332573b516"
 _REFERENCE_LICENSE_SHA = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+_EXPECTED_ATOL = 1e-4
+_EXPECTED_DTYPE = np.dtype(np.float32)
+_EXPECTED_SHAPE = (1024, 128)
 
 
 def _manifest() -> dict[str, Any]:
@@ -80,6 +83,9 @@ def test_golden_fixture_provenance_and_strict_parity() -> None:
     assert manifest["source"]["sha256"] == _REFERENCE_SOURCE_SHA
     assert manifest["reference_test"]["sha256"] == _REFERENCE_TEST_SHA
     assert manifest["license"]["sha256"] == _REFERENCE_LICENSE_SHA
+    assert manifest["comparison"]["atol"] == _EXPECTED_ATOL
+    assert manifest["comparison"]["rtol"] == 0
+    assert manifest["comparison"]["max_abs_diff_operator"] == "<"
     expected_info = manifest["expected"]
     fixture_path = _FIXTURE_DIRECTORY / expected_info["file"]
     fixture_bytes = fixture_path.read_bytes()
@@ -88,15 +94,15 @@ def test_golden_fixture_provenance_and_strict_parity() -> None:
     with np.load(fixture_path, allow_pickle=False) as fixture:
         assert set(fixture.files) == {expected_info["key"]}
         expected = fixture[expected_info["key"]]
-    assert expected.dtype == np.dtype(expected_info["dtype"])
-    assert expected.shape == tuple(expected_info["shape"])
+    assert expected_info["dtype"] == _EXPECTED_DTYPE.name
+    assert tuple(expected_info["shape"]) == _EXPECTED_SHAPE
+    assert expected.dtype == _EXPECTED_DTYPE
+    assert expected.shape == _EXPECTED_SHAPE
     assert np.isfinite(expected).all()
 
     actual = _frontend().extract(_waveform_from_recipe())
     max_abs_diff = np.abs(actual.astype(np.float64) - expected.astype(np.float64)).max()
-    assert max_abs_diff < manifest["comparison"]["atol"], f"max_abs_diff={max_abs_diff:.9g}"
-    assert manifest["comparison"]["rtol"] == 0
-    assert manifest["comparison"]["max_abs_diff_operator"] == "<"
+    assert max_abs_diff < _EXPECTED_ATOL, f"max_abs_diff={max_abs_diff:.9g}"
 
 
 def test_recipe_and_extract_are_repeatably_bitwise_deterministic() -> None:
