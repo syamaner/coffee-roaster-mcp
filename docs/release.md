@@ -216,7 +216,7 @@ The dry run:
 - Confirms both distribution artifacts exist.
 - Does not publish to PyPI or the MCP Registry.
 
-## v0.1 Release Checklist
+## v0.2.0 Release Checklist
 
 Use this checklist for the selected `0.2.0` release candidate from updated
 `main`. `v0.1.16` remains the currently published package and registry version
