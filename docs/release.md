@@ -47,13 +47,15 @@ This release-preparation slice neither authorises nor performs those actions.
   integration removes the runtime Torch, Torchaudio, and Transformers
   feature-extraction path and adds clean-wheel package installation tests
   (`4d40fc08dd3ca6fec0752618efd12d8a8bf0712b`). The #194 software
-  instrumentation adds the additive `fc_status` fields described below
+  instrumentation adds the additive `get_roast_state.first_crack_status` fields
+  described below
   (`7c08ad9ab843e60b240b5ec71027388e721a53a3`).
 
 - The #194 instrumentation adds additive
-  `fc_status` fields: `max_consecutive_overflow_count` is the per-capture-run
-  maximum consecutive overflow streak across independent inputs (maximum
-  aggregation, not a sum). `last_inference_duration_ms` and
+  `get_roast_state.first_crack_status` fields:
+  `max_consecutive_overflow_count` is the per-capture-run maximum consecutive
+  overflow streak across independent inputs (maximum aggregation, not a sum).
+  `last_inference_duration_ms` and
   `max_inference_duration_ms` are the latest and per-roast-session maximum
   monotonic-clock elapsed durations for every inference attempt, including
   attempts that raise and successful attempts that return no result; and
@@ -216,10 +218,11 @@ The dry run:
 
 ## v0.1 Release Checklist
 
-Use this checklist for a future release candidate from updated `main`.
-The current published package and registry metadata are `0.1.16`; the latest
-E7-S5a first-crack replay evidence uses released Hugging Face INT8 artifacts
-from `syamaner/coffee-first-crack-detection` pinned to revision
+Use this checklist for the selected `0.2.0` release candidate from updated
+`main`. `v0.1.16` remains the currently published package and registry version
+until `0.2.0` is published; the latest E7-S5a first-crack replay evidence uses
+released Hugging Face INT8 artifacts from `syamaner/coffee-first-crack-detection`
+pinned to revision
 `b349a919c34b6130472da97c01817be404e4f629`.
 
 ### Required Tests And Checks
@@ -272,17 +275,17 @@ Before tagging, confirm these values all match the release version:
 - `src/coffee_roaster_mcp/__init__.py` `__version__`
 - `server.json.version`
 - `server.json.packages[0].version`
-- the pushed tag name, illustrated as `v0.2.0` only
+- the pushed tag name, `v0.2.0`
 - installed CLI output from `coffee-roaster-mcp --version`
 
-Confirm the candidate version is aligned across all package and registry
-metadata. A later release candidate must update all three checked-in version
-fields in the same PR before the human operator tags it.
+Confirm the selected candidate version is aligned across all package and
+registry metadata. A later release candidate must update all three checked-in
+version fields in the same PR before the human operator tags it.
 
 ### Hugging Face First-Crack Artifact Pin
 
-For the v0.1 release candidate, record the first-crack artifact pin in the
-release notes or release PR:
+For the selected `0.2.0` release candidate, record the first-crack artifact pin
+in the release notes or release PR:
 
 - repo: `syamaner/coffee-first-crack-detection`
 - revision: `b349a919c34b6130472da97c01817be404e4f629`
@@ -323,9 +326,9 @@ model cards, and dataset cards remain in `coffee-first-crack-detection`.
    uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.2.0 coffee-roaster-mcp --version
    ```
 
-`v0.2.0` / `0.2.0` are illustrative planned-next-minor examples only, not
-tagging or publication authority; a human operator selects and authorises the
-actual candidate version.
+`v0.2.0` / `0.2.0` are the selected candidate version, not tagging or
+publication authority; a human operator still authorises tagging and
+publication.
 
 ### MCP Registry Publish Steps
 
@@ -369,8 +372,8 @@ alone.
 
 A release may be described as mock-safe when default install, package smoke,
 MCP client, and mock roast validation pass without hardware or model download.
-The current `v0.1.16` state is mock-safe by default and includes E7-S5a
-labelled WAV replay evidence for the released first-crack artifact pin.
+The currently published `v0.1.16` release is mock-safe by default and includes
+E7-S5a labelled WAV replay evidence for the released first-crack artifact pin.
 
 A release may be described as hardware-validated only when the release
 candidate has current evidence for:
@@ -402,9 +405,8 @@ After all prerequisites are confirmed:
    git push origin v0.2.0
    ```
 
-   `v0.2.0` is an illustrative planned-next-minor example only, not tagging or
-   publication authority; a human operator selects and authorises the actual
-   candidate version.
+   `v0.2.0` is the selected candidate version, not tagging or publication
+   authority; a human operator still authorises tagging and publication.
 
 3. Approve the `release` environment deployment in GitHub Actions.
 4. Confirm the workflow completes in this order:
