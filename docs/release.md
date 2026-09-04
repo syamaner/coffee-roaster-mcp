@@ -29,6 +29,10 @@ Only the human release operator may create or push tags, approve the release
 environment, publish packages, or verify live PyPI and MCP Registry artefacts.
 Publication may occur only after the release-preparation PR is merged and the
 release-workflow dry run succeeds.
+These conditions are necessary rather than sufficient: publication is not
+automatic, and the human operator must still approve the protected release
+environment. Outstanding D192 work is a downstream full-appliance acceptance
+prerequisite rather than a blocker to publishing this MCP component.
 This release-preparation slice neither authorises nor performs those actions.
 
 ## Changelog
@@ -62,8 +66,9 @@ This release-preparation slice neither authorises nor performs those actions.
   does not grant release authority.
 - D191's ratified acceptance limits are `N = 1`, the maximum permitted
   consecutive audio-overflow streak, and `X = 200 ms`, the maximum permitted
-  peak trailing-60-second lost-audio duration; they are distinct from the
-  unchanged production fatal streak of `30`.
+  peak of the trailing-60-second lost-audio estimate observed across
+  characterisation evidence snapshots; they are distinct from the unchanged
+  production fatal streak of `30`.
 - D190's artificial-music, single-stimulus, zero-overflow result does not prove
   that a non-zero margin is necessary, establish sufficient headroom for other
   inputs or conditions, or show that `N=1` can be tightened. Its
