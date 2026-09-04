@@ -20,6 +20,11 @@ since `v0.1.16` includes D184 governance at
 `30d556a2059001d551f50476dfa63c3586d85e3c`, and the material functional
 commits recorded below. #157 and #194 remain open.
 
+This `0.2.0` release-preparation candidate is bound to published plan authority
+`b49409ad833372fb0061ce83c788f3f872a67f32` and software implementation base
+`7c08ad9ab843e60b240b5ec71027388e721a53a3`. This binding does not predetermine
+the authorised eventual tag, which will point to the post-merge release commit.
+
 Only the human release operator may create or push tags, approve the release
 environment, publish packages, or verify live PyPI and MCP Registry artefacts.
 This release-preparation slice neither authorises nor performs those actions.
@@ -50,8 +55,8 @@ This release-preparation slice neither authorises nor performs those actions.
   reads; only the existing trailing-60-second rolling overflow count and
   lost-audio estimate decay. This is software-readiness evidence and does not
   grant release authority.
-- D191's recorded operational values remain `N=1`, `X=200 ms`, and production
-  fatal streak `30`.
+- D191's ratified acceptance limits are `N=1` and `X=200 ms`; they are distinct
+  from the unchanged production fatal streak of `30`.
 - D190 used an artificial music stimulus; its zero observed overflows do not
   prove that a non-zero margin is necessary, and its sanitised text review did
   not re-hash private evidence. It is not Pi, full-stack, detector, live-roast,
