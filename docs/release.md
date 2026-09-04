@@ -10,34 +10,76 @@ The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 ## Current Release Authority
 
-`v0.1.16` is the current published PyPI and MCP Registry release. Its tag and
-successful release run `32657497601` bind to base
-`07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance is the current
-prerequisite for future implementation; #157 remains open after software
-integration and local package readiness, and #194's software instrumentation
-slice is implemented while #194 remains open for later operator
-characterisation and acceptance. The intended future minor is `0.2.0`.
+`v0.1.16` remains the current published PyPI and MCP Registry release. Its tag
+and successful release run `32657497601` bind to base
+`07a6b96beae252c9b326f9374a64d91271f08105`. The checked-in `0.2.0` package
+and Registry metadata are a release candidate only: tag creation, publication,
+and live artefact verification remain human-operator actions. Its ancestry
+since `v0.1.16` includes D184 governance at
+`2c854d34bdb43f587db438436202b97e1dd01468`, state reconciliation at
+`30d556a2059001d551f50476dfa63c3586d85e3c`, and the material functional
+commits recorded below. #157 and #194 remain open.
+
+This `0.2.0` release-preparation candidate is bound to published plan authority
+`b49409ad833372fb0061ce83c788f3f872a67f32` and software implementation base
+`7c08ad9ab843e60b240b5ec71027388e721a53a3`. This binding does not predetermine
+the authorised eventual tag, which will point to the post-merge release commit.
 
 Only the human release operator may create or push tags, approve the release
 environment, publish packages, or verify live PyPI and MCP Registry artefacts.
-This governance slice neither authorises nor performs those actions.
+Publication may occur only after the release-preparation PR is merged and the
+release-workflow dry run succeeds.
+These conditions are necessary rather than sufficient: publication is not
+automatic, and the human operator must still approve the protected release
+environment. Outstanding D192 work is a downstream full-appliance acceptance
+prerequisite rather than a blocker to publishing this MCP component.
+This release-preparation slice neither authorises nor performs those actions.
 
 ## Changelog
 
-### Unreleased software-readiness instrumentation
+### 0.2.0 (release candidate; not published)
 
-- The implemented #194 software instrumentation slice adds additive
-  `fc_status` fields: `max_consecutive_overflow_count` is the per-capture-run
-  maximum consecutive overflow streak across independent inputs (maximum
-  aggregation, not a sum); `last_inference_duration_ms` and
-  `max_inference_duration_ms` are the latest and per-session maximum
-  single-attempt inference durations in milliseconds; and
-  `inference_overrun_count` counts per-session attempts at or beyond the
-  effective audio hop. Stop/fault snapshots retain these values across repeated
-  reads; only the existing trailing-60-second rolling overflow count and
-  lost-audio estimate decay. This is software-readiness work only: it is not a
-  release, does not change `v0.1.16` as the current release, and grants no
-  release authority.
+- D184 governance and its state reconciliation establish the release-process
+  baseline in this ancestry; they are not functional changes and do not imply
+  that the following functional entries are an exhaustive commit list.
+- The MCP-owned NumPy/SciPy mel frontend adds strict AST/Kaldi golden-parity
+  test coverage (`7b5c3eca87648bd7dde23cda769fcf51df29c872`). Its ONNX detector
+  integration removes the runtime Torch, Torchaudio, and Transformers
+  feature-extraction path and adds clean-wheel package installation tests
+  (`4d40fc08dd3ca6fec0752618efd12d8a8bf0712b`). The #194 software
+  instrumentation adds the additive `get_roast_state.first_crack_status` fields
+  described below
+  (`7c08ad9ab843e60b240b5ec71027388e721a53a3`).
+
+- The #194 instrumentation adds additive
+  `get_roast_state.first_crack_status` fields:
+  `max_consecutive_overflow_count` is the per-capture-run maximum consecutive
+  overflow streak across independent inputs (maximum aggregation, not a sum).
+  `last_inference_duration_ms` and
+  `max_inference_duration_ms` are the latest and per-roast-session maximum
+  monotonic-clock elapsed durations for every inference attempt, including
+  attempts that raise and successful attempts that return no result; and
+  `inference_overrun_count` counts per-roast-session attempts at or beyond the
+  effective audio hop. The per-capture-run overflow maximum and per-roast-session
+  inference metrics intentionally have different lifetimes, matching their
+  current source reset behaviour. Stop/fault snapshots retain these values
+  across repeated reads; only the existing trailing-60-second rolling overflow
+  count and lost-audio estimate decay. This is software-readiness evidence and
+  does not grant release authority.
+- D191's ratified acceptance limits are `N = 1`, the maximum permitted
+  consecutive audio-overflow streak, and `X = 200 ms`, the maximum permitted
+  peak of the trailing-60-second lost-audio estimate observed across
+  characterisation evidence snapshots; they are distinct from the unchanged
+  production fatal streak of `30`.
+- D190's artificial-music, single-stimulus, zero-overflow result does not prove
+  that a non-zero margin is necessary, establish sufficient headroom for other
+  inputs or conditions, or show that `N=1` can be tightened. Its
+  sanitised text review did not independently re-verify private evidence hashes.
+  It is not Pi, full-stack, detector, live-roast, or combined acceptance.
+- D192 full-stack 30+30 characterisation and separate supervised >=20-minute
+  live-roast acceptance remain outstanding. This release-preparation slice
+  changes no runtime, model, dependency, configuration, workflow, hardware, or
+  private evidence.
 
 ### 0.1.16
 
@@ -174,12 +216,13 @@ The dry run:
 - Confirms both distribution artifacts exist.
 - Does not publish to PyPI or the MCP Registry.
 
-## v0.1 Release Checklist
+## v0.2.0 Release Checklist
 
-Use this checklist for a future release candidate from updated `main`.
-The current published package and registry metadata are `0.1.16`; the latest
-E7-S5a first-crack replay evidence uses released Hugging Face INT8 artifacts
-from `syamaner/coffee-first-crack-detection` pinned to revision
+Use this checklist for the selected `0.2.0` release candidate from updated
+`main`. `v0.1.16` remains the currently published package and registry version
+until `0.2.0` is published; the latest E7-S5a first-crack replay evidence uses
+released Hugging Face INT8 artifacts from `syamaner/coffee-first-crack-detection`
+pinned to revision
 `b349a919c34b6130472da97c01817be404e4f629`.
 
 ### Required Tests And Checks
@@ -232,17 +275,17 @@ Before tagging, confirm these values all match the release version:
 - `src/coffee_roaster_mcp/__init__.py` `__version__`
 - `server.json.version`
 - `server.json.packages[0].version`
-- the pushed tag name, illustrated as `v0.2.0` only
+- the pushed tag name, `v0.2.0`
 - installed CLI output from `coffee-roaster-mcp --version`
 
-Confirm the candidate version is aligned across all package and registry
-metadata. A later release candidate must update all three checked-in version
-fields in the same PR before the human operator tags it.
+Confirm the selected candidate version is aligned across all package and
+registry metadata. A later release candidate must update all three checked-in
+version fields in the same PR before the human operator tags it.
 
 ### Hugging Face First-Crack Artifact Pin
 
-For the v0.1 release candidate, record the first-crack artifact pin in the
-release notes or release PR:
+For the selected `0.2.0` release candidate, record the first-crack artifact pin
+in the release notes or release PR:
 
 - repo: `syamaner/coffee-first-crack-detection`
 - revision: `b349a919c34b6130472da97c01817be404e4f629`
@@ -283,9 +326,9 @@ model cards, and dataset cards remain in `coffee-first-crack-detection`.
    uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.2.0 coffee-roaster-mcp --version
    ```
 
-`v0.2.0` / `0.2.0` are illustrative planned-next-minor examples only, not
-tagging or publication authority; a human operator selects and authorises the
-actual candidate version.
+`v0.2.0` / `0.2.0` are the selected candidate version, not tagging or
+publication authority; a human operator still authorises tagging and
+publication.
 
 ### MCP Registry Publish Steps
 
@@ -329,8 +372,8 @@ alone.
 
 A release may be described as mock-safe when default install, package smoke,
 MCP client, and mock roast validation pass without hardware or model download.
-The current `v0.1.16` state is mock-safe by default and includes E7-S5a
-labelled WAV replay evidence for the released first-crack artifact pin.
+The currently published `v0.1.16` release is mock-safe by default and includes
+E7-S5a labelled WAV replay evidence for the released first-crack artifact pin.
 
 A release may be described as hardware-validated only when the release
 candidate has current evidence for:
@@ -362,9 +405,8 @@ After all prerequisites are confirmed:
    git push origin v0.2.0
    ```
 
-   `v0.2.0` is an illustrative planned-next-minor example only, not tagging or
-   publication authority; a human operator selects and authorises the actual
-   candidate version.
+   `v0.2.0` is the selected candidate version, not tagging or publication
+   authority; a human operator still authorises tagging and publication.
 
 3. Approve the `release` environment deployment in GitHub Actions.
 4. Confirm the workflow completes in this order:

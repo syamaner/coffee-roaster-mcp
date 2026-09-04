@@ -27,9 +27,16 @@ drops were executed, with no failed command events or safety alerts in either
 completed run.
 
 Those roasts used the pinned `coffee-roaster-mcp` 0.1.13 runtime. Versions
-0.1.14 and 0.1.15 changed package metadata and release plumbing only; this
-0.1.16 update changes documentation and release metadata only. Runtime
-behaviour is unchanged. See the
+0.1.14-0.1.16 were metadata/docs releases; the selected `0.2.0` release
+candidate carries the MCP-owned NumPy/SciPy, Torch/Torchaudio/Transformers-free
+ONNX feature-extraction path and additive first-crack observability. D190 was
+MCP-only component characterisation with artificial music: zero observed
+overflow does not establish headroom for other conditions or prove the non-zero
+allowance necessary; sanitised review did not rehash private evidence, and it
+is not detector, live-roast, full-stack, or combined acceptance. D192 full-stack
+30+30 and separate supervised >=20-minute live roast remain outstanding.
+Publication remains operator-only after merge, a successful release-workflow
+dry run, and protected-environment approval. See the
 [2026-08-16 agent-roast validation report](https://github.com/syamaner/coffee-roaster-mcp/blob/main/docs/session-summaries/2026-08-16-agent-roast-validation.md)
 for the authority-ledger, session, ambient, and capture evidence, including its
 provenance limits.
