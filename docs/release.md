@@ -10,23 +10,36 @@ The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 ## Current Release Authority
 
-`v0.1.16` is the current published PyPI and MCP Registry release. Its tag and
-successful release run `32657497601` bind to base
-`07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance is the current
-prerequisite for future implementation; #157 remains open after software
-integration and local package readiness, and #194's software instrumentation
-slice is implemented while #194 remains open for later operator
-characterisation and acceptance. The intended future minor is `0.2.0`.
+`v0.1.16` remains the current published PyPI and MCP Registry release. Its tag
+and successful release run `32657497601` bind to base
+`07a6b96beae252c9b326f9374a64d91271f08105`. The checked-in `0.2.0` package
+and Registry metadata are a release candidate only: tag creation, publication,
+and live artefact verification remain human-operator actions. Its ancestry
+since `v0.1.16` includes D184 governance at
+`2c854d34bdb43f587db438436202b97e1dd01468`, state reconciliation at
+`30d556a2059001d551f50476dfa63c3586d85e3c`, and the material functional
+commits recorded below. #157 and #194 remain open.
 
 Only the human release operator may create or push tags, approve the release
 environment, publish packages, or verify live PyPI and MCP Registry artefacts.
-This governance slice neither authorises nor performs those actions.
+This release-preparation slice neither authorises nor performs those actions.
 
 ## Changelog
 
-### Unreleased software-readiness instrumentation
+### 0.2.0 (release candidate; not published)
 
-- The implemented #194 software instrumentation slice adds additive
+- D184 governance and its state reconciliation establish the release-process
+  baseline in this ancestry; they are not functional changes and do not imply
+  that the three material functional commits are the complete release history.
+- The MCP-owned NumPy/SciPy mel frontend adds strict AST/Kaldi golden-parity
+  coverage (`7b5c3eca87648bd7dde23cda769fcf51df29c872`). Its ONNX detector
+  integration removes the runtime Torch, Torchaudio, and Transformers
+  feature-extraction path and adds clean-wheel package acceptance
+  (`4d40fc08dd3ca6fec0752618efd12d8a8bf0712b`). The #194 software
+  instrumentation adds the additive `fc_status` fields described below
+  (`7c08ad9ab843e60b240b5ec71027388e721a53a3`).
+
+- The #194 instrumentation adds additive
   `fc_status` fields: `max_consecutive_overflow_count` is the per-capture-run
   maximum consecutive overflow streak across independent inputs (maximum
   aggregation, not a sum); `last_inference_duration_ms` and
@@ -35,9 +48,18 @@ This governance slice neither authorises nor performs those actions.
   `inference_overrun_count` counts per-session attempts at or beyond the
   effective audio hop. Stop/fault snapshots retain these values across repeated
   reads; only the existing trailing-60-second rolling overflow count and
-  lost-audio estimate decay. This is software-readiness work only: it is not a
-  release, does not change `v0.1.16` as the current release, and grants no
-  release authority.
+  lost-audio estimate decay. This is software-readiness evidence and does not
+  grant release authority.
+- D191's recorded operational values remain `N=1`, `X=200 ms`, and production
+  fatal streak `30`.
+- D190 used an artificial music stimulus; its zero observed overflows do not
+  prove that a non-zero margin is necessary, and its sanitised text review did
+  not re-hash private evidence. It is not Pi, full-stack, detector, live-roast,
+  or combined acceptance.
+- D192 full-stack 30+30 characterisation and separate supervised >=20-minute
+  live-roast acceptance remain outstanding. This release-preparation slice
+  changes no runtime, model, dependency, configuration, workflow, hardware, or
+  private evidence.
 
 ### 0.1.16
 
