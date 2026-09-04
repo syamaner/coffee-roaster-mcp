@@ -27,6 +27,8 @@ the authorised eventual tag, which will point to the post-merge release commit.
 
 Only the human release operator may create or push tags, approve the release
 environment, publish packages, or verify live PyPI and MCP Registry artefacts.
+Publication may occur only after the release-preparation PR is merged and the
+release-workflow dry run succeeds.
 This release-preparation slice neither authorises nor performs those actions.
 
 ## Changelog
@@ -35,11 +37,11 @@ This release-preparation slice neither authorises nor performs those actions.
 
 - D184 governance and its state reconciliation establish the release-process
   baseline in this ancestry; they are not functional changes and do not imply
-  that the three material functional commits are the complete release history.
+  that the following functional entries are an exhaustive commit list.
 - The MCP-owned NumPy/SciPy mel frontend adds strict AST/Kaldi golden-parity
-  coverage (`7b5c3eca87648bd7dde23cda769fcf51df29c872`). Its ONNX detector
+  test coverage (`7b5c3eca87648bd7dde23cda769fcf51df29c872`). Its ONNX detector
   integration removes the runtime Torch, Torchaudio, and Transformers
-  feature-extraction path and adds clean-wheel package acceptance
+  feature-extraction path and adds clean-wheel package installation tests
   (`4d40fc08dd3ca6fec0752618efd12d8a8bf0712b`). The #194 software
   instrumentation adds the additive `fc_status` fields described below
   (`7c08ad9ab843e60b240b5ec71027388e721a53a3`).
@@ -47,20 +49,26 @@ This release-preparation slice neither authorises nor performs those actions.
 - The #194 instrumentation adds additive
   `fc_status` fields: `max_consecutive_overflow_count` is the per-capture-run
   maximum consecutive overflow streak across independent inputs (maximum
-  aggregation, not a sum); `last_inference_duration_ms` and
-  `max_inference_duration_ms` are the latest and per-session maximum
-  single-attempt inference durations in milliseconds; and
-  `inference_overrun_count` counts per-session attempts at or beyond the
-  effective audio hop. Stop/fault snapshots retain these values across repeated
-  reads; only the existing trailing-60-second rolling overflow count and
-  lost-audio estimate decay. This is software-readiness evidence and does not
-  grant release authority.
-- D191's ratified acceptance limits are `N=1` and `X=200 ms`; they are distinct
-  from the unchanged production fatal streak of `30`.
-- D190 used an artificial music stimulus; its zero observed overflows do not
-  prove that a non-zero margin is necessary, and its sanitised text review did
-  not re-hash private evidence. It is not Pi, full-stack, detector, live-roast,
-  or combined acceptance.
+  aggregation, not a sum). `last_inference_duration_ms` and
+  `max_inference_duration_ms` are the latest and per-roast-session maximum
+  monotonic-clock elapsed durations for every inference attempt, including
+  attempts that raise and successful attempts that return no result; and
+  `inference_overrun_count` counts per-roast-session attempts at or beyond the
+  effective audio hop. The per-capture-run overflow maximum and per-roast-session
+  inference metrics intentionally have different lifetimes, matching their
+  current source reset behaviour. Stop/fault snapshots retain these values
+  across repeated reads; only the existing trailing-60-second rolling overflow
+  count and lost-audio estimate decay. This is software-readiness evidence and
+  does not grant release authority.
+- D191's ratified acceptance limits are `N = 1`, the maximum permitted
+  consecutive audio-overflow streak, and `X = 200 ms`, the maximum permitted
+  peak trailing-60-second lost-audio duration; they are distinct from the
+  unchanged production fatal streak of `30`.
+- D190's artificial-music, single-stimulus, zero-overflow result does not prove
+  that a non-zero margin is necessary, establish sufficient headroom for other
+  inputs or conditions, or show that `N=1` can be tightened. Its
+  sanitised text review did not independently re-verify private evidence hashes.
+  It is not Pi, full-stack, detector, live-roast, or combined acceptance.
 - D192 full-stack 30+30 characterisation and separate supervised >=20-minute
   live-roast acceptance remain outstanding. This release-preparation slice
   changes no runtime, model, dependency, configuration, workflow, hardware, or
