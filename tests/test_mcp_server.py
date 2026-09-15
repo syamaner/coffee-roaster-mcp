@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import inspect
 import json
 import logging
@@ -490,6 +491,30 @@ def test_disconnect_exception_is_retained_for_disconnect_only_retry(tmp_path: Pa
     result = _finalise_cold_characterisation_session(context, session.id)
     assert result.status == "disconnect_indeterminate"
     assert result.disconnect.last_error == "RuntimeError: disconnect failed"
+
+
+def test_persisted_pre_disconnect_abort_returns_without_disconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final checkpoint is rebound before any disconnect driver call."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+    original = context.session_store.persist_finalisation
+
+    def abort_committed_disconnect(live_session: RoastSession, record: object) -> object:
+        persisted = original(live_session, record)
+        if getattr(getattr(persisted, "disconnect", None), "attempt_count", 0) == 1:
+            return dataclasses.replace(cast(Any, persisted), status="aborted")
+        return persisted
+
+    monkeypatch.setattr(context.session_store, "persist_finalisation", abort_committed_disconnect)
+    result = _finalise_cold_characterisation_session(context, session.id)
+
+    assert result.status == "aborted"
+    assert driver.actions == ["connect"]
 
 
 def test_resume_returns_retained_abort_when_revalidation_invalidates_reservation(

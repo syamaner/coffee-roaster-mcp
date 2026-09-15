@@ -1808,6 +1808,25 @@ def test_mock_lifecycle_evidence_is_non_advancing_and_tracks_connection() -> Non
     assert first.raw_vendor_data["sample_index"] != second.raw_vendor_data["sample_index"]
 
 
+def test_mock_lifecycle_evidence_tracks_heat_drop_cooling_and_emergency_stop() -> None:
+    """Mock evidence reflects the same safe-zero dimensions finalisation admits."""
+    driver = MockRoasterDriver()
+    driver.connect()
+    driver.set_heat(heat_level_percent=40)
+    heated = driver.read_lifecycle_evidence()
+    driver.drop_beans()
+    driver.stop_cooling()
+    assert driver.read_lifecycle_evidence().main_fan_level_percent == 100
+    driver.set_fan(fan_level_percent=0)
+    stopped = driver.read_lifecycle_evidence()
+    driver.emergency_stop(reason="test")
+    emergency = driver.read_lifecycle_evidence()
+
+    assert heated.heat_level_percent == 40
+    assert stopped.heat_level_percent == 0 and stopped.main_fan_level_percent == 0
+    assert emergency.heat_level_percent == 0 and emergency.main_fan_level_percent == 100
+
+
 def test_hottop_lifecycle_evidence_tracks_connect_disconnect_without_actuation() -> None:
     """Hottop evidence exposes retained counters and safe-zero state around its lifecycle."""
     factory = FakeSerialFactory()
@@ -1839,6 +1858,12 @@ def test_hottop_lifecycle_evidence_tracks_connect_disconnect_without_actuation()
     assert after.command_loop_running is False
     assert after.serial_open is False
     assert after.command_write_count == connected.command_write_count
+    assert factory.transport.close_calls == 1
+    assert all(
+        write == build_hottop_command_packet()
+        for write in factory.transport.writes_snapshot()
+        if is_hottop_command_packet(write)
+    )
 
 
 def test_hottop_lifecycle_evidence_surfaces_transport_is_open_failure() -> None:
