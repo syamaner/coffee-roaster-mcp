@@ -964,6 +964,27 @@ def test_failed_audio_capture_start_remains_a_retryable_finalisation_failure() -
     )
 
 
+def test_unexpected_capture_preparation_failure_remains_a_finalisation_failure() -> None:
+    """An unexpected capture setup error cannot become not-applicable teardown."""
+    session = RoastSessionStore().start_session(purpose="cold_characterisation")
+
+    def fail_pipeline(_config: AudioConfig) -> FakeAudioPipeline:
+        raise RuntimeError("backend setup failed")
+
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=fail_pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+
+    snapshot = runtime.start_for_session(session)
+    assert snapshot.status == "unavailable"
+    assert "RuntimeError: backend setup failed" in (snapshot.reason or "")
+    assert runtime.finalise_for_session(session.id)[0] == "stop_failed"
+
+
 def test_audio_runtime_reports_capture_and_detector_faults() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
