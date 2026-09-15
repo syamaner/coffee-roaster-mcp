@@ -324,6 +324,25 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
             "start_roast_session",
             "stop_cooling",
         }
+        tool_schemas = {tool.name: tool.inputSchema for tool in tools.tools}
+        assert tool_schemas["finalise_cold_characterisation_session"] == {
+            "properties": {"session_id": {"title": "Session Id", "type": "string"}},
+            "required": ["session_id"],
+            "title": "finalise_cold_characterisation_sessionArguments",
+            "type": "object",
+        }
+        assert tool_schemas["start_roast_session"] == {
+            "properties": {
+                "purpose": {
+                    "default": "roast",
+                    "enum": ["roast", "cold_characterisation"],
+                    "title": "Purpose",
+                    "type": "string",
+                }
+            },
+            "title": "start_roast_sessionArguments",
+            "type": "object",
+        }
 
         server_info = cast(Any, await _call_with_timeout(session.call_tool("get_server_info", {})))
         assert server_info.structuredContent is not None

@@ -239,6 +239,8 @@ then stops sampling and capture, verifies recording artifacts, and disconnects.
 confirmed, and final driver evidence remains safe zero. `partial` and
 `disconnect_indeterminate` retain evidence for a later retry; this does not
 make any readiness claim.
+Terminal finalisation leaves the session phase unchanged; consumers must use
+`active` and `session_active_after`, rather than infer completion from phase.
 
 `export_roast_log` writes `roast.jsonl`, `roast.csv`, and `summary.json` files
 for the current in-process session. Runtime events and sampled telemetry are
