@@ -43,6 +43,7 @@ from coffee_roaster_mcp.mcp_server import (
     ServerContext,
     _disconnect_finalisation,  # pyright: ignore[reportPrivateUsage]
     _evidence_admission_rejection,  # pyright: ignore[reportPrivateUsage]
+    _fault_active_session_after_sampler_failure,  # pyright: ignore[reportPrivateUsage]
     _finalise_cold_characterisation_session,  # pyright: ignore[reportPrivateUsage]
     _process_ambient_runtime_for_active_session,  # pyright: ignore[reportPrivateUsage]
     _process_first_crack_runtime_for_active_session,  # pyright: ignore[reportPrivateUsage]
@@ -558,6 +559,41 @@ def test_disconnect_indeterminate_retries_only_disconnect_for_same_session(tmp_p
     assert driver.actions == ["connect", "disconnect", "disconnect"]
 
 
+def test_not_applicable_first_crack_stage_is_not_rerun_on_disconnect_retry(tmp_path: Path) -> None:
+    """A retained not-applicable stage keeps its original completion evidence."""
+
+    class NotApplicableRuntime(FakeFirstCrackRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finalise_calls = 0
+
+        def finalise_for_session(self, session_id: str) -> tuple[str, str | None, bool]:
+            del session_id
+            self.finalise_calls += 1
+            return "not_active", None, False
+
+        def recording_for_session(self, session_id: str) -> tuple[None, None]:
+            del session_id
+            return None, None
+
+    context = _cold_finalisation_context(tmp_path)
+    driver = RetryLifecycleDriver()
+    runtime = NotApplicableRuntime()
+    object.__setattr__(context, "roaster_driver", driver)
+    _set_first_crack_runtime(context, runtime)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+    first = _finalise_cold_characterisation_session(context, session.id)
+    stage = first.stages[1]
+    assert stage.status == "not_applicable"
+    driver.confirm_disconnect = True
+    second = _finalise_cold_characterisation_session(context, session.id)
+    assert second.status == "clean"
+    assert runtime.finalise_calls == 1
+    assert second.stages[1].completed_at_utc == stage.completed_at_utc
+    assert second.stages[1].completed_in_attempt == stage.completed_in_attempt
+
+
 def test_sampler_join_timeout_resumes_only_the_sampler_stage(tmp_path: Path) -> None:
     """A bounded sampler timeout retains partial finalisation and resumes cleanly."""
     context = _cold_finalisation_context(tmp_path)
@@ -671,6 +707,47 @@ def test_disconnect_commit_wins_over_waiting_emergency_stop(tmp_path: Path) -> N
     )
     assert driver.actions == ["connect", "disconnect"]
     assert len(errors) == 1 and isinstance(errors[0], ValueError)
+
+
+def test_sampler_fault_waits_for_committed_disconnect_without_corrupting_result(
+    tmp_path: Path,
+) -> None:
+    """A sampler fault cannot interleave its driver stop with committed disconnect."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = BlockingDisconnectDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+    results: list[object] = []
+    errors: list[BaseException] = []
+    finaliser = Thread(
+        target=lambda: _record_finalisation_result(results, errors, context, session.id)
+    )
+    finaliser.start()
+    assert driver.disconnect_started.wait(timeout=1.0)
+    fault_started = Event()
+
+    def fault() -> None:
+        fault_started.set()
+        _fault_active_session_after_sampler_failure(
+            context, session=session, error=RuntimeError("sampler")
+        )
+
+    fault_thread = Thread(target=fault)
+    fault_thread.start()
+    assert fault_started.wait(timeout=1.0)
+    assert driver.actions == ["connect", "disconnect"]
+    driver.release_disconnect.set()
+    finaliser.join(timeout=1.0)
+    fault_thread.join(timeout=1.0)
+    assert not finaliser.is_alive() and not fault_thread.is_alive()
+    assert not errors
+    assert cast(Any, results[0]).status == "clean"
+    assert driver.actions == [
+        "connect",
+        "disconnect",
+        "emergency_stop:autonomous telemetry sampler failed: RuntimeError: sampler",
+    ]
 
 
 def test_quiet_sdk_per_request_log_suppresses_info_keeps_warning() -> None:

@@ -729,11 +729,29 @@ def test_emergency_abort_releases_finalisation_reservation_for_recovery() -> Non
 
     record = Record()
     store.attach_finalisation(session, record)
-    store.emergency_stop(session, reason="test")
+    store.emergency_stop(
+        session,
+        reason="test",
+        safety_payload={
+            "driver": "test",
+            "driver_safety_method": "emergency_stop",
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    )
     assert record.status == "aborted"
     assert record.abort_reason == "emergency_stop"
     assert session.pending_driver_command_token is None
     assert session.pending_driver_command_kind is None
+    recovery = store.reserve_driver_stop_cooling_recovery(session)
+    store.complete_reserved_driver_stop_cooling_recovery_snapshot(
+        session,
+        reservation=recovery,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=False,
+    )
 
 
 @pytest.mark.parametrize("mismatch", ("token", "generation"))
