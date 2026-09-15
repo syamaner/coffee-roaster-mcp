@@ -1838,11 +1838,16 @@ def _append_finalisation_failure(
 
 
 def _recording_evidence(
-    plan: RecordingArtifactPlan | None, recorder: object | None
+    plan: RecordingArtifactPlan | None, recorder: object | None, *, expected: bool = False
 ) -> RecordingFinalisationEvidence:
     """Use only filesystem metadata to report required recording artifacts."""
     if plan is None:
-        return RecordingFinalisationEvidence(False, "not_configured", None, ())
+        return RecordingFinalisationEvidence(
+            expected,
+            "failed" if expected else "not_configured",
+            "Recording plan was unavailable." if expected else None,
+            (),
+        )
     minimum_sizes = {
         "primary_wav": 45,
         "recording_sidecar": 1,
@@ -1914,7 +1919,7 @@ def _finalise_cold_characterisation_session(
             )
         purpose = None if session is None else session.purpose
         return _rejected_finalisation(
-            session_id, purpose, cast(FinalisationRejectionReason, rejection)
+            session_id, purpose, cast(FinalisationRejectionReason, rejection), session=session
         )
     existing = session.finalisation
     if existing is not None:
@@ -1931,7 +1936,9 @@ def _finalise_cold_characterisation_session(
             server_context.session_store.abandon_finalisation_admission(session)
             if session.active and session.purpose == "cold_characterisation":
                 server_context.telemetry_sampler.start_for_session(session.id)
-            return _rejected_finalisation(session.id, session.purpose, evidence_rejection)
+            return _rejected_finalisation(
+                session.id, session.purpose, evidence_rejection, session=session
+            )
         try:
             result = _initial_finalisation_result(
                 session, cast(int, generation), evidence, server_context
@@ -1966,7 +1973,7 @@ def _finalise_cold_characterisation_session(
                 SessionFinalisationResult,
                 server_context.session_store.persist_finalisation(session, result),
             )
-        if result.stages[1].status not in ("completed", "not_applicable"):
+        if result.stages[1].status in ("pending", "incomplete"):
             outcome, error, capture_running = (
                 server_context.first_crack_runtime.finalise_for_session(session.id)
             )
@@ -2002,7 +2009,15 @@ def _finalise_cold_characterisation_session(
             )
         if result.stages[2].status == "pending":
             recorder, plan = server_context.first_crack_runtime.recording_for_session(session.id)
-            recording = _recording_evidence(plan, recorder)
+            recording = _recording_evidence(
+                plan,
+                recorder,
+                expected=(
+                    server_context.config.recording.enabled
+                    and server_context.config.recording.autocapture
+                    and server_context.config.first_crack.mode == "audio"
+                ),
+            )
             result = dataclasses.replace(result, recording=recording)
             if recording.outcome in ("not_configured", "finalised"):
                 result = _with_stage(
@@ -2078,7 +2093,12 @@ def _disconnect_finalisation(
             disconnect=disconnect,
             emergency_stop_ordering="finalisation_committed_first",
         )
-        server_context.session_store.persist_finalisation(session, result)
+        result = cast(
+            SessionFinalisationResult,
+            server_context.session_store.persist_finalisation(session, result),
+        )
+        if result.status == "aborted":
+            return result
         error: str | None = None
         try:
             server_context.roaster_driver.disconnect()
@@ -2176,7 +2196,11 @@ def _disconnect_finalisation(
 
 
 def _rejected_finalisation(
-    session_id: str, purpose: SessionPurpose | None, reason: FinalisationRejectionReason
+    session_id: str,
+    purpose: SessionPurpose | None,
+    reason: FinalisationRejectionReason,
+    *,
+    session: RoastSession | None = None,
 ) -> SessionFinalisationResult:
     """Return a non-retained rejection without running any teardown stage."""
     stages = tuple(
@@ -2209,8 +2233,8 @@ def _rejected_finalisation(
         first_crack_runtime=None,
         recording=None,
         disconnect=DisconnectEvidence(),
-        session_active_after=False,
-        session_phase_after=None,
+        session_active_after=False if session is None else session.active,
+        session_phase_after=None if session is None else session.phase,
     )
 
 

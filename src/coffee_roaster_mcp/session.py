@@ -1446,13 +1446,6 @@ class RoastSessionStore:
             if session.pending_driver_command_token == reservation.token:
                 self._clear_driver_command_reservation_locked(session, reservation)
 
-    def cancel_pending_driver_command(self, session: RoastSession) -> None:
-        """Cancel any pending non-emergency driver command for one session."""
-        with self._lock:
-            self._assert_latest_session(session)
-            session.pending_driver_command_token = None
-            session.pending_driver_command_kind = None
-
     def cancel_nonfinalisation_driver_command(self, session: RoastSession) -> None:
         """Atomically cancel a pending command unless finalisation owns it."""
         with self._lock:
@@ -1917,6 +1910,8 @@ class RoastSessionStore:
                     )
                     object.__setattr__(record, "emergency_stop_ordering", ordering)
                     object.__setattr__(record, "retained", True)
+                    object.__setattr__(record, "session_active_after", session.active)
+                    object.__setattr__(record, "session_phase_after", session.phase)
                 self._clear_finalisation_locked(session)
             return event
 
@@ -2012,6 +2007,7 @@ class RoastSessionStore:
                 return session, "command_in_progress", None
             self._finalisation_generation += 1
             self._finalisation_in_progress.add(session_id)
+            self._nonterminal_finalisations.add(session_id)
             self._reserve_driver_command_locked(session, kind="finalisation")
             token = session.pending_driver_command_token
             assert token is not None
@@ -2031,11 +2027,17 @@ class RoastSessionStore:
                     else "session_or_reservation_changed",
                 )
                 object.__setattr__(record, "retained", True)
+                object.__setattr__(
+                    record,
+                    "emergency_stop_ordering",
+                    "emergency_stop_before_disconnect_commit",
+                )
+                object.__setattr__(record, "session_active_after", session.active)
+                object.__setattr__(record, "session_phase_after", session.phase)
                 session.finalisation = record
                 self._clear_finalisation_locked(session)
                 return record
             session.finalisation = record
-            self._nonterminal_finalisations.add(session.id)
             return record
 
     def abandon_finalisation_admission(self, session: RoastSession) -> None:
@@ -2157,6 +2159,8 @@ class RoastSessionStore:
             if getattr(record, "abort_reason", None) != "emergency_stop":
                 object.__setattr__(record, "abort_reason", "session_or_reservation_changed")
             object.__setattr__(record, "retained", True)
+            object.__setattr__(record, "session_active_after", session.active)
+            object.__setattr__(record, "session_phase_after", session.phase)
         self._clear_finalisation_locked(session)
         return deepcopy(record)
 

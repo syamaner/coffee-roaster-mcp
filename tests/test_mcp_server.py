@@ -524,6 +524,8 @@ def test_normal_session_finalisation_is_rejected_without_disconnect(tmp_path: Pa
 
     assert result.status == "rejected"
     assert result.rejection_reason == "session_purpose_not_eligible"
+    assert result.session_active_after is True
+    assert result.session_phase_after == session.phase
     assert context.roaster_driver.read_state().connected is True
 
 
@@ -2824,7 +2826,7 @@ def test_stale_stop_cooling_recovery_fails_closed(tmp_path: Path) -> None:
 
     latest_session = server_context.session_store.get_latest_session()
     assert latest_session is not None
-    server_context.session_store.cancel_pending_driver_command(latest_session)
+    server_context.session_store.cancel_nonfinalisation_driver_command(latest_session)
     release_command.set()
     stop_thread.join(timeout=1.0)
 

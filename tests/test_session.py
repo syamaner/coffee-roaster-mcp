@@ -726,6 +726,8 @@ def test_emergency_abort_releases_finalisation_reservation_for_recovery() -> Non
         reservation_generation = generation
         abort_reason: str | None = None
         retained = False
+        session_active_after = True
+        session_phase_after: str | None = None
 
     record = Record()
     store.attach_finalisation(session, record)
@@ -742,6 +744,8 @@ def test_emergency_abort_releases_finalisation_reservation_for_recovery() -> Non
     )
     assert record.status == "aborted"
     assert record.abort_reason == "emergency_stop"
+    assert record.session_active_after is False
+    assert record.session_phase_after == "fault"
     assert session.pending_driver_command_token is None
     assert session.pending_driver_command_kind is None
     recovery = store.reserve_driver_stop_cooling_recovery(session)
@@ -765,6 +769,9 @@ def test_admission_before_attach_invalidation_retains_abort_and_clears_fence() -
         status = "partial"
         abort_reason: str | None = None
         retained = False
+        emergency_stop_ordering = "not_reached"
+        session_active_after = True
+        session_phase_after: str | None = None
 
         def __init__(self) -> None:
             self.reservation_generation = generation
@@ -779,6 +786,36 @@ def test_admission_before_attach_invalidation_retains_abort_and_clears_fence() -
     assert session.finalisation is record
     assert session.pending_driver_command_token is None
     assert session.id not in store._finalisation_in_progress  # pyright: ignore[reportPrivateUsage]
+
+
+def test_emergency_stop_between_admission_and_attach_retains_truthful_abort() -> None:
+    """The reservation-time fence closes the admission-before-attach emergency window."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(session.id)
+    assert rejection is None and generation is not None
+
+    class Record:
+        status = "partial"
+        abort_reason: str | None = None
+        retained = False
+        emergency_stop_ordering = "not_reached"
+        session_active_after = True
+        session_phase_after: str | None = None
+
+        def __init__(self) -> None:
+            self.reservation_generation = generation
+
+    store.emergency_stop(session, reason="window")
+    record = Record()
+    store.attach_finalisation(session, record)
+
+    assert record.status == "aborted"
+    assert record.abort_reason == "emergency_stop"
+    assert record.emergency_stop_ordering == "emergency_stop_before_disconnect_commit"
+    assert record.session_active_after is False and record.session_phase_after == "fault"
+    assert session.pending_driver_command_token is None
+    assert store.reserve_driver_stop_cooling_recovery(session).kind == "stop_cooling"
 
 
 def test_terminal_and_progress_persistence_do_not_overwrite_an_abort() -> None:
