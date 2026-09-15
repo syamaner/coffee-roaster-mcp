@@ -823,6 +823,20 @@ def test_finalisation_private_fence_mismatch_returns_retained_abort(mismatch: st
         assert session.pending_driver_command_token is None
 
 
+def test_invalid_finalisation_without_retained_record_fails_closed() -> None:
+    """An impossible invalid admission cannot be mistaken for a valid disconnect path."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(session.id)
+    assert rejection is None
+
+    with pytest.raises(SessionLifecycleError, match="invalid without a record"):
+        store.abort_finalisation_if_invalid(session, generation)
+
+    assert session.finalisation is None
+    assert session.pending_driver_command_kind == "finalisation"
+
+
 def test_append_telemetry_rejects_out_of_order_samples() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(

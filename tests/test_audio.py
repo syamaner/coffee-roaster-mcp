@@ -24,6 +24,7 @@ from coffee_roaster_mcp.audio import (
     MicrophoneAudioInput,
     OverflowSnapshot,
     RoastAudioRecorder,
+    RoastRecorder,
     WavAudioInput,
     amplitude_to_dbfs,
     audio_capture_settings_from_config,
@@ -1041,6 +1042,17 @@ def test_audio_capture_stop_does_not_close_input_while_worker_reads() -> None:
     assert not worker.is_alive()
     pipeline.stop(timeout_seconds=1.0)
     assert pipeline.shutdown_confirmed is True
+
+
+def test_pipeline_shutdown_is_unconfirmed_for_an_unknown_recorder_boundary() -> None:
+    """An injected recorder must explicitly confirm shutdown before finalisation trusts it."""
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(input_device="fake", sample_rate=4, window_seconds=1.0),
+        audio_input=FiniteAudioInput(()),
+        recorder=cast("RoastRecorder", object()),
+    )
+
+    assert pipeline.shutdown_confirmed is False
 
 
 def test_stop_drains_the_readers_final_chunk_after_a_timed_out_join() -> None:

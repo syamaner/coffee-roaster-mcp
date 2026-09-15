@@ -566,12 +566,12 @@ def test_audio_runtime_reports_stopped_after_pipeline_stop_returns_running_snaps
     assert snapshot.active is True
     assert snapshot.audio_running is True
 
-    # A false aggregate running value cannot prove both capture workers stopped;
-    # finalisation retains the pipeline until its strong shutdown query agrees.
+    # Ordinary roast teardown clears handles even when a test double reports an
+    # unconfirmed worker; only cold finalisation retains retry state.
     stopped = runtime.stop_for_session(session.id, reason="roast complete")
     assert pipeline.stopped is True
-    assert stopped.active is True
-    assert stopped.audio_running is True
+    assert stopped.active is False
+    assert stopped.audio_running is False
 
 
 def test_runtime_mic_levels_are_live_only_and_none_after_stop() -> None:
@@ -752,11 +752,10 @@ def test_runtime_overflow_rolling_fields_decay_from_last_live_poll_when_stop_its
     # refresh _last_capture_snapshot with a fresh stop-instant read — the
     # 90-second-old live poll is all that remains.
     stopped = runtime.stop_for_session(session.id, reason="roast complete")
-    # An unconfirmed stop retains the live capture handle rather than claiming
-    # that its reader has gone away.
+    # Ordinary-stop teardown clears runtime handles even when stop itself fails.
     assert stopped.status == "faulted"
-    assert stopped.active is True
-    assert stopped.overflow_count_last_minute == 7
+    assert stopped.active is False
+    assert stopped.overflow_count_last_minute == 0
     # The lifetime total survives regardless of decay.
     assert stopped.total_overflow_count == 42
 
@@ -960,7 +959,7 @@ def test_failed_audio_capture_start_remains_a_retryable_finalisation_failure() -
     assert runtime.finalise_for_session(session.id) == (
         "stop_failed",
         "Audio capture did not start.",
-        True,
+        False,
     )
 
 

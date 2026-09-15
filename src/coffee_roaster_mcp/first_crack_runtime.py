@@ -618,7 +618,7 @@ class FirstCrackSessionRuntime:
             pipeline = self._pipeline
             if pipeline is None:
                 if self._capture_start_failed_for_session:
-                    return "stop_failed", "Audio capture did not start.", True
+                    return "stop_failed", "Audio capture did not start.", False
                 return (
                     ("stopped", None, False)
                     if self._capture_started_for_session
@@ -871,6 +871,9 @@ class FirstCrackSessionRuntime:
             except Exception as exc:  # noqa: BLE001 - shutdown should be best effort.
                 self._status = "faulted"
                 self._reason = f"Audio capture stop failed: {type(exc).__name__}: {exc}"
+            finally:
+                self._pipeline = None
+                self._adapter = None
         # The session is over: the next roast may set fresh recording metadata,
         # and inference may run again from scratch (#181).
         self._recorder_built_for_session = False

@@ -241,6 +241,8 @@ confirmed, and final driver evidence remains safe zero. `partial` and
 make any readiness claim.
 Terminal finalisation leaves the session phase unchanged; consumers must use
 `active` and `session_active_after`, rather than infer completion from phase.
+`completed_not_clean` is not a readiness or safety confirmation: investigate it
+before starting any new session.
 
 `export_roast_log` writes `roast.jsonl`, `roast.csv`, and `summary.json` files
 for the current in-process session. Runtime events and sampled telemetry are
@@ -273,6 +275,8 @@ The mock-safe Claude/operator flow is:
 5. Use `stop_cooling` when cooling is complete. `start_cooling` remains
    available as an explicit advanced/manual recovery tool, not as the normal
    roast flow after `drop_beans`.
+   A heated mock rehearsal must then call `set_fan(0)` after the empty
+   drop/cooling/stop-cooling path before safe-zero finalisation.
 
 `mark_beans_added` and `mark_first_crack` are explicit override tools. They are
 kept available for operator recovery and controlled manual runs. The primary

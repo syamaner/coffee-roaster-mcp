@@ -1651,15 +1651,7 @@ def _fault_active_session_after_sampler_failure(
         with server_context.lifecycle_barrier:
             latest_session = server_context.session_store.get_latest_session()
             terminal = getattr(getattr(session, "finalisation", None), "status", None)
-            if (
-                latest_session is session
-                and not session.active
-                and terminal
-                in (
-                    "clean",
-                    "completed_not_clean",
-                )
-            ):
+            if latest_session is session and not session.active and terminal == "clean":
                 return
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
             _, snapshot = server_context.session_store.emergency_stop_snapshot(
@@ -1851,11 +1843,17 @@ def _recording_evidence(
     """Use only filesystem metadata to report required recording artifacts."""
     if plan is None:
         return RecordingFinalisationEvidence(False, "not_configured", None, ())
+    minimum_sizes = {
+        "primary_wav": 45,
+        "recording_sidecar": 1,
+        "annotation_session_sidecar": 1,
+        "additional_wav": 45,
+    }
     items: list[RecordingArtifact] = []
-    for role, path, _minimum in (
-        ("primary_wav", plan.primary_wav, 45),
-        ("recording_sidecar", plan.recording_sidecar, 1),
-        ("annotation_session_sidecar", plan.annotation_session_sidecar, 1),
+    for role, path in (
+        ("primary_wav", plan.primary_wav),
+        ("recording_sidecar", plan.recording_sidecar),
+        ("annotation_session_sidecar", plan.annotation_session_sidecar),
     ):
         try:
             exists = path.is_file()
@@ -1891,9 +1889,7 @@ def _recording_evidence(
             True, "not_started", "Recorder did not start.", tuple(items)
         )
     complete = all(
-        item.exists
-        and item.size_bytes is not None
-        and item.size_bytes >= (45 if item.role == "primary_wav" else 1)
+        item.exists and item.size_bytes is not None and item.size_bytes >= minimum_sizes[item.role]
         for item in items
     )
     return RecordingFinalisationEvidence(
@@ -1985,15 +1981,21 @@ def _finalise_cold_characterisation_session(
                 ),
             )
             result = dataclasses.replace(result, first_crack_runtime=first_crack)
-            if outcome in ("capture_still_running", "stop_failed"):
+            if outcome == "capture_still_running" or (outcome == "stop_failed" and capture_running):
                 result = _append_finalisation_failure(
                     result, "first_crack_runtime", outcome, error or outcome
                 )
                 result = _with_stage(result, 1, "incomplete", error or outcome)
                 return _persist_partial(session, result, server_context)
-            result = _with_stage(
-                result, 1, "not_applicable" if outcome == "not_active" else "completed"
-            )
+            if outcome == "stop_failed":
+                result = _append_finalisation_failure(
+                    result, "first_crack_runtime", outcome, error or outcome
+                )
+                result = _with_stage(result, 1, "failed", error or outcome)
+            else:
+                result = _with_stage(
+                    result, 1, "not_applicable" if outcome == "not_active" else "completed"
+                )
             result = cast(
                 SessionFinalisationResult,
                 server_context.session_store.persist_finalisation(session, result),

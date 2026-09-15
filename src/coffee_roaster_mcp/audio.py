@@ -1924,7 +1924,10 @@ class AudioCapturePipeline:
                 thread is None or not thread.is_alive()
                 for thread in (self._reader_thread, self._thread)
             )
-        return capture_threads_stopped and bool(getattr(self._recorder, "shutdown_confirmed", True))
+            recorder = self._recorder
+        return capture_threads_stopped and (
+            recorder is None or bool(getattr(recorder, "shutdown_confirmed", False))
+        )
 
     def start(self) -> AudioCaptureSnapshot:
         """Start background audio capture and return the current status snapshot.

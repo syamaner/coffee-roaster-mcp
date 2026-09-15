@@ -2092,7 +2092,10 @@ class RoastSessionStore:
                 == session.pending_driver_command_token
             ):
                 return None
-            return self._abort_finalisation_locked(session)
+            if record is None:
+                raise SessionLifecycleError("Finalisation reservation is invalid without a record.")
+            aborted = self._abort_finalisation_locked(session)
+            return aborted
 
     def copy_session(self, session: RoastSession) -> RoastSession:
         """Return a deep-copied snapshot of one known session object under the store lock."""

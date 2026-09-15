@@ -368,6 +368,50 @@ def test_recording_evidence_rejects_header_only_primary_wav(tmp_path: Path) -> N
     assert evidence.artifacts[0].size_bytes == 44
 
 
+@pytest.mark.parametrize("size, expected", ((44, "failed"), (45, "finalised")))
+def test_recording_evidence_uses_the_wav_threshold_for_every_wav(
+    tmp_path: Path, size: int, expected: str
+) -> None:
+    """Primary and additional WAVs require at least one frame beyond the header."""
+    primary, sidecar, annotation, additional = (
+        tmp_path / name for name in ("p.wav", "r.json", "a.json", "extra.wav")
+    )
+    primary.write_bytes(b"x" * size)
+    additional.write_bytes(b"x" * size)
+    sidecar.write_text("{}", encoding="utf-8")
+    annotation.write_text("{}", encoding="utf-8")
+
+    evidence = _recording_evidence(
+        RecordingArtifactPlan(primary, sidecar, annotation, (additional,)),
+        SimpleNamespace(started_monotonic_seconds=1.0),
+    )
+
+    assert evidence.outcome == expected
+
+
+def test_failed_capture_start_finalises_not_clean_without_a_retry(tmp_path: Path) -> None:
+    """No-resource capture startup failure is terminal evidence, not a partial retry."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+    runtime = FakeFirstCrackRuntime()
+    runtime.finalise_for_session = lambda _session_id: (  # type: ignore[method-assign]
+        "stop_failed",
+        "Audio capture did not start.",
+        False,
+    )
+    runtime.recording_for_session = lambda _session_id: (None, None)  # type: ignore[method-assign]
+    _set_first_crack_runtime(context, runtime)
+
+    result = _finalise_cold_characterisation_session(context, session.id)
+
+    assert result.status == "completed_not_clean"
+    assert result.stages[1].status == "failed"
+    assert result.disconnect.attempt_count == 1
+    assert session.pending_driver_command_token is None
+    assert _finalise_cold_characterisation_session(context, session.id) == result
+
+
 def test_invalid_finalisation_reservation_returns_its_retained_abort(tmp_path: Path) -> None:
     """A later invocation returns the aborted retained result without disconnecting."""
     context = _cold_finalisation_context(tmp_path)
@@ -625,6 +669,7 @@ def test_finalisation_path_has_no_forbidden_actuator_calls() -> None:
     tree = ast.parse(
         inspect.getsource(_finalise_cold_characterisation_session)
         + inspect.getsource(_disconnect_finalisation)
+        + inspect.getsource(FirstCrackSessionRuntime.finalise_for_session)
     )
     forbidden = {
         "set_heat",
