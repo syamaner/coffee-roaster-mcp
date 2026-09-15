@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import logging
 import time
@@ -21,7 +23,12 @@ from coffee_roaster_mcp.detector import (
     FirstCrackDetectorOutput,
     build_first_crack_detector_adapter,
 )
-from coffee_roaster_mcp.drivers import EmergencyStopResult, MockRoasterDriver, RoasterState
+from coffee_roaster_mcp.drivers import (
+    DriverLifecycleEvidence,
+    EmergencyStopResult,
+    MockRoasterDriver,
+    RoasterState,
+)
 from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackRuntimeSnapshot,
     FirstCrackRuntimeState,
@@ -31,6 +38,7 @@ from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
     ServerContext,
     _finalise_cold_characterisation_session,  # pyright: ignore[reportPrivateUsage]
+    _read_driver_lifecycle_evidence,  # pyright: ignore[reportPrivateUsage]
     _serialize_first_crack_status,  # pyright: ignore[reportPrivateUsage]
     build_server_context,
     create_mcp_server,
@@ -80,6 +88,197 @@ def test_normal_session_finalisation_is_rejected_without_disconnect(tmp_path: Pa
     assert result.status == "rejected"
     assert result.rejection_reason == "session_purpose_not_eligible"
     assert context.roaster_driver.read_state().connected is True
+
+
+@pytest.mark.parametrize(
+    "dimension",
+    (
+        "heat_level_percent",
+        "roast_fan_level_percent",
+        "main_fan_level_percent",
+        "drum_motor_on",
+        "cooling_motor_on",
+        "solenoid_open",
+    ),
+)
+def test_cold_finalisation_rejects_each_nonzero_lifecycle_dimension(
+    tmp_path: Path, dimension: str
+) -> None:
+    """N1-N6: every non-zero command dimension fails admission without teardown."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver(non_zero_dimension=dimension)
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+
+    result = _finalise_cold_characterisation_session(context, session.id)
+
+    assert result.status == "rejected"
+    assert result.rejection_reason == "driver_state_not_safe_zero"
+    assert result.admission_driver_evidence is None
+    assert driver.actions == ["connect"]
+    assert context.session_store.get_session_snapshot(session_id=session.id).active is True
+
+
+@pytest.mark.parametrize(
+    ("driver_kind", "reason"),
+    (
+        ("unsupported", "driver_lifecycle_evidence_unsupported"),
+        ("unreadable", "driver_state_unreadable"),
+        ("malformed", "driver_state_malformed"),
+        ("disconnected", "driver_not_connected"),
+    ),
+)
+def test_cold_finalisation_rejects_unadmissible_driver_evidence(
+    tmp_path: Path, driver_kind: str, reason: str
+) -> None:
+    """N7-N10: unsupported, unreadable, malformed, and disconnected evidence fails closed."""
+    context = _cold_finalisation_context(tmp_path)
+    driver: object
+    if driver_kind == "unsupported":
+        driver = RecordingRoasterDriver()
+    elif driver_kind == "unreadable":
+        driver = BrokenLifecycleDriver("raise")
+    elif driver_kind == "malformed":
+        driver = BrokenLifecycleDriver("malformed")
+    else:
+        driver = LifecycleRecordingDriver(initially_connected=False)
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    if hasattr(driver, "connect") and not isinstance(driver, LifecycleRecordingDriver):
+        cast(Any, driver).connect()
+
+    result = _finalise_cold_characterisation_session(context, session.id)
+
+    assert result.status == "rejected"
+    assert result.rejection_reason == reason
+    assert context.session_store.get_session_snapshot(session_id=session.id).active is True
+
+
+def test_finalisation_reservation_fences_ordinary_commands_and_events(tmp_path: Path) -> None:
+    """N11: a retained finalisation reservation excludes normal command and event mutation."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+    reserved, rejection, _ = context.session_store.begin_finalisation(session.id)
+
+    assert reserved is session
+    assert rejection is None
+    with pytest.raises(SessionLifecycleError, match="Another driver command"):
+        context.session_store.reserve_driver_command(session, kind="control")
+    with pytest.raises(SessionLifecycleError, match="finalisation"):
+        context.session_store.record_event_snapshot(session, "beans_added")
+    with pytest.raises(SessionLifecycleError, match="finalisation"):
+        context.session_store.record_telemetry_sample(
+            session,
+            bean_temp_c=20.0,
+            env_temp_c=20.0,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=False,
+        )
+    context.session_store.abandon_finalisation_admission(session)
+
+
+def test_finalisation_result_has_exact_safe_request_and_terminal_schema(tmp_path: Path) -> None:
+    """N12: the registered stdio tool takes only a session id and returns terminal evidence."""
+    context = _cold_finalisation_context(tmp_path)
+    server = create_mcp_server()
+    tool = server._tool_manager.get_tool("finalise_cold_characterisation_session")  # pyright: ignore[reportPrivateUsage]
+    assert tool is not None
+    assert set(tool.parameters["properties"]) == {"session_id"}
+    assert tool.parameters["required"] == ["session_id"]
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+
+    result = _finalise_cold_characterisation_session(context, session.id)
+
+    assert result.status == "clean"
+    assert result.disconnect.connected_false_confirmed is True
+    assert tuple(stage.stage for stage in result.stages) == (
+        "telemetry_sampler",
+        "first_crack_runtime",
+        "recording",
+        "driver_disconnect",
+    )
+
+
+def test_finalisation_path_has_no_forbidden_actuator_calls() -> None:
+    """N13: static proof keeps cold finalisation non-actuating except disconnect."""
+    tree = ast.parse(inspect.getsource(_finalise_cold_characterisation_session))
+    forbidden = {
+        "set_heat",
+        "set_fan",
+        "drop_beans",
+        "start_cooling",
+        "stop_cooling",
+        "emergency_stop",
+    }
+    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    assert not attributes & forbidden
+
+
+def test_lifecycle_evidence_serializes_safe_zero_and_streaming_transitions(tmp_path: Path) -> None:
+    """N14: evidence reports all safe-zero fields before and after a disconnect."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver(streaming=True)
+    object.__setattr__(context, "roaster_driver", driver)
+    driver.connect()
+    before = _read_driver_lifecycle_evidence(context)
+    driver.disconnect()
+    after = _read_driver_lifecycle_evidence(context)
+
+    assert before.outcome == "read"
+    assert before.evidence is not None and before.evidence.safe_zero is True
+    assert before.evidence.command_loop_running is True
+    assert before.evidence.serial_open is True
+    assert after.evidence is not None and after.evidence.connected is False
+    assert after.evidence.command_loop_running is False
+    assert after.evidence.serial_open is False
+
+
+def test_emergency_stop_during_finalisation_prevents_later_disconnect(tmp_path: Path) -> None:
+    """N5/N12: an emergency stop during teardown must fence the later disconnect commit."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    runtime = BlockingFinalisationRuntime()
+    _set_first_crack_runtime(context, runtime)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+    results: list[object] = []
+    errors: list[BaseException] = []
+    thread = Thread(
+        target=lambda: _record_finalisation_result(results, errors, context, session.id)
+    )
+    thread.start()
+    assert runtime.finalise_started.wait(timeout=1.0)
+
+    context.session_store.emergency_stop(session, reason="test race")
+    runtime.release_finalise.set()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert not errors
+    assert driver.actions == ["connect"]
+    assert results and cast(Any, results[0]).status == "aborted"
+
+
+def test_nonterminal_finalisation_cannot_resume_after_a_later_session_starts(
+    tmp_path: Path,
+) -> None:
+    """N12/N13: an old retained result must not bypass latest-session admission."""
+    context = _cold_finalisation_context(tmp_path)
+    old = context.session_store.start_session(purpose="cold_characterisation")
+    old.finalisation = SimpleNamespace(reservation_generation=7, status="partial")
+    old.monotonic_stop = old.monotonic_start
+    context.session_store.start_session(purpose="cold_characterisation")
+
+    session, rejection, generation = context.session_store.begin_finalisation(old.id)
+
+    assert session is old
+    assert rejection == "not_latest_session"
+    assert generation is None
 
 
 def test_quiet_sdk_per_request_log_suppresses_info_keeps_warning() -> None:
@@ -2226,3 +2425,109 @@ def _call_tool(server: FastMCP, tool_name: str, ctx: Any, **kwargs: object) -> A
     tool = tool_manager.get_tool(tool_name)
     assert tool is not None
     return tool.fn(ctx, **kwargs)
+
+
+def _cold_finalisation_context(tmp_path: Path) -> ServerContext:
+    """Build a hardware-free server context for one cold-finalisation test."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("{}\n", encoding="utf-8")
+    return build_server_context(config_path=config_path)
+
+
+def _record_finalisation_result(
+    results: list[object], errors: list[BaseException], context: ServerContext, session_id: str
+) -> None:
+    """Run finalisation in a test thread and retain its outcome."""
+    try:
+        results.append(_finalise_cold_characterisation_session(context, session_id))
+    except BaseException as exc:  # noqa: BLE001 - test thread reports exact failure.
+        errors.append(exc)
+
+
+class LifecycleRecordingDriver(RecordingRoasterDriver):
+    """Recording driver with controllable, read-only lifecycle evidence."""
+
+    def __init__(
+        self,
+        *,
+        non_zero_dimension: str | None = None,
+        streaming: bool = False,
+        initially_connected: bool = True,
+    ) -> None:
+        """Initialize a safe-zero evidence double with one optional non-zero dimension."""
+        super().__init__()
+        self.non_zero_dimension = non_zero_dimension
+        self.streaming = streaming
+        self.connected = initially_connected
+
+    def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
+        """Return a complete, non-actuating evidence snapshot."""
+        values: dict[str, int | bool] = {
+            "heat_level_percent": 0,
+            "roast_fan_level_percent": 0,
+            "main_fan_level_percent": 0,
+            "drum_motor_on": False,
+            "cooling_motor_on": False,
+            "solenoid_open": False,
+        }
+        if self.non_zero_dimension is not None:
+            values[self.non_zero_dimension] = (
+                1 if self.non_zero_dimension.endswith("percent") else True
+            )
+        return DriverLifecycleEvidence(
+            driver=self.name,
+            connected=self.connected,
+            command_streaming_required=self.streaming,
+            command_loop_running=self.connected if self.streaming else None,
+            serial_open=self.connected if self.streaming else None,
+            heat_level_percent=cast(int, values["heat_level_percent"]),
+            roast_fan_level_percent=cast(int, values["roast_fan_level_percent"]),
+            main_fan_level_percent=cast(int, values["main_fan_level_percent"]),
+            drum_motor_on=cast(bool, values["drum_motor_on"]),
+            cooling_motor_on=cast(bool, values["cooling_motor_on"]),
+            solenoid_open=cast(bool, values["solenoid_open"]),
+            command_send_attempts=0 if self.streaming else None,
+            command_write_count=0 if self.streaming else None,
+            last_command_write_size=0 if self.streaming else None,
+            command_loop_error_count=0 if self.streaming else None,
+            status_packet_count=0 if self.streaming else None,
+            status_read_error_count=0 if self.streaming else None,
+        )
+
+
+class BrokenLifecycleDriver:
+    """Lifecycle-evidence double for fail-closed admission paths."""
+
+    name = "broken"
+
+    def __init__(self, outcome: str) -> None:
+        """Initialize an unreadable or malformed evidence response."""
+        self.outcome = outcome
+
+    def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
+        """Raise or return a deliberately invalid evidence result."""
+        if self.outcome == "raise":
+            raise RuntimeError("evidence unavailable")
+        return cast(DriverLifecycleEvidence, object())
+
+
+class BlockingFinalisationRuntime(FakeFirstCrackRuntime):
+    """First-crack runtime double that exposes a deterministic teardown race."""
+
+    def __init__(self) -> None:
+        """Initialize stage-two rendezvous events."""
+        super().__init__()
+        self.finalise_started = Event()
+        self.release_finalise = Event()
+
+    def finalise_for_session(self, session_id: str) -> tuple[str, None, bool]:
+        """Block after admission until the test applies an emergency stop."""
+        assert session_id == self.active_session_id or self.active_session_id is None
+        self.finalise_started.set()
+        assert self.release_finalise.wait(timeout=1.0)
+        return "not_active", None, False
+
+    def recording_for_session(self, session_id: str) -> tuple[None, None]:
+        """Return no recording plan for a disabled first-crack configuration."""
+        del session_id
+        return None, None
