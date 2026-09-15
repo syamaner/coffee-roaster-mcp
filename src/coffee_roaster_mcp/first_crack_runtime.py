@@ -387,7 +387,11 @@ class FirstCrackSessionRuntime:
                         # WAVs. The pipeline finalises at stop_for_session.
                         self._inference_stopped = True
                         break
-            except (AudioCaptureError, FirstCrackDetectorError, SessionLifecycleError) as exc:
+            except SessionLifecycleError as exc:
+                if session_store.finalisation_blocks_session(session.id):
+                    return self.snapshot()
+                self._mark_faulted_locked(f"First-crack detection failed: {exc}")
+            except (AudioCaptureError, FirstCrackDetectorError) as exc:
                 self._mark_faulted_locked(f"First-crack detection failed: {exc}")
             except Exception as exc:  # noqa: BLE001 - detector backends vary.
                 self._mark_faulted_locked(

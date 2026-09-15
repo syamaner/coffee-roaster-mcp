@@ -2033,10 +2033,7 @@ class RoastSessionStore:
     def abandon_finalisation_admission(self, session: RoastSession) -> None:
         """Release a failed first-admission reservation."""
         with self._lock:
-            session.pending_driver_command_token = None
-            session.pending_driver_command_kind = None
-            self._finalisation_in_progress.discard(session.id)
-            self._finalisation_tokens.pop(session.id, None)
+            self._clear_finalisation_locked(session)
 
     def finish_finalisation_invocation(self, session: RoastSession) -> None:
         """Clear the in-progress marker after one finalisation call returns."""
@@ -2149,11 +2146,12 @@ class RoastSessionStore:
 
     def _clear_finalisation_locked(self, session: RoastSession) -> None:
         """Release private finalisation fencing and reservation bookkeeping."""
-        session.pending_driver_command_token = None
-        session.pending_driver_command_kind = None
+        token = self._finalisation_tokens.pop(session.id, None)
+        if token is not None and session.pending_driver_command_token == token:
+            session.pending_driver_command_token = None
+            session.pending_driver_command_kind = None
         self._nonterminal_finalisations.discard(session.id)
         self._finalisation_in_progress.discard(session.id)
-        self._finalisation_tokens.pop(session.id, None)
 
     def _assert_latest_session(self, session: RoastSession) -> None:
         """Validate that one session is the latest known session."""

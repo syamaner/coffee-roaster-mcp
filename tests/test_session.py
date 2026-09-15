@@ -816,7 +816,10 @@ def test_finalisation_private_fence_mismatch_returns_retained_abort(mismatch: st
         record.reservation_generation += 1
     assert store.abort_finalisation_if_invalid(session, generation) is record
     assert record.status == "aborted" and record.retained is True
-    assert session.pending_driver_command_token is None
+    if mismatch == "token":
+        assert session.pending_driver_command_token is not None
+    else:
+        assert session.pending_driver_command_token is None
 
 
 def test_append_telemetry_rejects_out_of_order_samples() -> None:

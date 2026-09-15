@@ -378,6 +378,30 @@ def test_cold_finalisation_rejects_unadmissible_driver_evidence(
     assert context.session_store.get_session_snapshot(session_id=session.id).active is True
 
 
+def test_rejected_admission_restarts_sampler_without_fencing_commands(tmp_path: Path) -> None:
+    """Evidence rejection restores a cold session sampler after reservation cleanup."""
+
+    class RestartTrackingSampler:
+        def __init__(self) -> None:
+            self.started: list[str] = []
+
+        def start_for_session(self, session_id: str) -> None:
+            self.started.append(session_id)
+
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver(non_zero_dimension="drum_motor_on")
+    sampler = RestartTrackingSampler()
+    object.__setattr__(context, "roaster_driver", driver)
+    object.__setattr__(context, "telemetry_sampler", sampler)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    sampler.start_for_session(session.id)
+    driver.connect()
+    result = _finalise_cold_characterisation_session(context, session.id)
+    assert result.status == "rejected"
+    assert sampler.started == [session.id, session.id]
+    assert context.session_store.reserve_driver_command(session, kind="control").kind == "control"
+
+
 def test_finalisation_reservation_fences_ordinary_commands_and_events(tmp_path: Path) -> None:
     """N11: a retained finalisation reservation excludes normal command and event mutation."""
     context = _cold_finalisation_context(tmp_path)

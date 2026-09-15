@@ -1120,7 +1120,8 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         with server_context.lifecycle_barrier:
             session = _require_active_session(server_context)
-            server_context.session_store.cancel_pending_driver_command(session)
+            if session.pending_driver_command_kind != "finalisation":
+                server_context.session_store.cancel_pending_driver_command(session)
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
             event, snapshot = server_context.session_store.emergency_stop_snapshot(
                 session,
@@ -1649,8 +1650,11 @@ def _fault_active_session_after_sampler_failure(
     reason = f"autonomous telemetry sampler failed: {type(error).__name__}: {error}"
     try:
         with server_context.lifecycle_barrier:
-            active_session = server_context.session_store.get_active_session()
-            if active_session is not session:
+            latest_session = server_context.session_store.get_latest_session()
+            terminal = getattr(getattr(session, "finalisation", None), "status", None)
+            if latest_session is not session or (
+                not session.active and terminal in ("clean", "completed_not_clean")
+            ):
                 return
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
             _, snapshot = server_context.session_store.emergency_stop_snapshot(
@@ -1919,6 +1923,8 @@ def _finalise_cold_characterisation_session(
         evidence_rejection = _evidence_admission_rejection(evidence)
         if evidence_rejection is not None:
             server_context.session_store.abandon_finalisation_admission(session)
+            if session.active and session.purpose == "cold_characterisation":
+                server_context.telemetry_sampler.start_for_session(session.id)
             return _rejected_finalisation(session.id, session.purpose, evidence_rejection)
         result = _initial_finalisation_result(
             session, cast(int, generation), evidence, server_context
@@ -2042,6 +2048,7 @@ def _disconnect_finalisation(
             disconnect=disconnect,
             emergency_stop_ordering="finalisation_committed_first",
         )
+        server_context.session_store.persist_finalisation(session, result)
         error: str | None = None
         try:
             server_context.roaster_driver.disconnect()
