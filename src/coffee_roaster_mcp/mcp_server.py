@@ -1907,7 +1907,10 @@ def _finalise_cold_characterisation_session(
     if session is None or rejection is not None:
         existing = None if session is None else session.finalisation
         if existing is not None and getattr(existing, "status", None) == "aborted":
-            return cast(SessionFinalisationResult, existing)
+            assert session is not None
+            return cast(
+                SessionFinalisationResult, server_context.session_store.copy_finalisation(session)
+            )
         purpose = None if session is None else session.purpose
         return _rejected_finalisation(
             session_id, purpose, cast(FinalisationRejectionReason, rejection)
@@ -1917,7 +1920,9 @@ def _finalise_cold_characterisation_session(
         result = cast(SessionFinalisationResult, existing)
         if result.status in ("clean", "completed_not_clean", "aborted"):
             server_context.session_store.finish_finalisation_invocation(session)
-            return result
+            return cast(
+                SessionFinalisationResult, server_context.session_store.copy_finalisation(session)
+            )
     else:
         evidence = _read_driver_lifecycle_evidence(server_context)
         evidence_rejection = _evidence_admission_rejection(evidence)
@@ -1926,17 +1931,21 @@ def _finalise_cold_characterisation_session(
             if session.active and session.purpose == "cold_characterisation":
                 server_context.telemetry_sampler.start_for_session(session.id)
             return _rejected_finalisation(session.id, session.purpose, evidence_rejection)
-        result = _initial_finalisation_result(
-            session, cast(int, generation), evidence, server_context
-        )
+        try:
+            result = _initial_finalisation_result(
+                session, cast(int, generation), evidence, server_context
+            )
+        except Exception:
+            server_context.session_store.abandon_finalisation_admission(session)
+            raise
         server_context.session_store.attach_finalisation(session, result)
-    aborted = server_context.session_store.abort_finalisation_if_invalid(
-        session, result.reservation_generation
-    )
-    if aborted is not None:
-        return cast(SessionFinalisationResult, aborted)
-    result = dataclasses.replace(result, attempt_number=result.attempt_number + 1)
     try:
+        aborted = server_context.session_store.abort_finalisation_if_invalid(
+            session, result.reservation_generation
+        )
+        if aborted is not None:
+            return cast(SessionFinalisationResult, aborted)
+        result = dataclasses.replace(result, attempt_number=result.attempt_number + 1)
         if result.stages[0].status != "completed":
             sampler = server_context.telemetry_sampler.stop_and_join_for_finalisation(session.id)
             result = dataclasses.replace(result, sampler=sampler)

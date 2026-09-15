@@ -211,8 +211,8 @@ def test_invalid_finalisation_reservation_returns_its_retained_abort(tmp_path: P
     session.pending_driver_command_token = None
     session.pending_driver_command_kind = None
     context.session_store.finish_finalisation_invocation(session)
-    assert _finalise_cold_characterisation_session(context, session.id) is record
-    assert record.status == "aborted"
+    returned = _finalise_cold_characterisation_session(context, session.id)
+    assert returned is not record and returned.status == record.status == "aborted"
     assert driver.actions == []
 
 
@@ -664,6 +664,22 @@ def test_disconnect_indeterminate_retries_only_disconnect_for_same_session(tmp_p
     assert second.disconnect.attempt_count == 2
     assert second.stages[3].status == "completed"
     assert driver.actions == ["connect", "disconnect", "disconnect"]
+
+
+def test_returned_indeterminate_result_is_detached_from_later_emergency_abort(
+    tmp_path: Path,
+) -> None:
+    """Finalisation callers retain a stable copy when the store record later aborts."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = RetryLifecycleDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+    returned = _finalise_cold_characterisation_session(context, session.id)
+    assert returned.status == "disconnect_indeterminate"
+    context.session_store.emergency_stop(session, reason="test")
+    assert returned.status == "disconnect_indeterminate"
+    assert _finalise_cold_characterisation_session(context, session.id).status == "aborted"
 
 
 def test_not_applicable_first_crack_stage_is_not_rerun_on_disconnect_retry(tmp_path: Path) -> None:

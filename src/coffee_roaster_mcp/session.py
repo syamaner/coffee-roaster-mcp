@@ -971,7 +971,7 @@ class RoastSessionStore:
         with self._lock:
             if self._latest_session is None or not self._latest_session.active:
                 return None
-            if self._latest_session.id in self._nonterminal_finalisations:
+            if self._finalisation_blocks_mutation(self._latest_session):
                 return None
             if session_id is not None and self._latest_session.id != session_id:
                 return None
@@ -2044,7 +2044,7 @@ class RoastSessionStore:
         """Release reservation and stop a successfully disconnected session."""
         with self._lock:
             if getattr(session.finalisation, "status", None) == "aborted":
-                return session.finalisation
+                return deepcopy(session.finalisation)
             self._assert_latest_active_session(session)
             session.finalisation = record
             self._clear_finalisation_locked(session)
@@ -2053,15 +2053,15 @@ class RoastSessionStore:
                 monotonic_now=self._monotonic_now,
                 phase=session.phase,
             )
-            return record
+            return deepcopy(record)
 
     def persist_finalisation(self, session: RoastSession, record: object) -> object:
         """Persist nonterminal finalisation progress without overwriting an abort."""
         with self._lock:
             if getattr(session.finalisation, "status", None) == "aborted":
-                return session.finalisation
+                return deepcopy(session.finalisation)
             session.finalisation = record
-            return record
+            return deepcopy(record)
 
     def finalisation_blocks_session(self, session_id: str) -> bool:
         """Return whether finalisation fences background mutation for this session."""
@@ -2090,6 +2090,11 @@ class RoastSessionStore:
         """Return a deep-copied snapshot of one known session object under the store lock."""
         with self._lock:
             return _copy_session_for_read(session)
+
+    def copy_finalisation(self, session: RoastSession) -> object | None:
+        """Return a detached finalisation record under store locking."""
+        with self._lock:
+            return deepcopy(session.finalisation)
 
     @property
     def telemetry_buffer_limit(self) -> int:
@@ -2142,7 +2147,7 @@ class RoastSessionStore:
                 object.__setattr__(record, "abort_reason", "session_or_reservation_changed")
             object.__setattr__(record, "retained", True)
         self._clear_finalisation_locked(session)
-        return record
+        return deepcopy(record)
 
     def _clear_finalisation_locked(self, session: RoastSession) -> None:
         """Release private finalisation fencing and reservation bookkeeping."""

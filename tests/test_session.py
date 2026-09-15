@@ -788,8 +788,9 @@ def test_terminal_and_progress_persistence_do_not_overwrite_an_abort() -> None:
     aborted = type("Record", (), {"status": "aborted"})()
     replacement = object()
     session.finalisation = aborted
-    assert store.persist_finalisation(session, replacement) is aborted
-    assert store.finish_finalisation_terminal(session, replacement) is aborted
+    assert store.persist_finalisation(session, replacement) is not aborted
+    assert store.finish_finalisation_terminal(session, replacement) is not aborted
+    assert session.finalisation is aborted
 
 
 @pytest.mark.parametrize("mismatch", ("token", "generation"))
@@ -814,7 +815,7 @@ def test_finalisation_private_fence_mismatch_returns_retained_abort(mismatch: st
         store._finalisation_tokens[session.id] = "wrong"  # pyright: ignore[reportPrivateUsage]
     else:
         record.reservation_generation += 1
-    assert store.abort_finalisation_if_invalid(session, generation) is record
+    assert store.abort_finalisation_if_invalid(session, generation) is not record
     assert record.status == "aborted" and record.retained is True
     if mismatch == "token":
         assert session.pending_driver_command_token is not None
