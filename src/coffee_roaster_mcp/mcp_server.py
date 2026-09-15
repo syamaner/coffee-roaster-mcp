@@ -1876,9 +1876,6 @@ def _finalise_cold_characterisation_session(
     """Run cold-session teardown without invoking any roaster control operation."""
     session, rejection, generation = server_context.session_store.begin_finalisation(session_id)
     if session is None or rejection is not None:
-        existing = None if session is None else session.finalisation
-        if existing is not None and getattr(existing, "status", None) == "aborted":
-            return cast(SessionFinalisationResult, existing)
         purpose = None if session is None else session.purpose
         return _rejected_finalisation(
             session_id, purpose, cast(FinalisationRejectionReason, rejection)
