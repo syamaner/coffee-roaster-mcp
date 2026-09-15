@@ -41,10 +41,14 @@ from coffee_roaster_mcp.mcp_server import (
     DriverEvidenceRead,
     SamplerFinalisationEvidence,
     ServerContext,
+    _disconnect_finalisation,  # pyright: ignore[reportPrivateUsage]
     _evidence_admission_rejection,  # pyright: ignore[reportPrivateUsage]
     _finalise_cold_characterisation_session,  # pyright: ignore[reportPrivateUsage]
+    _process_ambient_runtime_for_active_session,  # pyright: ignore[reportPrivateUsage]
+    _process_first_crack_runtime_for_active_session,  # pyright: ignore[reportPrivateUsage]
     _read_driver_lifecycle_evidence,  # pyright: ignore[reportPrivateUsage]
     _recording_evidence,  # pyright: ignore[reportPrivateUsage]
+    _sample_active_session_telemetry,  # pyright: ignore[reportPrivateUsage]
     _serialize_first_crack_status,  # pyright: ignore[reportPrivateUsage]
     _TelemetrySampler,  # pyright: ignore[reportPrivateUsage]
     build_server_context,
@@ -158,6 +162,25 @@ def test_recording_evidence_includes_additional_wavs(tmp_path: Path) -> None:
         "annotation_session_sidecar",
         "additional_wav",
     ]
+
+
+def test_recording_metadata_filesystem_error_is_terminal_and_disconnects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unreadable recording metadata is retained as a terminal recording failure."""
+    context = _cold_finalisation_context(tmp_path)
+    _set_first_crack_runtime(context, RecordingFailureRuntime(tmp_path, "recording_sidecar"))
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+
+    def unreadable_path(_self: Path) -> bool:
+        raise OSError("metadata unavailable")
+
+    monkeypatch.setattr(Path, "is_file", unreadable_path)
+    result = _finalise_cold_characterisation_session(context, session.id)
+    assert result.status == "completed_not_clean"
+    assert result.stages[2].status == "failed"
+    assert result.disconnect.connected_false_confirmed is True
 
 
 def test_pre_disconnect_unreadable_evidence_retains_partial_result(tmp_path: Path) -> None:
@@ -353,7 +376,10 @@ def test_finalisation_result_has_exact_safe_request_and_terminal_schema(tmp_path
 
 def test_finalisation_path_has_no_forbidden_actuator_calls() -> None:
     """N13: static proof keeps cold finalisation non-actuating except disconnect."""
-    tree = ast.parse(inspect.getsource(_finalise_cold_characterisation_session))
+    tree = ast.parse(
+        inspect.getsource(_finalise_cold_characterisation_session)
+        + inspect.getsource(_disconnect_finalisation)
+    )
     forbidden = {
         "set_heat",
         "set_fan",
@@ -361,9 +387,28 @@ def test_finalisation_path_has_no_forbidden_actuator_calls() -> None:
         "start_cooling",
         "stop_cooling",
         "emergency_stop",
+        "connect",
     }
     attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
     assert not attributes & forbidden
+
+
+def test_finalisation_admission_fences_background_work_before_record_attach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The admission reservation prevents sampler and runtime work before record attach."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    _, rejection, _ = context.session_store.begin_finalisation(session.id)
+    assert rejection is None
+
+    def forbidden_read() -> RoasterState:
+        raise AssertionError("fenced sampler read the driver")
+
+    monkeypatch.setattr(context.roaster_driver, "read_state", forbidden_read)
+    assert _sample_active_session_telemetry(context, session_id=session.id) is False
+    _process_first_crack_runtime_for_active_session(context, session_id=session.id)
+    _process_ambient_runtime_for_active_session(context, session_id=session.id)
 
 
 def test_lifecycle_evidence_serializes_safe_zero_and_streaming_transitions(tmp_path: Path) -> None:
@@ -410,6 +455,11 @@ def test_emergency_stop_during_finalisation_prevents_later_disconnect(tmp_path: 
     assert not errors
     assert driver.actions == ["connect"]
     assert results and cast(Any, results[0]).status == "aborted"
+    assert cast(Any, results[0]).abort_reason == "emergency_stop"
+    assert (
+        cast(Any, results[0]).emergency_stop_ordering == "emergency_stop_before_disconnect_commit"
+    )
+    assert session.pending_driver_command_token is None
 
 
 def test_nonterminal_finalisation_cannot_resume_after_a_later_session_starts(

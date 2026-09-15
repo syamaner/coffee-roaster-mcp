@@ -736,6 +736,33 @@ def test_emergency_abort_releases_finalisation_reservation_for_recovery() -> Non
     assert session.pending_driver_command_kind is None
 
 
+@pytest.mark.parametrize("mismatch", ("token", "generation"))
+def test_finalisation_private_fence_mismatch_returns_retained_abort(mismatch: str) -> None:
+    """A retained result aborts when either private finalisation fence changes."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(session.id)
+    assert rejection is None and generation is not None
+
+    class Record:
+        status = "partial"
+        abort_reason: str | None = None
+        retained = False
+
+        def __init__(self, reservation_generation: int) -> None:
+            self.reservation_generation = reservation_generation
+
+    record = Record(generation)
+    store.attach_finalisation(session, record)
+    if mismatch == "token":
+        store._finalisation_tokens[session.id] = "wrong"  # pyright: ignore[reportPrivateUsage]
+    else:
+        record.reservation_generation += 1
+    assert store.abort_finalisation_if_invalid(session, generation) is record
+    assert record.status == "aborted" and record.retained is True
+    assert session.pending_driver_command_token is None
+
+
 def test_append_telemetry_rejects_out_of_order_samples() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(

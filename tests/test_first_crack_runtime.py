@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -12,7 +13,12 @@ from coffee_roaster_mcp.artifacts import (
     ResolvedArtifact,
     ResolvedDetectorArtifacts,
 )
-from coffee_roaster_mcp.audio import AudioCaptureError, AudioCaptureSnapshot, AudioWindow
+from coffee_roaster_mcp.audio import (
+    AudioCaptureError,
+    AudioCaptureSettings,
+    AudioCaptureSnapshot,
+    AudioWindow,
+)
 from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig
 from coffee_roaster_mcp.detector import (
     FirstCrackDetectorAdapter,
@@ -1141,6 +1147,62 @@ def test_default_pipeline_factory_passes_recorder(monkeypatch: pytest.MonkeyPatc
     # The default factory built the pipeline with the session recorder teed in.
     assert snapshot.status == "pending"
     assert captured["recorder"] is not None
+
+
+def test_default_pipeline_tees_generated_wav_into_real_recorder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordinary default pipeline records generated WAV samples without a device."""
+    import struct
+    import wave
+
+    import coffee_roaster_mcp.audio as audio_module
+    from coffee_roaster_mcp.audio import RoastAudioRecorder, WavAudioInput
+    from coffee_roaster_mcp.config import RecordingConfig
+
+    source = tmp_path / "source.wav"
+    with wave.open(str(source), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(struct.pack("<32000h", *([1024] * 32_000)))
+    read_started = Event()
+
+    class EventedWavInput:
+        def __init__(self) -> None:
+            self._source = WavAudioInput(source, sample_rate=16_000)
+
+        def read_samples(self, sample_count: int) -> Sequence[float]:
+            read_started.set()
+            return self._source.read_samples(sample_count)
+
+        def close(self) -> None:
+            self._source.close()
+
+    def wav_input(_settings: AudioCaptureSettings) -> EventedWavInput:
+        return EventedWavInput()
+
+    monkeypatch.setattr(audio_module, "build_configured_audio_input", wav_input)
+    store = RoastSessionStore()
+    session = store.start_session()
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            audio=AudioConfig(source="microphone", sample_rate=16_000),
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+            recording=RecordingConfig(
+                enabled=True, autocapture=True, export_location=tmp_path / "out"
+            ),
+        ),
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+    runtime.start_for_session(session)
+    assert read_started.wait(timeout=1.0)
+    assert runtime.finalise_for_session(session.id) == ("stopped", None, False)
+    recorder, plan = runtime.recording_for_session(session.id)
+    assert isinstance(recorder, RoastAudioRecorder)
+    assert plan is not None and plan.primary_wav.is_file()
 
 
 def test_build_session_recorder_milestones_track_session(tmp_path: Path) -> None:
