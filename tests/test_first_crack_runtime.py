@@ -2244,3 +2244,33 @@ def test_finalise_for_session_stops_without_inference_and_preserves_other_sessio
     assert pipeline.stopped is True
     assert backend.windows == []
     assert runtime.recording_for_session(session.id) == (None, None)
+
+
+@pytest.mark.parametrize("mode", ("no_pipeline", "stop_failure", "still_running"))
+def test_finalise_for_session_reports_nonclean_capture_states(mode: str) -> None:
+    """Finalisation preserves bounded capture failures without detector inference."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    pipeline = FakeAudioPipeline(running_after_stop=mode == "still_running")
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+    runtime.start_for_session(session)
+    if mode == "no_pipeline":
+        runtime._pipeline = None  # pyright: ignore[reportPrivateUsage]
+        expected = ("not_active", None, False)
+    elif mode == "stop_failure":
+
+        def fail_stop(*, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
+            del timeout_seconds
+            raise RuntimeError("stop failed")
+
+        pipeline.stop = fail_stop  # type: ignore[method-assign]
+        expected = ("stop_failed", "RuntimeError: stop failed", True)
+    else:
+        expected = ("capture_still_running", None, True)
+    assert runtime.finalise_for_session(session.id) == expected

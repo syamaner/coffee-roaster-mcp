@@ -1767,6 +1767,30 @@ def test_lifecycle_evidence_requires_complete_streaming_fields() -> None:
         )
 
 
+def test_non_streaming_lifecycle_evidence_rejects_lifecycle_fields() -> None:
+    """Non-streaming drivers must not claim command-loop lifecycle evidence."""
+    with pytest.raises(ValueError, match="must omit lifecycle fields"):
+        DriverLifecycleEvidence(
+            driver="mock",
+            connected=True,
+            command_streaming_required=False,
+            command_loop_running=False,
+            serial_open=None,
+            heat_level_percent=0,
+            roast_fan_level_percent=0,
+            main_fan_level_percent=0,
+            drum_motor_on=False,
+            cooling_motor_on=False,
+            solenoid_open=False,
+            command_send_attempts=None,
+            command_write_count=None,
+            last_command_write_size=None,
+            command_loop_error_count=None,
+            status_packet_count=None,
+            status_read_error_count=None,
+        )
+
+
 def test_mock_lifecycle_evidence_is_non_advancing_and_tracks_connection() -> None:
     """Mock lifecycle reads retain safe-zero state and do not advance telemetry."""
     driver = MockRoasterDriver()

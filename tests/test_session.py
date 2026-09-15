@@ -638,6 +638,82 @@ def test_record_active_telemetry_sample_returns_none_when_session_is_stale() -> 
     assert list(second_session.telemetry_buffer) == []
 
 
+def test_finalisation_reservation_blocks_snapshot_telemetry_and_second_admission() -> None:
+    """A retained cold finalisation fences telemetry and concurrent invocations."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    admitted, rejection, generation = store.begin_finalisation(session.id)
+    assert admitted is session and rejection is None and generation is not None
+
+    class Record:
+        status: str = "partial"
+        reservation_generation = generation
+
+    record = Record()
+    store.attach_finalisation(session, record)
+
+    assert (
+        store.record_active_telemetry_sample(
+            session_id=session.id,
+            bean_temp_c=100.0,
+            env_temp_c=120.0,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=False,
+        )
+        is None
+    )
+    _, rejection, _ = store.begin_finalisation(session.id)
+    assert rejection == "finalisation_in_progress"
+
+
+def test_session_snapshot_and_finalisation_admission_rejections() -> None:
+    """Snapshot startup and faulted, held, and concurrent admissions fail closed."""
+    store = RoastSessionStore()
+    snapshot = store.start_session_snapshot(purpose="cold_characterisation")
+    assert snapshot.active is True and snapshot.purpose == "cold_characterisation"
+    live = store._latest_session  # pyright: ignore[reportPrivateUsage]
+    assert live is not None
+    object.__setattr__(live, "faulted_at_utc", live.created_at_utc)
+    _, rejection, _ = store.begin_finalisation(live.id)
+    assert rejection == "session_faulted"
+
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    store.reserve_driver_command(session, kind="control")
+    _, rejection, _ = store.begin_finalisation(session.id)
+    assert rejection == "command_in_progress"
+
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, _ = store.begin_finalisation(session.id)
+    assert rejection is None
+    _, rejection, _ = store.begin_finalisation(session.id)
+    assert rejection == "finalisation_in_progress"
+
+
+def test_resumed_finalisation_requires_its_retained_reservation() -> None:
+    """A retained partial result aborts if its finalisation token was lost."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(session.id)
+    assert rejection is None and generation is not None
+
+    class Record:
+        def __init__(self, reservation_generation: int) -> None:
+            self.status = "partial"
+            self.reservation_generation = reservation_generation
+
+    record = Record(generation)
+    store.attach_finalisation(session, record)
+    session.pending_driver_command_token = None
+    session.pending_driver_command_kind = None
+    store.finish_finalisation_invocation(session)
+    _, rejection, _ = store.begin_finalisation(session.id)
+    assert rejection == "command_in_progress"
+    assert record.status == "aborted"
+
+
 def test_append_telemetry_rejects_out_of_order_samples() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(

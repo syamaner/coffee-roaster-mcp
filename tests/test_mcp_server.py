@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import json
 import logging
@@ -37,10 +38,13 @@ from coffee_roaster_mcp.first_crack_runtime import (
 )
 from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
+    DriverEvidenceRead,
     SamplerFinalisationEvidence,
     ServerContext,
+    _evidence_admission_rejection,  # pyright: ignore[reportPrivateUsage]
     _finalise_cold_characterisation_session,  # pyright: ignore[reportPrivateUsage]
     _read_driver_lifecycle_evidence,  # pyright: ignore[reportPrivateUsage]
+    _recording_evidence,  # pyright: ignore[reportPrivateUsage]
     _serialize_first_crack_status,  # pyright: ignore[reportPrivateUsage]
     build_server_context,
     create_mcp_server,
@@ -75,6 +79,147 @@ def test_cold_characterisation_finalisation_is_clean_and_idempotent(tmp_path: Pa
     assert result.final_driver_evidence.evidence.connected is False
     assert context.session_store.get_session_snapshot(session_id=session.id).active is False
     assert _finalise_cold_characterisation_session(context, session.id) == result
+
+
+def test_registered_finalisation_tool_runs_in_process_wrapper(tmp_path: Path) -> None:
+    """The registered async tool delegates cold finalisation to its worker thread."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+    server = create_mcp_server()
+    result = asyncio.run(
+        _call_tool(
+            server, "finalise_cold_characterisation_session", _ctx(context), session_id=session.id
+        )
+    )
+    assert result.status == "clean"
+
+
+def test_lifecycle_evidence_conversion_and_impossible_none_fail_closed() -> None:
+    """Malformed lifecycle values and absent read evidence remain non-admissible."""
+
+    class CorruptEvidence(DriverLifecycleEvidence):
+        poisoned = False
+
+        def __getattribute__(self, name: str) -> object:
+            if name == "connected" and type(self).poisoned:
+                raise ValueError("corrupt lifecycle evidence")
+            return super().__getattribute__(name)
+
+    raw = CorruptEvidence(
+        driver="mock",
+        connected=True,
+        command_streaming_required=False,
+        command_loop_running=None,
+        serial_open=None,
+        heat_level_percent=0,
+        roast_fan_level_percent=0,
+        main_fan_level_percent=0,
+        drum_motor_on=False,
+        cooling_motor_on=False,
+        solenoid_open=False,
+        command_send_attempts=None,
+        command_write_count=None,
+        last_command_write_size=None,
+        command_loop_error_count=None,
+        status_packet_count=None,
+        status_read_error_count=None,
+    )
+    CorruptEvidence.poisoned = True
+
+    class CorruptDriver:
+        def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
+            return raw
+
+    driver = CorruptDriver()
+    context = SimpleNamespace(roaster_driver=driver)
+    assert _read_driver_lifecycle_evidence(cast(ServerContext, context)).outcome == "malformed"
+    assert (
+        _evidence_admission_rejection(DriverEvidenceRead("now", "read", None, None))
+        == "driver_state_malformed"
+    )
+
+
+def test_recording_evidence_includes_additional_wavs(tmp_path: Path) -> None:
+    """Every planned additional WAV is retained in final recording evidence."""
+    paths = [
+        tmp_path / name for name in ("main.wav", "recording.json", "annotation.json", "extra.wav")
+    ]
+    for path in paths:
+        path.write_bytes(b"x" * 44)
+    plan = RecordingArtifactPlan(paths[0], paths[1], paths[2], (paths[3],))
+    recorder = SimpleNamespace(started_monotonic_seconds=1.0)
+    evidence = _recording_evidence(plan, recorder)
+    assert evidence.outcome == "finalised"
+    assert [item.role for item in evidence.artifacts] == [
+        "primary_wav",
+        "recording_sidecar",
+        "annotation_session_sidecar",
+        "additional_wav",
+    ]
+
+
+def test_pre_disconnect_unreadable_evidence_retains_partial_result(tmp_path: Path) -> None:
+    """A failed revalidation never starts disconnect and remains resumable."""
+
+    class UnreadableBeforeDisconnectDriver(LifecycleRecordingDriver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reads = 0
+
+        def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
+            self.reads += 1
+            if self.reads > 1:
+                raise RuntimeError("unreadable before disconnect")
+            return super().read_lifecycle_evidence()
+
+    context = _cold_finalisation_context(tmp_path)
+    driver = UnreadableBeforeDisconnectDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+    result = _finalise_cold_characterisation_session(context, session.id)
+    assert result.status == "partial"
+    assert result.failures[-1].code == "driver_state_unreadable"
+    assert driver.actions == ["connect"]
+
+
+def test_disconnect_exception_is_retained_for_disconnect_only_retry(tmp_path: Path) -> None:
+    """An exception after a committed disconnect attempt is confirmation-indeterminate."""
+
+    class RaisingDisconnectDriver(LifecycleRecordingDriver):
+        def disconnect(self) -> None:
+            self.actions.append("disconnect")
+            raise RuntimeError("disconnect failed")
+
+    context = _cold_finalisation_context(tmp_path)
+    driver = RaisingDisconnectDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+    result = _finalise_cold_characterisation_session(context, session.id)
+    assert result.status == "disconnect_indeterminate"
+    assert result.disconnect.last_error == "RuntimeError: disconnect failed"
+
+
+def test_resume_returns_retained_abort_when_revalidation_invalidates_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An emergency-path invalidation between admission and work returns its retained abort."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+    aborted = SimpleNamespace(status="aborted", abort_reason="session_or_reservation_changed")
+
+    def return_aborted(_session: RoastSession, _generation: int | None) -> object:
+        return aborted
+
+    monkeypatch.setattr(
+        context.session_store,
+        "abort_finalisation_if_invalid",
+        return_aborted,
+    )
+    assert _finalise_cold_characterisation_session(context, session.id) is aborted
 
 
 def test_normal_session_finalisation_is_rejected_without_disconnect(tmp_path: Path) -> None:
