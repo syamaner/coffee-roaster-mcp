@@ -1809,13 +1809,11 @@ def _append_finalisation_failure(
     code: str,
     message: str,
 ) -> SessionFinalisationResult:
-    """Append immutable failure evidence and mark recovery when applicable."""
+    """Append immutable failure evidence without changing recovery state."""
     failure = FinalisationFailure(
         stage, code, message, result.attempt_number, datetime.now(UTC).isoformat()
     )
-    return dataclasses.replace(
-        result, failures=(*result.failures, failure), recovered_after_failure=True
-    )
+    return dataclasses.replace(result, failures=(*result.failures, failure))
 
 
 def _recording_evidence(
@@ -2078,6 +2076,7 @@ def _disconnect_finalisation(
             result,
             status="clean" if clean else "completed_not_clean",
             clean=clean,
+            recovered_after_failure=clean and bool(result.failures),
             last_ended_at_utc=datetime.now(UTC).isoformat(),
             last_ended_session_elapsed_seconds=session.elapsed_monotonic_seconds(time.monotonic),
             session_active_after=False,

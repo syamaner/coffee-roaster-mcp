@@ -490,6 +490,7 @@ def test_disconnect_indeterminate_retries_only_disconnect_for_same_session(tmp_p
 
     first = _finalise_cold_characterisation_session(context, session.id)
     assert first.status == "disconnect_indeterminate"
+    assert first.recovered_after_failure is False
     assert first.disconnect.attempt_count == 1
     assert [stage.status for stage in first.stages[:3]] == [
         "completed",
@@ -500,6 +501,7 @@ def test_disconnect_indeterminate_retries_only_disconnect_for_same_session(tmp_p
 
     second = _finalise_cold_characterisation_session(context, session.id)
     assert second.status == "clean"
+    assert second.recovered_after_failure is True
     assert second.disconnect.attempt_count == 2
     assert second.stages[3].status == "completed"
     assert driver.actions == ["connect", "disconnect", "disconnect"]
@@ -515,6 +517,7 @@ def test_sampler_join_timeout_resumes_only_the_sampler_stage(tmp_path: Path) -> 
 
     partial = _finalise_cold_characterisation_session(context, session.id)
     assert partial.status == "partial"
+    assert partial.recovered_after_failure is False
     assert partial.stages[0].status == "incomplete"
     completed = _finalise_cold_characterisation_session(context, session.id)
 
@@ -535,10 +538,12 @@ def test_first_crack_stop_failure_resumes_without_rerunning_sampler(tmp_path: Pa
 
     partial = _finalise_cold_characterisation_session(context, session.id)
     assert partial.status == "partial"
+    assert partial.recovered_after_failure is False
     assert partial.stages[1].status == "incomplete"
     completed = _finalise_cold_characterisation_session(context, session.id)
 
     assert completed.status == "clean"
+    assert completed.recovered_after_failure is True
     assert runtime.calls == 2
     assert sampler.calls == 1
 
@@ -558,6 +563,7 @@ def test_recording_failure_is_terminal_not_clean_and_idempotent(
 
     assert result.status == "completed_not_clean"
     assert result.clean is False and result.retained is True
+    assert result.recovered_after_failure is False
     assert result.stages[2].status == "failed"
     assert result.disconnect.connected_false_confirmed is True
     assert result.failures[-1].stage == "recording"
