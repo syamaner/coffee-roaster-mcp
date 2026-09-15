@@ -1841,6 +1841,39 @@ def test_hottop_lifecycle_evidence_tracks_connect_disconnect_without_actuation()
     assert after.command_write_count == connected.command_write_count
 
 
+def test_hottop_lifecycle_evidence_surfaces_transport_is_open_failure() -> None:
+    """Evidence never pretends a serial-open read succeeded when it raised."""
+
+    class IsOpenFailingTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            self.raise_on_is_open = False
+            super().__init__()
+
+        @property
+        def is_open(self) -> bool:
+            if self.raise_on_is_open:
+                raise RuntimeError("serial state unreadable")
+            return self._is_open
+
+        @is_open.setter
+        def is_open(self, value: bool) -> None:
+            self._is_open = value
+
+    transport = IsOpenFailingTransport()
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.05,
+        serial_factory=FakeSerialFactory(transport=transport),
+    )
+    driver.connect()
+    transport.raise_on_is_open = True
+    with pytest.raises(RuntimeError, match="serial state unreadable"):
+        driver.read_lifecycle_evidence()
+    transport.raise_on_is_open = False
+    driver.disconnect()
+    assert transport.close_calls == 1
+
+
 def test_hottop_lifecycle_evidence_reports_stuck_loop_after_disconnect_timeout() -> None:
     """A timed-out Hottop loop remains visible as failed disconnect confirmation evidence."""
     factory = FakeSerialFactory()

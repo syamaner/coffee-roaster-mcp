@@ -18,8 +18,9 @@ from coffee_roaster_mcp.audio import (
     AudioCaptureSettings,
     AudioCaptureSnapshot,
     AudioWindow,
+    RoastRecorder,
 )
-from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig
+from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig, RecordingConfig
 from coffee_roaster_mcp.detector import (
     FirstCrackDetectorAdapter,
     FirstCrackDetectorOutput,
@@ -146,6 +147,10 @@ class FakeAudioPipeline:
             total_overflow_count=self.total_overflow_count,
             max_consecutive_overflow_count=self.max_consecutive_overflow_count,
         )
+
+    @property
+    def shutdown_confirmed(self) -> bool:
+        return self.stopped and not self.running_after_stop
 
 
 def test_disabled_and_manual_modes_do_not_prepare_audio_or_detector() -> None:
@@ -561,13 +566,12 @@ def test_audio_runtime_reports_stopped_after_pipeline_stop_returns_running_snaps
     assert snapshot.active is True
     assert snapshot.audio_running is True
 
-    # stop_for_session finalises capture. Even though this pipeline's snapshot
-    # keeps claiming running after stop() (running_after_stop=True), the runtime
-    # forces the stopped snapshot once it has torn the pipeline down.
+    # A false aggregate running value cannot prove both capture workers stopped;
+    # finalisation retains the pipeline until its strong shutdown query agrees.
     stopped = runtime.stop_for_session(session.id, reason="roast complete")
     assert pipeline.stopped is True
-    assert stopped.active is False
-    assert stopped.audio_running is False
+    assert stopped.active is True
+    assert stopped.audio_running is True
 
 
 def test_runtime_mic_levels_are_live_only_and_none_after_stop() -> None:
@@ -748,12 +752,11 @@ def test_runtime_overflow_rolling_fields_decay_from_last_live_poll_when_stop_its
     # refresh _last_capture_snapshot with a fresh stop-instant read — the
     # 90-second-old live poll is all that remains.
     stopped = runtime.stop_for_session(session.id, reason="roast complete")
-    # The stop failure itself faults the runtime; the overflow fields must
-    # still reflect the correctly-decayed 90-second-old aggregate rather
-    # than a value frozen fresh at the (failed) stop instant.
+    # An unconfirmed stop retains the live capture handle rather than claiming
+    # that its reader has gone away.
     assert stopped.status == "faulted"
-    assert stopped.overflow_count_last_minute == 0
-    assert stopped.estimated_lost_audio_ms_last_minute == 0.0
+    assert stopped.active is True
+    assert stopped.overflow_count_last_minute == 7
     # The lifetime total survives regardless of decay.
     assert stopped.total_overflow_count == 42
 
@@ -2324,6 +2327,7 @@ def test_finalise_for_session_reports_nonclean_capture_states(mode: str) -> None
     runtime.start_for_session(session)
     if mode == "no_pipeline":
         runtime._pipeline = None  # pyright: ignore[reportPrivateUsage]
+        runtime._capture_started_for_session = False  # pyright: ignore[reportPrivateUsage]
         expected = ("not_active", None, False)
     elif mode == "stop_failure":
 
@@ -2336,6 +2340,57 @@ def test_finalise_for_session_reports_nonclean_capture_states(mode: str) -> None
     else:
         expected = ("capture_still_running", None, True)
     assert runtime.finalise_for_session(session.id) == expected
+    if mode == "still_running":
+        pipeline.running_after_stop = False
+        assert runtime.finalise_for_session(session.id) == ("stopped", None, False)
+
+
+def test_finalise_recognises_capture_stopped_before_finalisation() -> None:
+    """A prior confirmed stop is not mistaken for never-started capture."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    pipeline = FakeAudioPipeline()
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+    runtime.start_for_session(session)
+    runtime.stop_for_session(session.id, reason="operator stopped capture")
+    assert runtime.finalise_for_session(session.id) == ("stopped", None, False)
+
+
+def test_recorder_build_failure_cannot_expose_prior_session_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Starting a new session clears prior recorder state before recorder construction."""
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+
+    config = AppConfig(
+        first_crack=FirstCrackConfig(mode="audio"),
+        recording=RecordingConfig(enabled=True, autocapture=True, export_location=tmp_path),
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=config,
+        audio_pipeline_factory=lambda _: FakeAudioPipeline(),
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+    first = RoastSessionStore().start_session()
+    runtime.start_for_session(first)
+    assert runtime.recording_for_session(first.id)[1] is not None
+
+    def fail_recorder(*_args: object, **_kwargs: object) -> RoastRecorder:
+        raise RuntimeError("recorder build failed")
+
+    monkeypatch.setattr(runtime_module, "build_session_recorder", fail_recorder)
+    second = RoastSessionStore().start_session()
+    with pytest.raises(RuntimeError, match="recorder build failed"):
+        runtime.start_for_session(second)
+    assert runtime.recording_for_session(second.id) == (None, None)
 
 
 def test_finalisation_fence_session_error_preserves_live_capture_handles(
@@ -2371,4 +2426,4 @@ def test_finalisation_fence_session_error_preserves_live_capture_handles(
     unfenced = runtime.process_available_windows(session_store=store, session=session)
     assert unfenced.status == "faulted"
     assert unfenced.reason == "First-crack detection failed: Session finalisation is in progress."
-    assert runtime.finalise_for_session(session.id)[0] == "not_active"
+    assert runtime.finalise_for_session(session.id)[0] == "stopped"

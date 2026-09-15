@@ -1120,8 +1120,7 @@ def create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         with server_context.lifecycle_barrier:
             session = _require_active_session(server_context)
-            if session.pending_driver_command_kind != "finalisation":
-                server_context.session_store.cancel_pending_driver_command(session)
+            server_context.session_store.cancel_nonfinalisation_driver_command(session)
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
             event, snapshot = server_context.session_store.emergency_stop_snapshot(
                 session,
@@ -1652,8 +1651,14 @@ def _fault_active_session_after_sampler_failure(
         with server_context.lifecycle_barrier:
             latest_session = server_context.session_store.get_latest_session()
             terminal = getattr(getattr(session, "finalisation", None), "status", None)
-            if latest_session is not session or (
-                not session.active and terminal in ("clean", "completed_not_clean")
+            if (
+                latest_session is session
+                and not session.active
+                and terminal
+                in (
+                    "clean",
+                    "completed_not_clean",
+                )
             ):
                 return
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
@@ -1937,6 +1942,8 @@ def _finalise_cold_characterisation_session(
             )
         except Exception:
             server_context.session_store.abandon_finalisation_admission(session)
+            if session.active and session.purpose == "cold_characterisation":
+                server_context.telemetry_sampler.start_for_session(session.id)
             raise
         server_context.session_store.attach_finalisation(session, result)
     try:
@@ -2118,7 +2125,16 @@ def _disconnect_finalisation(
                     ),
                 ),
             )
-        result = _with_stage(result, 3, "completed")
+        if final.evidence is not None and not final.evidence.safe_zero:
+            result = _append_finalisation_failure(
+                result,
+                "driver_disconnect",
+                "final_driver_not_safe_zero",
+                "Final driver evidence was not safe zero.",
+            )
+            result = _with_stage(result, 3, "failed", "Final driver evidence was not safe zero.")
+        else:
+            result = _with_stage(result, 3, "completed")
         clean = (
             all(stage.status in ("completed", "not_applicable") for stage in result.stages)
             and all(stage.status != "failed" for stage in result.stages)

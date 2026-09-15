@@ -104,6 +104,8 @@ def test_initial_finalisation_construction_error_releases_fresh_admission(
     context = _cold_finalisation_context(tmp_path)
     session = context.session_store.start_session(purpose="cold_characterisation")
     context.roaster_driver.connect()
+    restarted: list[str] = []
+    monkeypatch.setattr(context.telemetry_sampler, "start_for_session", restarted.append)
 
     def fail_initial(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("initial result failed")
@@ -115,6 +117,46 @@ def test_initial_finalisation_construction_error_releases_fresh_admission(
     assert session.pending_driver_command_kind is None
     assert session.finalisation is None
     assert session.id not in context.session_store._finalisation_in_progress  # pyright: ignore[reportPrivateUsage]
+    assert restarted == [session.id]
+
+
+def test_confirmed_disconnect_with_nonzero_final_evidence_is_not_clean(tmp_path: Path) -> None:
+    """Disconnect confirmation still records unsafe final driver evidence."""
+    context = _cold_finalisation_context(tmp_path)
+
+    class UnsafeAfterDisconnectDriver(LifecycleRecordingDriver):
+        def disconnect(self) -> None:
+            super().disconnect()
+            self.non_zero_dimension = "drum_motor_on"
+
+    driver = UnsafeAfterDisconnectDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+
+    result = _finalise_cold_characterisation_session(context, session.id)
+
+    assert result.status == "completed_not_clean"
+    assert result.disconnect.connected_false_confirmed is True
+    assert result.stages[3].status == "failed"
+    assert result.failures[-1].code == "final_driver_not_safe_zero"
+
+
+def test_normal_roast_sampler_failure_still_fails_closed(tmp_path: Path) -> None:
+    """A normal session's sampler failure remains an emergency-stop path."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session()
+    driver.connect()
+
+    _fault_active_session_after_sampler_failure(
+        context, session=session, error=RuntimeError("lost")
+    )
+
+    assert driver.actions[-1].startswith("emergency_stop:")
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.phase == "fault"
 
 
 def test_registered_finalisation_tool_runs_in_process_wrapper(tmp_path: Path) -> None:
@@ -2307,6 +2349,10 @@ class _QueuedWindowAudioPipeline:
             peak_dbfs=None,
             rms_dbfs=None,
         )
+
+    @property
+    def shutdown_confirmed(self) -> bool:
+        return self.stopped
 
 
 class _OneShotDetectorBackend:

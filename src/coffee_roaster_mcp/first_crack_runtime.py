@@ -70,6 +70,11 @@ class FirstCrackAudioPipeline(Protocol):
         """Return current capture status."""
         ...
 
+    @property
+    def shutdown_confirmed(self) -> bool:
+        """Return whether every capture worker has stopped."""
+        ...
+
 
 FirstCrackAudioPipelineFactory = Callable[[AudioConfig], FirstCrackAudioPipeline]
 FirstCrackDetectorAdapterFactory = Callable[[FirstCrackConfig], FirstCrackDetectorAdapter]
@@ -169,6 +174,7 @@ class FirstCrackSessionRuntime:
         self._lock = RLock()
         self._active_session_id: str | None = None
         self._pipeline: FirstCrackAudioPipeline | None = None
+        self._capture_started_for_session = False
         self._adapter: FirstCrackDetectorAdapter | None = None
         self._status: FirstCrackRuntimeState = _initial_status(config.first_crack)
         self._reason: str | None = _initial_reason(config.first_crack)
@@ -282,6 +288,7 @@ class FirstCrackSessionRuntime:
             self._inference_stopped = False
             self._last_capture_snapshot = None
             self._last_capture_snapshot_as_of_monotonic_seconds = None
+            self._capture_started_for_session = False
             # Fresh empty box every session (#191): a prior roast's recovered
             # milestone must never leak into this one's sidecar.
             self._recovered_first_crack_holder = []
@@ -293,6 +300,8 @@ class FirstCrackSessionRuntime:
 
             self._status = "pending"
             self._reason = "Audio first-crack detection is prepared for this session."
+            self._active_recorder = None
+            self._recording_plan = None
             recorder = build_session_recorder(
                 self._config,
                 session,
@@ -311,6 +320,7 @@ class FirstCrackSessionRuntime:
                 adapter = self._detector_adapter_factory(self._config.first_crack)
                 pipeline = self._audio_pipeline_factory(self._config.audio)
                 self._last_capture_snapshot = pipeline.start()
+                self._capture_started_for_session = True
             except ArtifactResolutionError as exc:
                 self._status = "unavailable"
                 self._reason = f"First-crack detector artifacts are unavailable: {exc}"
@@ -601,14 +611,18 @@ class FirstCrackSessionRuntime:
                 return "not_active", None, False
             pipeline = self._pipeline
             if pipeline is None:
-                return "not_active", None, False
+                return (
+                    ("stopped", None, False)
+                    if self._capture_started_for_session
+                    else ("not_active", None, False)
+                )
             try:
                 capture = pipeline.stop(timeout_seconds=self._stop_timeout_seconds)
             except Exception as exc:  # noqa: BLE001 - teardown must be reported.
                 return "stop_failed", f"{type(exc).__name__}: {exc}", True
             self._last_capture_snapshot = _stopped_capture_snapshot(capture)
             self._last_capture_snapshot_as_of_monotonic_seconds = self._monotonic_now()
-            if capture.running:
+            if not pipeline.shutdown_confirmed:
                 return "capture_still_running", None, True
             self._pipeline = None
             self._adapter = None
@@ -837,12 +851,12 @@ class FirstCrackSessionRuntime:
                     pipeline.stop(timeout_seconds=self._stop_timeout_seconds)
                 )
                 self._last_capture_snapshot_as_of_monotonic_seconds = self._monotonic_now()
+                if pipeline.shutdown_confirmed:
+                    self._pipeline = None
+                    self._adapter = None
             except Exception as exc:  # noqa: BLE001 - shutdown should be best effort.
                 self._status = "faulted"
                 self._reason = f"Audio capture stop failed: {type(exc).__name__}: {exc}"
-            finally:
-                self._pipeline = None
-                self._adapter = None
         # The session is over: the next roast may set fresh recording metadata,
         # and inference may run again from scratch (#181).
         self._recorder_built_for_session = False

@@ -1025,6 +1025,11 @@ def test_audio_capture_stop_does_not_close_input_while_worker_reads() -> None:
     # Worker is parked inside read(); a zero-timeout join must not close the input.
     pipeline.stop(timeout_seconds=0.0)
     assert audio_input.closed is False
+    _wait_for(
+        lambda: pipeline._thread is not None and not pipeline._thread.is_alive()  # pyright: ignore[reportPrivateUsage]
+    )
+    assert audio_input.worker_thread is not None and audio_input.worker_thread.is_alive()
+    assert pipeline.shutdown_confirmed is False
 
     # Releasing the read lets the worker observe the stop request, exit, and close.
     audio_input.release()
@@ -1034,6 +1039,8 @@ def test_audio_capture_stop_does_not_close_input_while_worker_reads() -> None:
     assert worker is not None
     worker.join(timeout=1.0)
     assert not worker.is_alive()
+    pipeline.stop(timeout_seconds=1.0)
+    assert pipeline.shutdown_confirmed is True
 
 
 def test_stop_drains_the_readers_final_chunk_after_a_timed_out_join() -> None:

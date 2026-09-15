@@ -1887,6 +1887,20 @@ class AudioCapturePipeline:
         """Return the immutable capture settings."""
         return self._settings
 
+    @property
+    def shutdown_confirmed(self) -> bool:
+        """Return whether neither capture worker thread remains alive.
+
+        This is deliberately a read-only lifecycle query: ``snapshot().running``
+        answers whether capture is currently healthy, whereas finalisation must
+        know that both the reader and processing workers have actually exited.
+        """
+        with self._state_lock:
+            return all(
+                thread is None or not thread.is_alive()
+                for thread in (self._reader_thread, self._thread)
+            )
+
     def start(self) -> AudioCaptureSnapshot:
         """Start background audio capture and return the current status snapshot.
 

@@ -2346,3 +2346,17 @@ def test_record_event_preserves_first_fault_timestamp_across_multiple_faults() -
     assert session.faulted_monotonic_seconds == 5.0
     assert session.event_timeline[0].payload["code"] == "sensor-timeout"
     assert session.event_timeline[1].payload["code"] == "driver-disconnect"
+
+
+def test_atomic_emergency_cancellation_preserves_finalisation_reservation() -> None:
+    """Emergency command cleanup cannot clear a concurrently owned finalisation token."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    admitted, rejection, _ = store.begin_finalisation(session.id)
+
+    assert admitted is session and rejection is None
+    token = session.pending_driver_command_token
+    store.cancel_nonfinalisation_driver_command(session)
+
+    assert session.pending_driver_command_token == token
+    assert session.pending_driver_command_kind == "finalisation"

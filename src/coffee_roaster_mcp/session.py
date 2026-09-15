@@ -1453,6 +1453,14 @@ class RoastSessionStore:
             session.pending_driver_command_token = None
             session.pending_driver_command_kind = None
 
+    def cancel_nonfinalisation_driver_command(self, session: RoastSession) -> None:
+        """Atomically cancel a pending command unless finalisation owns it."""
+        with self._lock:
+            self._assert_latest_session(session)
+            if session.pending_driver_command_kind != "finalisation":
+                session.pending_driver_command_token = None
+                session.pending_driver_command_kind = None
+
     def start_cooling(self, session: RoastSession) -> RoastEvent:
         """Start cooling for one active session."""
         with self._lock:
