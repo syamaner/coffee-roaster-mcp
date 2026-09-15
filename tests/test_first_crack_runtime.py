@@ -2366,4 +2366,9 @@ def test_finalisation_fence_session_error_preserves_live_capture_handles(
     snapshot = runtime.process_available_windows(session_store=store, session=session)
     assert snapshot.status == "pending", snapshot.reason
     assert snapshot.audio_running is True
-    assert runtime.finalise_for_session(session.id)[0] == "stopped"
+    store.abandon_finalisation_admission(session)
+    pipeline.add_window(_audio_window(sequence_number=2))
+    unfenced = runtime.process_available_windows(session_store=store, session=session)
+    assert unfenced.status == "faulted"
+    assert unfenced.reason == "First-crack detection failed: Session finalisation is in progress."
+    assert runtime.finalise_for_session(session.id)[0] == "not_active"
