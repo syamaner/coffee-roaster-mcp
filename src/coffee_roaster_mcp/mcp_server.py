@@ -1649,6 +1649,9 @@ def _fault_active_session_after_sampler_failure(
     reason = f"autonomous telemetry sampler failed: {type(error).__name__}: {error}"
     try:
         with server_context.lifecycle_barrier:
+            active_session = server_context.session_store.get_active_session()
+            if active_session is not session:
+                return
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
             _, snapshot = server_context.session_store.emergency_stop_snapshot(
                 session,

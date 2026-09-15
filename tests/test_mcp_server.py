@@ -743,11 +743,9 @@ def test_sampler_fault_waits_for_committed_disconnect_without_corrupting_result(
     assert not finaliser.is_alive() and not fault_thread.is_alive()
     assert not errors
     assert cast(Any, results[0]).status == "clean"
-    assert driver.actions == [
-        "connect",
-        "disconnect",
-        "emergency_stop:autonomous telemetry sampler failed: RuntimeError: sampler",
-    ]
+    assert driver.actions == ["connect", "disconnect"]
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.phase != "fault" and cast(Any, snapshot.finalisation).status == "clean"
 
 
 def test_quiet_sdk_per_request_log_suppresses_info_keeps_warning() -> None:
