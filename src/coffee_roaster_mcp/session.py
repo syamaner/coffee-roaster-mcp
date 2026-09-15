@@ -925,6 +925,7 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
+            self._assert_finalisation_allows_mutation(session)
             sample = TelemetrySample(
                 recorded_at_utc=self._utc_now(),
                 monotonic_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
@@ -1511,8 +1512,8 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
-            if session.id in self._nonterminal_finalisations and kind != "fault":
-                raise SessionLifecycleError("Session finalisation is in progress.")
+            if kind != "fault":
+                self._assert_finalisation_allows_mutation(session)
             if session.faulted_at_utc is not None and kind != "fault":
                 raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
 
@@ -1587,7 +1588,7 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
-            if session.id in self._nonterminal_finalisations:
+            if self._finalisation_blocks_mutation(session):
                 return None, _copy_session_for_read(session)
             if session.beans_added_at_utc is not None:
                 return self._get_existing_singleton_event(session, "beans_added"), (
@@ -1740,6 +1741,7 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
+            self._assert_finalisation_allows_mutation(session)
             recorded_at_utc = self._utc_now()
             monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
             session.fc_window_count += 1
@@ -1808,6 +1810,7 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
+            self._assert_finalisation_allows_mutation(session)
             if session.faulted_at_utc is not None:
                 raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
 
@@ -1971,18 +1974,29 @@ class RoastSessionStore:
             if session is None:
                 return None, "unknown_session", None
             if session.finalisation is not None:
+                if getattr(session.finalisation, "status", None) in (
+                    "clean",
+                    "completed_not_clean",
+                    "aborted",
+                ):
+                    return (
+                        session,
+                        None,
+                        getattr(session.finalisation, "reservation_generation", None),
+                    )
                 if session_id in self._finalisation_in_progress:
                     return session, "finalisation_in_progress", None
+                rejection = self._finalisation_admission_rejection_locked(
+                    session, require_reservation=True
+                )
+                if rejection is not None:
+                    self._abort_finalisation_locked(session)
+                    return session, rejection, None
                 self._finalisation_in_progress.add(session_id)
                 return session, None, getattr(session.finalisation, "reservation_generation", None)
-            if self._latest_session is not session:
-                return session, "not_latest_session", None
-            if not session.active:
-                return session, "session_not_active", None
-            if session.purpose != "cold_characterisation":
-                return session, "session_purpose_not_eligible", None
-            if session.faulted_at_utc is not None:
-                return session, "session_faulted", None
+            rejection = self._finalisation_admission_rejection_locked(session)
+            if rejection is not None:
+                return session, rejection, None
             if session_id in self._finalisation_in_progress:
                 return session, "finalisation_in_progress", None
             if session.pending_driver_command_token is not None:
@@ -2025,6 +2039,21 @@ class RoastSessionStore:
             )
             return _copy_session_for_read(session)
 
+    def abort_finalisation_if_invalid(
+        self, session: RoastSession, generation: int | None
+    ) -> object | None:
+        """Atomically abort a retained finalisation when its reservation changed."""
+        with self._lock:
+            record = session.finalisation
+            if (
+                record is not None
+                and self._finalisation_admission_rejection_locked(session, require_reservation=True)
+                is None
+                and getattr(record, "reservation_generation", None) == generation
+            ):
+                return None
+            return self._abort_finalisation_locked(session)
+
     def copy_session(self, session: RoastSession) -> RoastSession:
         """Return a deep-copied snapshot of one known session object under the store lock."""
         with self._lock:
@@ -2040,6 +2069,48 @@ class RoastSessionStore:
         self._assert_latest_session(session)
         if not session.active:
             raise SessionLifecycleError("Stopped sessions cannot be mutated.")
+
+    def _finalisation_blocks_mutation(self, session: RoastSession) -> bool:
+        """Return whether a finalisation reservation excludes ordinary mutation."""
+        return (
+            session.id in self._nonterminal_finalisations
+            or session.pending_driver_command_kind == "finalisation"
+        )
+
+    def _assert_finalisation_allows_mutation(self, session: RoastSession) -> None:
+        """Reject an ordinary mutation while a finalisation reservation is active."""
+        if self._finalisation_blocks_mutation(session):
+            raise SessionLifecycleError("Session finalisation is in progress.")
+
+    def _finalisation_admission_rejection_locked(
+        self, session: RoastSession, *, require_reservation: bool = False
+    ) -> str | None:
+        """Return the current finalisation-identity rejection under store locking."""
+        if self._latest_session is not session:
+            return "not_latest_session"
+        if not session.active:
+            return "session_not_active"
+        if session.purpose != "cold_characterisation":
+            return "session_purpose_not_eligible"
+        if session.faulted_at_utc is not None:
+            return "session_faulted"
+        if require_reservation and (
+            session.pending_driver_command_kind != "finalisation"
+            or session.pending_driver_command_token is None
+        ):
+            return "command_in_progress"
+        return None
+
+    def _abort_finalisation_locked(self, session: RoastSession) -> object | None:
+        """Mark a retained finalisation aborted without changing driver lifecycle."""
+        record = session.finalisation
+        if record is not None:
+            object.__setattr__(record, "status", "aborted")
+            object.__setattr__(record, "abort_reason", "session_or_reservation_changed")
+            object.__setattr__(record, "retained", True)
+        self._nonterminal_finalisations.discard(session.id)
+        self._finalisation_in_progress.discard(session.id)
+        return record
 
     def _assert_latest_session(self, session: RoastSession) -> None:
         """Validate that one session is the latest known session."""

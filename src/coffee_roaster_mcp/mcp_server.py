@@ -558,6 +558,9 @@ EmergencyStopOrdering = Literal[
     "emergency_stop_after_disconnect_attempt",
 ]
 ConfirmationState = Literal["confirmed", "not_applicable", "not_confirmed"]
+RecordingArtifactRole = Literal[
+    "primary_wav", "recording_sidecar", "annotation_session_sidecar", "additional_wav"
+]
 
 
 @dataclass(frozen=True)
@@ -580,6 +583,14 @@ class FinalisationStageResult:
     completed_at_utc: str | None = None
     completed_in_attempt: int | None = None
     detail: str | None = None
+
+
+FinalisationStages = tuple[
+    FinalisationStageResult,
+    FinalisationStageResult,
+    FinalisationStageResult,
+    FinalisationStageResult,
+]
 
 
 @dataclass(frozen=True)
@@ -640,9 +651,7 @@ class FirstCrackRuntimeFinalisationEvidence:
 class RecordingArtifact:
     """Identity and stat-only observation of one recording artifact."""
 
-    role: Literal[
-        "primary_wav", "recording_sidecar", "annotation_session_sidecar", "additional_wav"
-    ]
+    role: RecordingArtifactRole
     filename: str
     path: str
     exists: bool
@@ -692,12 +701,7 @@ class SessionFinalisationResult:
     last_ended_at_utc: str | None
     last_ended_session_elapsed_seconds: float | None
     emergency_stop_ordering: EmergencyStopOrdering
-    stages: tuple[
-        FinalisationStageResult,
-        FinalisationStageResult,
-        FinalisationStageResult,
-        FinalisationStageResult,
-    ]
+    stages: FinalisationStages
     failures: tuple[FinalisationFailure, ...]
     admission_driver_evidence: DriverEvidenceRead | None
     pre_disconnect_driver_evidence: DriverEvidenceRead | None
@@ -1754,15 +1758,7 @@ def _initial_finalisation_result(
         last_ended_at_utc=None,
         last_ended_session_elapsed_seconds=None,
         emergency_stop_ordering="not_reached",
-        stages=cast(
-            tuple[
-                FinalisationStageResult,
-                FinalisationStageResult,
-                FinalisationStageResult,
-                FinalisationStageResult,
-            ],
-            stages,
-        ),
+        stages=cast(FinalisationStages, stages),
         failures=(),
         admission_driver_evidence=evidence,
         pre_disconnect_driver_evidence=None,
@@ -1803,15 +1799,7 @@ def _with_stage(
     )
     return dataclasses.replace(
         result,
-        stages=cast(
-            tuple[
-                FinalisationStageResult,
-                FinalisationStageResult,
-                FinalisationStageResult,
-                FinalisationStageResult,
-            ],
-            tuple(stages),
-        ),
+        stages=cast(FinalisationStages, tuple(stages)),
     )
 
 
@@ -1846,15 +1834,7 @@ def _recording_evidence(
         size = path.stat().st_size if exists else None
         items.append(
             RecordingArtifact(
-                cast(
-                    Literal[
-                        "primary_wav",
-                        "recording_sidecar",
-                        "annotation_session_sidecar",
-                        "additional_wav",
-                    ],
-                    role,
-                ),
+                cast(RecordingArtifactRole, role),
                 path.name,
                 str(path),
                 exists,
@@ -1896,6 +1876,9 @@ def _finalise_cold_characterisation_session(
     """Run cold-session teardown without invoking any roaster control operation."""
     session, rejection, generation = server_context.session_store.begin_finalisation(session_id)
     if session is None or rejection is not None:
+        existing = None if session is None else session.finalisation
+        if existing is not None and getattr(existing, "status", None) == "aborted":
+            return cast(SessionFinalisationResult, existing)
         purpose = None if session is None else session.purpose
         return _rejected_finalisation(
             session_id, purpose, cast(FinalisationRejectionReason, rejection)
@@ -1916,6 +1899,11 @@ def _finalise_cold_characterisation_session(
             session, cast(int, generation), evidence, server_context
         )
         server_context.session_store.attach_finalisation(session, result)
+    aborted = server_context.session_store.abort_finalisation_if_invalid(
+        session, result.reservation_generation
+    )
+    if aborted is not None:
+        return cast(SessionFinalisationResult, aborted)
     result = dataclasses.replace(result, attempt_number=result.attempt_number + 1)
     try:
         if result.stages[0].status != "completed":
@@ -1997,6 +1985,11 @@ def _disconnect_finalisation(
 ) -> SessionFinalisationResult:
     """Commit one ordered disconnect attempt and confirm it by evidence read."""
     with server_context.lifecycle_barrier:
+        aborted = server_context.session_store.abort_finalisation_if_invalid(
+            session, result.reservation_generation
+        )
+        if aborted is not None:
+            return cast(SessionFinalisationResult, aborted)
         pre = _read_driver_lifecycle_evidence(server_context)
         if result.disconnect.attempt_count == 0:
             rejection = _evidence_admission_rejection(pre)
@@ -2125,15 +2118,7 @@ def _rejected_finalisation(
         None,
         None,
         "not_reached",
-        cast(
-            tuple[
-                FinalisationStageResult,
-                FinalisationStageResult,
-                FinalisationStageResult,
-                FinalisationStageResult,
-            ],
-            stages,
-        ),
+        cast(FinalisationStages, stages),
         (),
         None,
         None,
