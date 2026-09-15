@@ -101,6 +101,7 @@ class _TelemetrySampler:
         self._lock = RLock()
         self._stop_event = Event()
         self._thread: Thread | None = None
+        self._thread_session_id: str | None = None
         self._active_session_id: str | None = None
         self._last_error: str | None = None
 
@@ -114,6 +115,7 @@ class _TelemetrySampler:
         with self._lock:
             self._stop_event = Event()
             self._active_session_id = session_id
+            self._thread_session_id = session_id
             self._last_error = None
             self._thread = Thread(
                 target=self._run,
@@ -136,7 +138,7 @@ class _TelemetrySampler:
     def stop_and_join_for_finalisation(self, session_id: str) -> SamplerFinalisationEvidence:
         """Stop an owning sampler and retain its handle if bounded join times out."""
         with self._lock:
-            owned = self._active_session_id == session_id
+            owned = self._thread_session_id == session_id
             thread = self._thread if owned else None
             if owned:
                 self._active_session_id = None
@@ -146,6 +148,7 @@ class _TelemetrySampler:
         with self._lock:
             if owned and not alive:
                 self._thread = None
+                self._thread_session_id = None
             return SamplerFinalisationEvidence(
                 owned_by_session_before_stop=owned,
                 thread_alive_after_join=alive,
@@ -184,12 +187,16 @@ class _TelemetrySampler:
                 with self._lock:
                     if self._active_session_id == session_id:
                         self._active_session_id = None
+                    if self._thread_session_id == session_id:
+                        self._thread = None
+                        self._thread_session_id = None
                 return
 
     def _stop_locked(self) -> Thread | None:
         thread = self._thread
         self._active_session_id = None
         self._thread = None
+        self._thread_session_id = None
         self._stop_event.set()
         return thread
 
@@ -1292,6 +1299,8 @@ def _process_first_crack_runtime_for_active_session(
         return
     if session_id is not None and session_id != active_session.id:
         return
+    if server_context.session_store.finalisation_blocks_session(active_session.id):
+        return
     server_context.first_crack_runtime.process_available_windows(
         session_store=server_context.session_store,
         session=active_session,
@@ -1315,6 +1324,8 @@ def _process_ambient_runtime_for_active_session(
         return
     if session_id is not None and session_id != active_session.id:
         return
+    if server_context.session_store.finalisation_blocks_session(active_session.id):
+        return
     server_context.ambient_runtime.poll()
 
 
@@ -1331,6 +1342,8 @@ def _process_auto_t0_for_active_session(
     if active_session is None:
         return False
     if session_id is not None and session_id != active_session.id:
+        return False
+    if server_context.session_store.finalisation_blocks_session(active_session.id):
         return False
     if active_session.phase != "pre_roast" or active_session.beans_added_at_utc is not None:
         return False
@@ -1509,13 +1522,14 @@ def _fail_closed_after_stale_driver_command(
     reservation: DriverCommandReservation,
 ) -> None:
     """Reapply driver safety when a completed command no longer owns the session."""
-    active_session = server_context.session_store.get_active_session()
-    if active_session is not None and active_session.id != reservation.session_id:
-        return
-    run_driver_emergency_stop(
-        server_context,
-        reason="stale driver command after session state changed",
-    )
+    with server_context.lifecycle_barrier:
+        active_session = server_context.session_store.get_active_session()
+        if active_session is not None and active_session.id != reservation.session_id:
+            return
+        run_driver_emergency_stop(
+            server_context,
+            reason="stale driver command after session state changed",
+        )
 
 
 def run_driver_emergency_stop(
@@ -1585,6 +1599,8 @@ def _sample_active_session_telemetry(
     active_session = server_context.session_store.get_active_session()
     if active_session is None or active_session.id != session_id:
         return False
+    if server_context.session_store.finalisation_blocks_session(session_id):
+        return False
 
     try:
         driver_state = server_context.roaster_driver.read_state()
@@ -1631,14 +1647,15 @@ def _fault_active_session_after_sampler_failure(
 ) -> None:
     """Fail closed when autonomous sampling cannot safely continue."""
     reason = f"autonomous telemetry sampler failed: {type(error).__name__}: {error}"
-    safety_payload = run_driver_emergency_stop(server_context, reason=reason)
     try:
-        _, snapshot = server_context.session_store.emergency_stop_snapshot(
-            session,
-            reason=reason,
-            safety_payload=safety_payload,
-            allow_stopped_latest=True,
-        )
+        with server_context.lifecycle_barrier:
+            safety_payload = run_driver_emergency_stop(server_context, reason=reason)
+            _, snapshot = server_context.session_store.emergency_stop_snapshot(
+                session,
+                reason=reason,
+                safety_payload=safety_payload,
+                allow_stopped_latest=True,
+            )
     except SessionLifecycleError:
         return
     server_context.first_crack_runtime.stop_for_session(
@@ -1828,8 +1845,11 @@ def _recording_evidence(
         ("recording_sidecar", plan.recording_sidecar, 1),
         ("annotation_session_sidecar", plan.annotation_session_sidecar, 1),
     ):
-        exists = path.is_file()
-        size = path.stat().st_size if exists else None
+        try:
+            exists = path.is_file()
+            size = path.stat().st_size if exists else None
+        except OSError:
+            exists, size = False, None
         items.append(
             RecordingArtifact(
                 cast(RecordingArtifactRole, role),
@@ -1840,14 +1860,18 @@ def _recording_evidence(
             )
         )
     for path in plan.additional_wavs:
-        exists = path.is_file()
+        try:
+            exists = path.is_file()
+            size = path.stat().st_size if exists else None
+        except OSError:
+            exists, size = False, None
         items.append(
             RecordingArtifact(
                 "additional_wav",
                 path.name,
                 str(path),
                 exists,
-                path.stat().st_size if exists else None,
+                size,
             )
         )
     if recorder is None or getattr(recorder, "started_monotonic_seconds", None) is None:
@@ -1874,6 +1898,9 @@ def _finalise_cold_characterisation_session(
     """Run cold-session teardown without invoking any roaster control operation."""
     session, rejection, generation = server_context.session_store.begin_finalisation(session_id)
     if session is None or rejection is not None:
+        existing = None if session is None else session.finalisation
+        if existing is not None and getattr(existing, "status", None) == "aborted":
+            return cast(SessionFinalisationResult, existing)
         purpose = None if session is None else session.purpose
         return _rejected_finalisation(
             session_id, purpose, cast(FinalisationRejectionReason, rejection)
@@ -1914,7 +1941,7 @@ def _finalise_cold_characterisation_session(
                 result = _with_stage(result, 0, "incomplete", "Sampler join timed out.")
                 return _persist_partial(session, result, server_context)
             result = _with_stage(result, 0, "completed")
-        if result.stages[1].status != "completed":
+        if result.stages[1].status not in ("completed", "not_applicable"):
             outcome, error, capture_running = (
                 server_context.first_crack_runtime.finalise_for_session(session.id)
             )
@@ -1971,8 +1998,10 @@ def _persist_partial(
         session_active_after=True,
         session_phase_after=session.phase,
     )
-    session.finalisation = result
-    return result
+    return cast(
+        SessionFinalisationResult,
+        server_context.session_store.persist_finalisation(session, result),
+    )
 
 
 def _disconnect_finalisation(
@@ -2055,16 +2084,21 @@ def _disconnect_finalisation(
                 "disconnect_not_confirmed",
                 error or "Disconnect state was not confirmed.",
             )
-            session.finalisation = dataclasses.replace(
-                result,
-                status="disconnect_indeterminate",
-                clean=False,
-                last_ended_at_utc=datetime.now(UTC).isoformat(),
-                last_ended_session_elapsed_seconds=session.elapsed_monotonic_seconds(
-                    time.monotonic
+            return cast(
+                SessionFinalisationResult,
+                server_context.session_store.persist_finalisation(
+                    session,
+                    dataclasses.replace(
+                        result,
+                        status="disconnect_indeterminate",
+                        clean=False,
+                        last_ended_at_utc=datetime.now(UTC).isoformat(),
+                        last_ended_session_elapsed_seconds=session.elapsed_monotonic_seconds(
+                            time.monotonic
+                        ),
+                    ),
                 ),
             )
-            return session.finalisation
         result = _with_stage(result, 3, "completed")
         clean = (
             all(stage.status in ("completed", "not_applicable") for stage in result.stages)
@@ -2082,8 +2116,10 @@ def _disconnect_finalisation(
             session_active_after=False,
             session_phase_after=session.phase,
         )
-        session.finalisation = final_result
-        server_context.session_store.finish_finalisation_terminal(session)
+        final_result = cast(
+            SessionFinalisationResult,
+            server_context.session_store.finish_finalisation_terminal(session, final_result),
+        )
     server_context.ambient_runtime.stop_for_session(
         session.id, reason="cold characterisation finalised"
     )

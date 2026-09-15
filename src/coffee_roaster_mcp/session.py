@@ -795,6 +795,7 @@ class RoastSessionStore:
         self._session_id_order: deque[str] = deque()
         self._pending_session_start_token: str | None = None
         self._finalisation_generation = 0
+        self._finalisation_tokens: dict[str, str] = {}
         self._finalisation_in_progress: set[str] = set()
         self._nonterminal_finalisations: set[str] = set()
 
@@ -1908,7 +1909,7 @@ class RoastSessionStore:
                     )
                     object.__setattr__(record, "emergency_stop_ordering", ordering)
                     object.__setattr__(record, "retained", True)
-                self._nonterminal_finalisations.discard(session.id)
+                self._clear_finalisation_locked(session)
             return event
 
     def emergency_stop_snapshot(
@@ -2004,14 +2005,30 @@ class RoastSessionStore:
             self._finalisation_generation += 1
             self._finalisation_in_progress.add(session_id)
             self._reserve_driver_command_locked(session, kind="finalisation")
+            token = session.pending_driver_command_token
+            assert token is not None
+            self._finalisation_tokens[session_id] = token
             return session, None, self._finalisation_generation
 
-    def attach_finalisation(self, session: RoastSession, record: object) -> None:
+    def attach_finalisation(self, session: RoastSession, record: object) -> object:
         """Attach a retained finalisation record after successful admission."""
         with self._lock:
-            self._assert_latest_active_session(session)
+            if self._finalisation_admission_rejection_locked(session, require_reservation=True):
+                object.__setattr__(record, "status", "aborted")
+                object.__setattr__(
+                    record,
+                    "abort_reason",
+                    "emergency_stop"
+                    if session.faulted_at_utc is not None
+                    else "session_or_reservation_changed",
+                )
+                object.__setattr__(record, "retained", True)
+                session.finalisation = record
+                self._clear_finalisation_locked(session)
+                return record
             session.finalisation = record
             self._nonterminal_finalisations.add(session.id)
+            return record
 
     def abandon_finalisation_admission(self, session: RoastSession) -> None:
         """Release a failed first-admission reservation."""
@@ -2019,25 +2036,41 @@ class RoastSessionStore:
             session.pending_driver_command_token = None
             session.pending_driver_command_kind = None
             self._finalisation_in_progress.discard(session.id)
+            self._finalisation_tokens.pop(session.id, None)
 
     def finish_finalisation_invocation(self, session: RoastSession) -> None:
         """Clear the in-progress marker after one finalisation call returns."""
         with self._lock:
             self._finalisation_in_progress.discard(session.id)
 
-    def finish_finalisation_terminal(self, session: RoastSession) -> RoastSession:
+    def finish_finalisation_terminal(self, session: RoastSession, record: object) -> object:
         """Release reservation and stop a successfully disconnected session."""
         with self._lock:
+            if getattr(session.finalisation, "status", None) == "aborted":
+                return session.finalisation
             self._assert_latest_active_session(session)
-            session.pending_driver_command_token = None
-            session.pending_driver_command_kind = None
-            self._nonterminal_finalisations.discard(session.id)
+            session.finalisation = record
+            self._clear_finalisation_locked(session)
             session.stop(
                 utc_now=self._utc_now,
                 monotonic_now=self._monotonic_now,
                 phase=session.phase,
             )
-            return _copy_session_for_read(session)
+            return record
+
+    def persist_finalisation(self, session: RoastSession, record: object) -> object:
+        """Persist nonterminal finalisation progress without overwriting an abort."""
+        with self._lock:
+            if getattr(session.finalisation, "status", None) == "aborted":
+                return session.finalisation
+            session.finalisation = record
+            return record
+
+    def finalisation_blocks_session(self, session_id: str) -> bool:
+        """Return whether finalisation fences background mutation for this session."""
+        with self._lock:
+            session = self._sessions_by_id.get(session_id)
+            return session is not None and self._finalisation_blocks_mutation(session)
 
     def abort_finalisation_if_invalid(
         self, session: RoastSession, generation: int | None
@@ -2050,6 +2083,8 @@ class RoastSessionStore:
                 and self._finalisation_admission_rejection_locked(session, require_reservation=True)
                 is None
                 and getattr(record, "reservation_generation", None) == generation
+                and self._finalisation_tokens.get(session.id)
+                == session.pending_driver_command_token
             ):
                 return None
             return self._abort_finalisation_locked(session)
@@ -2106,11 +2141,19 @@ class RoastSessionStore:
         record = session.finalisation
         if record is not None:
             object.__setattr__(record, "status", "aborted")
-            object.__setattr__(record, "abort_reason", "session_or_reservation_changed")
+            if getattr(record, "abort_reason", None) != "emergency_stop":
+                object.__setattr__(record, "abort_reason", "session_or_reservation_changed")
             object.__setattr__(record, "retained", True)
+        self._clear_finalisation_locked(session)
+        return record
+
+    def _clear_finalisation_locked(self, session: RoastSession) -> None:
+        """Release private finalisation fencing and reservation bookkeeping."""
+        session.pending_driver_command_token = None
+        session.pending_driver_command_kind = None
         self._nonterminal_finalisations.discard(session.id)
         self._finalisation_in_progress.discard(session.id)
-        return record
+        self._finalisation_tokens.pop(session.id, None)
 
     def _assert_latest_session(self, session: RoastSession) -> None:
         """Validate that one session is the latest known session."""

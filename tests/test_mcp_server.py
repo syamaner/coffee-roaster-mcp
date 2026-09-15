@@ -46,6 +46,7 @@ from coffee_roaster_mcp.mcp_server import (
     _read_driver_lifecycle_evidence,  # pyright: ignore[reportPrivateUsage]
     _recording_evidence,  # pyright: ignore[reportPrivateUsage]
     _serialize_first_crack_status,  # pyright: ignore[reportPrivateUsage]
+    _TelemetrySampler,  # pyright: ignore[reportPrivateUsage]
     build_server_context,
     create_mcp_server,
     quiet_sdk_per_request_log,
@@ -524,6 +525,28 @@ def test_sampler_join_timeout_resumes_only_the_sampler_stage(tmp_path: Path) -> 
     assert completed.status == "clean"
     assert completed.recovered_after_failure is True
     assert sampler.calls == 2
+
+
+def test_real_sampler_retains_thread_owner_until_timeout_retry_joins() -> None:
+    """A timed-out finalisation retry joins the same stopped sampler thread."""
+    entered = Event()
+    release = Event()
+
+    def block_sample(_session_id: str) -> bool:
+        entered.set()
+        assert release.wait(timeout=2.0)
+        return False
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=block_sample)
+    sampler.start_for_session("cold-session")
+    assert entered.wait(timeout=1.0)
+    first = sampler.stop_and_join_for_finalisation("cold-session")
+    assert first.owned_by_session_before_stop is True
+    assert first.thread_alive_after_join is True
+    release.set()
+    second = sampler.stop_and_join_for_finalisation("cold-session")
+    assert second.owned_by_session_before_stop is True
+    assert second.thread_alive_after_join is False
 
 
 def test_first_crack_stop_failure_resumes_without_rerunning_sampler(tmp_path: Path) -> None:

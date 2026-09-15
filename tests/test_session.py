@@ -714,6 +714,28 @@ def test_resumed_finalisation_requires_its_retained_reservation() -> None:
     assert record.status == "aborted"
 
 
+def test_emergency_abort_releases_finalisation_reservation_for_recovery() -> None:
+    """Emergency abort keeps its reason and frees the finalisation command token."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(session.id)
+    assert rejection is None and generation is not None
+
+    class Record:
+        status = "partial"
+        reservation_generation = generation
+        abort_reason: str | None = None
+        retained = False
+
+    record = Record()
+    store.attach_finalisation(session, record)
+    store.emergency_stop(session, reason="test")
+    assert record.status == "aborted"
+    assert record.abort_reason == "emergency_stop"
+    assert session.pending_driver_command_token is None
+    assert session.pending_driver_command_kind is None
+
+
 def test_append_telemetry_rejects_out_of_order_samples() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
