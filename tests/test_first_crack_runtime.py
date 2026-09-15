@@ -2215,3 +2215,32 @@ def test_recording_spans_charge_to_session_stop_not_to_first_crack(tmp_path: Pat
     assert annotation_path.exists(), "annotation session JSON must be written at finalisation"
     annotation = json.loads(annotation_path.read_text())
     assert annotation["mics"][0]["file"] == wav_path.name
+
+
+def test_finalise_for_session_stops_without_inference_and_preserves_other_session() -> None:
+    """Cold finalisation stops only its capture and does not invoke the detector."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session(purpose="cold_characterisation")
+    pipeline = FakeAudioPipeline(
+        (_audio_window(sequence_number=1, started_at_monotonic_seconds=1),)
+    )
+    backend = MockDetectorBackend(())
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), backend
+        ),
+    )
+    runtime.start_for_session(session)
+
+    outcome, error, running = runtime.finalise_for_session("other-session")
+    assert (outcome, error, running) == ("not_active", None, False)
+    assert pipeline.stopped is False
+
+    outcome, error, running = runtime.finalise_for_session(session.id)
+    assert (outcome, error, running) == ("stopped", None, False)
+    assert pipeline.stopped is True
+    assert backend.windows == []
+    assert runtime.recording_for_session(session.id) == (None, None)

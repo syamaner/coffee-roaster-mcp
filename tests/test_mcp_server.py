@@ -281,6 +281,83 @@ def test_nonterminal_finalisation_cannot_resume_after_a_later_session_starts(
     assert generation is None
 
 
+def test_finalisation_reservation_fences_first_crack_and_auto_t0_mutation(tmp_path: Path) -> None:
+    """All inference and automatic-T0 mutation paths stop at a finalisation reservation."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    _, rejection, _ = context.session_store.begin_finalisation(session.id)
+
+    assert rejection is None
+    with pytest.raises(SessionLifecycleError, match="finalisation"):
+        context.session_store.record_first_crack_window_observation(
+            session,
+            window_sequence_number=1,
+            confidence=0.5,
+            positive_window_count=1,
+            confirmed=False,
+            fc_status="listening",
+        )
+    with pytest.raises(SessionLifecycleError, match="finalisation"):
+        context.session_store.record_first_crack_detection_snapshot(
+            session, detected_at_monotonic_seconds=session.monotonic_start
+        )
+    event, snapshot = context.session_store.process_auto_t0_reading_snapshot(
+        session, bean_temp_c=100.0, drop_threshold_c=25.0
+    )
+    assert event is None
+    assert snapshot.auto_t0_preheat_sample_count == 0
+    context.session_store.abandon_finalisation_admission(session)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ("unknown", "stopped", "faulted", "held"),
+)
+def test_finalisation_store_rejects_ineligible_sessions(tmp_path: Path, kind: str) -> None:
+    """Unknown, stopped, faulted, and held sessions cannot start finalisation."""
+    context = _cold_finalisation_context(tmp_path)
+    if kind == "unknown":
+        session, rejection, _ = context.session_store.begin_finalisation("missing")
+        assert session is None and rejection == "unknown_session"
+        return
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    if kind == "stopped":
+        session.monotonic_stop = session.monotonic_start
+    elif kind == "faulted":
+        context.session_store.emergency_stop(session, reason="test")
+    else:
+        context.session_store.reserve_driver_command(session, kind="control")
+
+    _, rejection, _ = context.session_store.begin_finalisation(session.id)
+
+    assert rejection in {"session_not_active", "session_faulted", "command_in_progress"}
+
+
+def test_disconnect_indeterminate_retries_only_disconnect_for_same_session(tmp_path: Path) -> None:
+    """A failed confirmation retains stages and retries only the bounded disconnect step."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = RetryLifecycleDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+
+    first = _finalise_cold_characterisation_session(context, session.id)
+    assert first.status == "disconnect_indeterminate"
+    assert first.disconnect.attempt_count == 1
+    assert [stage.status for stage in first.stages[:3]] == [
+        "completed",
+        "not_applicable",
+        "not_applicable",
+    ]
+    driver.confirm_disconnect = True
+
+    second = _finalise_cold_characterisation_session(context, session.id)
+    assert second.status == "clean"
+    assert second.disconnect.attempt_count == 2
+    assert second.stages[3].status == "completed"
+    assert driver.actions == ["connect", "disconnect", "disconnect"]
+
+
 def test_quiet_sdk_per_request_log_suppresses_info_keeps_warning() -> None:
     """Quieting raises the SDK per-request logger to WARNING without touching others."""
     sdk_logger = logging.getLogger(SDK_REQUEST_LOGGER_NAME)
@@ -2509,6 +2586,21 @@ class BrokenLifecycleDriver:
         if self.outcome == "raise":
             raise RuntimeError("evidence unavailable")
         return cast(DriverLifecycleEvidence, object())
+
+
+class RetryLifecycleDriver(LifecycleRecordingDriver):
+    """Lifecycle driver that withholds disconnect confirmation until a retry."""
+
+    def __init__(self) -> None:
+        """Initialize with disconnect confirmation deliberately disabled."""
+        super().__init__()
+        self.confirm_disconnect = False
+
+    def disconnect(self) -> None:
+        """Record every disconnect attempt and confirm only when enabled."""
+        self.actions.append("disconnect")
+        if self.confirm_disconnect:
+            self.connected = False
 
 
 class BlockingFinalisationRuntime(FakeFirstCrackRuntime):

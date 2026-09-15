@@ -11,6 +11,7 @@ from coffee_roaster_mcp.drivers import (
     HOTTOP_PACKET_LENGTH,
     HOTTOP_PACKET_PREFIX,
     CommandStreaming,
+    DriverLifecycleEvidence,
     HottopRoasterDriver,
     MockRoasterDriver,
     RoasterDriver,
@@ -1692,3 +1693,125 @@ def test_mock_driver_emergency_stop_returns_safe_session_state() -> None:
     assert driver.read_state().heat_level_percent == 0
     assert driver.read_state().fan_level_percent == 100
     assert driver.read_state().cooling_on is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("heat_level_percent", True, "integer between 0 and 100"),
+        ("main_fan_level_percent", 101, "between 0 and 100"),
+        ("command_write_count", -1, "non-negative integer"),
+    ),
+)
+def test_lifecycle_evidence_rejects_invalid_command_values(
+    field: str, value: int | bool, message: str
+) -> None:
+    """Lifecycle evidence rejects bool controls, bounds violations, and negative counters."""
+    values: dict[str, object] = {
+        "driver": "mock",
+        "connected": True,
+        "command_streaming_required": False,
+        "command_loop_running": None,
+        "serial_open": None,
+        "heat_level_percent": 0,
+        "roast_fan_level_percent": 0,
+        "main_fan_level_percent": 0,
+        "drum_motor_on": False,
+        "cooling_motor_on": False,
+        "solenoid_open": False,
+        "command_send_attempts": None,
+        "command_write_count": None,
+        "last_command_write_size": None,
+        "command_loop_error_count": None,
+        "status_packet_count": None,
+        "status_read_error_count": None,
+    }
+    values[field] = value
+    if field == "command_write_count":
+        values.update(
+            command_streaming_required=True,
+            command_loop_running=True,
+            serial_open=True,
+            command_send_attempts=0,
+            last_command_write_size=0,
+            command_loop_error_count=0,
+            status_packet_count=0,
+            status_read_error_count=0,
+        )
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        DriverLifecycleEvidence(**cast(dict[str, object], values))  # type: ignore[arg-type]
+
+
+def test_lifecycle_evidence_requires_complete_streaming_fields() -> None:
+    """Streaming evidence fails closed when any lifecycle field is absent."""
+    with pytest.raises(ValueError, match="must be complete"):
+        DriverLifecycleEvidence(
+            driver="mock",
+            connected=True,
+            command_streaming_required=True,
+            command_loop_running=True,
+            serial_open=True,
+            heat_level_percent=0,
+            roast_fan_level_percent=0,
+            main_fan_level_percent=0,
+            drum_motor_on=False,
+            cooling_motor_on=False,
+            solenoid_open=False,
+            command_send_attempts=0,
+            command_write_count=None,
+            last_command_write_size=0,
+            command_loop_error_count=0,
+            status_packet_count=0,
+            status_read_error_count=0,
+        )
+
+
+def test_mock_lifecycle_evidence_is_non_advancing_and_tracks_connection() -> None:
+    """Mock lifecycle reads retain safe-zero state and do not advance telemetry."""
+    driver = MockRoasterDriver()
+    before = driver.read_lifecycle_evidence()
+    first = driver.read_state()
+    driver.connect()
+    connected = driver.read_lifecycle_evidence()
+    second = driver.read_state()
+    driver.disconnect()
+    disconnected = driver.read_lifecycle_evidence()
+
+    assert before.connected is False and before.heat_level_percent == 0
+    assert connected.connected is True and connected.command_streaming_required is False
+    assert disconnected.connected is False
+    assert first.raw_vendor_data["sample_index"] != second.raw_vendor_data["sample_index"]
+
+
+def test_hottop_lifecycle_evidence_tracks_connect_disconnect_without_actuation() -> None:
+    """Hottop evidence exposes retained counters and safe-zero state around its lifecycle."""
+    factory = FakeSerialFactory()
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop", command_interval_seconds=0.05, serial_factory=factory
+    )
+
+    before = driver.read_lifecycle_evidence()
+    driver.connect()
+    connected = driver.read_lifecycle_evidence()
+    driver.disconnect()
+    after = driver.read_lifecycle_evidence()
+
+    assert before.connected is False
+    assert before.command_loop_running is False
+    assert before.serial_open is False
+    assert connected.connected is True
+    assert connected.command_loop_running is True
+    assert connected.serial_open is True
+    assert all(
+        value == 0
+        for value in (
+            connected.heat_level_percent,
+            connected.roast_fan_level_percent,
+            connected.main_fan_level_percent,
+        )
+    )
+    assert after.connected is False
+    assert after.command_loop_running is False
+    assert after.serial_open is False
+    assert after.command_write_count == connected.command_write_count
