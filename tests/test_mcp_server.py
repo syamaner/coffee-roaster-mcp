@@ -30,6 +30,7 @@ from coffee_roaster_mcp.first_crack_runtime import (
 from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
     ServerContext,
+    _finalise_cold_characterisation_session,  # pyright: ignore[reportPrivateUsage]
     _serialize_first_crack_status,  # pyright: ignore[reportPrivateUsage]
     build_server_context,
     create_mcp_server,
@@ -43,6 +44,42 @@ def test_sdk_request_logger_name_matches_installed_sdk() -> None:
     import mcp.server.lowlevel.server as sdk_server
 
     assert sdk_server.logger.name == SDK_REQUEST_LOGGER_NAME
+
+
+def test_cold_characterisation_finalisation_is_clean_and_idempotent(tmp_path: Path) -> None:
+    """A safe mock cold session tears down without issuing an actuator command."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("logging:\n  sample_interval_seconds: 0.01\n", encoding="utf-8")
+    context = build_server_context(config_path=config_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+    context.telemetry_sampler.start_for_session(session.id)
+
+    result = _finalise_cold_characterisation_session(context, session.id)
+
+    assert result.status == "clean"
+    assert result.clean is True
+    assert result.session_purpose == "cold_characterisation"
+    assert result.final_driver_evidence is not None
+    assert result.final_driver_evidence.evidence is not None
+    assert result.final_driver_evidence.evidence.connected is False
+    assert context.session_store.get_session_snapshot(session_id=session.id).active is False
+    assert _finalise_cold_characterisation_session(context, session.id) == result
+
+
+def test_normal_session_finalisation_is_rejected_without_disconnect(tmp_path: Path) -> None:
+    """Normal roast sessions are not eligible for cold-characterisation teardown."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("{}\n", encoding="utf-8")
+    context = build_server_context(config_path=config_path)
+    session = context.session_store.start_session()
+    context.roaster_driver.connect()
+
+    result = _finalise_cold_characterisation_session(context, session.id)
+
+    assert result.status == "rejected"
+    assert result.rejection_reason == "session_purpose_not_eligible"
+    assert context.roaster_driver.read_state().connected is True
 
 
 def test_quiet_sdk_per_request_log_suppresses_info_keeps_warning() -> None:

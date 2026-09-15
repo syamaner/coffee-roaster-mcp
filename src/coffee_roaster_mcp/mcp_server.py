@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import logging
 import time
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Event, RLock, Thread
-from typing import Literal
+from threading import Event, Lock, RLock, Thread
+from typing import Literal, cast
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
@@ -28,11 +30,18 @@ from coffee_roaster_mcp.config import (
     FirstCrackMode,
     load_config,
 )
-from coffee_roaster_mcp.drivers import RoasterDriver, RoasterState, create_roaster_driver
+from coffee_roaster_mcp.drivers import (
+    DriverLifecycleEvidence,
+    LifecycleEvidenceDriver,
+    RoasterDriver,
+    RoasterState,
+    create_roaster_driver,
+)
 from coffee_roaster_mcp.exports import export_roast_snapshot
 from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackRuntimeSnapshot,
     FirstCrackSessionRuntime,
+    RecordingArtifactPlan,
     build_first_crack_session_runtime,
 )
 from coffee_roaster_mcp.session import (
@@ -43,6 +52,7 @@ from coffee_roaster_mcp.session import (
     RoastSession,
     RoastSessionStore,
     SessionLifecycleError,
+    SessionPurpose,
     compute_roast_metrics,
     default_emergency_safety_payload,
 )
@@ -71,6 +81,7 @@ class ServerContext:
     ambient_runtime: AmbientSessionRuntime
     telemetry_sampler: _TelemetrySampler
     started_at_utc: datetime
+    lifecycle_barrier: Lock = field(default_factory=Lock)
 
 
 TelemetrySampleCallback = Callable[[str], bool]
@@ -121,6 +132,25 @@ class _TelemetrySampler:
                 return
             thread = self._stop_locked()
         self._join_thread(thread)
+
+    def stop_and_join_for_finalisation(self, session_id: str) -> SamplerFinalisationEvidence:
+        """Stop an owning sampler and retain its handle if bounded join times out."""
+        with self._lock:
+            owned = self._active_session_id == session_id
+            thread = self._thread if owned else None
+            if owned:
+                self._active_session_id = None
+                self._stop_event.set()
+        self._join_thread(thread)
+        alive = thread is not None and thread.is_alive()
+        with self._lock:
+            if owned and not alive:
+                self._thread = None
+            return SamplerFinalisationEvidence(
+                owned_by_session_before_stop=owned,
+                thread_alive_after_join=alive,
+                last_error=self._last_error,
+            )
 
     def shutdown(self) -> None:
         """Stop any active sampler worker."""
@@ -441,6 +471,7 @@ class RoastSessionState:
     ambient_status: AmbientStatus
     events: tuple[EventSnapshot, ...]
     log_dir: str | None
+    session_purpose: SessionPurpose = "roast"
 
 
 @dataclass(frozen=True)
@@ -495,6 +526,189 @@ class ExportRoastLogResult:
     summary_path: str
     ready: bool
     note: str
+
+
+SessionFinalisationStatus = Literal[
+    "rejected", "clean", "completed_not_clean", "partial", "disconnect_indeterminate", "aborted"
+]
+FinalisationRejectionReason = Literal[
+    "unknown_session",
+    "not_latest_session",
+    "session_not_active",
+    "session_purpose_not_eligible",
+    "session_faulted",
+    "command_in_progress",
+    "finalisation_in_progress",
+    "driver_lifecycle_evidence_unsupported",
+    "driver_state_unreadable",
+    "driver_state_malformed",
+    "driver_not_connected",
+    "driver_state_not_safe_zero",
+]
+FinalisationStageName = Literal[
+    "telemetry_sampler", "first_crack_runtime", "recording", "driver_disconnect"
+]
+FinalisationStageStatus = Literal[
+    "pending", "completed", "incomplete", "failed", "not_applicable", "skipped"
+]
+EmergencyStopOrdering = Literal[
+    "not_reached",
+    "finalisation_committed_first",
+    "emergency_stop_before_disconnect_commit",
+    "emergency_stop_after_disconnect_attempt",
+]
+ConfirmationState = Literal["confirmed", "not_applicable", "not_confirmed"]
+
+
+@dataclass(frozen=True)
+class FinalisationFailure:
+    """One append-only failure observed while finalising a session."""
+
+    stage: FinalisationStageName | Literal["revalidation"]
+    code: str
+    message: str
+    attempt_number: int
+    recorded_at_utc: str
+
+
+@dataclass(frozen=True)
+class FinalisationStageResult:
+    """Outcome of one ordered finalisation stage."""
+
+    stage: FinalisationStageName
+    status: FinalisationStageStatus = "pending"
+    completed_at_utc: str | None = None
+    completed_in_attempt: int | None = None
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class DriverCommandStateEvidence:
+    """Validated, read-only driver lifecycle evidence with safe-zero summary."""
+
+    driver: str
+    connected: bool
+    command_streaming_required: bool
+    command_loop_running: bool | None
+    serial_open: bool | None
+    heat_level_percent: int
+    roast_fan_level_percent: int
+    main_fan_level_percent: int
+    drum_motor_on: bool
+    cooling_motor_on: bool
+    solenoid_open: bool
+    safe_zero: bool
+    non_zero_dimensions: tuple[str, ...]
+    command_send_attempts: int | None
+    command_write_count: int | None
+    last_command_write_size: int | None
+    command_loop_error_count: int | None
+    status_packet_count: int | None
+    status_read_error_count: int | None
+
+
+@dataclass(frozen=True)
+class DriverEvidenceRead:
+    """One non-actuating lifecycle evidence read outcome."""
+
+    captured_at_utc: str
+    outcome: Literal["read", "unsupported", "unreadable", "malformed"]
+    error: str | None
+    evidence: DriverCommandStateEvidence | None
+
+
+@dataclass(frozen=True)
+class SamplerFinalisationEvidence:
+    """Bounded telemetry sampler stop evidence."""
+
+    owned_by_session_before_stop: bool
+    thread_alive_after_join: bool
+    last_error: str | None
+
+
+@dataclass(frozen=True)
+class FirstCrackRuntimeFinalisationEvidence:
+    """First-crack capture stop evidence."""
+
+    outcome: Literal["not_active", "stopped", "capture_still_running", "stop_failed"]
+    stop_error: str | None
+    capture_running_after_stop: bool
+    final_status: FirstCrackStatus
+
+
+@dataclass(frozen=True)
+class RecordingArtifact:
+    """Identity and stat-only observation of one recording artifact."""
+
+    role: Literal[
+        "primary_wav", "recording_sidecar", "annotation_session_sidecar", "additional_wav"
+    ]
+    filename: str
+    path: str
+    exists: bool
+    size_bytes: int | None
+
+
+@dataclass(frozen=True)
+class RecordingFinalisationEvidence:
+    """Recording teardown and artifact evidence."""
+
+    expected: bool
+    outcome: Literal["not_configured", "finalised", "not_started", "failed"]
+    reason: str | None
+    artifacts: tuple[RecordingArtifact, ...]
+
+
+@dataclass(frozen=True)
+class DisconnectEvidence:
+    """Append-only disconnect-attempt and confirmation evidence."""
+
+    attempt_count: int = 0
+    first_attempted_at_utc: str | None = None
+    last_attempted_at_utc: str | None = None
+    last_returned_without_error: bool | None = None
+    last_error: str | None = None
+    connected_false_confirmed: bool = False
+    command_loop_stopped: ConfirmationState = "not_confirmed"
+    serial_closed: ConfirmationState = "not_confirmed"
+
+
+@dataclass(frozen=True)
+class SessionFinalisationResult:
+    """Retained non-actuating cold-characterisation teardown result."""
+
+    session_id: str
+    session_purpose: SessionPurpose | None
+    status: SessionFinalisationStatus
+    clean: bool
+    rejection_reason: FinalisationRejectionReason | None
+    abort_reason: Literal["emergency_stop", "session_or_reservation_changed"] | None
+    retained: bool
+    reservation_generation: int | None
+    attempt_number: int
+    recovered_after_failure: bool
+    first_started_at_utc: str | None
+    first_started_session_elapsed_seconds: float | None
+    last_ended_at_utc: str | None
+    last_ended_session_elapsed_seconds: float | None
+    emergency_stop_ordering: EmergencyStopOrdering
+    stages: tuple[
+        FinalisationStageResult,
+        FinalisationStageResult,
+        FinalisationStageResult,
+        FinalisationStageResult,
+    ]
+    failures: tuple[FinalisationFailure, ...]
+    admission_driver_evidence: DriverEvidenceRead | None
+    pre_disconnect_driver_evidence: DriverEvidenceRead | None
+    final_driver_evidence: DriverEvidenceRead | None
+    sampler: SamplerFinalisationEvidence | None
+    pre_finalisation_first_crack_status: FirstCrackStatus | None
+    first_crack_runtime: FirstCrackRuntimeFinalisationEvidence | None
+    recording: RecordingFinalisationEvidence | None
+    disconnect: DisconnectEvidence
+    session_active_after: bool
+    session_phase_after: RoastPhase | None
 
 
 def build_server_context(
@@ -616,6 +830,7 @@ def create_mcp_server(
                 "export_roast_log",
                 "emergency_stop",
                 "set_recording_metadata",
+                "finalise_cold_characterisation_session",
             ),
             started_at_utc=server_context.started_at_utc.isoformat(),
         )
@@ -647,13 +862,16 @@ def create_mcp_server(
     @mcp.tool()
     def start_roast_session(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
+        purpose: SessionPurpose = "roast",
     ) -> StartRoastSessionResult:
         """Start one new authoritative roast session and prepare the driver."""
         server_context = ctx.request_context.lifespan_context
         reservation = server_context.session_store.reserve_session_start()
         try:
             server_context.roaster_driver.connect()
-            session = server_context.session_store.complete_session_start_snapshot(reservation)
+            session = server_context.session_store.complete_session_start_snapshot(
+                reservation, purpose=purpose
+            )
         except Exception:
             server_context.session_store.clear_session_start_reservation(reservation)
             raise
@@ -667,6 +885,17 @@ def create_mcp_server(
                 first_crack_runtime=server_context.first_crack_runtime.snapshot(),
                 ambient_runtime=server_context.ambient_runtime.snapshot(),
             )
+        )
+
+    @mcp.tool()
+    async def finalise_cold_characterisation_session(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext], session_id: str
+    ) -> SessionFinalisationResult:
+        """Finalise one eligible cold-characterisation session without actuation."""
+        return await asyncio.to_thread(
+            _finalise_cold_characterisation_session,
+            ctx.request_context.lifespan_context,
+            session_id,
         )
 
     @mcp.tool()
@@ -878,15 +1107,16 @@ def create_mcp_server(
     ) -> EventCommandResult:
         """Call the configured driver safety method and record a fault event."""
         server_context = ctx.request_context.lifespan_context
-        session = _require_active_session(server_context)
-        server_context.session_store.cancel_pending_driver_command(session)
-        safety_payload = run_driver_emergency_stop(server_context, reason=reason)
-        event, snapshot = server_context.session_store.emergency_stop_snapshot(
-            session,
-            reason=reason,
-            safety_payload=safety_payload,
-            allow_stopped_latest=True,
-        )
+        with server_context.lifecycle_barrier:
+            session = _require_active_session(server_context)
+            server_context.session_store.cancel_pending_driver_command(session)
+            safety_payload = run_driver_emergency_stop(server_context, reason=reason)
+            event, snapshot = server_context.session_store.emergency_stop_snapshot(
+                session,
+                reason=reason,
+                safety_payload=safety_payload,
+                allow_stopped_latest=True,
+            )
         server_context.first_crack_runtime.stop_for_session(
             snapshot.id,
             reason="emergency stop",
@@ -1417,6 +1647,507 @@ def _fault_active_session_after_sampler_failure(
     )
 
 
+def _read_driver_lifecycle_evidence(server_context: ServerContext) -> DriverEvidenceRead:
+    """Capture one read-only lifecycle evidence result without driver mutation."""
+    captured_at_utc = datetime.now(UTC).isoformat()
+    driver = server_context.roaster_driver
+    if not isinstance(driver, LifecycleEvidenceDriver):
+        return DriverEvidenceRead(captured_at_utc, "unsupported", None, None)
+    try:
+        raw = driver.read_lifecycle_evidence()
+    except Exception as exc:  # noqa: BLE001 - driver boundaries vary.
+        return DriverEvidenceRead(
+            captured_at_utc, "unreadable", f"{type(exc).__name__}: {exc}", None
+        )
+    if not isinstance(cast(object, raw), DriverLifecycleEvidence):
+        return DriverEvidenceRead(captured_at_utc, "malformed", "Unexpected evidence type.", None)
+    try:
+        dimensions = tuple(
+            name
+            for name, non_zero in (
+                ("heat_level_percent", raw.heat_level_percent != 0),
+                ("roast_fan_level_percent", raw.roast_fan_level_percent != 0),
+                ("main_fan_level_percent", raw.main_fan_level_percent != 0),
+                ("drum_motor_on", raw.drum_motor_on),
+                ("cooling_motor_on", raw.cooling_motor_on),
+                ("solenoid_open", raw.solenoid_open),
+            )
+            if non_zero
+        )
+        evidence = DriverCommandStateEvidence(
+            driver=raw.driver,
+            connected=raw.connected,
+            command_streaming_required=raw.command_streaming_required,
+            command_loop_running=raw.command_loop_running,
+            serial_open=raw.serial_open,
+            heat_level_percent=raw.heat_level_percent,
+            roast_fan_level_percent=raw.roast_fan_level_percent,
+            main_fan_level_percent=raw.main_fan_level_percent,
+            drum_motor_on=raw.drum_motor_on,
+            cooling_motor_on=raw.cooling_motor_on,
+            solenoid_open=raw.solenoid_open,
+            safe_zero=not dimensions,
+            non_zero_dimensions=dimensions,
+            command_send_attempts=raw.command_send_attempts,
+            command_write_count=raw.command_write_count,
+            last_command_write_size=raw.last_command_write_size,
+            command_loop_error_count=raw.command_loop_error_count,
+            status_packet_count=raw.status_packet_count,
+            status_read_error_count=raw.status_read_error_count,
+        )
+    except (TypeError, ValueError) as exc:
+        return DriverEvidenceRead(
+            captured_at_utc, "malformed", f"{type(exc).__name__}: {exc}", None
+        )
+    return DriverEvidenceRead(captured_at_utc, "read", None, evidence)
+
+
+def _evidence_admission_rejection(
+    evidence: DriverEvidenceRead,
+) -> FinalisationRejectionReason | None:
+    """Return the ordered admission rejection implied by evidence."""
+    if evidence.outcome == "unsupported":
+        return "driver_lifecycle_evidence_unsupported"
+    if evidence.outcome == "unreadable":
+        return "driver_state_unreadable"
+    if evidence.outcome == "malformed":
+        return "driver_state_malformed"
+    current = evidence.evidence
+    if current is None:
+        return "driver_state_malformed"
+    if not current.connected or (
+        current.command_streaming_required
+        and (not current.command_loop_running or not current.serial_open)
+    ):
+        return "driver_not_connected"
+    if not current.safe_zero:
+        return "driver_state_not_safe_zero"
+    return None
+
+
+def _initial_finalisation_result(
+    session: RoastSession,
+    generation: int,
+    evidence: DriverEvidenceRead,
+    server_context: ServerContext,
+) -> SessionFinalisationResult:
+    """Create the retained result after successful admission."""
+    now = datetime.now(UTC).isoformat()
+    elapsed = session.elapsed_monotonic_seconds(time.monotonic)
+    stages = tuple(
+        FinalisationStageResult(stage=name)
+        for name in ("telemetry_sampler", "first_crack_runtime", "recording", "driver_disconnect")
+    )
+    return SessionFinalisationResult(
+        session_id=session.id,
+        session_purpose=session.purpose,
+        status="partial",
+        clean=False,
+        rejection_reason=None,
+        abort_reason=None,
+        retained=True,
+        reservation_generation=generation,
+        attempt_number=0,
+        recovered_after_failure=False,
+        first_started_at_utc=now,
+        first_started_session_elapsed_seconds=elapsed,
+        last_ended_at_utc=None,
+        last_ended_session_elapsed_seconds=None,
+        emergency_stop_ordering="not_reached",
+        stages=cast(
+            tuple[
+                FinalisationStageResult,
+                FinalisationStageResult,
+                FinalisationStageResult,
+                FinalisationStageResult,
+            ],
+            stages,
+        ),
+        failures=(),
+        admission_driver_evidence=evidence,
+        pre_disconnect_driver_evidence=None,
+        final_driver_evidence=None,
+        sampler=None,
+        pre_finalisation_first_crack_status=_serialize_first_crack_status(
+            session,
+            config=server_context.config,
+            first_crack_runtime=server_context.first_crack_runtime.snapshot(),
+        ),
+        first_crack_runtime=None,
+        recording=None,
+        disconnect=DisconnectEvidence(),
+        session_active_after=True,
+        session_phase_after=session.phase,
+    )
+
+
+def _with_stage(
+    result: SessionFinalisationResult,
+    index: int,
+    status: FinalisationStageStatus,
+    detail: str | None = None,
+) -> SessionFinalisationResult:
+    """Return a result with one stage replaced without disturbing prior stages."""
+    stages = list(result.stages)
+    stage = stages[index]
+    stages[index] = dataclasses.replace(
+        stage,
+        status=status,
+        completed_at_utc=datetime.now(UTC).isoformat()
+        if status in ("completed", "not_applicable", "failed")
+        else None,
+        completed_in_attempt=result.attempt_number
+        if status in ("completed", "not_applicable", "failed")
+        else None,
+        detail=detail,
+    )
+    return dataclasses.replace(
+        result,
+        stages=cast(
+            tuple[
+                FinalisationStageResult,
+                FinalisationStageResult,
+                FinalisationStageResult,
+                FinalisationStageResult,
+            ],
+            tuple(stages),
+        ),
+    )
+
+
+def _append_finalisation_failure(
+    result: SessionFinalisationResult,
+    stage: FinalisationStageName | Literal["revalidation"],
+    code: str,
+    message: str,
+) -> SessionFinalisationResult:
+    """Append immutable failure evidence and mark recovery when applicable."""
+    failure = FinalisationFailure(
+        stage, code, message, result.attempt_number, datetime.now(UTC).isoformat()
+    )
+    return dataclasses.replace(
+        result, failures=(*result.failures, failure), recovered_after_failure=True
+    )
+
+
+def _recording_evidence(
+    plan: RecordingArtifactPlan | None, recorder: object | None
+) -> RecordingFinalisationEvidence:
+    """Use only filesystem metadata to report required recording artifacts."""
+    if plan is None:
+        return RecordingFinalisationEvidence(False, "not_configured", None, ())
+    items: list[RecordingArtifact] = []
+    for role, path, _minimum in (
+        ("primary_wav", plan.primary_wav, 44),
+        ("recording_sidecar", plan.recording_sidecar, 1),
+        ("annotation_session_sidecar", plan.annotation_session_sidecar, 1),
+    ):
+        exists = path.is_file()
+        size = path.stat().st_size if exists else None
+        items.append(
+            RecordingArtifact(
+                cast(
+                    Literal[
+                        "primary_wav",
+                        "recording_sidecar",
+                        "annotation_session_sidecar",
+                        "additional_wav",
+                    ],
+                    role,
+                ),
+                path.name,
+                str(path),
+                exists,
+                size,
+            )
+        )
+    for path in plan.additional_wavs:
+        exists = path.is_file()
+        items.append(
+            RecordingArtifact(
+                "additional_wav",
+                path.name,
+                str(path),
+                exists,
+                path.stat().st_size if exists else None,
+            )
+        )
+    if recorder is None or getattr(recorder, "started_monotonic_seconds", None) is None:
+        return RecordingFinalisationEvidence(
+            True, "not_started", "Recorder did not start.", tuple(items)
+        )
+    complete = all(
+        item.exists
+        and item.size_bytes is not None
+        and item.size_bytes >= (44 if item.role == "primary_wav" else 1)
+        for item in items
+    )
+    return RecordingFinalisationEvidence(
+        True,
+        "finalised" if complete else "failed",
+        None if complete else "Required recording artifact is missing or empty.",
+        tuple(items),
+    )
+
+
+def _finalise_cold_characterisation_session(
+    server_context: ServerContext, session_id: str
+) -> SessionFinalisationResult:
+    """Run cold-session teardown without invoking any roaster control operation."""
+    session, rejection, generation = server_context.session_store.begin_finalisation(session_id)
+    if session is None or rejection is not None:
+        purpose = None if session is None else session.purpose
+        return _rejected_finalisation(
+            session_id, purpose, cast(FinalisationRejectionReason, rejection)
+        )
+    existing = session.finalisation
+    if existing is not None:
+        result = cast(SessionFinalisationResult, existing)
+        if result.status in ("clean", "completed_not_clean", "aborted"):
+            server_context.session_store.finish_finalisation_invocation(session)
+            return result
+    else:
+        evidence = _read_driver_lifecycle_evidence(server_context)
+        evidence_rejection = _evidence_admission_rejection(evidence)
+        if evidence_rejection is not None:
+            server_context.session_store.abandon_finalisation_admission(session)
+            return _rejected_finalisation(session.id, session.purpose, evidence_rejection)
+        result = _initial_finalisation_result(
+            session, cast(int, generation), evidence, server_context
+        )
+        server_context.session_store.attach_finalisation(session, result)
+    result = dataclasses.replace(result, attempt_number=result.attempt_number + 1)
+    try:
+        if result.stages[0].status != "completed":
+            sampler = server_context.telemetry_sampler.stop_and_join_for_finalisation(session.id)
+            result = dataclasses.replace(result, sampler=sampler)
+            if sampler.thread_alive_after_join:
+                result = _append_finalisation_failure(
+                    result,
+                    "telemetry_sampler",
+                    "join_timeout",
+                    "Telemetry sampler is still running.",
+                )
+                result = _with_stage(result, 0, "incomplete", "Sampler join timed out.")
+                return _persist_partial(session, result, server_context)
+            result = _with_stage(result, 0, "completed")
+        if result.stages[1].status != "completed":
+            outcome, error, capture_running = (
+                server_context.first_crack_runtime.finalise_for_session(session.id)
+            )
+            first_crack = FirstCrackRuntimeFinalisationEvidence(
+                outcome,
+                error,
+                capture_running,
+                _serialize_first_crack_status(
+                    session,
+                    config=server_context.config,
+                    first_crack_runtime=server_context.first_crack_runtime.snapshot(),
+                ),
+            )
+            result = dataclasses.replace(result, first_crack_runtime=first_crack)
+            if outcome in ("capture_still_running", "stop_failed"):
+                result = _append_finalisation_failure(
+                    result, "first_crack_runtime", outcome, error or outcome
+                )
+                result = _with_stage(result, 1, "incomplete", error or outcome)
+                return _persist_partial(session, result, server_context)
+            result = _with_stage(
+                result, 1, "not_applicable" if outcome == "not_active" else "completed"
+            )
+        if result.stages[2].status == "pending":
+            recorder, plan = server_context.first_crack_runtime.recording_for_session(session.id)
+            recording = _recording_evidence(plan, recorder)
+            result = dataclasses.replace(result, recording=recording)
+            if recording.outcome in ("not_configured", "finalised"):
+                result = _with_stage(
+                    result,
+                    2,
+                    "not_applicable" if recording.outcome == "not_configured" else "completed",
+                )
+            else:
+                result = _append_finalisation_failure(
+                    result, "recording", recording.outcome, recording.reason or "Recording failed."
+                )
+                result = _with_stage(result, 2, "failed", recording.reason)
+        return _disconnect_finalisation(server_context, session, result)
+    finally:
+        server_context.session_store.finish_finalisation_invocation(session)
+
+
+def _persist_partial(
+    session: RoastSession, result: SessionFinalisationResult, server_context: ServerContext
+) -> SessionFinalisationResult:
+    """Persist a resumable result without releasing the reserved session."""
+    result = dataclasses.replace(
+        result,
+        status="partial",
+        clean=False,
+        last_ended_at_utc=datetime.now(UTC).isoformat(),
+        last_ended_session_elapsed_seconds=session.elapsed_monotonic_seconds(time.monotonic),
+        session_active_after=True,
+        session_phase_after=session.phase,
+    )
+    session.finalisation = result
+    return result
+
+
+def _disconnect_finalisation(
+    server_context: ServerContext, session: RoastSession, result: SessionFinalisationResult
+) -> SessionFinalisationResult:
+    """Commit one ordered disconnect attempt and confirm it by evidence read."""
+    with server_context.lifecycle_barrier:
+        pre = _read_driver_lifecycle_evidence(server_context)
+        if result.disconnect.attempt_count == 0:
+            rejection = _evidence_admission_rejection(pre)
+            if rejection is not None:
+                result = _append_finalisation_failure(
+                    result, "revalidation", rejection, "Pre-disconnect revalidation failed."
+                )
+                return _persist_partial(
+                    session,
+                    dataclasses.replace(result, pre_disconnect_driver_evidence=pre),
+                    server_context,
+                )
+        now = datetime.now(UTC).isoformat()
+        disconnect = dataclasses.replace(
+            result.disconnect,
+            attempt_count=result.disconnect.attempt_count + 1,
+            first_attempted_at_utc=result.disconnect.first_attempted_at_utc or now,
+            last_attempted_at_utc=now,
+        )
+        result = dataclasses.replace(
+            result,
+            pre_disconnect_driver_evidence=pre,
+            disconnect=disconnect,
+            emergency_stop_ordering="finalisation_committed_first",
+        )
+        error: str | None = None
+        try:
+            server_context.roaster_driver.disconnect()
+        except Exception as exc:  # noqa: BLE001 - confirmation decides retry.
+            error = f"{type(exc).__name__}: {exc}"
+        final = _read_driver_lifecycle_evidence(server_context)
+        evidence = final.evidence
+        confirmed = (
+            final.outcome == "read"
+            and evidence is not None
+            and not evidence.connected
+            and (
+                not evidence.command_streaming_required
+                or (not evidence.command_loop_running and not evidence.serial_open)
+            )
+            and error is None
+        )
+        disconnect = dataclasses.replace(
+            disconnect,
+            last_returned_without_error=error is None,
+            last_error=error,
+            connected_false_confirmed=bool(evidence is not None and not evidence.connected),
+            command_loop_stopped="not_applicable"
+            if evidence is not None and not evidence.command_streaming_required
+            else (
+                "confirmed"
+                if evidence is not None and not evidence.command_loop_running
+                else "not_confirmed"
+            ),
+            serial_closed="not_applicable"
+            if evidence is not None and not evidence.command_streaming_required
+            else (
+                "confirmed"
+                if evidence is not None and not evidence.serial_open
+                else "not_confirmed"
+            ),
+        )
+        result = dataclasses.replace(result, final_driver_evidence=final, disconnect=disconnect)
+        if not confirmed:
+            result = _append_finalisation_failure(
+                result,
+                "driver_disconnect",
+                "disconnect_not_confirmed",
+                error or "Disconnect state was not confirmed.",
+            )
+            session.finalisation = dataclasses.replace(
+                result,
+                status="disconnect_indeterminate",
+                clean=False,
+                last_ended_at_utc=datetime.now(UTC).isoformat(),
+                last_ended_session_elapsed_seconds=session.elapsed_monotonic_seconds(
+                    time.monotonic
+                ),
+            )
+            return session.finalisation
+        result = _with_stage(result, 3, "completed")
+        clean = (
+            all(stage.status in ("completed", "not_applicable") for stage in result.stages)
+            and all(stage.status != "failed" for stage in result.stages)
+            and final.evidence is not None
+            and final.evidence.safe_zero
+        )
+        final_result = dataclasses.replace(
+            result,
+            status="clean" if clean else "completed_not_clean",
+            clean=clean,
+            last_ended_at_utc=datetime.now(UTC).isoformat(),
+            last_ended_session_elapsed_seconds=session.elapsed_monotonic_seconds(time.monotonic),
+            session_active_after=False,
+            session_phase_after=session.phase,
+        )
+        session.finalisation = final_result
+        server_context.session_store.finish_finalisation_terminal(session)
+    server_context.ambient_runtime.stop_for_session(
+        session.id, reason="cold characterisation finalised"
+    )
+    return final_result
+
+
+def _rejected_finalisation(
+    session_id: str, purpose: SessionPurpose | None, reason: FinalisationRejectionReason
+) -> SessionFinalisationResult:
+    """Return a non-retained rejection without running any teardown stage."""
+    stages = tuple(
+        FinalisationStageResult(stage=name, status="skipped")
+        for name in ("telemetry_sampler", "first_crack_runtime", "recording", "driver_disconnect")
+    )
+    return SessionFinalisationResult(
+        session_id,
+        purpose,
+        "rejected",
+        False,
+        reason,
+        None,
+        False,
+        None,
+        0,
+        False,
+        None,
+        None,
+        None,
+        None,
+        "not_reached",
+        cast(
+            tuple[
+                FinalisationStageResult,
+                FinalisationStageResult,
+                FinalisationStageResult,
+                FinalisationStageResult,
+            ],
+            stages,
+        ),
+        (),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        DisconnectEvidence(),
+        False,
+        None,
+    )
+
+
 def _serialize_session_state(
     session: RoastSession,
     *,
@@ -1475,6 +2206,7 @@ def _serialize_session_state(
         log_dir=str(session.log_writer.log_dir.resolve())
         if session.log_writer is not None
         else None,
+        session_purpose=session.purpose,
     )
 
 

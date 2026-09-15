@@ -227,6 +227,18 @@ The current MCP tool surface includes:
 - `export_roast_log`
 - `emergency_stop`
 - `set_recording_metadata`
+- `finalise_cold_characterisation_session`
+
+### Cold-characterisation finalisation
+
+`finalise_cold_characterisation_session` is a non-actuating teardown tool for an
+active, latest session started with `purpose="cold_characterisation"`; it is not
+for normal roasts. It only admits known connected safe-zero driver evidence,
+then stops sampling and capture, verifies recording artifacts, and disconnects.
+`clean` means all stages completed (or were not applicable), disconnect was
+confirmed, and final driver evidence remains safe zero. `partial` and
+`disconnect_indeterminate` retain evidence for a later retry; this does not
+make any readiness claim.
 
 `export_roast_log` writes `roast.jsonl`, `roast.csv`, and `summary.json` files
 for the current in-process session. Runtime events and sampled telemetry are

@@ -57,6 +57,7 @@ _EXPECTED_ROAST_STATE_KEYS = {
     "phase",
     "roast_elapsed_seconds",
     "session_id",
+    "session_purpose",
     "stopped_at_utc",
     "t0_status",
 }
@@ -223,6 +224,7 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
             "drop_beans",
             "emergency_stop",
             "export_roast_log",
+            "finalise_cold_characterisation_session",
             "get_roast_state",
             "get_runtime_config",
             "get_server_info",
