@@ -39,13 +39,16 @@ from coffee_roaster_mcp.first_crack_runtime import (
 from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
     DriverEvidenceRead,
+    RoasterDeviceState,
     SamplerFinalisationEvidence,
     ServerContext,
     _disconnect_finalisation,  # pyright: ignore[reportPrivateUsage]
     _evidence_admission_rejection,  # pyright: ignore[reportPrivateUsage]
+    _fail_closed_after_stale_driver_command,  # pyright: ignore[reportPrivateUsage]
     _fault_active_session_after_sampler_failure,  # pyright: ignore[reportPrivateUsage]
     _finalise_cold_characterisation_session,  # pyright: ignore[reportPrivateUsage]
     _process_ambient_runtime_for_active_session,  # pyright: ignore[reportPrivateUsage]
+    _process_auto_t0_for_active_session,  # pyright: ignore[reportPrivateUsage]
     _process_first_crack_runtime_for_active_session,  # pyright: ignore[reportPrivateUsage]
     _read_driver_lifecycle_evidence,  # pyright: ignore[reportPrivateUsage]
     _recording_evidence,  # pyright: ignore[reportPrivateUsage]
@@ -56,7 +59,12 @@ from coffee_roaster_mcp.mcp_server import (
     create_mcp_server,
     quiet_sdk_per_request_log,
 )
-from coffee_roaster_mcp.session import RoastSession, RoastSessionStore, SessionLifecycleError
+from coffee_roaster_mcp.session import (
+    DriverCommandReservation,
+    RoastSession,
+    RoastSessionStore,
+    SessionLifecycleError,
+)
 
 
 def test_sdk_request_logger_name_matches_installed_sdk() -> None:
@@ -163,6 +171,49 @@ def test_recording_evidence_includes_additional_wavs(tmp_path: Path) -> None:
         "annotation_session_sidecar",
         "additional_wav",
     ]
+
+
+def test_additional_wav_metadata_error_is_retained_as_missing_artifact(tmp_path: Path) -> None:
+    """A failed additional-WAV metadata read becomes terminal recording evidence."""
+
+    class UnreadablePath:
+        name = "extra.wav"
+
+        def is_file(self) -> bool:
+            raise OSError("unreadable")
+
+        def stat(self) -> object:
+            raise OSError("unreadable")
+
+        def __str__(self) -> str:
+            return "extra.wav"
+
+    primary, sidecar, annotation = (tmp_path / name for name in ("p.wav", "r.json", "a.json"))
+    for path in (primary, sidecar, annotation):
+        path.write_bytes(b"x" * 44)
+    plan = RecordingArtifactPlan(primary, sidecar, annotation, (cast(Path, UnreadablePath()),))
+    evidence = _recording_evidence(plan, SimpleNamespace(started_monotonic_seconds=1.0))
+    assert evidence.outcome == "failed"
+    assert evidence.artifacts[-1].exists is False
+    assert evidence.artifacts[-1].size_bytes is None
+
+
+def test_invalid_finalisation_reservation_returns_its_retained_abort(tmp_path: Path) -> None:
+    """A later invocation returns the aborted retained result without disconnecting."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = context.session_store.begin_finalisation(session.id)
+    assert rejection is None and generation is not None
+    record = SimpleNamespace(status="partial", reservation_generation=generation, retained=False)
+    context.session_store.attach_finalisation(session, record)
+    session.pending_driver_command_token = None
+    session.pending_driver_command_kind = None
+    context.session_store.finish_finalisation_invocation(session)
+    assert _finalise_cold_characterisation_session(context, session.id) is record
+    assert record.status == "aborted"
+    assert driver.actions == []
 
 
 def test_recording_metadata_filesystem_error_is_terminal_and_disconnects(
@@ -410,6 +461,38 @@ def test_finalisation_admission_fences_background_work_before_record_attach(
     assert _sample_active_session_telemetry(context, session_id=session.id) is False
     _process_first_crack_runtime_for_active_session(context, session_id=session.id)
     _process_ambient_runtime_for_active_session(context, session_id=session.id)
+
+
+def test_auto_t0_skips_when_finalisation_reservation_is_active(tmp_path: Path) -> None:
+    """Automatic T0 cannot mutate a cold session held for finalisation."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("session:\n  auto_t0_detection_enabled: true\n", encoding="utf-8")
+    context = build_server_context(config_path=config_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    _, rejection, _ = context.session_store.begin_finalisation(session.id)
+    assert rejection is None
+    device = RoasterDeviceState("mock", True, 100.0, None, 0, 0, False, {})
+    assert (
+        _process_auto_t0_for_active_session(context, session_id=session.id, device_state=device)
+        is False
+    )
+    assert session.auto_t0_preheat_sample_count == 0
+
+
+def test_stale_command_for_different_active_session_skips_driver_stop(tmp_path: Path) -> None:
+    """A stale command cannot emergency-stop a newer session owner."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    old = context.session_store.start_session(purpose="cold_characterisation")
+    old.monotonic_stop = old.monotonic_start
+    current = context.session_store.start_session(purpose="cold_characterisation")
+    _fail_closed_after_stale_driver_command(
+        context,
+        reservation=DriverCommandReservation(old.id, "stale", "control"),
+    )
+    assert context.session_store.get_active_session() is current
+    assert driver.actions == []
 
 
 def test_lifecycle_evidence_serializes_safe_zero_and_streaming_transitions(tmp_path: Path) -> None:

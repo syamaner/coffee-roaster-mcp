@@ -754,6 +754,44 @@ def test_emergency_abort_releases_finalisation_reservation_for_recovery() -> Non
     )
 
 
+def test_admission_before_attach_invalidation_retains_abort_and_clears_fence() -> None:
+    """An invalidated admission attaches an aborted record and releases its bookkeeping."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(session.id)
+    assert rejection is None and generation is not None
+
+    class Record:
+        status = "partial"
+        abort_reason: str | None = None
+        retained = False
+
+        def __init__(self) -> None:
+            self.reservation_generation = generation
+
+    record = Record()
+    session.pending_driver_command_token = None
+    session.pending_driver_command_kind = None
+    assert store.attach_finalisation(session, record) is record
+    assert record.status == "aborted"
+    assert record.abort_reason == "session_or_reservation_changed"
+    assert record.retained is True
+    assert session.finalisation is record
+    assert session.pending_driver_command_token is None
+    assert session.id not in store._finalisation_in_progress  # pyright: ignore[reportPrivateUsage]
+
+
+def test_terminal_and_progress_persistence_do_not_overwrite_an_abort() -> None:
+    """Store persistence preserves an already-aborted retained finalisation result."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    aborted = type("Record", (), {"status": "aborted"})()
+    replacement = object()
+    session.finalisation = aborted
+    assert store.persist_finalisation(session, replacement) is aborted
+    assert store.finish_finalisation_terminal(session, replacement) is aborted
+
+
 @pytest.mark.parametrize("mismatch", ("token", "generation"))
 def test_finalisation_private_fence_mismatch_returns_retained_abort(mismatch: str) -> None:
     """A retained result aborts when either private finalisation fence changes."""
