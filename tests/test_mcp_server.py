@@ -95,6 +95,28 @@ def test_cold_characterisation_finalisation_is_clean_and_idempotent(tmp_path: Pa
     assert _finalise_cold_characterisation_session(context, session.id) == result
 
 
+def test_initial_finalisation_construction_error_releases_fresh_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An error before record attach releases only the fresh finalisation admission."""
+    import coffee_roaster_mcp.mcp_server as server_module
+
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+
+    def fail_initial(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("initial result failed")
+
+    monkeypatch.setattr(server_module, "_initial_finalisation_result", fail_initial)
+    with pytest.raises(RuntimeError, match="initial result failed"):
+        _finalise_cold_characterisation_session(context, session.id)
+    assert session.pending_driver_command_token is None
+    assert session.pending_driver_command_kind is None
+    assert session.finalisation is None
+    assert session.id not in context.session_store._finalisation_in_progress  # pyright: ignore[reportPrivateUsage]
+
+
 def test_registered_finalisation_tool_runs_in_process_wrapper(tmp_path: Path) -> None:
     """The registered async tool delegates cold finalisation to its worker thread."""
     context = _cold_finalisation_context(tmp_path)

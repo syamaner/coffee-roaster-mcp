@@ -26,7 +26,7 @@ from coffee_roaster_mcp.detector import (
     build_first_crack_detector_adapter,
 )
 from coffee_roaster_mcp.first_crack_runtime import FirstCrackSessionRuntime
-from coffee_roaster_mcp.session import RoastSessionStore
+from coffee_roaster_mcp.session import RoastSessionStore, SessionLifecycleError
 
 
 class ClockHarness:
@@ -2336,3 +2336,34 @@ def test_finalise_for_session_reports_nonclean_capture_states(mode: str) -> None
     else:
         expected = ("capture_still_running", None, True)
     assert runtime.finalise_for_session(session.id) == expected
+
+
+def test_finalisation_fence_session_error_preserves_live_capture_handles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finalisation-race write rejection is an expected inference skip, not a fault."""
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    store.record_event(session, "beans_added")
+    pipeline = FakeAudioPipeline((_audio_window(sequence_number=1),))
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+    runtime.start_for_session(session)
+    _, rejection, _ = store.begin_finalisation(session.id)
+    assert rejection is None
+
+    def fenced_write(**_kwargs: object) -> None:
+        raise SessionLifecycleError("Session finalisation is in progress.")
+
+    monkeypatch.setattr(runtime_module, "integrate_first_crack_window_with_session", fenced_write)
+    snapshot = runtime.process_available_windows(session_store=store, session=session)
+    assert snapshot.status == "pending", snapshot.reason
+    assert snapshot.audio_running is True
+    assert runtime.finalise_for_session(session.id)[0] == "stopped"
