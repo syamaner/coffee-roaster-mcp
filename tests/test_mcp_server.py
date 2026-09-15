@@ -36,6 +36,7 @@ from coffee_roaster_mcp.first_crack_runtime import (
 )
 from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
+    SamplerFinalisationEvidence,
     ServerContext,
     _finalise_cold_characterisation_session,  # pyright: ignore[reportPrivateUsage]
     _read_driver_lifecycle_evidence,  # pyright: ignore[reportPrivateUsage]
@@ -356,6 +357,44 @@ def test_disconnect_indeterminate_retries_only_disconnect_for_same_session(tmp_p
     assert second.disconnect.attempt_count == 2
     assert second.stages[3].status == "completed"
     assert driver.actions == ["connect", "disconnect", "disconnect"]
+
+
+def test_sampler_join_timeout_resumes_only_the_sampler_stage(tmp_path: Path) -> None:
+    """A bounded sampler timeout retains partial finalisation and resumes cleanly."""
+    context = _cold_finalisation_context(tmp_path)
+    sampler = RetryFinalisationSampler()
+    object.__setattr__(context, "telemetry_sampler", sampler)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+
+    partial = _finalise_cold_characterisation_session(context, session.id)
+    assert partial.status == "partial"
+    assert partial.stages[0].status == "incomplete"
+    completed = _finalise_cold_characterisation_session(context, session.id)
+
+    assert completed.status == "clean"
+    assert completed.recovered_after_failure is True
+    assert sampler.calls == 2
+
+
+def test_first_crack_stop_failure_resumes_without_rerunning_sampler(tmp_path: Path) -> None:
+    """Capture-stop failure is partial and retries only the first-crack stage."""
+    context = _cold_finalisation_context(tmp_path)
+    runtime = RetryFinalisationRuntime()
+    sampler = RetryFinalisationSampler(alive_on_first=False)
+    _set_first_crack_runtime(context, runtime)
+    object.__setattr__(context, "telemetry_sampler", sampler)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+
+    partial = _finalise_cold_characterisation_session(context, session.id)
+    assert partial.status == "partial"
+    assert partial.stages[1].status == "incomplete"
+    completed = _finalise_cold_characterisation_session(context, session.id)
+
+    assert completed.status == "clean"
+    assert runtime.calls == 2
+    assert sampler.calls == 1
 
 
 def test_quiet_sdk_per_request_log_suppresses_info_keeps_warning() -> None:
@@ -2601,6 +2640,47 @@ class RetryLifecycleDriver(LifecycleRecordingDriver):
         self.actions.append("disconnect")
         if self.confirm_disconnect:
             self.connected = False
+
+
+class RetryFinalisationSampler:
+    """Sampler double that reports one optional bounded join timeout."""
+
+    def __init__(self, *, alive_on_first: bool = True) -> None:
+        """Initialize the deterministic join sequence."""
+        self.alive_on_first = alive_on_first
+        self.calls = 0
+
+    def stop_and_join_for_finalisation(self, session_id: str) -> SamplerFinalisationEvidence:
+        """Return one timeout observation followed by a joined sampler."""
+        del session_id
+        self.calls += 1
+        return SamplerFinalisationEvidence(
+            owned_by_session_before_stop=True,
+            thread_alive_after_join=self.alive_on_first and self.calls == 1,
+            last_error=None,
+        )
+
+
+class RetryFinalisationRuntime(FakeFirstCrackRuntime):
+    """Runtime double that fails its first bounded finalise call only."""
+
+    def __init__(self) -> None:
+        """Initialize the finalisation attempt counter."""
+        super().__init__()
+        self.calls = 0
+
+    def finalise_for_session(self, session_id: str) -> tuple[str, str | None, bool]:
+        """Report one stop failure followed by a clean stopped state."""
+        del session_id
+        self.calls += 1
+        if self.calls == 1:
+            return "stop_failed", "test stop failure", True
+        return "not_active", None, False
+
+    def recording_for_session(self, session_id: str) -> tuple[None, None]:
+        """Keep recording out of this runtime-stage test."""
+        del session_id
+        return None, None
 
 
 class BlockingFinalisationRuntime(FakeFirstCrackRuntime):

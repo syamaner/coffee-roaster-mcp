@@ -1815,3 +1815,25 @@ def test_hottop_lifecycle_evidence_tracks_connect_disconnect_without_actuation()
     assert after.command_loop_running is False
     assert after.serial_open is False
     assert after.command_write_count == connected.command_write_count
+
+
+def test_hottop_lifecycle_evidence_reports_stuck_loop_after_disconnect_timeout() -> None:
+    """A timed-out Hottop loop remains visible as failed disconnect confirmation evidence."""
+    factory = FakeSerialFactory()
+    driver = StuckHottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        join_timeout_seconds=0.01,
+        serial_factory=factory,
+    )
+    driver.connect()
+    try:
+        with pytest.raises(RuntimeError, match="did not stop"):
+            driver.disconnect()
+        evidence = driver.read_lifecycle_evidence()
+        assert evidence.connected is False
+        assert evidence.command_loop_running is True
+        assert evidence.serial_open is False
+    finally:
+        driver.release_command_loop()
+        driver.disconnect()

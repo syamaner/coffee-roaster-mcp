@@ -207,6 +207,93 @@ def test_stdio_server_starts_and_exposes_bootstrap_tools(tmp_path: Path) -> None
     asyncio.run(_assert_stdio_server_tools(tmp_path))
 
 
+def test_stdio_cold_session_finalisation_has_exact_schema_and_is_idempotent(tmp_path: Path) -> None:
+    """The public stdio path finalises only an explicit cold session."""
+    asyncio.run(_assert_stdio_cold_session_finalisation(tmp_path))
+
+
+async def _assert_stdio_cold_session_finalisation(tmp_path: Path) -> None:
+    """Exercise finalisation through the packaged stdio server."""
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "coffee_roaster_mcp.cli", "serve"],
+        env=_build_clean_server_env(),
+        cwd=tmp_path,
+    )
+    async with stdio_client(server_params) as (read, write), ClientSession(read, write) as session:
+        await _call_with_timeout(session.initialize())
+        started = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool("start_roast_session", {"purpose": "cold_characterisation"})
+            ),
+        ).structuredContent["session"]
+        session_id = started["session_id"]
+        await _call_with_timeout(session.call_tool("mark_beans_added", {}))
+        first = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool(
+                    "finalise_cold_characterisation_session", {"session_id": session_id}
+                )
+            ),
+        ).structuredContent
+        assert set(first) == {
+            "session_id",
+            "session_purpose",
+            "status",
+            "clean",
+            "rejection_reason",
+            "abort_reason",
+            "retained",
+            "reservation_generation",
+            "attempt_number",
+            "recovered_after_failure",
+            "first_started_at_utc",
+            "first_started_session_elapsed_seconds",
+            "last_ended_at_utc",
+            "last_ended_session_elapsed_seconds",
+            "emergency_stop_ordering",
+            "stages",
+            "failures",
+            "admission_driver_evidence",
+            "pre_disconnect_driver_evidence",
+            "final_driver_evidence",
+            "sampler",
+            "pre_finalisation_first_crack_status",
+            "first_crack_runtime",
+            "recording",
+            "disconnect",
+            "session_active_after",
+            "session_phase_after",
+        }
+        assert first["clean"] is True
+        assert first["final_driver_evidence"]["evidence"]["connected"] is False
+        assert first["pre_finalisation_first_crack_status"]["status"] == "disabled"
+        assert first["recording"]["outcome"] == "not_configured"
+        second = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool(
+                    "finalise_cold_characterisation_session", {"session_id": session_id}
+                )
+            ),
+        ).structuredContent
+        assert second == first
+        normal = cast(Any, await _call_with_timeout(session.call_tool("start_roast_session", {})))
+        rejected = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool(
+                    "finalise_cold_characterisation_session",
+                    {"session_id": normal.structuredContent["session"]["session_id"]},
+                )
+            ),
+        ).structuredContent
+        assert rejected["status"] == "rejected"
+        assert rejected["rejection_reason"] == "session_purpose_not_eligible"
+
+
 async def _assert_stdio_server_tools(tmp_path: Path) -> None:
     server_params = StdioServerParameters(
         command=sys.executable,
