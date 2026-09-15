@@ -33,6 +33,7 @@ from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackRuntimeSnapshot,
     FirstCrackRuntimeState,
     FirstCrackSessionRuntime,
+    RecordingArtifactPlan,
 )
 from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
@@ -395,6 +396,57 @@ def test_first_crack_stop_failure_resumes_without_rerunning_sampler(tmp_path: Pa
     assert completed.status == "clean"
     assert runtime.calls == 2
     assert sampler.calls == 1
+
+
+@pytest.mark.parametrize("failure", ("not_started", "recording_sidecar", "annotation_sidecar"))
+def test_recording_failure_is_terminal_not_clean_and_idempotent(
+    tmp_path: Path, failure: str
+) -> None:
+    """Every recording failure still disconnects and retains one terminal result."""
+    context = _cold_finalisation_context(tmp_path)
+    runtime = RecordingFailureRuntime(tmp_path, failure)
+    _set_first_crack_runtime(context, runtime)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+
+    result = _finalise_cold_characterisation_session(context, session.id)
+
+    assert result.status == "completed_not_clean"
+    assert result.clean is False and result.retained is True
+    assert result.stages[2].status == "failed"
+    assert result.disconnect.connected_false_confirmed is True
+    assert result.failures[-1].stage == "recording"
+    assert _finalise_cold_characterisation_session(context, session.id) == result
+
+
+def test_disconnect_commit_wins_over_waiting_emergency_stop(tmp_path: Path) -> None:
+    """An emergency request cannot interleave after finalisation commits disconnect."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = BlockingDisconnectDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+    results: list[object] = []
+    errors: list[BaseException] = []
+    finaliser = Thread(
+        target=lambda: _record_finalisation_result(results, errors, context, session.id)
+    )
+    finaliser.start()
+    assert driver.disconnect_started.wait(timeout=1.0)
+    emergency = Thread(
+        target=lambda: _record_tool_error(errors, server, "emergency_stop", _ctx(context))
+    )
+    emergency.start()
+    driver.release_disconnect.set()
+    finaliser.join(timeout=1.0)
+    emergency.join(timeout=1.0)
+    assert not finaliser.is_alive() and not emergency.is_alive()
+    assert (
+        results and cast(Any, results[0]).emergency_stop_ordering == "finalisation_committed_first"
+    )
+    assert driver.actions == ["connect", "disconnect"]
+    assert len(errors) == 1 and isinstance(errors[0], ValueError)
 
 
 def test_quiet_sdk_per_request_log_suppresses_info_keeps_warning() -> None:
@@ -2642,6 +2694,23 @@ class RetryLifecycleDriver(LifecycleRecordingDriver):
             self.connected = False
 
 
+class BlockingDisconnectDriver(LifecycleRecordingDriver):
+    """Driver double that pauses after disconnect commit."""
+
+    def __init__(self) -> None:
+        """Create commit and release rendezvous events."""
+        super().__init__()
+        self.disconnect_started = Event()
+        self.release_disconnect = Event()
+
+    def disconnect(self) -> None:
+        """Hold the lifecycle barrier until the test releases confirmation."""
+        self.actions.append("disconnect")
+        self.disconnect_started.set()
+        assert self.release_disconnect.wait(timeout=1.0)
+        self.connected = False
+
+
 class RetryFinalisationSampler:
     """Sampler double that reports one optional bounded join timeout."""
 
@@ -2681,6 +2750,34 @@ class RetryFinalisationRuntime(FakeFirstCrackRuntime):
         """Keep recording out of this runtime-stage test."""
         del session_id
         return None, None
+
+
+class RecordingFailureRuntime(FakeFirstCrackRuntime):
+    """Runtime double with one generated recording artifact omitted."""
+
+    def __init__(self, root: Path, failure: str) -> None:
+        """Create a recording plan with a selected terminal failure."""
+        super().__init__()
+        primary, sidecar, annotation = root / "p.wav", root / "r.json", root / "a.json"
+        primary.write_bytes(b"x" * 44)
+        if failure != "recording_sidecar":
+            sidecar.write_text("{}", encoding="utf-8")
+        if failure != "annotation_sidecar":
+            annotation.write_text("{}", encoding="utf-8")
+        self.plan = RecordingArtifactPlan(primary, sidecar, annotation, ())
+        self.recorder = SimpleNamespace(
+            started_monotonic_seconds=None if failure == "not_started" else 1.0
+        )
+
+    def finalise_for_session(self, session_id: str) -> tuple[str, None, bool]:
+        """Report a stopped capture without inference."""
+        del session_id
+        return "not_active", None, False
+
+    def recording_for_session(self, session_id: str) -> tuple[object, RecordingArtifactPlan]:
+        """Return the generated plan."""
+        del session_id
+        return self.recorder, self.plan
 
 
 class BlockingFinalisationRuntime(FakeFirstCrackRuntime):
