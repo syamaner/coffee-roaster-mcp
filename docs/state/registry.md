@@ -8,9 +8,9 @@
 - Repository: `syamaner/coffee-roaster-mcp`
 - Package: `coffee-roaster-mcp`
 - MCP Registry name: `io.github.syamaner/coffee-roaster-mcp`
-- Current phase: #157 in progress through completed standalone frontend and software-integration
-  slices #210 and #212 and the implemented #194 instrumentation software slice;
-  #194 and #157 remain open for later operator characterisation and acceptance
+- Current phase: #218's non-actuating cold-characterisation session-finalisation
+  prerequisite is implemented by this delivery and closes on merge. #157 and
+  #194 remain separate open hardware/component acceptance work.
 
 ## Working Rules
 
@@ -24,16 +24,14 @@
 
 ## Active Context
 
-`v0.1.16` is published on PyPI and in the MCP Registry. Tag `v0.1.16` and
-successful release run `32657497601` bind to base
-`07a6b96beae252c9b326f9374a64d91271f08105`. D184 governance issue #206
-completed through PR #207, squash-merged to `main` at
-`2c854d34bdb43f587db438436202b97e1dd01468`. Issue #157 is in progress through
-completed standalone frontend and software-integration slices #210 and #212 and
-the implemented #194 instrumentation software slice; #194 and #157 remain open
-for later operator characterisation and acceptance. The
-intended future minor is `0.2.0`; tag creation,
-publication, and live verification remain human-operator-only actions.
+Per D193, the current released baseline is `v0.2.0` at
+`be1be35f44f76a2057a3f5f3a334420bcf8bfb99`. D184 governance issue #206 completed
+through PR #207, squash-merged to `main` at
+`2c854d34bdb43f587db438436202b97e1dd01468`. Issue #218's non-actuating
+cold-characterisation session-finalisation prerequisite is implemented by this
+delivery and closes on merge. #157 and #194 remain separate open
+hardware/component acceptance work; this state update makes no hardware or
+readiness claim.
 
 ## Historical Narrative (Superseded For Current Delivery)
 

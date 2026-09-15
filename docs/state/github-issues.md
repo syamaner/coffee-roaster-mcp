@@ -2,15 +2,20 @@
 
 Repository: `syamaner/coffee-roaster-mcp`
 
-Milestone: `v0.1`
+Milestone: `v0.2`
+
+Current released baseline (D193): `v0.2.0` at
+`be1be35f44f76a2057a3f5f3a334420bcf8bfb99`
 
 ## Current Stories
 
-- #157: in progress; standalone frontend and software-integration slices #210 and #212 are complete.
+- #218: non-actuating cold-characterisation session-finalisation prerequisite
+  implemented by this delivery; closes on merge.
+- #157: open; separate hardware/component acceptance work.
 - #210: complete; standalone Torch-free NumPy/SciPy mel frontend parity slice.
 - #212: complete; MCP-owned frontend integration and local package readiness slice.
-- #194: instrumentation software slice implemented; remains open for later
-  operator characterisation and supervised acceptance, with no readiness claim.
+- #194: open; separate hardware/component acceptance work, with no readiness
+  claim.
 - #200: complete.
 - #202: complete.
 - #204: complete.
