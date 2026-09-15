@@ -875,6 +875,11 @@ class RoastRecorder(Protocol):
         """Flush, finalize every WAV, and write the sidecar."""
         ...
 
+    @property
+    def shutdown_confirmed(self) -> bool:
+        """Return whether every recorder-owned capture worker has stopped."""
+        ...
+
 
 def device_label_to_filename(label: str) -> str:
     """Derive a filesystem-safe WAV stem fragment from a device label.
@@ -1185,6 +1190,12 @@ class _IndependentCaptureStream:
         return self._writer
 
     @property
+    def shutdown_confirmed(self) -> bool:
+        """Return whether this independent recorder capture thread has stopped."""
+        thread = self._thread
+        return thread is None or not thread.is_alive()
+
+    @property
     def overflow_snapshot(self) -> OverflowSnapshot | None:
         """Return this stream's overflow diagnostics, if its input reports them.
 
@@ -1337,6 +1348,11 @@ class RoastAudioRecorder:
     def started_monotonic_seconds(self) -> float | None:
         """Return the absolute monotonic timestamp captured at recording start."""
         return self._started_monotonic_seconds
+
+    @property
+    def shutdown_confirmed(self) -> bool:
+        """Return true because this recorder owns no independent worker."""
+        return True
 
     def begin(self) -> None:
         """Open the WAV writer and capture the recording-start monotonic time."""
@@ -1526,6 +1542,11 @@ class MultiDeviceRoastRecorder:
         return self._started_monotonic_seconds
 
     @property
+    def shutdown_confirmed(self) -> bool:
+        """Return whether every independently-captured recorder stream stopped."""
+        return all(stream.shutdown_confirmed for stream in self._additional_streams)
+
+    @property
     def overflow_snapshot(self) -> OverflowSnapshot | None:
         """Return overflow diagnostics AGGREGATED across additional devices.
 
@@ -1603,6 +1624,9 @@ class MultiDeviceRoastRecorder:
         """
         with self._close_lock:
             if self._closed:
+                for stream in self._additional_streams:
+                    with suppress(Exception):
+                        stream.stop(timeout_seconds=self._stop_timeout_seconds)
                 return
             self._closed = True
             if self._started_monotonic_seconds is None:
@@ -1896,10 +1920,11 @@ class AudioCapturePipeline:
         know that both the reader and processing workers have actually exited.
         """
         with self._state_lock:
-            return all(
+            capture_threads_stopped = all(
                 thread is None or not thread.is_alive()
                 for thread in (self._reader_thread, self._thread)
             )
+        return capture_threads_stopped and bool(getattr(self._recorder, "shutdown_confirmed", True))
 
     def start(self) -> AudioCaptureSnapshot:
         """Start background audio capture and return the current status snapshot.

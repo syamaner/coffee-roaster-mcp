@@ -175,6 +175,8 @@ class FirstCrackSessionRuntime:
         self._active_session_id: str | None = None
         self._pipeline: FirstCrackAudioPipeline | None = None
         self._capture_started_for_session = False
+        self._capture_start_failed_for_session = False
+        self._capture_teardown_started = False
         self._adapter: FirstCrackDetectorAdapter | None = None
         self._status: FirstCrackRuntimeState = _initial_status(config.first_crack)
         self._reason: str | None = _initial_reason(config.first_crack)
@@ -289,6 +291,8 @@ class FirstCrackSessionRuntime:
             self._last_capture_snapshot = None
             self._last_capture_snapshot_as_of_monotonic_seconds = None
             self._capture_started_for_session = False
+            self._capture_start_failed_for_session = False
+            self._capture_teardown_started = False
             # Fresh empty box every session (#191): a prior roast's recovered
             # milestone must never leak into this one's sidecar.
             self._recovered_first_crack_holder = []
@@ -332,6 +336,7 @@ class FirstCrackSessionRuntime:
                 self._reason = f"Audio first-crack detection is unavailable: {exc}"
                 self._adapter = None
                 self._pipeline = None
+                self._capture_start_failed_for_session = True
                 return self.snapshot()
             except Exception as exc:  # noqa: BLE001 - dependency backends vary.
                 self._status = "unavailable"
@@ -341,6 +346,7 @@ class FirstCrackSessionRuntime:
                 )
                 self._adapter = None
                 self._pipeline = None
+                self._capture_start_failed_for_session = True
                 return self.snapshot()
             finally:
                 # The recorder is consumed by the pipeline factory; clear the
@@ -611,12 +617,15 @@ class FirstCrackSessionRuntime:
                 return "not_active", None, False
             pipeline = self._pipeline
             if pipeline is None:
+                if self._capture_start_failed_for_session:
+                    return "stop_failed", "Audio capture did not start.", True
                 return (
                     ("stopped", None, False)
                     if self._capture_started_for_session
                     else ("not_active", None, False)
                 )
             try:
+                self._capture_teardown_started = True
                 capture = pipeline.stop(timeout_seconds=self._stop_timeout_seconds)
             except Exception as exc:  # noqa: BLE001 - teardown must be reported.
                 return "stop_failed", f"{type(exc).__name__}: {exc}", True
@@ -802,6 +811,8 @@ class FirstCrackSessionRuntime:
         # never drain/detect again until a fresh session resets the flag.
         if self._inference_stopped:
             return False
+        if self._capture_teardown_started:
+            return False
         if self._status != "pending":
             return False
         return session.active and session.phase == "roasting"
@@ -829,6 +840,8 @@ class FirstCrackSessionRuntime:
             return False
         if self._inference_stopped:
             return False
+        if self._capture_teardown_started:
+            return False
         if self._status != "pending":
             return False
         return session.phase in ("dropped", "cooling")
@@ -842,6 +855,7 @@ class FirstCrackSessionRuntime:
         pipeline = self._pipeline
         if pipeline is not None:
             try:
+                self._capture_teardown_started = True
                 # pipeline.stop() returns a FINAL LIVE snapshot taken during
                 # the stop call itself, so "now" genuinely is this
                 # aggregate's true as-of instant (#193 review finding,

@@ -1976,6 +1976,33 @@ def test_multi_device_recorder_writes_two_wavs(tmp_path: Path) -> None:
     assert recorder.additional_wav_paths == (tmp_path / "roast.atr2100x.wav",)
 
 
+def test_multi_device_shutdown_waits_for_a_live_additional_capture_thread(tmp_path: Path) -> None:
+    """Recorder shutdown is unconfirmed until every independent input exits."""
+    from coffee_roaster_mcp.audio import AdditionalRecordingDevice, MultiDeviceRoastRecorder
+
+    additional_input = BlockingClosableAudioInput()
+    recorder = MultiDeviceRoastRecorder(
+        detector_wav_path=tmp_path / "detector.wav",
+        detector_device_label=None,
+        sidecar_path=tmp_path / "recording.json",
+        sample_rate=4,
+        session_id="session",
+        additional_devices=[AdditionalRecordingDevice("extra", tmp_path / "extra.wav", 4)],
+        additional_input_factory=lambda _device: additional_input,
+        stop_timeout_seconds=0.0,
+    )
+
+    recorder.begin()
+    assert additional_input.read_started.wait(timeout=1.0)
+    recorder.close()
+    assert recorder.shutdown_confirmed is False
+
+    additional_input.release()
+    _wait_for(lambda: additional_input.closed)
+    recorder.close()
+    assert recorder.shutdown_confirmed is True
+
+
 def test_multi_device_recorder_aggregates_overflow_across_additional_streams(
     tmp_path: Path,
 ) -> None:
@@ -2083,6 +2110,10 @@ def test_pipeline_snapshot_folds_in_recorder_overflow_additively() -> None:
         @property
         def started_monotonic_seconds(self) -> float | None:
             return None
+
+        @property
+        def shutdown_confirmed(self) -> bool:
+            return True
 
         def begin(self) -> None:
             return None

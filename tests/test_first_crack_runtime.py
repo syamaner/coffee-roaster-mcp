@@ -941,6 +941,29 @@ def test_audio_runtime_reports_unavailable_artifact_errors_without_crashing() ->
     assert snapshot.active is False
 
 
+def test_failed_audio_capture_start_remains_a_retryable_finalisation_failure() -> None:
+    """An attempted but failed capture start cannot become not-applicable teardown."""
+    session = RoastSessionStore().start_session(purpose="cold_characterisation")
+
+    def fail_pipeline(_config: AudioConfig) -> FakeAudioPipeline:
+        raise AudioCaptureError("input unavailable")
+
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=fail_pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+
+    assert runtime.start_for_session(session).status == "unavailable"
+    assert runtime.finalise_for_session(session.id) == (
+        "stop_failed",
+        "Audio capture did not start.",
+        True,
+    )
+
+
 def test_audio_runtime_reports_capture_and_detector_faults() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
@@ -2360,6 +2383,30 @@ def test_finalise_recognises_capture_stopped_before_finalisation() -> None:
     runtime.start_for_session(session)
     runtime.stop_for_session(session.id, reason="operator stopped capture")
     assert runtime.finalise_for_session(session.id) == ("stopped", None, False)
+
+
+def test_post_drop_windows_are_not_inferred_after_teardown_begins() -> None:
+    """A retained, unconfirmed stop never feeds post-drop windows to the detector."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    pipeline = FakeAudioPipeline((_audio_window(sequence_number=1),), running_after_stop=True)
+    backend = MockDetectorBackend(())
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), backend
+        ),
+    )
+    runtime.start_for_session(session)
+    assert runtime.finalise_for_session(session.id)[0] == "capture_still_running"
+    store.record_event(session, "beans_added")
+    store.record_event(session, "beans_dropped")
+
+    runtime.process_pending_windows_after_drop(session_store=store, session=session)
+
+    assert backend.windows == []
+    assert pipeline.drain_limits == []
 
 
 def test_recorder_build_failure_cannot_expose_prior_session_artifacts(

@@ -1728,7 +1728,7 @@ def _read_driver_lifecycle_evidence(server_context: ServerContext) -> DriverEvid
             status_packet_count=raw.status_packet_count,
             status_read_error_count=raw.status_read_error_count,
         )
-    except (TypeError, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001 - malformed driver properties vary.
         return DriverEvidenceRead(
             captured_at_utc, "malformed", f"{type(exc).__name__}: {exc}", None
         )
@@ -1853,7 +1853,7 @@ def _recording_evidence(
         return RecordingFinalisationEvidence(False, "not_configured", None, ())
     items: list[RecordingArtifact] = []
     for role, path, _minimum in (
-        ("primary_wav", plan.primary_wav, 44),
+        ("primary_wav", plan.primary_wav, 45),
         ("recording_sidecar", plan.recording_sidecar, 1),
         ("annotation_session_sidecar", plan.annotation_session_sidecar, 1),
     ):
@@ -1893,7 +1893,7 @@ def _recording_evidence(
     complete = all(
         item.exists
         and item.size_bytes is not None
-        and item.size_bytes >= (44 if item.role == "primary_wav" else 1)
+        and item.size_bytes >= (45 if item.role == "primary_wav" else 1)
         for item in items
     )
     return RecordingFinalisationEvidence(
@@ -1966,6 +1966,10 @@ def _finalise_cold_characterisation_session(
                 result = _with_stage(result, 0, "incomplete", "Sampler join timed out.")
                 return _persist_partial(session, result, server_context)
             result = _with_stage(result, 0, "completed")
+            result = cast(
+                SessionFinalisationResult,
+                server_context.session_store.persist_finalisation(session, result),
+            )
         if result.stages[1].status not in ("completed", "not_applicable"):
             outcome, error, capture_running = (
                 server_context.first_crack_runtime.finalise_for_session(session.id)
@@ -1990,6 +1994,10 @@ def _finalise_cold_characterisation_session(
             result = _with_stage(
                 result, 1, "not_applicable" if outcome == "not_active" else "completed"
             )
+            result = cast(
+                SessionFinalisationResult,
+                server_context.session_store.persist_finalisation(session, result),
+            )
         if result.stages[2].status == "pending":
             recorder, plan = server_context.first_crack_runtime.recording_for_session(session.id)
             recording = _recording_evidence(plan, recorder)
@@ -2005,6 +2013,10 @@ def _finalise_cold_characterisation_session(
                     result, "recording", recording.outcome, recording.reason or "Recording failed."
                 )
                 result = _with_stage(result, 2, "failed", recording.reason)
+            result = cast(
+                SessionFinalisationResult,
+                server_context.session_store.persist_finalisation(session, result),
+            )
         return _disconnect_finalisation(server_context, session, result)
     finally:
         server_context.session_store.finish_finalisation_invocation(session)

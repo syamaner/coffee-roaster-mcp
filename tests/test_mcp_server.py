@@ -218,13 +218,103 @@ def test_lifecycle_evidence_conversion_and_impossible_none_fail_closed() -> None
     )
 
 
+def test_unexpected_evidence_property_error_releases_finalisation_admission(tmp_path: Path) -> None:
+    """A property failure is typed malformed evidence, never a leaked reservation."""
+
+    class ExplodingEvidence(DriverLifecycleEvidence):
+        poisoned = False
+
+        def __getattribute__(self, name: str) -> object:
+            if name == "heat_level_percent" and type(self).poisoned:
+                raise RuntimeError("property failed")
+            return super().__getattribute__(name)
+
+    evidence = ExplodingEvidence(
+        driver="mock",
+        connected=True,
+        command_streaming_required=False,
+        command_loop_running=None,
+        serial_open=None,
+        heat_level_percent=0,
+        roast_fan_level_percent=0,
+        main_fan_level_percent=0,
+        drum_motor_on=False,
+        cooling_motor_on=False,
+        solenoid_open=False,
+        command_send_attempts=None,
+        command_write_count=None,
+        last_command_write_size=None,
+        command_loop_error_count=None,
+        status_packet_count=None,
+        status_read_error_count=None,
+    )
+    ExplodingEvidence.poisoned = True
+
+    class ExplodingDriver:
+        def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
+            return evidence
+
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "roaster_driver", ExplodingDriver())
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    result = _finalise_cold_characterisation_session(context, session.id)
+
+    assert result.rejection_reason == "driver_state_malformed"
+    assert session.pending_driver_command_token is None
+    context.session_store.record_event(session, "beans_added")
+
+
+@pytest.mark.parametrize("stage_index", (0, 1, 2))
+def test_emergency_abort_retains_each_persisted_finalisation_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage_index: int
+) -> None:
+    """An abort after a stage persist retains that stage's evidence and status."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+    runtime = FakeFirstCrackRuntime()
+    runtime.finalise_for_session = lambda _session_id: (  # type: ignore[method-assign]
+        "not_active",
+        None,
+        False,
+    )
+    runtime.recording_for_session = lambda _session_id: (None, None)  # type: ignore[method-assign]
+    if stage_index == 2:
+        primary, sidecar, annotation = (tmp_path / name for name in ("p.wav", "r.json", "a.json"))
+        primary.write_bytes(b"x" * 45)
+        sidecar.write_text("{}", encoding="utf-8")
+        annotation.write_text("{}", encoding="utf-8")
+        runtime.recording_for_session = lambda _session_id: (  # type: ignore[method-assign]
+            SimpleNamespace(started_monotonic_seconds=1.0),
+            RecordingArtifactPlan(primary, sidecar, annotation, ()),
+        )
+    _set_first_crack_runtime(context, runtime)
+    tripped = False
+    original = context.session_store.persist_finalisation
+
+    def persist_then_abort(live_session: RoastSession, record: object) -> object:
+        nonlocal tripped
+        persisted = original(live_session, record)
+        stages = cast(Any, persisted).stages
+        if not tripped and stages[stage_index].status in ("completed", "not_applicable", "failed"):
+            tripped = True
+            context.session_store.emergency_stop(live_session, reason="stage race")
+        return persisted
+
+    monkeypatch.setattr(context.session_store, "persist_finalisation", persist_then_abort)
+    result = _finalise_cold_characterisation_session(context, session.id)
+
+    assert result.status == "aborted"
+    assert result.stages[stage_index].status in ("completed", "not_applicable", "failed")
+
+
 def test_recording_evidence_includes_additional_wavs(tmp_path: Path) -> None:
     """Every planned additional WAV is retained in final recording evidence."""
     paths = [
         tmp_path / name for name in ("main.wav", "recording.json", "annotation.json", "extra.wav")
     ]
     for path in paths:
-        path.write_bytes(b"x" * 44)
+        path.write_bytes(b"x" * 45)
     plan = RecordingArtifactPlan(paths[0], paths[1], paths[2], (paths[3],))
     recorder = SimpleNamespace(started_monotonic_seconds=1.0)
     evidence = _recording_evidence(plan, recorder)
@@ -260,6 +350,22 @@ def test_additional_wav_metadata_error_is_retained_as_missing_artifact(tmp_path:
     assert evidence.outcome == "failed"
     assert evidence.artifacts[-1].exists is False
     assert evidence.artifacts[-1].size_bytes is None
+
+
+def test_recording_evidence_rejects_header_only_primary_wav(tmp_path: Path) -> None:
+    """A valid but zero-frame WAV header is not recording completion evidence."""
+    primary, sidecar, annotation = (tmp_path / name for name in ("p.wav", "r.json", "a.json"))
+    primary.write_bytes(b"R" * 44)
+    sidecar.write_text("{}", encoding="utf-8")
+    annotation.write_text("{}", encoding="utf-8")
+
+    evidence = _recording_evidence(
+        RecordingArtifactPlan(primary, sidecar, annotation, ()),
+        SimpleNamespace(started_monotonic_seconds=1.0),
+    )
+
+    assert evidence.outcome == "failed"
+    assert evidence.artifacts[0].size_bytes == 44
 
 
 def test_invalid_finalisation_reservation_returns_its_retained_abort(tmp_path: Path) -> None:
