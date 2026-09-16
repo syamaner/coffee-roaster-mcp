@@ -756,6 +756,7 @@ def test_runtime_overflow_rolling_fields_decay_from_last_live_poll_when_stop_its
     assert stopped.status == "faulted"
     assert stopped.active is False
     assert stopped.overflow_count_last_minute == 0
+    assert stopped.estimated_lost_audio_ms_last_minute == 0.0
     # The lifetime total survives regardless of decay.
     assert stopped.total_overflow_count == 42
 

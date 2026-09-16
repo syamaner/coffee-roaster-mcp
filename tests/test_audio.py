@@ -1316,6 +1316,43 @@ def test_pipeline_recorder_write_failure_does_not_kill_detection(tmp_path: Path)
     assert pipeline.drain_windows()[0].samples == (0.0, 1.0, 2.0, 3.0)
 
 
+def test_disabled_recorder_retains_unconfirmed_shutdown_proof(tmp_path: Path) -> None:
+    """A dropped recorder cannot erase an additional-stream shutdown failure."""
+
+    from coffee_roaster_mcp.audio import AdditionalRecordingDevice, MultiDeviceRoastRecorder
+
+    class FailingMultiDeviceRecorder(MultiDeviceRoastRecorder):
+        def write_samples(self, samples: Sequence[float]) -> None:
+            del samples
+            raise RuntimeError("recording stream failed")
+
+    additional_input = BlockingClosableAudioInput()
+    recorder = FailingMultiDeviceRecorder(
+        detector_wav_path=tmp_path / "detector.wav",
+        detector_device_label=None,
+        sidecar_path=tmp_path / "roast.json",
+        sample_rate=4,
+        session_id="s",
+        additional_devices=[AdditionalRecordingDevice("extra", tmp_path / "extra.wav", 4)],
+        additional_input_factory=lambda _device: additional_input,
+        stop_timeout_seconds=0.0,
+    )
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(input_device=None, sample_rate=4, window_seconds=1.0),
+        audio_input=FiniteAudioInput((0.0, 1.0, 2.0, 3.0)),
+        recorder=recorder,
+    )
+
+    pipeline.start()
+    assert additional_input.read_started.wait(timeout=1.0)
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count == 1)
+    pipeline.stop()
+    assert pipeline.shutdown_confirmed is False
+    additional_input.release()
+    _wait_for(lambda: additional_input.closed)
+    assert pipeline.shutdown_confirmed is True
+
+
 def test_pipeline_recorder_begin_failure_does_not_kill_detection(tmp_path: Path) -> None:
     """Finding #1: a recording-START failure must not stop capture/detection."""
 

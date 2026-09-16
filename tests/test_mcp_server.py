@@ -966,7 +966,9 @@ def test_returned_indeterminate_result_is_detached_from_later_emergency_abort(
     assert returned.status == "disconnect_indeterminate"
     context.session_store.emergency_stop(session, reason="test")
     assert returned.status == "disconnect_indeterminate"
-    assert _finalise_cold_characterisation_session(context, session.id).status == "aborted"
+    aborted = _finalise_cold_characterisation_session(context, session.id)
+    assert aborted.status == "aborted"
+    assert aborted.emergency_stop_ordering == "emergency_stop_after_disconnect_attempt"
 
 
 def test_not_applicable_first_crack_stage_is_not_rerun_on_disconnect_retry(tmp_path: Path) -> None:

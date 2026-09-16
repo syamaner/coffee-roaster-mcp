@@ -1852,6 +1852,7 @@ class AudioCapturePipeline:
         self._audio_input = audio_input
         self._monotonic_now = monotonic_now or time.monotonic
         self._recorder = recorder
+        self._disabled_recorder: RoastRecorder | None = None
         self._windows: Queue[AudioWindow] = Queue(maxsize=settings.queue_limit)
         self._sample_buffer: list[float] = []
         self._stop_requested = Event()
@@ -1924,7 +1925,13 @@ class AudioCapturePipeline:
                 thread is None or not thread.is_alive()
                 for thread in (self._reader_thread, self._thread)
             )
-            recorder = self._recorder
+            recorder = self._recorder or self._disabled_recorder
+            if (
+                self._recorder is None
+                and self._disabled_recorder is not None
+                and bool(getattr(self._disabled_recorder, "shutdown_confirmed", False))
+            ):
+                self._disabled_recorder = None
         return capture_threads_stopped and (
             recorder is None or bool(getattr(recorder, "shutdown_confirmed", False))
         )
@@ -2395,6 +2402,9 @@ class AudioCapturePipeline:
         if recorder is not None:
             with suppress(Exception):
                 recorder.close()
+            if not bool(getattr(recorder, "shutdown_confirmed", False)):
+                with self._state_lock:
+                    self._disabled_recorder = recorder
 
     def _emit_complete_windows(self) -> None:
         window_sample_count = self._settings.window_sample_count
@@ -2526,6 +2536,7 @@ class AudioCapturePipeline:
         self._emitted_window_count = 0
         self._dropped_window_count = 0
         self._latest_error = None
+        self._disabled_recorder = None
         self._level_meter.reset()
         # coffee-roaster-mcp#193 review finding: a pipeline instance can be
         # start()ed more than once against the SAME audio input (see
