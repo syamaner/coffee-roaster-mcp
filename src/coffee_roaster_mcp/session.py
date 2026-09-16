@@ -35,7 +35,8 @@ RoastEventKind = Literal[
     "fault",
 ]
 EventPayloadValue = str | int | float | bool | None
-DriverCommandKind = Literal["control", "drop", "start_cooling", "stop_cooling"]
+SessionPurpose = Literal["roast", "cold_characterisation"]
+DriverCommandKind = Literal["control", "drop", "start_cooling", "stop_cooling", "finalisation"]
 
 _SINGLETON_EVENT_KINDS: frozenset[RoastEventKind] = frozenset(
     {
@@ -350,6 +351,7 @@ class RoastSession:
     id: str
     created_at_utc: datetime
     monotonic_start: float
+    purpose: SessionPurpose = "roast"
     phase: RoastPhase = "pre_roast"
     beans_added_at_utc: datetime | None = None
     beans_added_monotonic_seconds: float | None = None
@@ -382,6 +384,10 @@ class RoastSession:
     monotonic_stop: float | None = None
     pending_driver_command_token: str | None = None
     pending_driver_command_kind: DriverCommandKind | None = None
+    # The concrete finalisation result is deliberately owned by mcp_server.
+    # Store only a deep-copyable opaque value here to keep the lifecycle store
+    # independent of the server/tool module.
+    finalisation: object | None = None
 
     @property
     def active(self) -> bool:
@@ -788,8 +794,12 @@ class RoastSessionStore:
         self._sessions_by_id: dict[str, RoastSession] = {}
         self._session_id_order: deque[str] = deque()
         self._pending_session_start_token: str | None = None
+        self._finalisation_generation = 0
+        self._finalisation_tokens: dict[str, str] = {}
+        self._finalisation_in_progress: set[str] = set()
+        self._nonterminal_finalisations: set[str] = set()
 
-    def start_session(self) -> RoastSession:
+    def start_session(self, *, purpose: SessionPurpose = "roast") -> RoastSession:
         """Start one new active session.
 
         Returns:
@@ -802,12 +812,12 @@ class RoastSessionStore:
         with self._lock:
             if self._pending_session_start_token is not None:
                 raise SessionLifecycleError("A roast session start is already in progress.")
-            return self._start_session_locked()
+            return self._start_session_locked(purpose=purpose)
 
-    def start_session_snapshot(self) -> RoastSession:
+    def start_session_snapshot(self, *, purpose: SessionPurpose = "roast") -> RoastSession:
         """Start one new session and return an atomic lightweight snapshot."""
         with self._lock:
-            session = self.start_session()
+            session = self.start_session(purpose=purpose)
             return _copy_session_for_read(session)
 
     def reserve_session_start(self) -> SessionStartReservation:
@@ -825,12 +835,14 @@ class RoastSessionStore:
     def complete_session_start_snapshot(
         self,
         reservation: SessionStartReservation,
+        *,
+        purpose: SessionPurpose = "roast",
     ) -> RoastSession:
         """Create the reserved session and return an atomic lightweight snapshot."""
         with self._lock:
             self._assert_session_start_reservation(reservation)
             try:
-                session = self._start_session_locked()
+                session = self._start_session_locked(purpose=purpose)
             finally:
                 self._pending_session_start_token = None
             return _copy_session_for_read(session)
@@ -914,6 +926,7 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
+            self._assert_finalisation_allows_mutation(session)
             sample = TelemetrySample(
                 recorded_at_utc=self._utc_now(),
                 monotonic_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
@@ -957,6 +970,8 @@ class RoastSessionStore:
         """
         with self._lock:
             if self._latest_session is None or not self._latest_session.active:
+                return None
+            if self._finalisation_blocks_mutation(self._latest_session):
                 return None
             if session_id is not None and self._latest_session.id != session_id:
                 return None
@@ -1431,12 +1446,13 @@ class RoastSessionStore:
             if session.pending_driver_command_token == reservation.token:
                 self._clear_driver_command_reservation_locked(session, reservation)
 
-    def cancel_pending_driver_command(self, session: RoastSession) -> None:
-        """Cancel any pending non-emergency driver command for one session."""
+    def cancel_nonfinalisation_driver_command(self, session: RoastSession) -> None:
+        """Atomically cancel a pending command unless finalisation owns it."""
         with self._lock:
             self._assert_latest_session(session)
-            session.pending_driver_command_token = None
-            session.pending_driver_command_kind = None
+            if session.pending_driver_command_kind != "finalisation":
+                session.pending_driver_command_token = None
+                session.pending_driver_command_kind = None
 
     def start_cooling(self, session: RoastSession) -> RoastEvent:
         """Start cooling for one active session."""
@@ -1498,6 +1514,8 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
+            if kind != "fault":
+                self._assert_finalisation_allows_mutation(session)
             if session.faulted_at_utc is not None and kind != "fault":
                 raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
 
@@ -1572,6 +1590,8 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
+            if self._finalisation_blocks_mutation(session):
+                return None, _copy_session_for_read(session)
             if session.beans_added_at_utc is not None:
                 return self._get_existing_singleton_event(session, "beans_added"), (
                     _copy_session_for_read(session)
@@ -1723,6 +1743,7 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
+            self._assert_finalisation_allows_mutation(session)
             recorded_at_utc = self._utc_now()
             monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
             session.fc_window_count += 1
@@ -1791,6 +1812,7 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
+            self._assert_finalisation_allows_mutation(session)
             if session.faulted_at_utc is not None:
                 raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
 
@@ -1872,6 +1894,25 @@ class RoastSessionStore:
                 )
             else:
                 session.phase = "fault"
+            if session.id in self._nonterminal_finalisations:
+                record = session.finalisation
+                if record is not None:
+                    # Result models are server-owned. Preserve their append-only
+                    # data and only apply the lifecycle fields common to all
+                    # finalisation records.
+                    object.__setattr__(record, "status", "aborted")
+                    object.__setattr__(record, "abort_reason", "emergency_stop")
+                    attempted = getattr(getattr(record, "disconnect", None), "attempt_count", 0)
+                    ordering = (
+                        "emergency_stop_after_disconnect_attempt"
+                        if attempted
+                        else "emergency_stop_before_disconnect_commit"
+                    )
+                    object.__setattr__(record, "emergency_stop_ordering", ordering)
+                    object.__setattr__(record, "retained", True)
+                    object.__setattr__(record, "session_active_after", session.active)
+                    object.__setattr__(record, "session_phase_after", session.phase)
+                self._clear_finalisation_locked(session)
             return event
 
     def emergency_stop_snapshot(
@@ -1923,10 +1964,150 @@ class RoastSessionStore:
                 raise SessionLifecycleError("No active roast session exists.")
             return _copy_session_for_read(session)
 
+    def begin_finalisation(
+        self, session_id: str
+    ) -> tuple[RoastSession | None, str | None, int | None]:
+        """Reserve an eligible latest session for finalisation.
+
+        Returns the live session, a rejection code, and a monotonically
+        increasing generation. The caller performs driver evidence reads after
+        reservation, then either attaches a retained record or abandons it.
+        """
+        with self._lock:
+            session = self._sessions_by_id.get(session_id)
+            if session is None:
+                return None, "unknown_session", None
+            if session.finalisation is not None:
+                if getattr(session.finalisation, "status", None) in (
+                    "clean",
+                    "completed_not_clean",
+                    "aborted",
+                ):
+                    return (
+                        session,
+                        None,
+                        getattr(session.finalisation, "reservation_generation", None),
+                    )
+                if session_id in self._finalisation_in_progress:
+                    return session, "finalisation_in_progress", None
+                rejection = self._finalisation_admission_rejection_locked(
+                    session, require_reservation=True
+                )
+                if rejection is not None:
+                    self._abort_finalisation_locked(session)
+                    return session, rejection, None
+                self._finalisation_in_progress.add(session_id)
+                return session, None, getattr(session.finalisation, "reservation_generation", None)
+            rejection = self._finalisation_admission_rejection_locked(session)
+            if rejection is not None:
+                return session, rejection, None
+            if session_id in self._finalisation_in_progress:
+                return session, "finalisation_in_progress", None
+            if session.pending_driver_command_token is not None:
+                return session, "command_in_progress", None
+            self._finalisation_generation += 1
+            self._finalisation_in_progress.add(session_id)
+            self._nonterminal_finalisations.add(session_id)
+            self._reserve_driver_command_locked(session, kind="finalisation")
+            token = session.pending_driver_command_token
+            assert token is not None
+            self._finalisation_tokens[session_id] = token
+            return session, None, self._finalisation_generation
+
+    def attach_finalisation(self, session: RoastSession, record: object) -> object:
+        """Attach a retained finalisation record after successful admission."""
+        with self._lock:
+            if self._finalisation_admission_rejection_locked(session, require_reservation=True):
+                object.__setattr__(record, "status", "aborted")
+                object.__setattr__(
+                    record,
+                    "abort_reason",
+                    "emergency_stop"
+                    if session.faulted_at_utc is not None
+                    else "session_or_reservation_changed",
+                )
+                object.__setattr__(record, "retained", True)
+                object.__setattr__(
+                    record,
+                    "emergency_stop_ordering",
+                    "emergency_stop_before_disconnect_commit",
+                )
+                object.__setattr__(record, "session_active_after", session.active)
+                object.__setattr__(record, "session_phase_after", session.phase)
+                session.finalisation = record
+                self._clear_finalisation_locked(session)
+                return record
+            session.finalisation = record
+            return record
+
+    def abandon_finalisation_admission(self, session: RoastSession) -> None:
+        """Release a failed first-admission reservation."""
+        with self._lock:
+            self._clear_finalisation_locked(session)
+
+    def finish_finalisation_invocation(self, session: RoastSession) -> None:
+        """Clear the in-progress marker after one finalisation call returns."""
+        with self._lock:
+            self._finalisation_in_progress.discard(session.id)
+
+    def finish_finalisation_terminal(self, session: RoastSession, record: object) -> object:
+        """Release reservation and stop a successfully disconnected session."""
+        with self._lock:
+            if getattr(session.finalisation, "status", None) == "aborted":
+                return deepcopy(session.finalisation)
+            self._assert_latest_active_session(session)
+            session.finalisation = record
+            self._clear_finalisation_locked(session)
+            session.stop(
+                utc_now=self._utc_now,
+                monotonic_now=self._monotonic_now,
+                phase=session.phase,
+            )
+            return deepcopy(record)
+
+    def persist_finalisation(self, session: RoastSession, record: object) -> object:
+        """Persist nonterminal finalisation progress without overwriting an abort."""
+        with self._lock:
+            if getattr(session.finalisation, "status", None) == "aborted":
+                return deepcopy(session.finalisation)
+            session.finalisation = record
+            return deepcopy(record)
+
+    def finalisation_blocks_session(self, session_id: str) -> bool:
+        """Return whether finalisation fences background mutation for this session."""
+        with self._lock:
+            session = self._sessions_by_id.get(session_id)
+            return session is not None and self._finalisation_blocks_mutation(session)
+
+    def abort_finalisation_if_invalid(
+        self, session: RoastSession, generation: int | None
+    ) -> object | None:
+        """Atomically abort a retained finalisation when its reservation changed."""
+        with self._lock:
+            record = session.finalisation
+            if (
+                record is not None
+                and self._finalisation_admission_rejection_locked(session, require_reservation=True)
+                is None
+                and getattr(record, "reservation_generation", None) == generation
+                and self._finalisation_tokens.get(session.id)
+                == session.pending_driver_command_token
+            ):
+                return None
+            if record is None:
+                raise SessionLifecycleError("Finalisation reservation is invalid without a record.")
+            aborted = self._abort_finalisation_locked(session)
+            return aborted
+
     def copy_session(self, session: RoastSession) -> RoastSession:
         """Return a deep-copied snapshot of one known session object under the store lock."""
         with self._lock:
             return _copy_session_for_read(session)
+
+    def copy_finalisation(self, session: RoastSession) -> object | None:
+        """Return a detached finalisation record under store locking."""
+        with self._lock:
+            return deepcopy(session.finalisation)
 
     @property
     def telemetry_buffer_limit(self) -> int:
@@ -1938,6 +2119,59 @@ class RoastSessionStore:
         self._assert_latest_session(session)
         if not session.active:
             raise SessionLifecycleError("Stopped sessions cannot be mutated.")
+
+    def _finalisation_blocks_mutation(self, session: RoastSession) -> bool:
+        """Return whether a finalisation reservation excludes ordinary mutation."""
+        return (
+            session.id in self._nonterminal_finalisations
+            or session.pending_driver_command_kind == "finalisation"
+        )
+
+    def _assert_finalisation_allows_mutation(self, session: RoastSession) -> None:
+        """Reject an ordinary mutation while a finalisation reservation is active."""
+        if self._finalisation_blocks_mutation(session):
+            raise SessionLifecycleError("Session finalisation is in progress.")
+
+    def _finalisation_admission_rejection_locked(
+        self, session: RoastSession, *, require_reservation: bool = False
+    ) -> str | None:
+        """Return the current finalisation-identity rejection under store locking."""
+        if self._latest_session is not session:
+            return "not_latest_session"
+        if not session.active:
+            return "session_not_active"
+        if session.purpose != "cold_characterisation":
+            return "session_purpose_not_eligible"
+        if session.faulted_at_utc is not None:
+            return "session_faulted"
+        if require_reservation and (
+            session.pending_driver_command_kind != "finalisation"
+            or session.pending_driver_command_token is None
+        ):
+            return "command_in_progress"
+        return None
+
+    def _abort_finalisation_locked(self, session: RoastSession) -> object | None:
+        """Mark a retained finalisation aborted without changing driver lifecycle."""
+        record = session.finalisation
+        if record is not None:
+            object.__setattr__(record, "status", "aborted")
+            if getattr(record, "abort_reason", None) != "emergency_stop":
+                object.__setattr__(record, "abort_reason", "session_or_reservation_changed")
+            object.__setattr__(record, "retained", True)
+            object.__setattr__(record, "session_active_after", session.active)
+            object.__setattr__(record, "session_phase_after", session.phase)
+        self._clear_finalisation_locked(session)
+        return deepcopy(record)
+
+    def _clear_finalisation_locked(self, session: RoastSession) -> None:
+        """Release private finalisation fencing and reservation bookkeeping."""
+        token = self._finalisation_tokens.pop(session.id, None)
+        if token is not None and session.pending_driver_command_token == token:
+            session.pending_driver_command_token = None
+            session.pending_driver_command_kind = None
+        self._nonterminal_finalisations.discard(session.id)
+        self._finalisation_in_progress.discard(session.id)
 
     def _assert_latest_session(self, session: RoastSession) -> None:
         """Validate that one session is the latest known session."""
@@ -1984,7 +2218,7 @@ class RoastSessionStore:
         _apply_event_timestamp(session, event)
         return event
 
-    def _start_session_locked(self) -> RoastSession:
+    def _start_session_locked(self, *, purpose: SessionPurpose = "roast") -> RoastSession:
         """Start one new active session while the store lock is already held."""
         self._assert_no_pending_fault_cooling_recovery_locked()
         if self._latest_session is not None and self._latest_session.active:
@@ -1995,6 +2229,7 @@ class RoastSessionStore:
             id=session_id,
             created_at_utc=self._utc_now(),
             monotonic_start=self._monotonic_now(),
+            purpose=purpose,
             log_writer=LogWriterReference(
                 session_id=session_id,
                 log_dir=self._default_log_dir / session_id,
@@ -2371,6 +2606,7 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         id=session.id,
         created_at_utc=session.created_at_utc,
         monotonic_start=session.monotonic_start,
+        purpose=session.purpose,
         phase=session.phase,
         beans_added_at_utc=session.beans_added_at_utc,
         beans_added_monotonic_seconds=session.beans_added_monotonic_seconds,
@@ -2405,4 +2641,5 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         monotonic_stop=session.monotonic_stop,
         pending_driver_command_token=session.pending_driver_command_token,
         pending_driver_command_kind=session.pending_driver_command_kind,
+        finalisation=deepcopy(session.finalisation),
     )

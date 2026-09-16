@@ -24,6 +24,7 @@ from coffee_roaster_mcp.audio import (
     MicrophoneAudioInput,
     OverflowSnapshot,
     RoastAudioRecorder,
+    RoastRecorder,
     WavAudioInput,
     amplitude_to_dbfs,
     audio_capture_settings_from_config,
@@ -1025,6 +1026,11 @@ def test_audio_capture_stop_does_not_close_input_while_worker_reads() -> None:
     # Worker is parked inside read(); a zero-timeout join must not close the input.
     pipeline.stop(timeout_seconds=0.0)
     assert audio_input.closed is False
+    _wait_for(
+        lambda: pipeline._thread is not None and not pipeline._thread.is_alive()  # pyright: ignore[reportPrivateUsage]
+    )
+    assert audio_input.worker_thread is not None and audio_input.worker_thread.is_alive()
+    assert pipeline.shutdown_confirmed is False
 
     # Releasing the read lets the worker observe the stop request, exit, and close.
     audio_input.release()
@@ -1034,6 +1040,19 @@ def test_audio_capture_stop_does_not_close_input_while_worker_reads() -> None:
     assert worker is not None
     worker.join(timeout=1.0)
     assert not worker.is_alive()
+    pipeline.stop(timeout_seconds=1.0)
+    assert pipeline.shutdown_confirmed is True
+
+
+def test_pipeline_shutdown_is_unconfirmed_for_an_unknown_recorder_boundary() -> None:
+    """An injected recorder must explicitly confirm shutdown before finalisation trusts it."""
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(input_device="fake", sample_rate=4, window_seconds=1.0),
+        audio_input=FiniteAudioInput(()),
+        recorder=cast("RoastRecorder", object()),
+    )
+
+    assert pipeline.shutdown_confirmed is False
 
 
 def test_stop_drains_the_readers_final_chunk_after_a_timed_out_join() -> None:
@@ -1295,6 +1314,43 @@ def test_pipeline_recorder_write_failure_does_not_kill_detection(tmp_path: Path)
     assert snapshot.emitted_window_count == 1
     assert snapshot.latest_error is None
     assert pipeline.drain_windows()[0].samples == (0.0, 1.0, 2.0, 3.0)
+
+
+def test_disabled_recorder_retains_unconfirmed_shutdown_proof(tmp_path: Path) -> None:
+    """A dropped recorder cannot erase an additional-stream shutdown failure."""
+
+    from coffee_roaster_mcp.audio import AdditionalRecordingDevice, MultiDeviceRoastRecorder
+
+    class FailingMultiDeviceRecorder(MultiDeviceRoastRecorder):
+        def write_samples(self, samples: Sequence[float]) -> None:
+            del samples
+            raise RuntimeError("recording stream failed")
+
+    additional_input = BlockingClosableAudioInput()
+    recorder = FailingMultiDeviceRecorder(
+        detector_wav_path=tmp_path / "detector.wav",
+        detector_device_label=None,
+        sidecar_path=tmp_path / "roast.json",
+        sample_rate=4,
+        session_id="s",
+        additional_devices=[AdditionalRecordingDevice("extra", tmp_path / "extra.wav", 4)],
+        additional_input_factory=lambda _device: additional_input,
+        stop_timeout_seconds=0.0,
+    )
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(input_device=None, sample_rate=4, window_seconds=1.0),
+        audio_input=FiniteAudioInput((0.0, 1.0, 2.0, 3.0)),
+        recorder=recorder,
+    )
+
+    pipeline.start()
+    assert additional_input.read_started.wait(timeout=1.0)
+    _wait_for(lambda: pipeline.snapshot().emitted_window_count == 1)
+    pipeline.stop()
+    assert pipeline.shutdown_confirmed is False
+    additional_input.release()
+    _wait_for(lambda: additional_input.closed)
+    assert pipeline.shutdown_confirmed is True
 
 
 def test_pipeline_recorder_begin_failure_does_not_kill_detection(tmp_path: Path) -> None:
@@ -1969,6 +2025,33 @@ def test_multi_device_recorder_writes_two_wavs(tmp_path: Path) -> None:
     assert recorder.additional_wav_paths == (tmp_path / "roast.atr2100x.wav",)
 
 
+def test_multi_device_shutdown_waits_for_a_live_additional_capture_thread(tmp_path: Path) -> None:
+    """Recorder shutdown is unconfirmed until every independent input exits."""
+    from coffee_roaster_mcp.audio import AdditionalRecordingDevice, MultiDeviceRoastRecorder
+
+    additional_input = BlockingClosableAudioInput()
+    recorder = MultiDeviceRoastRecorder(
+        detector_wav_path=tmp_path / "detector.wav",
+        detector_device_label=None,
+        sidecar_path=tmp_path / "recording.json",
+        sample_rate=4,
+        session_id="session",
+        additional_devices=[AdditionalRecordingDevice("extra", tmp_path / "extra.wav", 4)],
+        additional_input_factory=lambda _device: additional_input,
+        stop_timeout_seconds=0.0,
+    )
+
+    recorder.begin()
+    assert additional_input.read_started.wait(timeout=1.0)
+    recorder.close()
+    assert recorder.shutdown_confirmed is False
+
+    additional_input.release()
+    _wait_for(lambda: additional_input.closed)
+    recorder.close()
+    assert recorder.shutdown_confirmed is True
+
+
 def test_multi_device_recorder_aggregates_overflow_across_additional_streams(
     tmp_path: Path,
 ) -> None:
@@ -2076,6 +2159,10 @@ def test_pipeline_snapshot_folds_in_recorder_overflow_additively() -> None:
         @property
         def started_monotonic_seconds(self) -> float | None:
             return None
+
+        @property
+        def shutdown_confirmed(self) -> bool:
+            return True
 
         def begin(self) -> None:
             return None

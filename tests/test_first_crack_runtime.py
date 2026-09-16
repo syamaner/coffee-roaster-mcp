@@ -3,7 +3,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from threading import Event
+from typing import Any, cast
 
 import pytest
 
@@ -12,15 +13,21 @@ from coffee_roaster_mcp.artifacts import (
     ResolvedArtifact,
     ResolvedDetectorArtifacts,
 )
-from coffee_roaster_mcp.audio import AudioCaptureError, AudioCaptureSnapshot, AudioWindow
-from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig
+from coffee_roaster_mcp.audio import (
+    AudioCaptureError,
+    AudioCaptureSettings,
+    AudioCaptureSnapshot,
+    AudioWindow,
+    RoastRecorder,
+)
+from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig, RecordingConfig
 from coffee_roaster_mcp.detector import (
     FirstCrackDetectorAdapter,
     FirstCrackDetectorOutput,
     build_first_crack_detector_adapter,
 )
 from coffee_roaster_mcp.first_crack_runtime import FirstCrackSessionRuntime
-from coffee_roaster_mcp.session import RoastSessionStore
+from coffee_roaster_mcp.session import RoastSessionStore, SessionLifecycleError
 
 
 class ClockHarness:
@@ -140,6 +147,10 @@ class FakeAudioPipeline:
             total_overflow_count=self.total_overflow_count,
             max_consecutive_overflow_count=self.max_consecutive_overflow_count,
         )
+
+    @property
+    def shutdown_confirmed(self) -> bool:
+        return self.stopped and not self.running_after_stop
 
 
 def test_disabled_and_manual_modes_do_not_prepare_audio_or_detector() -> None:
@@ -555,9 +566,8 @@ def test_audio_runtime_reports_stopped_after_pipeline_stop_returns_running_snaps
     assert snapshot.active is True
     assert snapshot.audio_running is True
 
-    # stop_for_session finalises capture. Even though this pipeline's snapshot
-    # keeps claiming running after stop() (running_after_stop=True), the runtime
-    # forces the stopped snapshot once it has torn the pipeline down.
+    # Ordinary roast teardown clears handles even when a test double reports an
+    # unconfirmed worker; only cold finalisation retains retry state.
     stopped = runtime.stop_for_session(session.id, reason="roast complete")
     assert pipeline.stopped is True
     assert stopped.active is False
@@ -742,10 +752,9 @@ def test_runtime_overflow_rolling_fields_decay_from_last_live_poll_when_stop_its
     # refresh _last_capture_snapshot with a fresh stop-instant read — the
     # 90-second-old live poll is all that remains.
     stopped = runtime.stop_for_session(session.id, reason="roast complete")
-    # The stop failure itself faults the runtime; the overflow fields must
-    # still reflect the correctly-decayed 90-second-old aggregate rather
-    # than a value frozen fresh at the (failed) stop instant.
+    # Ordinary-stop teardown clears runtime handles even when stop itself fails.
     assert stopped.status == "faulted"
+    assert stopped.active is False
     assert stopped.overflow_count_last_minute == 0
     assert stopped.estimated_lost_audio_ms_last_minute == 0.0
     # The lifetime total survives regardless of decay.
@@ -930,6 +939,50 @@ def test_audio_runtime_reports_unavailable_artifact_errors_without_crashing() ->
     assert snapshot.status == "unavailable"
     assert "missing onnx/int8/model_quantized.onnx" in (snapshot.reason or "")
     assert snapshot.active is False
+
+
+def test_failed_audio_capture_start_remains_a_retryable_finalisation_failure() -> None:
+    """An attempted but failed capture start cannot become not-applicable teardown."""
+    session = RoastSessionStore().start_session(purpose="cold_characterisation")
+
+    def fail_pipeline(_config: AudioConfig) -> FakeAudioPipeline:
+        raise AudioCaptureError("input unavailable")
+
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=fail_pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+
+    assert runtime.start_for_session(session).status == "unavailable"
+    assert runtime.finalise_for_session(session.id) == (
+        "stop_failed",
+        "Audio capture did not start.",
+        False,
+    )
+
+
+def test_unexpected_capture_preparation_failure_remains_a_finalisation_failure() -> None:
+    """An unexpected capture setup error cannot become not-applicable teardown."""
+    session = RoastSessionStore().start_session(purpose="cold_characterisation")
+
+    def fail_pipeline(_config: AudioConfig) -> FakeAudioPipeline:
+        raise RuntimeError("backend setup failed")
+
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=fail_pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+
+    snapshot = runtime.start_for_session(session)
+    assert snapshot.status == "unavailable"
+    assert "RuntimeError: backend setup failed" in (snapshot.reason or "")
+    assert runtime.finalise_for_session(session.id)[0] == "stop_failed"
 
 
 def test_audio_runtime_reports_capture_and_detector_faults() -> None:
@@ -1141,6 +1194,62 @@ def test_default_pipeline_factory_passes_recorder(monkeypatch: pytest.MonkeyPatc
     # The default factory built the pipeline with the session recorder teed in.
     assert snapshot.status == "pending"
     assert captured["recorder"] is not None
+
+
+def test_default_pipeline_tees_generated_wav_into_real_recorder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordinary default pipeline records generated WAV samples without a device."""
+    import struct
+    import wave
+
+    import coffee_roaster_mcp.audio as audio_module
+    from coffee_roaster_mcp.audio import RoastAudioRecorder, WavAudioInput
+    from coffee_roaster_mcp.config import RecordingConfig
+
+    source = tmp_path / "source.wav"
+    with wave.open(str(source), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(struct.pack("<32000h", *([1024] * 32_000)))
+    read_started = Event()
+
+    class EventedWavInput:
+        def __init__(self) -> None:
+            self._source = WavAudioInput(source, sample_rate=16_000)
+
+        def read_samples(self, sample_count: int) -> Sequence[float]:
+            read_started.set()
+            return self._source.read_samples(sample_count)
+
+        def close(self) -> None:
+            self._source.close()
+
+    def wav_input(_settings: AudioCaptureSettings) -> EventedWavInput:
+        return EventedWavInput()
+
+    monkeypatch.setattr(audio_module, "build_configured_audio_input", wav_input)
+    store = RoastSessionStore()
+    session = store.start_session()
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            audio=AudioConfig(source="microphone", sample_rate=16_000),
+            first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0"),
+            recording=RecordingConfig(
+                enabled=True, autocapture=True, export_location=tmp_path / "out"
+            ),
+        ),
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+    runtime.start_for_session(session)
+    assert read_started.wait(timeout=1.0)
+    assert runtime.finalise_for_session(session.id) == ("stopped", None, False)
+    recorder, plan = runtime.recording_for_session(session.id)
+    assert isinstance(recorder, RoastAudioRecorder)
+    assert plan is not None and plan.primary_wav.is_file()
 
 
 def test_build_session_recorder_milestones_track_session(tmp_path: Path) -> None:
@@ -1702,6 +1811,37 @@ def test_build_session_recorder_multi_device(tmp_path: Path) -> None:
     assert recorder.additional_wav_paths == (tmp_path / session.id / "mic2-brazil-roast7.wav",)
 
 
+@pytest.mark.parametrize("devices", (("USB PnP",), ("USB PnP", "ATR2100x", "Mic 3")))
+def test_recording_artifact_plan_matches_built_recorder_paths(
+    tmp_path: Path, devices: tuple[str, ...]
+) -> None:
+    """Single and multi-device recorder construction preserves the pure artifact plan."""
+    from coffee_roaster_mcp.first_crack_runtime import (
+        RecordingMetadata,
+        build_session_recorder,
+        plan_session_recording_artifacts,
+    )
+
+    session = RoastSessionStore().start_session()
+    config = AppConfig(
+        recording=RecordingConfig(
+            enabled=True,
+            autocapture=True,
+            export_location=tmp_path,
+            devices=devices,
+        )
+    )
+    metadata = RecordingMetadata(origin="brazil", roast_num=7)
+    plan = plan_session_recording_artifacts(config, session, metadata)
+    recorder = build_session_recorder(config, session, metadata=metadata)
+
+    assert plan is not None and recorder is not None
+    assert cast(Any, recorder).wav_path == plan.primary_wav
+    assert cast(Any, recorder).sidecar_path == plan.recording_sidecar
+    assert cast(Any, recorder)._annotation_session.path == plan.annotation_session_sidecar
+    assert getattr(recorder, "additional_wav_paths", ()) == plan.additional_wavs
+
+
 def test_build_session_recorder_single_device_labels_wav(tmp_path: Path) -> None:
     from coffee_roaster_mcp.audio import RoastAudioRecorder
     from coffee_roaster_mcp.config import RecordingConfig
@@ -2215,3 +2355,174 @@ def test_recording_spans_charge_to_session_stop_not_to_first_crack(tmp_path: Pat
     assert annotation_path.exists(), "annotation session JSON must be written at finalisation"
     annotation = json.loads(annotation_path.read_text())
     assert annotation["mics"][0]["file"] == wav_path.name
+
+
+def test_finalise_for_session_stops_without_inference_and_preserves_other_session() -> None:
+    """Cold finalisation stops only its capture and does not invoke the detector."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session(purpose="cold_characterisation")
+    pipeline = FakeAudioPipeline(
+        (_audio_window(sequence_number=1, started_at_monotonic_seconds=1),)
+    )
+    backend = MockDetectorBackend(())
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), backend
+        ),
+    )
+    runtime.start_for_session(session)
+
+    outcome, error, running = runtime.finalise_for_session("other-session")
+    assert (outcome, error, running) == ("not_active", None, False)
+    assert pipeline.stopped is False
+
+    outcome, error, running = runtime.finalise_for_session(session.id)
+    assert (outcome, error, running) == ("stopped", None, False)
+    assert pipeline.stopped is True
+    assert backend.windows == []
+    assert runtime.recording_for_session(session.id) == (None, None)
+
+
+@pytest.mark.parametrize("mode", ("no_pipeline", "stop_failure", "still_running"))
+def test_finalise_for_session_reports_nonclean_capture_states(mode: str) -> None:
+    """Finalisation preserves bounded capture failures without detector inference."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    pipeline = FakeAudioPipeline(running_after_stop=mode == "still_running")
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+    runtime.start_for_session(session)
+    if mode == "no_pipeline":
+        runtime._pipeline = None  # pyright: ignore[reportPrivateUsage]
+        runtime._capture_started_for_session = False  # pyright: ignore[reportPrivateUsage]
+        expected = ("not_active", None, False)
+    elif mode == "stop_failure":
+
+        def fail_stop(*, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
+            del timeout_seconds
+            raise RuntimeError("stop failed")
+
+        pipeline.stop = fail_stop  # type: ignore[method-assign]
+        expected = ("stop_failed", "RuntimeError: stop failed", True)
+    else:
+        expected = ("capture_still_running", None, True)
+    assert runtime.finalise_for_session(session.id) == expected
+    if mode == "still_running":
+        pipeline.running_after_stop = False
+        assert runtime.finalise_for_session(session.id) == ("stopped", None, False)
+
+
+def test_finalise_recognises_capture_stopped_before_finalisation() -> None:
+    """A prior confirmed stop is not mistaken for never-started capture."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    pipeline = FakeAudioPipeline()
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+    runtime.start_for_session(session)
+    runtime.stop_for_session(session.id, reason="operator stopped capture")
+    assert runtime.finalise_for_session(session.id) == ("stopped", None, False)
+
+
+def test_post_drop_windows_are_not_inferred_after_teardown_begins() -> None:
+    """A retained, unconfirmed stop never feeds post-drop windows to the detector."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    pipeline = FakeAudioPipeline((_audio_window(sequence_number=1),), running_after_stop=True)
+    backend = MockDetectorBackend(())
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), backend
+        ),
+    )
+    runtime.start_for_session(session)
+    assert runtime.finalise_for_session(session.id)[0] == "capture_still_running"
+    store.record_event(session, "beans_added")
+    store.record_event(session, "beans_dropped")
+
+    runtime.process_pending_windows_after_drop(session_store=store, session=session)
+
+    assert backend.windows == []
+    assert pipeline.drain_limits == []
+
+
+def test_recorder_build_failure_cannot_expose_prior_session_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Starting a new session clears prior recorder state before recorder construction."""
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+
+    config = AppConfig(
+        first_crack=FirstCrackConfig(mode="audio"),
+        recording=RecordingConfig(enabled=True, autocapture=True, export_location=tmp_path),
+    )
+    runtime = FirstCrackSessionRuntime(
+        config=config,
+        audio_pipeline_factory=lambda _: FakeAudioPipeline(),
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+    first = RoastSessionStore().start_session()
+    runtime.start_for_session(first)
+    assert runtime.recording_for_session(first.id)[1] is not None
+
+    def fail_recorder(*_args: object, **_kwargs: object) -> RoastRecorder:
+        raise RuntimeError("recorder build failed")
+
+    monkeypatch.setattr(runtime_module, "build_session_recorder", fail_recorder)
+    second = RoastSessionStore().start_session()
+    with pytest.raises(RuntimeError, match="recorder build failed"):
+        runtime.start_for_session(second)
+    assert runtime.recording_for_session(second.id) == (None, None)
+
+
+def test_finalisation_fence_session_error_preserves_live_capture_handles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finalisation-race write rejection is an expected inference skip, not a fault."""
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    store.record_event(session, "beans_added")
+    pipeline = FakeAudioPipeline((_audio_window(sequence_number=1),))
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", revision="v0.1.0")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), MockDetectorBackend(())
+        ),
+    )
+    runtime.start_for_session(session)
+    _, rejection, _ = store.begin_finalisation(session.id)
+    assert rejection is None
+
+    def fenced_write(**_kwargs: object) -> None:
+        raise SessionLifecycleError("Session finalisation is in progress.")
+
+    monkeypatch.setattr(runtime_module, "integrate_first_crack_window_with_session", fenced_write)
+    snapshot = runtime.process_available_windows(session_store=store, session=session)
+    assert snapshot.status == "pending", snapshot.reason
+    assert snapshot.audio_running is True
+    store.abandon_finalisation_admission(session)
+    pipeline.add_window(_audio_window(sequence_number=2))
+    unfenced = runtime.process_available_windows(session_store=store, session=session)
+    assert unfenced.status == "faulted"
+    assert unfenced.reason == "First-crack detection failed: Session finalisation is in progress."
+    assert runtime.finalise_for_session(session.id)[0] == "stopped"

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from importlib import import_module
 from math import isfinite
 from threading import Event, Lock, Thread
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol, cast, runtime_checkable
 
 from coffee_roaster_mcp.controls import validate_control_percent
 from coffee_roaster_mcp.session import EventPayloadValue
@@ -211,6 +211,83 @@ class EmergencyStopResult:
             "fan_level_percent": self.fan_level_percent,
             "cooling_on": self.cooling_on,
         }
+
+
+@dataclass(frozen=True)
+class DriverLifecycleEvidence:
+    """Non-actuating command-state evidence captured from one driver."""
+
+    driver: str
+    connected: bool
+    command_streaming_required: bool
+    command_loop_running: bool | None
+    serial_open: bool | None
+    heat_level_percent: int
+    roast_fan_level_percent: int
+    main_fan_level_percent: int
+    drum_motor_on: bool
+    cooling_motor_on: bool
+    solenoid_open: bool
+    command_send_attempts: int | None
+    command_write_count: int | None
+    last_command_write_size: int | None
+    command_loop_error_count: int | None
+    status_packet_count: int | None
+    status_read_error_count: int | None
+
+    def __post_init__(self) -> None:
+        """Validate that evidence is complete for its driver mode."""
+        _validate_driver_name(self.driver)
+        for name in (
+            "connected",
+            "command_streaming_required",
+            "drum_motor_on",
+            "cooling_motor_on",
+            "solenoid_open",
+        ):
+            _validate_exact_bool(getattr(self, name), label=name)
+        for name in (
+            "heat_level_percent",
+            "roast_fan_level_percent",
+            "main_fan_level_percent",
+        ):
+            object.__setattr__(
+                self, name, validate_control_percent(getattr(self, name), label=name)
+            )
+        optional = (
+            "command_loop_running",
+            "serial_open",
+            "command_send_attempts",
+            "command_write_count",
+            "last_command_write_size",
+            "command_loop_error_count",
+            "status_packet_count",
+            "status_read_error_count",
+        )
+        values = tuple(getattr(self, name) for name in optional)
+        if self.command_streaming_required and any(value is None for value in values):
+            raise ValueError("Streaming driver lifecycle evidence must be complete.")
+        if not self.command_streaming_required and any(value is not None for value in values):
+            raise ValueError("Non-streaming driver lifecycle evidence must omit lifecycle fields.")
+        for name in ("command_loop_running", "serial_open"):
+            value = getattr(self, name)
+            if value is not None:
+                _validate_exact_bool(value, label=name)
+        for name in optional[2:]:
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative integer or None.")
+
+
+@runtime_checkable
+class LifecycleEvidenceDriver(Protocol):
+    """Optional read-only driver lifecycle-evidence capability."""
+
+    def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
+        """Return non-actuating driver command-state evidence."""
+        ...
 
 
 class RoasterDriver(Protocol):
@@ -545,6 +622,8 @@ class MockRoasterDriver:
         self._cooling_on = False
         self._beans_dropped = False
         self._sample_index = 0
+        self._drum_motor_on = False
+        self._solenoid_open = False
 
     @property
     def capabilities(self) -> RoasterCapabilities:
@@ -575,6 +654,28 @@ class MockRoasterDriver:
         """Mark the mock driver disconnected."""
         self._connected = False
 
+    def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
+        """Return mock command-state evidence without advancing telemetry."""
+        return DriverLifecycleEvidence(
+            driver=self.name,
+            connected=self._connected,
+            command_streaming_required=False,
+            command_loop_running=None,
+            serial_open=None,
+            heat_level_percent=self._heat_level_percent,
+            roast_fan_level_percent=0,
+            main_fan_level_percent=self._fan_level_percent,
+            drum_motor_on=self._drum_motor_on,
+            cooling_motor_on=self._cooling_on,
+            solenoid_open=self._solenoid_open,
+            command_send_attempts=None,
+            command_write_count=None,
+            last_command_write_size=None,
+            command_loop_error_count=None,
+            status_packet_count=None,
+            status_read_error_count=None,
+        )
+
     def read_state(self) -> RoasterState:
         """Return deterministic mock roaster state."""
         self._advance_telemetry()
@@ -603,6 +704,8 @@ class MockRoasterDriver:
             heat_level_percent,
             label="heat_level_percent",
         )
+        if self._heat_level_percent > 0:
+            self._drum_motor_on = True
         return self._state_snapshot()
 
     def set_fan(self, *, fan_level_percent: int) -> RoasterState:
@@ -619,6 +722,8 @@ class MockRoasterDriver:
         self._heat_level_percent = 0
         self._fan_level_percent = 100
         self._cooling_on = True
+        self._drum_motor_on = True
+        self._solenoid_open = True
         return self._state_snapshot()
 
     def start_cooling(self) -> RoasterState:
@@ -629,6 +734,8 @@ class MockRoasterDriver:
     def stop_cooling(self) -> RoasterState:
         """Stop mock cooling and return normalized state."""
         self._cooling_on = False
+        self._drum_motor_on = False
+        self._solenoid_open = False
         return self._state_snapshot()
 
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
@@ -637,6 +744,8 @@ class MockRoasterDriver:
         self._heat_level_percent = 0
         self._fan_level_percent = 100
         self._cooling_on = True
+        self._drum_motor_on = False
+        self._solenoid_open = False
         return EmergencyStopResult(
             driver=self.name,
             safety_method="emergency_stop",
@@ -913,6 +1022,32 @@ class HottopRoasterDriver:
                     "drum_motor_on": self._drum_motor_on,
                     "cooling_motor_on": self._cooling_motor_on,
                 },
+            )
+
+    def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
+        """Read command lifecycle state under one state-lock hold."""
+        with self._state_lock:
+            serial_open = self._serial is not None and self._serial.is_open
+            return DriverLifecycleEvidence(
+                driver=self.name,
+                connected=self._connected,
+                command_streaming_required=True,
+                command_loop_running=(
+                    self._command_thread is not None and self._command_thread.is_alive()
+                ),
+                serial_open=serial_open,
+                heat_level_percent=self._heat_level_percent,
+                roast_fan_level_percent=self._roast_fan_level_percent,
+                main_fan_level_percent=self._main_fan_level_percent,
+                drum_motor_on=self._drum_motor_on,
+                cooling_motor_on=self._cooling_motor_on,
+                solenoid_open=self._solenoid_open,
+                command_send_attempts=self._command_send_attempts,
+                command_write_count=self._command_write_count,
+                last_command_write_size=self._last_command_write_size,
+                command_loop_error_count=self._command_loop_error_count,
+                status_packet_count=self._status_packet_count,
+                status_read_error_count=self._status_read_error_count,
             )
 
     def set_heat(self, *, heat_level_percent: int) -> RoasterState:

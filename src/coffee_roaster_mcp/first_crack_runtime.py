@@ -70,6 +70,11 @@ class FirstCrackAudioPipeline(Protocol):
         """Return current capture status."""
         ...
 
+    @property
+    def shutdown_confirmed(self) -> bool:
+        """Return whether every capture worker has stopped."""
+        ...
+
 
 FirstCrackAudioPipelineFactory = Callable[[AudioConfig], FirstCrackAudioPipeline]
 FirstCrackDetectorAdapterFactory = Callable[[FirstCrackConfig], FirstCrackDetectorAdapter]
@@ -169,6 +174,9 @@ class FirstCrackSessionRuntime:
         self._lock = RLock()
         self._active_session_id: str | None = None
         self._pipeline: FirstCrackAudioPipeline | None = None
+        self._capture_started_for_session = False
+        self._capture_start_failed_for_session = False
+        self._capture_teardown_started = False
         self._adapter: FirstCrackDetectorAdapter | None = None
         self._status: FirstCrackRuntimeState = _initial_status(config.first_crack)
         self._reason: str | None = _initial_reason(config.first_crack)
@@ -216,6 +224,8 @@ class FirstCrackSessionRuntime:
         #: a fresh empty box each session so a prior roast's recovery can never
         #: leak into the next one's sidecar.
         self._recovered_first_crack_holder: list[float | None] = []
+        self._active_recorder: RoastRecorder | None = None
+        self._recording_plan: RecordingArtifactPlan | None = None
 
     def set_recording_metadata(self, *, origin: str, roast_num: int) -> RecordingMetadata:
         """Store annotation-pipeline metadata for the next roast's recording.
@@ -280,6 +290,9 @@ class FirstCrackSessionRuntime:
             self._inference_stopped = False
             self._last_capture_snapshot = None
             self._last_capture_snapshot_as_of_monotonic_seconds = None
+            self._capture_started_for_session = False
+            self._capture_start_failed_for_session = False
+            self._capture_teardown_started = False
             # Fresh empty box every session (#191): a prior roast's recovered
             # milestone must never leak into this one's sidecar.
             self._recovered_first_crack_holder = []
@@ -291,11 +304,17 @@ class FirstCrackSessionRuntime:
 
             self._status = "pending"
             self._reason = "Audio first-crack detection is prepared for this session."
+            self._active_recorder = None
+            self._recording_plan = None
             recorder = build_session_recorder(
                 self._config,
                 session,
                 metadata=self._recording_metadata,
                 recovered_first_crack_holder=self._recovered_first_crack_holder,
+            )
+            self._active_recorder = recorder
+            self._recording_plan = plan_session_recording_artifacts(
+                self._config, session, self._recording_metadata
             )
             self._pending_recorder = recorder
             # Once the recorder exists the WAV names are fixed; a later
@@ -305,6 +324,7 @@ class FirstCrackSessionRuntime:
                 adapter = self._detector_adapter_factory(self._config.first_crack)
                 pipeline = self._audio_pipeline_factory(self._config.audio)
                 self._last_capture_snapshot = pipeline.start()
+                self._capture_started_for_session = True
             except ArtifactResolutionError as exc:
                 self._status = "unavailable"
                 self._reason = f"First-crack detector artifacts are unavailable: {exc}"
@@ -316,6 +336,7 @@ class FirstCrackSessionRuntime:
                 self._reason = f"Audio first-crack detection is unavailable: {exc}"
                 self._adapter = None
                 self._pipeline = None
+                self._capture_start_failed_for_session = True
                 return self.snapshot()
             except Exception as exc:  # noqa: BLE001 - dependency backends vary.
                 self._status = "unavailable"
@@ -325,6 +346,7 @@ class FirstCrackSessionRuntime:
                 )
                 self._adapter = None
                 self._pipeline = None
+                self._capture_start_failed_for_session = True
                 return self.snapshot()
             finally:
                 # The recorder is consumed by the pipeline factory; clear the
@@ -381,7 +403,11 @@ class FirstCrackSessionRuntime:
                         # WAVs. The pipeline finalises at stop_for_session.
                         self._inference_stopped = True
                         break
-            except (AudioCaptureError, FirstCrackDetectorError, SessionLifecycleError) as exc:
+            except SessionLifecycleError as exc:
+                if session_store.finalisation_blocks_session(session.id):
+                    return self.snapshot()
+                self._mark_faulted_locked(f"First-crack detection failed: {exc}")
+            except (AudioCaptureError, FirstCrackDetectorError) as exc:
                 self._mark_faulted_locked(f"First-crack detection failed: {exc}")
             except Exception as exc:  # noqa: BLE001 - detector backends vary.
                 self._mark_faulted_locked(
@@ -580,6 +606,50 @@ class FirstCrackSessionRuntime:
             self._stop_locked(reason=reason)
             return self.snapshot()
 
+    def finalise_for_session(
+        self, session_id: str
+    ) -> tuple[
+        Literal["not_active", "stopped", "capture_still_running", "stop_failed"], str | None, bool
+    ]:
+        """Stop capture without inference and retain it for a later retry."""
+        with self._lock:
+            if self._active_session_id != session_id:
+                return "not_active", None, False
+            pipeline = self._pipeline
+            if pipeline is None:
+                if self._capture_start_failed_for_session:
+                    return "stop_failed", "Audio capture did not start.", False
+                return (
+                    ("stopped", None, False)
+                    if self._capture_started_for_session
+                    else ("not_active", None, False)
+                )
+            try:
+                self._capture_teardown_started = True
+                capture = pipeline.stop(timeout_seconds=self._stop_timeout_seconds)
+            except Exception as exc:  # noqa: BLE001 - teardown must be reported.
+                return "stop_failed", f"{type(exc).__name__}: {exc}", True
+            self._last_capture_snapshot = _stopped_capture_snapshot(capture)
+            self._last_capture_snapshot_as_of_monotonic_seconds = self._monotonic_now()
+            if not pipeline.shutdown_confirmed:
+                return "capture_still_running", None, True
+            self._pipeline = None
+            self._adapter = None
+            self._recorder_built_for_session = False
+            self._inference_stopped = False
+            if self._status == "pending":
+                self._reason = "Audio first-crack detection stopped for finalisation."
+            return "stopped", None, False
+
+    def recording_for_session(
+        self, session_id: str
+    ) -> tuple[RoastRecorder | None, RecordingArtifactPlan | None]:
+        """Return recorder and pure artifact plan for the owning session."""
+        with self._lock:
+            if self._active_session_id != session_id:
+                return None, None
+            return self._active_recorder, self._recording_plan
+
     def discard_queued_windows_for_session(
         self,
         session_id: str,
@@ -741,6 +811,8 @@ class FirstCrackSessionRuntime:
         # never drain/detect again until a fresh session resets the flag.
         if self._inference_stopped:
             return False
+        if self._capture_teardown_started:
+            return False
         if self._status != "pending":
             return False
         return session.active and session.phase == "roasting"
@@ -768,6 +840,8 @@ class FirstCrackSessionRuntime:
             return False
         if self._inference_stopped:
             return False
+        if self._capture_teardown_started:
+            return False
         if self._status != "pending":
             return False
         return session.phase in ("dropped", "cooling")
@@ -781,6 +855,7 @@ class FirstCrackSessionRuntime:
         pipeline = self._pipeline
         if pipeline is not None:
             try:
+                self._capture_teardown_started = True
                 # pipeline.stop() returns a FINAL LIVE snapshot taken during
                 # the stop call itself, so "now" genuinely is this
                 # aggregate's true as-of instant (#193 review finding,
@@ -790,6 +865,9 @@ class FirstCrackSessionRuntime:
                     pipeline.stop(timeout_seconds=self._stop_timeout_seconds)
                 )
                 self._last_capture_snapshot_as_of_monotonic_seconds = self._monotonic_now()
+                if pipeline.shutdown_confirmed:
+                    self._pipeline = None
+                    self._adapter = None
             except Exception as exc:  # noqa: BLE001 - shutdown should be best effort.
                 self._status = "faulted"
                 self._reason = f"Audio capture stop failed: {type(exc).__name__}: {exc}"
@@ -839,6 +917,42 @@ class RecordingMetadata:
 
     origin: str
     roast_num: int
+
+
+@dataclass(frozen=True)
+class RecordingArtifactPlan:
+    """Pure recording artifact identities for one session."""
+
+    primary_wav: Path
+    recording_sidecar: Path
+    annotation_session_sidecar: Path
+    additional_wavs: tuple[Path, ...]
+
+
+def plan_session_recording_artifacts(
+    config: AppConfig,
+    session: RoastSession,
+    metadata: RecordingMetadata | None = None,
+) -> RecordingArtifactPlan | None:
+    """Plan recording artifact paths without opening or reading any artifact."""
+    recording = config.recording
+    if not recording.enabled or not recording.autocapture:
+        return None
+    export_location = recording.export_location or (
+        config.logging.log_dir / _DEFAULT_RECORDING_SUBDIR
+    )
+    session_dir = export_location / session.id
+    origin = _normalize_origin_slug(metadata.origin if metadata is not None else session.id)
+    roast_num = metadata.roast_num if metadata is not None else 0
+    return RecordingArtifactPlan(
+        primary_wav=session_dir / f"mic1-{origin}-roast{roast_num}.wav",
+        recording_sidecar=session_dir / "roast.recording.json",
+        annotation_session_sidecar=session_dir / f"{origin}-roast{roast_num}-session.json",
+        additional_wavs=tuple(
+            session_dir / f"mic{index + 2}-{origin}-roast{roast_num}.wav"
+            for index in range(len(recording.devices or ()) - 1)
+        ),
+    )
 
 
 def _normalize_origin_slug(origin: str) -> str:
@@ -908,13 +1022,10 @@ def build_session_recorder(
         is not autostarted for this roast.
     """
     recording = config.recording
-    if not recording.enabled or not recording.autocapture:
+    plan = plan_session_recording_artifacts(config, session, metadata)
+    if plan is None:
         return None
-    export_location = recording.export_location or (
-        config.logging.log_dir / _DEFAULT_RECORDING_SUBDIR
-    )
-    session_dir = export_location / session.id
-    sidecar_path = session_dir / "roast.recording.json"
+    sidecar_path = plan.recording_sidecar
     # The teed mic1 stream IS the FC detector's stream, so its WAV header must use
     # the detector's TRUE capture rate (audio.sample_rate), not recording.sample_rate
     # (#176 hardware bug 1: a 16 kHz teed stream mislabelled at 44.1 kHz played
@@ -926,10 +1037,12 @@ def build_session_recorder(
 
     origin = _normalize_origin_slug(metadata.origin if metadata is not None else session.id)
     roast_num = metadata.roast_num if metadata is not None else 0
-    annotation_path = session_dir / f"{origin}-roast{roast_num}-session.json"
+    annotation_path = plan.annotation_session_sidecar
 
     def _mic_wav(mic_num: int) -> Path:
-        return session_dir / f"mic{mic_num}-{origin}-roast{roast_num}.wav"
+        if mic_num == 1:
+            return plan.primary_wav
+        return plan.additional_wavs[mic_num - 2]
 
     # The milestones closure needs the recorder's start instant to rebase the
     # session-elapsed milestone times onto the recording clock, but the recorder

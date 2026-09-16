@@ -227,6 +227,22 @@ The current MCP tool surface includes:
 - `export_roast_log`
 - `emergency_stop`
 - `set_recording_metadata`
+- `finalise_cold_characterisation_session`
+
+### Cold-characterisation finalisation
+
+`finalise_cold_characterisation_session` is a non-actuating teardown tool for an
+active, latest session started with `purpose="cold_characterisation"`; it is not
+for normal roasts. It only admits known connected safe-zero driver evidence,
+then stops sampling and capture, verifies recording artifacts, and disconnects.
+`clean` means all stages completed (or were not applicable), disconnect was
+confirmed, and final driver evidence remains safe zero. `partial` and
+`disconnect_indeterminate` retain evidence for a later retry; this does not
+make any readiness claim.
+Terminal finalisation leaves the session phase unchanged; consumers must use
+`active` and `session_active_after`, rather than infer completion from phase.
+`completed_not_clean` is not a readiness or safety confirmation: investigate it
+before starting any new session.
 
 `export_roast_log` writes `roast.jsonl`, `roast.csv`, and `summary.json` files
 for the current in-process session. Runtime events and sampled telemetry are
@@ -259,6 +275,8 @@ The mock-safe Claude/operator flow is:
 5. Use `stop_cooling` when cooling is complete. `start_cooling` remains
    available as an explicit advanced/manual recovery tool, not as the normal
    roast flow after `drop_beans`.
+   A heated mock rehearsal must then call `set_fan(0)` after the empty
+   drop/cooling/stop-cooling path before safe-zero finalisation.
 
 `mark_beans_added` and `mark_first_crack` are explicit override tools. They are
 kept available for operator recovery and controlled manual runs. The primary

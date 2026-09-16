@@ -15,16 +15,13 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Active Context
 
-- Current phase: D184 governance baseline active; #206 completed through PR
-  #207, squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`
-- Active story: #157 in progress through completed standalone frontend and
-  software-integration slices #210 and #212 and the implemented #194
-  instrumentation software slice; #194 and #157 remain open for later operator
-  characterisation and acceptance
-- Current target: #212 software integration and the #194 instrumentation
-  software slice are complete; #157 remains open for Pi and combined acceptance.
-  Do not infer microphone, serial, Hottop, or publication authority
-- Latest package release: `v0.1.16`; PyPI and MCP Registry publication verified
+- Current released baseline: per D193, `v0.2.0` at
+  `be1be35f44f76a2057a3f5f3a334420bcf8bfb99`
+- Current delivery: #218's non-actuating cold-characterisation
+  session-finalisation prerequisite is implemented and closes on merge
+- Separate open acceptance work: #157 and #194 remain open for their respective
+  hardware/component acceptance. Do not infer microphone, serial, Hottop, or
+  readiness authority from this delivery
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -40,11 +37,11 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
 - D184 governance baseline is active. Issue #206 completed through PR #207,
   squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`.
-  #157 is in progress through completed standalone frontend and software-
-  integration slices #210 and #212 and the implemented #194 instrumentation
-  software slice; #194 and #157 remain open for later operator characterisation
-  and acceptance. The intended future minor is `0.2.0`, while tags,
-  publication, and live verification remain human-operator-only.
+  Per D193, the current released baseline is `v0.2.0` at
+  `be1be35f44f76a2057a3f5f3a334420bcf8bfb99`. #218's non-actuating
+  cold-characterisation session-finalisation prerequisite is implemented by
+  this delivery and closes on merge. #157 and #194 remain separate open
+  hardware/component acceptance work; no hardware or readiness claim follows.
 - `E7-S1` keeps broad mock-safe validation on the public stdio MCP tool path:
   a default-config server uses the mock driver, first-crack mode remains
   disabled, auto-T0 remains disabled, and exported JSONL, CSV, and

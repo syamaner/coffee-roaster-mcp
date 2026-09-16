@@ -638,6 +638,280 @@ def test_record_active_telemetry_sample_returns_none_when_session_is_stale() -> 
     assert list(second_session.telemetry_buffer) == []
 
 
+def test_finalisation_reservation_blocks_snapshot_telemetry_and_second_admission() -> None:
+    """A retained cold finalisation fences telemetry and concurrent invocations."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    admitted, rejection, generation = store.begin_finalisation(session.id)
+    assert admitted is session and rejection is None and generation is not None
+
+    class Record:
+        status: str = "partial"
+        reservation_generation = generation
+
+    record = Record()
+    store.attach_finalisation(session, record)
+
+    assert (
+        store.record_active_telemetry_sample(
+            session_id=session.id,
+            bean_temp_c=100.0,
+            env_temp_c=120.0,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=False,
+        )
+        is None
+    )
+    _, rejection, _ = store.begin_finalisation(session.id)
+    assert rejection == "finalisation_in_progress"
+
+
+def test_finalisation_generation_increases_across_successive_eligible_sessions() -> None:
+    """Each newly admitted cold session receives a strictly newer finalisation generation."""
+    store = RoastSessionStore()
+    first = store.start_session(purpose="cold_characterisation")
+    _, rejection, first_generation = store.begin_finalisation(first.id)
+    assert rejection is None and first_generation is not None
+    store.abandon_finalisation_admission(first)
+    store.stop_session()
+
+    second = store.start_session(purpose="cold_characterisation")
+    _, rejection, second_generation = store.begin_finalisation(second.id)
+
+    assert rejection is None and second_generation is not None
+    assert second_generation > first_generation
+
+
+def test_pruning_evicts_terminal_finalisation_with_its_completed_session() -> None:
+    """History eviction keeps an old terminal record from affecting the new session."""
+    store = RoastSessionStore(session_history_limit=1)
+    first = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(first.id)
+    assert rejection is None and generation is not None
+
+    class Record:
+        status = "clean"
+        reservation_generation = generation
+
+    record = Record()
+    store.attach_finalisation(first, record)
+    store.finish_finalisation_terminal(first, record)
+    second = store.start_session(purpose="cold_characterisation")
+
+    with pytest.raises(SessionLifecycleError, match=first.id):
+        store.get_session_snapshot(session_id=first.id)
+    assert store.get_session_snapshot(session_id=second.id).active is True
+    assert second.pending_driver_command_token is None
+
+
+def test_session_snapshot_and_finalisation_admission_rejections() -> None:
+    """Snapshot startup and faulted, held, and concurrent admissions fail closed."""
+    store = RoastSessionStore()
+    snapshot = store.start_session_snapshot(purpose="cold_characterisation")
+    assert snapshot.active is True and snapshot.purpose == "cold_characterisation"
+    live = store._latest_session  # pyright: ignore[reportPrivateUsage]
+    assert live is not None
+    object.__setattr__(live, "faulted_at_utc", live.created_at_utc)
+    _, rejection, _ = store.begin_finalisation(live.id)
+    assert rejection == "session_faulted"
+
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    store.reserve_driver_command(session, kind="control")
+    _, rejection, _ = store.begin_finalisation(session.id)
+    assert rejection == "command_in_progress"
+
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, _ = store.begin_finalisation(session.id)
+    assert rejection is None
+    _, rejection, _ = store.begin_finalisation(session.id)
+    assert rejection == "finalisation_in_progress"
+
+
+def test_resumed_finalisation_requires_its_retained_reservation() -> None:
+    """A retained partial result aborts if its finalisation token was lost."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(session.id)
+    assert rejection is None and generation is not None
+
+    class Record:
+        def __init__(self, reservation_generation: int) -> None:
+            self.status = "partial"
+            self.reservation_generation = reservation_generation
+
+    record = Record(generation)
+    store.attach_finalisation(session, record)
+    session.pending_driver_command_token = None
+    session.pending_driver_command_kind = None
+    store.finish_finalisation_invocation(session)
+    _, rejection, _ = store.begin_finalisation(session.id)
+    assert rejection == "command_in_progress"
+    assert record.status == "aborted"
+
+
+def test_emergency_abort_releases_finalisation_reservation_for_recovery() -> None:
+    """Emergency abort keeps its reason and frees the finalisation command token."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(session.id)
+    assert rejection is None and generation is not None
+
+    class Record:
+        status = "partial"
+        reservation_generation = generation
+        abort_reason: str | None = None
+        retained = False
+        session_active_after = True
+        session_phase_after: str | None = None
+
+    record = Record()
+    store.attach_finalisation(session, record)
+    store.emergency_stop(
+        session,
+        reason="test",
+        safety_payload={
+            "driver": "test",
+            "driver_safety_method": "emergency_stop",
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    )
+    assert record.status == "aborted"
+    assert record.abort_reason == "emergency_stop"
+    assert record.session_active_after is False
+    assert record.session_phase_after == "fault"
+    assert session.pending_driver_command_token is None
+    assert session.pending_driver_command_kind is None
+    recovery = store.reserve_driver_stop_cooling_recovery(session)
+    store.complete_reserved_driver_stop_cooling_recovery_snapshot(
+        session,
+        reservation=recovery,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=False,
+    )
+
+
+def test_admission_before_attach_invalidation_retains_abort_and_clears_fence() -> None:
+    """An invalidated admission attaches an aborted record and releases its bookkeeping."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(session.id)
+    assert rejection is None and generation is not None
+
+    class Record:
+        status = "partial"
+        abort_reason: str | None = None
+        retained = False
+        emergency_stop_ordering = "not_reached"
+        session_active_after = True
+        session_phase_after: str | None = None
+
+        def __init__(self) -> None:
+            self.reservation_generation = generation
+
+    record = Record()
+    session.pending_driver_command_token = None
+    session.pending_driver_command_kind = None
+    assert store.attach_finalisation(session, record) is record
+    assert record.status == "aborted"
+    assert record.abort_reason == "session_or_reservation_changed"
+    assert record.retained is True
+    assert session.finalisation is record
+    assert session.pending_driver_command_token is None
+    assert session.id not in store._finalisation_in_progress  # pyright: ignore[reportPrivateUsage]
+
+
+def test_emergency_stop_between_admission_and_attach_retains_truthful_abort() -> None:
+    """The reservation-time fence closes the admission-before-attach emergency window."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(session.id)
+    assert rejection is None and generation is not None
+
+    class Record:
+        status = "partial"
+        abort_reason: str | None = None
+        retained = False
+        emergency_stop_ordering = "not_reached"
+        session_active_after = True
+        session_phase_after: str | None = None
+
+        def __init__(self) -> None:
+            self.reservation_generation = generation
+
+    store.emergency_stop(session, reason="window")
+    record = Record()
+    store.attach_finalisation(session, record)
+
+    assert record.status == "aborted"
+    assert record.abort_reason == "emergency_stop"
+    assert record.emergency_stop_ordering == "emergency_stop_before_disconnect_commit"
+    assert record.session_active_after is False and record.session_phase_after == "fault"
+    assert session.pending_driver_command_token is None
+    assert store.reserve_driver_stop_cooling_recovery(session).kind == "stop_cooling"
+
+
+def test_terminal_and_progress_persistence_do_not_overwrite_an_abort() -> None:
+    """Store persistence preserves an already-aborted retained finalisation result."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    aborted = type("Record", (), {"status": "aborted"})()
+    replacement = object()
+    session.finalisation = aborted
+    assert store.persist_finalisation(session, replacement) is not aborted
+    assert store.finish_finalisation_terminal(session, replacement) is not aborted
+    assert session.finalisation is aborted
+
+
+@pytest.mark.parametrize("mismatch", ("token", "generation"))
+def test_finalisation_private_fence_mismatch_returns_retained_abort(mismatch: str) -> None:
+    """A retained result aborts when either private finalisation fence changes."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(session.id)
+    assert rejection is None and generation is not None
+
+    class Record:
+        status = "partial"
+        abort_reason: str | None = None
+        retained = False
+
+        def __init__(self, reservation_generation: int) -> None:
+            self.reservation_generation = reservation_generation
+
+    record = Record(generation)
+    store.attach_finalisation(session, record)
+    if mismatch == "token":
+        store._finalisation_tokens[session.id] = "wrong"  # pyright: ignore[reportPrivateUsage]
+    else:
+        record.reservation_generation += 1
+    assert store.abort_finalisation_if_invalid(session, generation) is not record
+    assert record.status == "aborted" and record.retained is True
+    if mismatch == "token":
+        assert session.pending_driver_command_token is not None
+    else:
+        assert session.pending_driver_command_token is None
+
+
+def test_invalid_finalisation_without_retained_record_fails_closed() -> None:
+    """An impossible invalid admission cannot be mistaken for a valid disconnect path."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(session.id)
+    assert rejection is None
+
+    with pytest.raises(SessionLifecycleError, match="invalid without a record"):
+        store.abort_finalisation_if_invalid(session, generation)
+
+    assert session.finalisation is None
+    assert session.pending_driver_command_kind == "finalisation"
+
+
 def test_append_telemetry_rejects_out_of_order_samples() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
@@ -2161,3 +2435,17 @@ def test_record_event_preserves_first_fault_timestamp_across_multiple_faults() -
     assert session.faulted_monotonic_seconds == 5.0
     assert session.event_timeline[0].payload["code"] == "sensor-timeout"
     assert session.event_timeline[1].payload["code"] == "driver-disconnect"
+
+
+def test_atomic_emergency_cancellation_preserves_finalisation_reservation() -> None:
+    """Emergency command cleanup cannot clear a concurrently owned finalisation token."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    admitted, rejection, _ = store.begin_finalisation(session.id)
+
+    assert admitted is session and rejection is None
+    token = session.pending_driver_command_token
+    store.cancel_nonfinalisation_driver_command(session)
+
+    assert session.pending_driver_command_token == token
+    assert session.pending_driver_command_kind == "finalisation"
