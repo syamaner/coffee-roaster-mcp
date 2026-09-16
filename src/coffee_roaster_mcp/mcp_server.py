@@ -1651,7 +1651,18 @@ def _fault_active_session_after_sampler_failure(
         with server_context.lifecycle_barrier:
             latest_session = server_context.session_store.get_latest_session()
             terminal = getattr(getattr(session, "finalisation", None), "status", None)
-            if latest_session is session and not session.active and terminal == "clean":
+            final_evidence = getattr(
+                getattr(session, "finalisation", None), "final_driver_evidence", None
+            )
+            safely_finalised = getattr(final_evidence, "outcome", None) == "read" and getattr(
+                getattr(final_evidence, "evidence", None), "safe_zero", False
+            )
+            if (
+                latest_session is session
+                and not session.active
+                and terminal in ("clean", "completed_not_clean")
+                and safely_finalised
+            ):
                 return
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
             _, snapshot = server_context.session_store.emergency_stop_snapshot(

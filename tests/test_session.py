@@ -667,6 +667,44 @@ def test_finalisation_reservation_blocks_snapshot_telemetry_and_second_admission
     assert rejection == "finalisation_in_progress"
 
 
+def test_finalisation_generation_increases_across_successive_eligible_sessions() -> None:
+    """Each newly admitted cold session receives a strictly newer finalisation generation."""
+    store = RoastSessionStore()
+    first = store.start_session(purpose="cold_characterisation")
+    _, rejection, first_generation = store.begin_finalisation(first.id)
+    assert rejection is None and first_generation is not None
+    store.abandon_finalisation_admission(first)
+    store.stop_session()
+
+    second = store.start_session(purpose="cold_characterisation")
+    _, rejection, second_generation = store.begin_finalisation(second.id)
+
+    assert rejection is None and second_generation is not None
+    assert second_generation > first_generation
+
+
+def test_pruning_evicts_terminal_finalisation_with_its_completed_session() -> None:
+    """History eviction keeps an old terminal record from affecting the new session."""
+    store = RoastSessionStore(session_history_limit=1)
+    first = store.start_session(purpose="cold_characterisation")
+    _, rejection, generation = store.begin_finalisation(first.id)
+    assert rejection is None and generation is not None
+
+    class Record:
+        status = "clean"
+        reservation_generation = generation
+
+    record = Record()
+    store.attach_finalisation(first, record)
+    store.finish_finalisation_terminal(first, record)
+    second = store.start_session(purpose="cold_characterisation")
+
+    with pytest.raises(SessionLifecycleError, match=first.id):
+        store.get_session_snapshot(session_id=first.id)
+    assert store.get_session_snapshot(session_id=second.id).active is True
+    assert second.pending_driver_command_token is None
+
+
 def test_session_snapshot_and_finalisation_admission_rejections() -> None:
     """Snapshot startup and faulted, held, and concurrent admissions fail closed."""
     store = RoastSessionStore()

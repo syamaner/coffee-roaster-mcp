@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -1809,6 +1809,37 @@ def test_build_session_recorder_multi_device(tmp_path: Path) -> None:
     # are named for the annotation pipeline: mic{N}-{origin}-roast{N}.wav.
     assert recorder.wav_path == tmp_path / session.id / "mic1-brazil-roast7.wav"
     assert recorder.additional_wav_paths == (tmp_path / session.id / "mic2-brazil-roast7.wav",)
+
+
+@pytest.mark.parametrize("devices", (("USB PnP",), ("USB PnP", "ATR2100x", "Mic 3")))
+def test_recording_artifact_plan_matches_built_recorder_paths(
+    tmp_path: Path, devices: tuple[str, ...]
+) -> None:
+    """Single and multi-device recorder construction preserves the pure artifact plan."""
+    from coffee_roaster_mcp.first_crack_runtime import (
+        RecordingMetadata,
+        build_session_recorder,
+        plan_session_recording_artifacts,
+    )
+
+    session = RoastSessionStore().start_session()
+    config = AppConfig(
+        recording=RecordingConfig(
+            enabled=True,
+            autocapture=True,
+            export_location=tmp_path,
+            devices=devices,
+        )
+    )
+    metadata = RecordingMetadata(origin="brazil", roast_num=7)
+    plan = plan_session_recording_artifacts(config, session, metadata)
+    recorder = build_session_recorder(config, session, metadata=metadata)
+
+    assert plan is not None and recorder is not None
+    assert cast(Any, recorder).wav_path == plan.primary_wav
+    assert cast(Any, recorder).sidecar_path == plan.recording_sidecar
+    assert cast(Any, recorder)._annotation_session.path == plan.annotation_session_sidecar
+    assert getattr(recorder, "additional_wav_paths", ()) == plan.additional_wavs
 
 
 def test_build_session_recorder_single_device_labels_wav(tmp_path: Path) -> None:
