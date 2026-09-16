@@ -96,6 +96,22 @@ def test_cold_characterisation_finalisation_is_clean_and_idempotent(tmp_path: Pa
     assert _finalise_cold_characterisation_session(context, session.id) == result
 
 
+def test_terminal_finalisation_of_a_does_not_disturb_later_active_b(tmp_path: Path) -> None:
+    """N13: retained terminal A remains idempotent after a separate active B starts."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    first = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+    terminal = _finalise_cold_characterisation_session(context, first.id)
+    second = context.session_store.start_session()
+    actions_before = list(driver.actions)
+
+    assert _finalise_cold_characterisation_session(context, first.id) == terminal
+    assert context.session_store.get_active_session() is second
+    assert driver.actions == actions_before
+
+
 def test_initial_finalisation_construction_error_releases_fresh_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -745,6 +761,35 @@ def test_auto_t0_skips_when_finalisation_reservation_is_active(tmp_path: Path) -
     assert session.auto_t0_preheat_sample_count == 0
 
 
+def test_get_roast_state_remains_readable_without_mutation_while_finalisation_reserved(
+    tmp_path: Path,
+) -> None:
+    """N4: a reserved cold session remains observable but its poll side effects are fenced."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("session:\n  auto_t0_detection_enabled: true\n", encoding="utf-8")
+    context = build_server_context(config_path=config_path)
+    server = create_mcp_server(config_path=config_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+    _, rejection, _ = context.session_store.begin_finalisation(session.id)
+    assert rejection is None
+    before = (
+        len(session.telemetry_buffer),
+        session.auto_t0_preheat_sample_count,
+        tuple(session.event_timeline),
+    )
+
+    state = _call_tool(server, "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert state.session_id == session.id
+    assert (
+        len(session.telemetry_buffer),
+        session.auto_t0_preheat_sample_count,
+        tuple(session.event_timeline),
+    ) == before
+    context.session_store.abandon_finalisation_admission(session)
+
+
 def test_stale_command_for_different_active_session_skips_driver_stop(tmp_path: Path) -> None:
     """A stale command cannot emergency-stop a newer session owner."""
     context = _cold_finalisation_context(tmp_path)
@@ -976,6 +1021,35 @@ def test_sampler_join_timeout_resumes_only_the_sampler_stage(tmp_path: Path) -> 
     assert completed.status == "clean"
     assert completed.recovered_after_failure is True
     assert sampler.calls == 2
+
+
+@pytest.mark.parametrize("outcome", ("partial", "disconnect_indeterminate"))
+def test_nonterminal_finalisation_blocks_registered_start_session(
+    tmp_path: Path, outcome: str
+) -> None:
+    """N13: a retained nonterminal finalisation prevents a second live session."""
+    context = _cold_finalisation_context(tmp_path)
+    server = create_mcp_server()
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.roaster_driver.connect()
+    if outcome == "partial":
+        object.__setattr__(context, "telemetry_sampler", RetryFinalisationSampler())
+    else:
+
+        class RaisingDisconnectDriver(LifecycleRecordingDriver):
+            def disconnect(self) -> None:
+                self.actions.append("disconnect")
+                raise RuntimeError("disconnect failed")
+
+        driver = RaisingDisconnectDriver()
+        object.__setattr__(context, "roaster_driver", driver)
+        driver.connect()
+
+    result = _finalise_cold_characterisation_session(context, session.id)
+    assert result.status == outcome
+    with pytest.raises(SessionLifecycleError):
+        _call_tool(server, "start_roast_session", _ctx(context))
+    assert context.session_store.get_latest_session() is session
 
 
 def test_real_sampler_retains_thread_owner_until_timeout_retry_joins() -> None:
