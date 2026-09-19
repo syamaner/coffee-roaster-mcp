@@ -10,34 +10,46 @@ The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 ## Current Release Authority
 
-`v0.1.16` remains the current published PyPI and MCP Registry release. Its tag
-and successful release run `32657497601` bind to base
-`07a6b96beae252c9b326f9374a64d91271f08105`. The checked-in `0.2.0` package
-and Registry metadata are a release candidate only: tag creation, publication,
-and live artefact verification remain human-operator actions. Its ancestry
-since `v0.1.16` includes D184 governance at
-`2c854d34bdb43f587db438436202b97e1dd01468`, state reconciliation at
-`30d556a2059001d551f50476dfa63c3586d85e3c`, and the material functional
-commits recorded below. #157 and #194 remain open.
+Per D193, `v0.2.0` is the current published PyPI and MCP Registry baseline. Its
+tag `v0.2.0` points to `be1be35f44f76a2057a3f5f3a334420bcf8bfb99`.
 
-This `0.2.0` release-preparation candidate is bound to published plan authority
-`b49409ad833372fb0061ce83c788f3f872a67f32` and software implementation base
-`7c08ad9ab843e60b240b5ec71027388e721a53a3`. This binding does not predetermine
-the authorised eventual tag, which will point to the post-merge release commit.
+`0.2.1` is an unpublished release candidate bound to plan SHA
+`d3e2de88f42c8d73a0ed6a6b91ddf0008865630f`, base/merge
+`3e0938649bff59f8c12a822b2fc77b2e08bed299`, and reviewed source head
+`642a81b4406bb61d48c6d5b73f7fcce0b999ebe5`. It carries the already-merged
+#218/#219 additive, non-actuating cold-characterisation session-purpose and
+finalisation contract. This release-preparation PR changes no runtime, detector,
+model, dependency, configuration, safety, workflow, or hardware-control
+behaviour. `safe_zero`
+and finalisation are commanded-driver/software evidence only, never physical
+proof. This candidate is Agent #954's dependency prerequisite only: it does
+not implement #954, authorise hardware, or authorise beans.
+
+D191's ratified limits remain `N = 1` and `X = 200 ms`; the production fatal
+streak remains `30`. D190, D192, and the open #157 and #194 acceptance work
+remain subject to their stated limitations below.
 
 Only the human release operator may create or push tags, approve the release
 environment, publish packages, or verify live PyPI and MCP Registry artefacts.
 Publication may occur only after the release-preparation PR is merged and the
-release-workflow dry run succeeds.
-These conditions are necessary rather than sufficient: publication is not
-automatic, and the human operator must still approve the protected release
-environment. Outstanding D192 work is a downstream full-appliance acceptance
-prerequisite rather than a blocker to publishing this MCP component.
-This release-preparation slice neither authorises nor performs those actions.
+release-workflow dry run succeeds. These conditions are necessary rather than
+sufficient: publication is not automatic, and the human operator must still
+approve the protected release environment. This release-preparation slice
+neither authorises nor performs those actions.
 
 ## Changelog
 
-### 0.2.0 (release candidate; not published)
+### 0.2.1 (release candidate; not published)
+
+- Carries the already-merged #218/#219 additive, non-actuating
+  cold-characterisation session-purpose and finalisation contract. It is
+  commanded-driver/software evidence only and never physical proof.
+- Is Agent #954's dependency prerequisite only; it does not implement #954,
+  authorise hardware, or authorise beans.
+- This release-preparation PR makes no runtime, detector, model, dependency,
+  configuration, safety, workflow, or hardware-control change.
+
+### 0.2.0 (published per D193)
 
 - D184 governance and its state reconciliation establish the release-process
   baseline in this ancestry; they are not functional changes and do not imply
@@ -77,8 +89,8 @@ This release-preparation slice neither authorises nor performs those actions.
   sanitised text review did not independently re-verify private evidence hashes.
   It is not Pi, full-stack, detector, live-roast, or combined acceptance.
 - D192 full-stack 30+30 characterisation and separate supervised >=20-minute
-  live-roast acceptance remain outstanding. This release-preparation slice
-  changes no runtime, model, dependency, configuration, workflow, hardware, or
+  live-roast acceptance remain outstanding. The 0.2.0 release-preparation PR
+  changed no runtime, model, dependency, configuration, workflow, hardware, or
   private evidence.
 
 ### 0.1.16
@@ -216,13 +228,37 @@ The dry run:
 - Confirms both distribution artifacts exist.
 - Does not publish to PyPI or the MCP Registry.
 
-## v0.2.0 Release Checklist
+## v0.2.1 Release Checklist
 
-Use this checklist for the selected `0.2.0` release candidate from updated
-`main`. `v0.1.16` remains the currently published package and registry version
-until `0.2.0` is published; the latest E7-S5a first-crack replay evidence uses
-released Hugging Face INT8 artifacts from `syamaner/coffee-first-crack-detection`
-pinned to revision
+Use this checklist for the unpublished `0.2.1` candidate after its
+release-preparation PR merges to `main`. `0.2.0` remains the published baseline
+until `0.2.1` publication completes. The first-crack artifact pin is unchanged:
+`syamaner/coffee-first-crack-detection` revision
+`b349a919c34b6130472da97c01817be404e4f629`, precision `int8`.
+
+1. Confirm exact version alignment at `0.2.1` for
+   `coffee_roaster_mcp.__version__`, `server.json.version`, and
+   `server.json.packages[0].version`, and confirm the installed CLI reports
+   `coffee-roaster-mcp 0.2.1`.
+2. Run the required hardware-free checks and the release-workflow dry run before
+   any tag is created or pushed.
+3. After the dry run succeeds, the human release operator may create and push
+   the matching protected tag `v0.2.1` from updated `main`.
+4. Only after publication makes the version available, run the published-package
+   smoke:
+
+   ```bash
+   uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.2.1 coffee-roaster-mcp --version
+   ```
+
+Tagging, publication, protected-environment approval, and live PyPI/MCP
+Registry verification remain human-only actions.
+
+## v0.2.0 Release Checklist (Historical)
+
+This historical checklist records the `0.2.0` candidate that is now published
+per D193. The latest E7-S5a first-crack replay evidence uses released Hugging
+Face INT8 artifacts from `syamaner/coffee-first-crack-detection` pinned to revision
 `b349a919c34b6130472da97c01817be404e4f629`.
 
 ### Required Tests And Checks
@@ -284,7 +320,7 @@ version fields in the same PR before the human operator tags it.
 
 ### Hugging Face First-Crack Artifact Pin
 
-For the selected `0.2.0` release candidate, record the first-crack artifact pin
+For the historical `0.2.0` release candidate, record the first-crack artifact pin
 in the release notes or release PR:
 
 - repo: `syamaner/coffee-first-crack-detection`
@@ -326,9 +362,8 @@ model cards, and dataset cards remain in `coffee-first-crack-detection`.
    uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.2.0 coffee-roaster-mcp --version
    ```
 
-`v0.2.0` / `0.2.0` are the selected candidate version, not tagging or
-publication authority; a human operator still authorises tagging and
-publication.
+This historical `v0.2.0` / `0.2.0` checklist did not itself authorise tagging
+or publication; those remained human-operator actions.
 
 ### MCP Registry Publish Steps
 
@@ -372,8 +407,8 @@ alone.
 
 A release may be described as mock-safe when default install, package smoke,
 MCP client, and mock roast validation pass without hardware or model download.
-The currently published `v0.1.16` release is mock-safe by default and includes
-E7-S5a labelled WAV replay evidence for the released first-crack artifact pin.
+The v0.1.16 release was mock-safe by default and included E7-S5a labelled WAV
+replay evidence for the released first-crack artifact pin.
 
 A release may be described as hardware-validated only when the release
 candidate has current evidence for:
@@ -401,11 +436,11 @@ After all prerequisites are confirmed:
 2. Push the matching version tag:
 
    ```bash
-   git tag v0.2.0
-   git push origin v0.2.0
+   git tag v0.2.1
+   git push origin v0.2.1
    ```
 
-   `v0.2.0` is the selected candidate version, not tagging or publication
+   `v0.2.1` is the selected candidate version, not tagging or publication
    authority; a human operator still authorises tagging and publication.
 
 3. Approve the `release` environment deployment in GitHub Actions.
