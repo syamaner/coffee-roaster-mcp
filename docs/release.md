@@ -18,8 +18,9 @@ tag `v0.2.0` points to `be1be35f44f76a2057a3f5f3a334420bcf8bfb99`.
 `3e0938649bff59f8c12a822b2fc77b2e08bed299`, and reviewed source head
 `642a81b4406bb61d48c6d5b73f7fcce0b999ebe5`. It carries the already-merged
 #218/#219 additive, non-actuating cold-characterisation session-purpose and
-finalisation contract. It changes no runtime, detector, model, dependency,
-configuration, safety, workflow, or hardware-control behaviour. `safe_zero`
+finalisation contract. This release-preparation PR changes no runtime, detector,
+model, dependency, configuration, safety, workflow, or hardware-control
+behaviour. `safe_zero`
 and finalisation are commanded-driver/software evidence only, never physical
 proof. This candidate is Agent #954's dependency prerequisite only: it does
 not implement #954, authorise hardware, or authorise beans.
@@ -45,8 +46,8 @@ neither authorises nor performs those actions.
   commanded-driver/software evidence only and never physical proof.
 - Is Agent #954's dependency prerequisite only; it does not implement #954,
   authorise hardware, or authorise beans.
-- Makes no runtime, detector, model, dependency, configuration, safety,
-  workflow, or hardware-control change.
+- This release-preparation PR makes no runtime, detector, model, dependency,
+  configuration, safety, workflow, or hardware-control change.
 
 ### 0.2.0 (published per D193)
 

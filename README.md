@@ -30,9 +30,9 @@ Those roasts used the pinned `coffee-roaster-mcp` 0.1.13 runtime. Versions
 0.1.14-0.1.16 were metadata/docs releases. `0.2.0` is the published baseline
 until `0.2.1` publication completes. The unpublished `0.2.1` candidate carries
 the already-merged #218/#219 additive, non-actuating cold-characterisation
-session-purpose and finalisation contract; it makes no runtime, detector,
-model, dependency, configuration, safety, workflow, or hardware-control
-change. Its `safe_zero` and finalisation evidence are commanded-driver/software
+session-purpose and finalisation contract. This release-preparation PR makes no
+runtime, detector, model, dependency, configuration, safety, workflow, or
+hardware-control change. Its `safe_zero` and finalisation evidence are commanded-driver/software
 evidence only, never physical proof. It is Agent #954's dependency prerequisite
 only: it does not implement #954, authorise hardware, or authorise beans.
 
