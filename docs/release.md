@@ -89,8 +89,8 @@ neither authorises nor performs those actions.
   sanitised text review did not independently re-verify private evidence hashes.
   It is not Pi, full-stack, detector, live-roast, or combined acceptance.
 - D192 full-stack 30+30 characterisation and separate supervised >=20-minute
-  live-roast acceptance remain outstanding. This release-preparation slice
-  changes no runtime, model, dependency, configuration, workflow, hardware, or
+  live-roast acceptance remain outstanding. The 0.2.0 release-preparation PR
+  changed no runtime, model, dependency, configuration, workflow, hardware, or
   private evidence.
 
 ### 0.1.16
@@ -407,8 +407,8 @@ alone.
 
 A release may be described as mock-safe when default install, package smoke,
 MCP client, and mock roast validation pass without hardware or model download.
-The currently published `v0.1.16` release is mock-safe by default and includes
-E7-S5a labelled WAV replay evidence for the released first-crack artifact pin.
+The v0.1.16 release was mock-safe by default and included E7-S5a labelled WAV
+replay evidence for the released first-crack artifact pin.
 
 A release may be described as hardware-validated only when the release
 candidate has current evidence for:
