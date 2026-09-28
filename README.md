@@ -237,12 +237,16 @@ The current MCP tool surface includes:
 - `set_recording_metadata`
 - `finalise_cold_characterisation_session`
 
-### Cold-characterisation finalisation
+### Per-poll cold-characterisation observation
 
-For an active, latest `purpose="cold_characterisation"` session only,
-`get_roast_state.cold_characterisation_observation` reports the commanded roast-fan
-level as a typed, read-only observation; it does not report physical sensing or
-duplicate heat, main-fan, or cooling state.
+`get_roast_state.cold_characterisation_observation` is meaningful only for a
+`purpose="cold_characterisation"` session; consumers must gate on
+`session_purpose`. It reports the commanded roast-fan level as a typed,
+read-only observation. It is neither physical, link, nor freshness proof, and
+is not atomic with `device_state`; it does not duplicate heat, main-fan, or
+cooling state.
+
+### Cold-characterisation finalisation
 
 `finalise_cold_characterisation_session` is a non-actuating teardown tool for an
 active, latest session started with `purpose="cold_characterisation"`; it is not
@@ -252,6 +256,7 @@ then stops sampling and capture, verifies recording artifacts, and disconnects.
 confirmed, and final driver evidence remains safe zero. `partial` and
 `disconnect_indeterminate` retain evidence for a later retry; this does not
 make any readiness claim.
+The D195 full safe-zero envelope remains finalisation-only.
 Terminal finalisation leaves the session phase unchanged; consumers must use
 `active` and `session_active_after`, rather than infer completion from phase.
 `completed_not_clean` is not a readiness or safety confirmation: investigate it

@@ -2077,7 +2077,7 @@ def test_cold_roast_fan_observation_has_closed_failure_outcomes(
         "outcome": "unreadable",
         "roast_fan_level_percent": None,
     }
-    serialised = repr(dataclasses.asdict(unreadable))
+    serialised = json.dumps(dataclasses.asdict(unreadable), sort_keys=True)
     assert all(
         value not in serialised for value in ("SENTINEL", "/dev/cu", "RuntimeError", "Traceback")
     )
@@ -2107,6 +2107,9 @@ def test_cold_roast_fan_observation_has_closed_failure_outcomes(
     bad_values.append(subclass)
     mismatch = _valid_lifecycle_evidence("other")
     bad_values.append(mismatch)
+    non_string_driver = _valid_lifecycle_evidence(driver.name)
+    object.__setattr__(non_string_driver, "driver", 7)
+    bad_values.append(non_string_driver)
     for value in (101, -1, True, 1.0, "0"):
         evidence = _valid_lifecycle_evidence(driver.name)
         object.__setattr__(evidence, "roast_fan_level_percent", value)

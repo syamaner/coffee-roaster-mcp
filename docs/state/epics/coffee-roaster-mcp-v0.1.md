@@ -20,8 +20,9 @@ The first implementation milestone is a mock vertical slice that requires no roa
   `5742280072`
 - #218 is complete. Current delivery: #222's typed, roast-fan-only
   cold-session `get_roast_state` observation is implemented and closes on merge
-  as a D197 software prerequisite for Agent #954; consumer release is separately
-  authorised
+  as a D197 software prerequisite for Agent #954 (plan merge
+  `2b1d1e0c156f38260231e2bf96c3a8d672ed8ca2`); it reports commanded state, not
+  physical proof, and consumer release is separately authorised
 - Separate open acceptance work: #157 and #194 remain open for their respective
   hardware/component acceptance. Do not infer microphone, serial, Hottop, or
   readiness authority from this delivery
