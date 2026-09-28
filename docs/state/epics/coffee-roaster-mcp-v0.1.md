@@ -15,10 +15,14 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Active Context
 
-- Current released baseline: per D193, `v0.2.0` at
-  `be1be35f44f76a2057a3f5f3a334420bcf8bfb99`
-- Current delivery: #218's non-actuating cold-characterisation
-  session-finalisation prerequisite is implemented and closes on merge
+- Current released baseline: `v0.2.1` at
+  `ac6df37be6c3f5fd91b726c2eec8f272ead76f63`, per OWNER #220 comment
+  `5742280072`
+- #218 is complete. Current delivery: #222's typed, roast-fan-only
+  cold-session `get_roast_state` observation is implemented and closes on merge
+  as a D197 software prerequisite for Agent #954 (plan merge
+  `2b1d1e0c156f38260231e2bf96c3a8d672ed8ca2`); it reports commanded state, not
+  physical proof, and consumer release is separately authorised
 - Separate open acceptance work: #157 and #194 remain open for their respective
   hardware/component acceptance. Do not infer microphone, serial, Hottop, or
   readiness authority from this delivery
@@ -37,11 +41,14 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
 - D184 governance baseline is active. Issue #206 completed through PR #207,
   squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`.
-  Per D193, the current released baseline is `v0.2.0` at
-  `be1be35f44f76a2057a3f5f3a334420bcf8bfb99`. #218's non-actuating
-  cold-characterisation session-finalisation prerequisite is implemented by
-  this delivery and closes on merge. #157 and #194 remain separate open
-  hardware/component acceptance work; no hardware or readiness claim follows.
+  The released baseline is `v0.2.1` at
+  `ac6df37be6c3f5fd91b726c2eec8f272ead76f63`, per OWNER #220 comment
+  `5742280072`. #218 is complete. #222 adds a typed, roast-fan-only
+  cold-session `get_roast_state` observation as a D197 software prerequisite
+  for Agent #954; it is implemented by this delivery and closes on merge.
+  #157 and #194 remain separate open hardware/component acceptance work; no
+  hardware or readiness claim follows, and consumer release is separately
+  authorised.
 - `E7-S1` keeps broad mock-safe validation on the public stdio MCP tool path:
   a default-config server uses the mock driver, first-crack mode remains
   disabled, auto-T0 remains disabled, and exported JSONL, CSV, and

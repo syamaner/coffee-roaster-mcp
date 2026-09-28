@@ -415,6 +415,20 @@ class AmbientStatus:
 
 
 T0RuntimeStatus = Literal["disabled", "pending", "detected", "unavailable"]
+ColdCharacterisationObservationOutcome = Literal[
+    "observed", "not_eligible", "unsupported", "unreadable", "malformed"
+]
+
+
+@dataclass(frozen=True)
+class ColdCharacterisationObservation:
+    """Read-only commanded roast-fan observation for a cold-characterisation session.
+
+    Values are the driver's commanded state, not physical sensing.
+    """
+
+    outcome: ColdCharacterisationObservationOutcome
+    roast_fan_level_percent: int | None
 
 
 @dataclass(frozen=True)
@@ -479,6 +493,7 @@ class RoastSessionState:
     events: tuple[EventSnapshot, ...]
     log_dir: str | None
     session_purpose: SessionPurpose = "roast"
+    cold_characterisation_observation: ColdCharacterisationObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -917,8 +932,14 @@ def create_mcp_server(
         """Return the current authoritative roast session state."""
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
+        observation_source_session_id = session.id
         driver_state = _read_current_driver_state(server_context)
         device_state = _serialize_device_state(driver_state)
+        cold_characterisation_observation = _observe_cold_characterisation_roast_fan(
+            server_context,
+            session=session,
+            driver_state=driver_state,
+        )
         session = _record_polling_telemetry_for_active_session(
             server_context,
             session=session,
@@ -938,12 +959,19 @@ def create_mcp_server(
         _process_first_crack_runtime_for_active_session(server_context, session_id=session_id)
         _process_ambient_runtime_for_active_session(server_context, session_id=session_id)
         session = _resolve_session(server_context, session_id=session_id)
+        cold_characterisation_observation = _reconcile_cold_characterisation_observation(
+            server_context,
+            session=session,
+            observation_source_session_id=observation_source_session_id,
+            observation=cold_characterisation_observation,
+        )
         return _serialize_session_state(
             session,
             config=server_context.config,
             device_state=device_state,
             first_crack_runtime=server_context.first_crack_runtime.snapshot(),
             ambient_runtime=server_context.ambient_runtime.snapshot(),
+            cold_characterisation_observation=cold_characterisation_observation,
         )
 
     @mcp.tool()
@@ -1569,6 +1597,70 @@ def _read_current_driver_state(server_context: ServerContext) -> RoasterState:
             f"Could not read current roaster state from driver {driver_name}: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
+
+
+def _observe_cold_characterisation_roast_fan(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    driver_state: RoasterState,
+) -> ColdCharacterisationObservation | None:
+    """Return the eligible cold-session roast-fan observation without mutation."""
+    if session.purpose == "roast":
+        return None
+
+    latest = server_context.session_store.get_latest_session()
+    if (
+        latest is None
+        or latest.id != session.id
+        or not latest.active
+        or latest.purpose != "cold_characterisation"
+    ):
+        return ColdCharacterisationObservation("not_eligible", None)
+
+    driver = server_context.roaster_driver
+    if not isinstance(driver, LifecycleEvidenceDriver):
+        return ColdCharacterisationObservation("unsupported", None)
+    try:
+        raw = driver.read_lifecycle_evidence()
+    except Exception:  # noqa: BLE001 - driver boundaries vary.
+        return ColdCharacterisationObservation("unreadable", None)
+
+    try:
+        if type(raw) is not DriverLifecycleEvidence:
+            return ColdCharacterisationObservation("malformed", None)
+        if type(raw.driver) is not str or raw.driver != driver_state.driver:
+            return ColdCharacterisationObservation("malformed", None)
+        roast_fan_level_percent = raw.roast_fan_level_percent
+        if type(roast_fan_level_percent) is not int or not 0 <= roast_fan_level_percent <= 100:
+            return ColdCharacterisationObservation("malformed", None)
+    except Exception:  # noqa: BLE001 - malformed driver properties vary.
+        return ColdCharacterisationObservation("malformed", None)
+    return ColdCharacterisationObservation("observed", roast_fan_level_percent)
+
+
+def _reconcile_cold_characterisation_observation(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    observation_source_session_id: str,
+    observation: ColdCharacterisationObservation | None,
+) -> ColdCharacterisationObservation | None:
+    """Keep a cold observation bound to the final returned session snapshot."""
+    if session.purpose == "roast":
+        return None
+
+    latest = server_context.session_store.get_latest_session()
+    if (
+        not session.active
+        or session.id != observation_source_session_id
+        or latest is None
+        or latest.id != session.id
+        or not latest.active
+        or latest.purpose != "cold_characterisation"
+    ):
+        return ColdCharacterisationObservation("not_eligible", None)
+    return observation
 
 
 def _record_polling_telemetry_for_active_session(
@@ -2256,6 +2348,7 @@ def _serialize_session_state(
     device_state: RoasterDeviceState | None = None,
     first_crack_runtime: FirstCrackRuntimeSnapshot | None = None,
     ambient_runtime: AmbientRuntimeSnapshot | None = None,
+    cold_characterisation_observation: ColdCharacterisationObservation | None = None,
 ) -> RoastSessionState:
     """Convert one in-memory session into an MCP-safe snapshot."""
     metrics = compute_roast_metrics(
@@ -2308,6 +2401,7 @@ def _serialize_session_state(
         if session.log_writer is not None
         else None,
         session_purpose=session.purpose,
+        cold_characterisation_observation=cold_characterisation_observation,
     )
 
 

@@ -4,13 +4,18 @@ Repository: `syamaner/coffee-roaster-mcp`
 
 Milestone: `v0.2`
 
-Current released baseline (D193): `v0.2.0` at
-`be1be35f44f76a2057a3f5f3a334420bcf8bfb99`
+Current released baseline: `v0.2.1` at
+`ac6df37be6c3f5fd91b726c2eec8f272ead76f63`, per OWNER #220 comment
+`5742280072`
 
 ## Current Stories
 
-- #218: non-actuating cold-characterisation session-finalisation prerequisite
-  implemented by this delivery; closes on merge.
+- #218: complete; non-actuating cold-characterisation session-finalisation
+  prerequisite.
+- #222: current; typed, roast-fan-only cold-session `get_roast_state`
+  observation, implemented by this delivery and closes on merge as a D197
+  software prerequisite for Agent #954. Consumer release is separately
+  authorised; no hardware or readiness claim follows.
 - #157: open; separate hardware/component acceptance work.
 - #210: complete; standalone Torch-free NumPy/SciPy mel frontend parity slice.
 - #212: complete; MCP-owned frontend integration and local package readiness slice.

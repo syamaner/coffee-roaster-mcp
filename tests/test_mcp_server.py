@@ -17,6 +17,7 @@ from typing import Any, cast
 import pytest
 from mcp.server.fastmcp import FastMCP
 
+import coffee_roaster_mcp.mcp_server as mcp_server
 from coffee_roaster_mcp.ambient_runtime import AmbientRuntimeSnapshot, AmbientRuntimeState
 from coffee_roaster_mcp.artifacts import ResolvedArtifact, ResolvedDetectorArtifacts
 from coffee_roaster_mcp.audio import AudioCaptureSnapshot, AudioWindow
@@ -28,6 +29,7 @@ from coffee_roaster_mcp.detector import (
 from coffee_roaster_mcp.drivers import (
     DriverLifecycleEvidence,
     EmergencyStopResult,
+    HottopRoasterDriver,
     MockRoasterDriver,
     RoasterState,
 )
@@ -39,6 +41,7 @@ from coffee_roaster_mcp.first_crack_runtime import (
 )
 from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
+    ColdCharacterisationObservation,
     DriverEvidenceRead,
     RoasterDeviceState,
     SamplerFinalisationEvidence,
@@ -65,6 +68,7 @@ from coffee_roaster_mcp.session import (
     RoastSession,
     RoastSessionStore,
     SessionLifecycleError,
+    SessionPurpose,
 )
 
 
@@ -1988,6 +1992,394 @@ def test_get_roast_state_reads_driver_before_detector_side_effects(
     ]
 
 
+def test_cold_roast_fan_observation_is_narrow_and_normal_roasts_skip_it(tmp_path: Path) -> None:
+    """Expose only commanded roast fan for eligible cold sessions."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver(non_zero_dimension="roast_fan_level_percent")
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+
+    normal = context.session_store.start_session()
+    normal_state = _call_tool(server, "get_roast_state", ctx, session_id=normal.id)
+    assert normal_state.cold_characterisation_observation is None
+    assert driver.lifecycle_evidence_calls == 0
+    assert normal_state.device_state is not None
+    assert set(dataclasses.asdict(normal_state.device_state)) == {
+        "bean_temp_c",
+        "connected",
+        "cooling_on",
+        "driver",
+        "env_temp_c",
+        "fan_level_percent",
+        "heat_level_percent",
+        "raw_vendor_data",
+    }
+
+    normal.monotonic_stop = normal.monotonic_start
+    cold = context.session_store.start_session(purpose="cold_characterisation")
+    cold_state = _call_tool(server, "get_roast_state", ctx, session_id=cold.id)
+    assert cold_state.cold_characterisation_observation is not None
+    assert dataclasses.asdict(cold_state.cold_characterisation_observation) == {
+        "outcome": "observed",
+        "roast_fan_level_percent": 1,
+    }
+    assert driver.actions == []
+    assert cold_state.events == ()
+    assert cold_state.active is True
+
+
+@pytest.mark.parametrize(
+    "non_zero_dimension",
+    (
+        "heat_level_percent",
+        "main_fan_level_percent",
+        "drum_motor_on",
+        "cooling_motor_on",
+        "solenoid_open",
+    ),
+)
+def test_cold_roast_fan_observation_does_not_duplicate_other_dimensions(
+    tmp_path: Path,
+    non_zero_dimension: str,
+) -> None:
+    """Keep every finalisation-only dimension out of the per-poll observation."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver(non_zero_dimension=non_zero_dimension)
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert state.cold_characterisation_observation is not None
+    assert dataclasses.asdict(state.cold_characterisation_observation) == {
+        "outcome": "observed",
+        "roast_fan_level_percent": 0,
+    }
+
+
+def test_cold_roast_fan_observation_has_closed_failure_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail closed without serial, exception, or malformed-value text in output."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    server = create_mcp_server()
+    ctx = _ctx(context)
+
+    driver.lifecycle_evidence_error = RuntimeError("SENTINEL-/dev/cu.leak-9f3")
+    unreadable = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    assert unreadable.cold_characterisation_observation is not None
+    assert dataclasses.asdict(unreadable.cold_characterisation_observation) == {
+        "outcome": "unreadable",
+        "roast_fan_level_percent": None,
+    }
+    serialised = json.dumps(dataclasses.asdict(unreadable), sort_keys=True)
+    assert all(
+        value not in serialised for value in ("SENTINEL", "/dev/cu", "RuntimeError", "Traceback")
+    )
+
+    driver.lifecycle_evidence_error = None
+    bad_values: list[object] = [object()]
+    valid = _valid_lifecycle_evidence(driver.name)
+    subclass = _LifecycleEvidenceSubclass(
+        driver=valid.driver,
+        connected=valid.connected,
+        command_streaming_required=valid.command_streaming_required,
+        command_loop_running=valid.command_loop_running,
+        serial_open=valid.serial_open,
+        heat_level_percent=valid.heat_level_percent,
+        roast_fan_level_percent=valid.roast_fan_level_percent,
+        main_fan_level_percent=valid.main_fan_level_percent,
+        drum_motor_on=valid.drum_motor_on,
+        cooling_motor_on=valid.cooling_motor_on,
+        solenoid_open=valid.solenoid_open,
+        command_send_attempts=valid.command_send_attempts,
+        command_write_count=valid.command_write_count,
+        last_command_write_size=valid.last_command_write_size,
+        command_loop_error_count=valid.command_loop_error_count,
+        status_packet_count=valid.status_packet_count,
+        status_read_error_count=valid.status_read_error_count,
+    )
+    bad_values.append(subclass)
+    mismatch = _valid_lifecycle_evidence("other")
+    bad_values.append(mismatch)
+    non_string_driver = _valid_lifecycle_evidence(driver.name)
+    object.__setattr__(non_string_driver, "driver", 7)
+    bad_values.append(non_string_driver)
+    for value in (101, -1, True, 1.0, "0"):
+        evidence = _valid_lifecycle_evidence(driver.name)
+        object.__setattr__(evidence, "roast_fan_level_percent", value)
+        bad_values.append(evidence)
+    for bad_value in bad_values:
+        driver.lifecycle_evidence_override = bad_value
+        malformed = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+        assert malformed.cold_characterisation_observation is not None
+        assert dataclasses.asdict(malformed.cold_characterisation_observation) == {
+            "outcome": "malformed",
+            "roast_fan_level_percent": None,
+        }
+
+    valid = _valid_lifecycle_evidence(driver.name)
+
+    def explode_roast_fan_read(instance: object, name: str) -> object:
+        """Simulate one malformed evidence property accessor."""
+        if name == "roast_fan_level_percent":
+            raise RuntimeError("malformed evidence property")
+        return object.__getattribute__(instance, name)
+
+    monkeypatch.setattr(DriverLifecycleEvidence, "__getattribute__", explode_roast_fan_read)
+    driver.lifecycle_evidence_override = valid
+    malformed_property = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    assert malformed_property.cold_characterisation_observation is not None
+    assert dataclasses.asdict(malformed_property.cold_characterisation_observation) == {
+        "outcome": "malformed",
+        "roast_fan_level_percent": None,
+    }
+
+    object.__setattr__(context, "roaster_driver", RecordingRoasterDriver())
+    unsupported = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    assert unsupported.cold_characterisation_observation is not None
+    assert dataclasses.asdict(unsupported.cold_characterisation_observation) == {
+        "outcome": "unsupported",
+        "roast_fan_level_percent": None,
+    }
+
+
+def test_cold_roast_fan_observation_skips_ineligible_sessions_and_finalisation_fence(
+    tmp_path: Path,
+) -> None:
+    """Read eligible cold sessions without fencing on finalisation reservations."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    first = context.session_store.start_session(purpose="cold_characterisation")
+    driver.connect()
+    assert _finalise_cold_characterisation_session(context, first.id).status == "clean"
+    lifecycle_calls_after_finalisation = driver.lifecycle_evidence_calls
+
+    inactive = _call_tool(server, "get_roast_state", _ctx(context), session_id=first.id)
+    assert inactive.cold_characterisation_observation is not None
+    assert inactive.cold_characterisation_observation.outcome == "not_eligible"
+    assert driver.lifecycle_evidence_calls == lifecycle_calls_after_finalisation
+
+    latest = context.session_store.start_session(purpose="cold_characterisation")
+    older = _call_tool(server, "get_roast_state", _ctx(context), session_id=first.id)
+    assert older.cold_characterisation_observation is not None
+    assert older.cold_characterisation_observation.outcome == "not_eligible"
+    assert driver.lifecycle_evidence_calls == lifecycle_calls_after_finalisation
+
+    _, rejection, _ = context.session_store.begin_finalisation(latest.id)
+    assert rejection is None
+    before = (
+        len(latest.telemetry_buffer),
+        latest.auto_t0_preheat_sample_count,
+        tuple(latest.event_timeline),
+    )
+    reserved = _call_tool(server, "get_roast_state", _ctx(context), session_id=latest.id)
+    assert reserved.cold_characterisation_observation is not None
+    assert reserved.cold_characterisation_observation.outcome == "observed"
+    assert driver.lifecycle_evidence_calls == lifecycle_calls_after_finalisation + 1
+    assert (
+        len(latest.telemetry_buffer),
+        latest.auto_t0_preheat_sample_count,
+        tuple(latest.event_timeline),
+    ) == before
+    context.session_store.abandon_finalisation_admission(latest)
+
+
+@pytest.mark.parametrize(
+    ("initial_purpose", "replacement_purpose", "expected_outcome"),
+    (
+        ("cold_characterisation", None, "not_eligible"),
+        ("cold_characterisation", "cold_characterisation", "not_eligible"),
+        ("cold_characterisation", "roast", None),
+        ("roast", "cold_characterisation", "not_eligible"),
+    ),
+)
+def test_cold_roast_fan_observation_reconciles_final_session_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_purpose: SessionPurpose,
+    replacement_purpose: SessionPurpose | None,
+    expected_outcome: str | None,
+) -> None:
+    """Fail closed when the session changes after the lifecycle evidence read."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    initial = context.session_store.start_session(purpose=initial_purpose)
+    original_observe = mcp_server._observe_cold_characterisation_roast_fan  # pyright: ignore[reportPrivateUsage]
+
+    def observe_then_transition(
+        server_context: ServerContext,
+        *,
+        session: RoastSession,
+        driver_state: RoasterState,
+    ) -> ColdCharacterisationObservation | None:
+        """Stop the observed session and optionally replace it after observation."""
+        observation = original_observe(
+            server_context,
+            session=session,
+            driver_state=driver_state,
+        )
+        initial.monotonic_stop = initial.monotonic_start
+        if replacement_purpose is not None:
+            context.session_store.start_session(purpose=replacement_purpose)
+        return observation
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_observe_cold_characterisation_roast_fan",
+        observe_then_transition,
+    )
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context))
+
+    if expected_outcome is None:
+        assert state.cold_characterisation_observation is None
+    else:
+        assert state.cold_characterisation_observation is not None
+        assert state.cold_characterisation_observation.outcome == expected_outcome
+        assert state.cold_characterisation_observation.roast_fan_level_percent is None
+    expected_lifecycle_calls = 1 if initial_purpose == "cold_characterisation" else 0
+    assert driver.lifecycle_evidence_calls == expected_lifecycle_calls
+
+
+def test_cold_roast_fan_observation_preserves_stable_closed_outcomes(
+    tmp_path: Path,
+) -> None:
+    """Retain stable observed and unreadable outcomes without a second driver read."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    server = create_mcp_server()
+    ctx = _ctx(context)
+
+    observed = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    assert observed.cold_characterisation_observation == ColdCharacterisationObservation(
+        "observed", 0
+    )
+
+    driver.lifecycle_evidence_error = RuntimeError("unreadable")
+    unreadable = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    assert unreadable.cold_characterisation_observation == ColdCharacterisationObservation(
+        "unreadable", None
+    )
+    assert driver.lifecycle_evidence_calls == 2
+
+
+def test_cold_roast_fan_observation_schema_is_closed() -> None:
+    """Publish the closed two-property observation schema and outcome enum."""
+    tool = create_mcp_server()._tool_manager.get_tool("get_roast_state")  # pyright: ignore[reportPrivateUsage]
+    assert tool is not None
+    schema = cast(dict[str, object], tool.output_schema)
+    definitions = cast(dict[str, object], schema["$defs"])
+    observation = cast(dict[str, object], definitions["ColdCharacterisationObservation"])
+    properties = cast(dict[str, object], observation["properties"])
+    outcome = cast(dict[str, object], properties["outcome"])
+    assert set(properties) == {"outcome", "roast_fan_level_percent"}
+    assert outcome["enum"] == [
+        "observed",
+        "not_eligible",
+        "unsupported",
+        "unreadable",
+        "malformed",
+    ]
+
+
+def test_cold_roast_fan_observation_precedes_poll_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read lifecycle evidence directly after driver state and before poll mutation."""
+    order: list[str] = []
+
+    class OrderedDriver(LifecycleRecordingDriver):
+        """Lifecycle double that retains read ordering."""
+
+        def read_state(self) -> RoasterState:
+            """Record the ordinary driver-state read."""
+            order.append("read_state")
+            return super().read_state()
+
+        def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
+            """Record the read-only lifecycle evidence call."""
+            order.append("read_lifecycle_evidence")
+            return super().read_lifecycle_evidence()
+
+    context = _cold_finalisation_context(tmp_path)
+    driver = OrderedDriver()
+    runtime = FakeFirstCrackRuntime()
+    object.__setattr__(context, "roaster_driver", driver)
+    _set_first_crack_runtime(context, runtime)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    original_telemetry = context.session_store.record_active_telemetry_sample
+    original_detector = runtime.process_available_windows
+
+    def record_telemetry(*args: object, **kwargs: object) -> RoastSession | None:
+        """Record telemetry side-effect position while preserving store behaviour."""
+        order.append("telemetry")
+        return original_telemetry(*args, **kwargs)
+
+    def process_detector(*args: object, **kwargs: object) -> FirstCrackRuntimeSnapshot:
+        """Record detector side-effect position while preserving fake behaviour."""
+        order.append("detector")
+        return original_detector(*args, **kwargs)
+
+    monkeypatch.setattr(context.session_store, "record_active_telemetry_sample", record_telemetry)
+    monkeypatch.setattr(runtime, "process_available_windows", process_detector)
+
+    _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert order == ["read_state", "read_lifecycle_evidence", "telemetry", "detector"]
+
+
+def test_autonomous_sampler_never_reads_cold_lifecycle_evidence(tmp_path: Path) -> None:
+    """Keep the lifecycle-evidence read exclusively on explicit state polling."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+
+    assert _sample_active_session_telemetry(context, session_id=session.id) is True
+    assert driver.lifecycle_evidence_calls == 0
+
+
+def test_hottop_fake_serial_cold_observation_keeps_roast_fan_separate(tmp_path: Path) -> None:
+    """Read Hottop commanded roast fan through a fake serial transport only."""
+    transport = _ObservationFakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="/dev/fake-roast-fan-observation",
+        command_interval_seconds=1.0,
+        serial_factory=lambda *_args, **_kwargs: transport,
+    )
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    driver.connect()
+    try:
+        _call_tool(server, "set_heat", ctx, heat_level_percent=40)
+        _call_tool(server, "set_fan", ctx, fan_level_percent=50)
+        state = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    finally:
+        driver.disconnect()
+
+    assert state.device_state is not None
+    assert state.device_state.heat_level_percent == 40
+    assert state.device_state.fan_level_percent == 50
+    assert state.cold_characterisation_observation is not None
+    assert dataclasses.asdict(state.cold_characterisation_observation) == {
+        "outcome": "observed",
+        "roast_fan_level_percent": 0,
+    }
+
+
 def test_mark_beans_added_returns_snapshot_after_immediate_detector_confirmation(
     tmp_path: Path,
 ) -> None:
@@ -3501,9 +3893,17 @@ class LifecycleRecordingDriver(RecordingRoasterDriver):
         self.non_zero_dimension = non_zero_dimension
         self.streaming = streaming
         self.connected = initially_connected
+        self.lifecycle_evidence_calls = 0
+        self.lifecycle_evidence_override: object | None = None
+        self.lifecycle_evidence_error: Exception | None = None
 
     def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
         """Return a complete, non-actuating evidence snapshot."""
+        self.lifecycle_evidence_calls += 1
+        if self.lifecycle_evidence_error is not None:
+            raise self.lifecycle_evidence_error
+        if self.lifecycle_evidence_override is not None:
+            return cast(DriverLifecycleEvidence, self.lifecycle_evidence_override)
         values: dict[str, int | bool] = {
             "heat_level_percent": 0,
             "roast_fan_level_percent": 0,
@@ -3551,6 +3951,59 @@ class BrokenLifecycleDriver:
         if self.outcome == "raise":
             raise RuntimeError("evidence unavailable")
         return cast(DriverLifecycleEvidence, object())
+
+
+class _LifecycleEvidenceSubclass(DriverLifecycleEvidence):
+    """Deliberate lifecycle-evidence subclass for exact-type boundary coverage."""
+
+
+class _ObservationFakeSerialTransport:
+    """Minimal in-memory Hottop transport for roast-fan observation coverage."""
+
+    def __init__(self) -> None:
+        """Initialize an open, no-input transport."""
+        self.is_open = True
+
+    @property
+    def in_waiting(self) -> int:
+        """Return no queued serial input."""
+        return 0
+
+    def close(self) -> None:
+        """Close the in-memory transport."""
+        self.is_open = False
+
+    def read(self, size: int) -> bytes:
+        """Return no serial input."""
+        del size
+        return b""
+
+    def write(self, data: bytes) -> int:
+        """Accept one command frame without external I/O."""
+        return len(data)
+
+
+def _valid_lifecycle_evidence(driver: str) -> DriverLifecycleEvidence:
+    """Build valid non-streaming evidence for observation-malformation tests."""
+    return DriverLifecycleEvidence(
+        driver=driver,
+        connected=True,
+        command_streaming_required=False,
+        command_loop_running=None,
+        serial_open=None,
+        heat_level_percent=0,
+        roast_fan_level_percent=0,
+        main_fan_level_percent=0,
+        drum_motor_on=False,
+        cooling_motor_on=False,
+        solenoid_open=False,
+        command_send_attempts=None,
+        command_write_count=None,
+        last_command_write_size=None,
+        command_loop_error_count=None,
+        status_packet_count=None,
+        status_read_error_count=None,
+    )
 
 
 class RetryLifecycleDriver(LifecycleRecordingDriver):
