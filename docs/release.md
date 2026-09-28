@@ -21,6 +21,20 @@ configuration, safety, workflow, or hardware-control behaviour. This candidate
 is Agent #954's upstream prerequisite only: it does not implement #954,
 authorise hardware, or authorise beans.
 
+Release-candidate traceability records #222's implementation merge
+`6b8c6f8922df02adc147719f1e8c91b824d13783` and D197's plan merge
+`2b1d1e0c156f38260231e2bf96c3a8d672ed8ca2`. They identify inputs to this
+candidate, not the eventual `v0.2.2` tag target.
+
+The cumulative D195 `safe_zero` and finalisation boundary remains
+commanded-driver/software-only evidence, never physical proof.
+
+Historical `0.2.1` candidate-stage traceability records plan SHA
+`d3e2de88f42c8d73a0ed6a6b91ddf0008865630f`, base/merge SHA
+`3e0938649bff59f8c12a822b2fc77b2e08bed299`, and reviewed source-head SHA
+`642a81b4406bb61d48c6d5b73f7fcce0b999ebe5`. These are candidate-stage
+records, not provenance for the published `v0.2.1` tag.
+
 D191's ratified limits remain `N = 1` and `X = 200 ms`; the production fatal
 streak remains `30`. D190, D192, and the open #157 and #194 acceptance work
 remain subject to their stated limitations below.
@@ -42,8 +56,8 @@ neither authorises nor performs those actions.
   never physical, link, or freshness proof.
 - Is Agent #954's upstream prerequisite only; it does not implement #954,
   authorise hardware, or authorise beans.
-- This release-preparation PR makes no runtime, detector, model, dependency,
-  configuration, safety, workflow, or hardware-control change.
+- The no-runtime-change claim applies only to this release-preparation PR;
+  the release carries #222's already-merged tool-shape change.
 
 ### 0.2.1 (published)
 
@@ -52,10 +66,14 @@ neither authorises nor performs those actions.
   commanded-driver/software evidence only and never physical proof.
 - Is Agent #954's dependency prerequisite only; it does not implement #954,
   authorise hardware, or authorise beans.
-- This release-preparation PR makes no runtime, detector, model, dependency,
-  configuration, safety, workflow, or hardware-control change.
+- The historical `0.2.1` release-preparation PR made no runtime, detector,
+  model, dependency, configuration, safety, workflow, or hardware-control
+  change; the release carried the already-merged #218/#219 contract.
 
 ### 0.2.0 (published per D193)
+
+Historical tag provenance: `v0.2.0` pointed to
+`be1be35f44f76a2057a3f5f3a334420bcf8bfb99`.
 
 - D184 governance and its state reconciliation establish the release-process
   baseline in this ancestry; they are not functional changes and do not imply
@@ -246,10 +264,13 @@ until `0.2.2` publication completes. The first-crack artifact pin is unchanged:
    `coffee_roaster_mcp.__version__`, `server.json.version`, and
    `server.json.packages[0].version`, and confirm the installed CLI reports
    `coffee-roaster-mcp 0.2.2`.
-2. Run the required hardware-free checks and the release-workflow dry run before
-   any tag is created or pushed.
-3. After the dry run succeeds, the human release operator may create and push
-   the matching protected tag `v0.2.2` from updated `main`.
+2. Before the human tag decision, confirm that the release-preparation PR is
+   merged, protected `Checks` and `Build Package` completed cleanly, all
+   conversations are resolved, the required hardware-free checks succeeded,
+   and the release-workflow dry run succeeded. These conditions are jointly
+   necessary but insufficient.
+3. Only after those conditions, the human release operator may decide whether
+   to create and push the matching protected tag `v0.2.2` from updated `main`.
 4. Only after publication makes the version available, run the published-package
    smoke:
 
@@ -258,23 +279,24 @@ until `0.2.2` publication completes. The first-crack artifact pin is unchanged:
    ```
 
 Tagging, publication, protected-environment approval, and live PyPI/MCP
-Registry verification remain human-only actions.
+Registry verification remain human-only actions. Checklist completion does not
+authorise a tag or publication.
 
-## v0.2.1 Release Checklist (Historical)
+## v0.2.1 Release Checklist (Historical Record Only)
 
-This historical checklist records the `0.2.1` candidate that is now published
-at `v0.2.1`.
+This is a non-executable historical record of the `0.2.1` candidate, now
+published at `v0.2.1`; it does not instruct creation or pushing of that
+existing tag.
 
-1. Confirm exact version alignment at `0.2.1` for
+1. The candidate recorded exact version alignment at `0.2.1` for
    `coffee_roaster_mcp.__version__`, `server.json.version`, and
-   `server.json.packages[0].version`, and confirm the installed CLI reports
+   `server.json.packages[0].version`, with installed CLI output
    `coffee-roaster-mcp 0.2.1`.
-2. Run the required hardware-free checks and the release-workflow dry run before
-   any tag is created or pushed.
-3. After the dry run succeeds, the human release operator may create and push
-   the matching protected tag `v0.2.1` from updated `main`.
-4. Only after publication makes the version available, run the published-package
-   smoke:
+2. The historical candidate process recorded hardware-free checks and a
+   release-workflow dry run before its tag decision.
+3. After that historical dry run, the human release operator created and pushed
+   the matching protected `v0.2.1` tag from then-current `main`.
+4. The historical published-package smoke target was:
 
    ```bash
    uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.2.1 coffee-roaster-mcp --version
