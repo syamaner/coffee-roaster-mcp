@@ -17,6 +17,7 @@ from typing import Any, cast
 import pytest
 from mcp.server.fastmcp import FastMCP
 
+import coffee_roaster_mcp.mcp_server as mcp_server
 from coffee_roaster_mcp.ambient_runtime import AmbientRuntimeSnapshot, AmbientRuntimeState
 from coffee_roaster_mcp.artifacts import ResolvedArtifact, ResolvedDetectorArtifacts
 from coffee_roaster_mcp.audio import AudioCaptureSnapshot, AudioWindow
@@ -40,6 +41,7 @@ from coffee_roaster_mcp.first_crack_runtime import (
 )
 from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
+    ColdCharacterisationObservation,
     DriverEvidenceRead,
     RoasterDeviceState,
     SamplerFinalisationEvidence,
@@ -66,6 +68,7 @@ from coffee_roaster_mcp.session import (
     RoastSession,
     RoastSessionStore,
     SessionLifecycleError,
+    SessionPurpose,
 )
 
 
@@ -2184,6 +2187,87 @@ def test_cold_roast_fan_observation_skips_ineligible_sessions_and_finalisation_f
         tuple(latest.event_timeline),
     ) == before
     context.session_store.abandon_finalisation_admission(latest)
+
+
+@pytest.mark.parametrize(
+    ("initial_purpose", "replacement_purpose", "expected_outcome"),
+    (
+        ("cold_characterisation", None, "not_eligible"),
+        ("cold_characterisation", "cold_characterisation", "not_eligible"),
+        ("cold_characterisation", "roast", None),
+        ("roast", "cold_characterisation", "not_eligible"),
+    ),
+)
+def test_cold_roast_fan_observation_reconciles_final_session_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_purpose: SessionPurpose,
+    replacement_purpose: SessionPurpose | None,
+    expected_outcome: str | None,
+) -> None:
+    """Fail closed when the session changes after the lifecycle evidence read."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    initial = context.session_store.start_session(purpose=initial_purpose)
+    original_observe = mcp_server._observe_cold_characterisation_roast_fan  # pyright: ignore[reportPrivateUsage]
+
+    def observe_then_transition(
+        server_context: ServerContext,
+        *,
+        session: RoastSession,
+        driver_state: RoasterState,
+    ) -> ColdCharacterisationObservation | None:
+        """Stop the observed session and optionally replace it after observation."""
+        observation = original_observe(
+            server_context,
+            session=session,
+            driver_state=driver_state,
+        )
+        initial.monotonic_stop = initial.monotonic_start
+        if replacement_purpose is not None:
+            context.session_store.start_session(purpose=replacement_purpose)
+        return observation
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_observe_cold_characterisation_roast_fan",
+        observe_then_transition,
+    )
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context))
+
+    if expected_outcome is None:
+        assert state.cold_characterisation_observation is None
+    else:
+        assert state.cold_characterisation_observation is not None
+        assert state.cold_characterisation_observation.outcome == expected_outcome
+        assert state.cold_characterisation_observation.roast_fan_level_percent is None
+    expected_lifecycle_calls = 1 if initial_purpose == "cold_characterisation" else 0
+    assert driver.lifecycle_evidence_calls == expected_lifecycle_calls
+
+
+def test_cold_roast_fan_observation_preserves_stable_closed_outcomes(
+    tmp_path: Path,
+) -> None:
+    """Retain stable observed and unreadable outcomes without a second driver read."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    server = create_mcp_server()
+    ctx = _ctx(context)
+
+    observed = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    assert observed.cold_characterisation_observation == ColdCharacterisationObservation(
+        "observed", 0
+    )
+
+    driver.lifecycle_evidence_error = RuntimeError("unreadable")
+    unreadable = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    assert unreadable.cold_characterisation_observation == ColdCharacterisationObservation(
+        "unreadable", None
+    )
+    assert driver.lifecycle_evidence_calls == 2
 
 
 def test_cold_roast_fan_observation_schema_is_closed() -> None:

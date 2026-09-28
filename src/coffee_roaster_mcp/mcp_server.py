@@ -932,6 +932,7 @@ def create_mcp_server(
         """Return the current authoritative roast session state."""
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
+        observation_source_session_id = session.id
         driver_state = _read_current_driver_state(server_context)
         device_state = _serialize_device_state(driver_state)
         cold_characterisation_observation = _observe_cold_characterisation_roast_fan(
@@ -958,6 +959,12 @@ def create_mcp_server(
         _process_first_crack_runtime_for_active_session(server_context, session_id=session_id)
         _process_ambient_runtime_for_active_session(server_context, session_id=session_id)
         session = _resolve_session(server_context, session_id=session_id)
+        cold_characterisation_observation = _reconcile_cold_characterisation_observation(
+            server_context,
+            session=session,
+            observation_source_session_id=observation_source_session_id,
+            observation=cold_characterisation_observation,
+        )
         return _serialize_session_state(
             session,
             config=server_context.config,
@@ -1630,6 +1637,30 @@ def _observe_cold_characterisation_roast_fan(
     except Exception:  # noqa: BLE001 - malformed driver properties vary.
         return ColdCharacterisationObservation("malformed", None)
     return ColdCharacterisationObservation("observed", roast_fan_level_percent)
+
+
+def _reconcile_cold_characterisation_observation(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    observation_source_session_id: str,
+    observation: ColdCharacterisationObservation | None,
+) -> ColdCharacterisationObservation | None:
+    """Keep a cold observation bound to the final returned session snapshot."""
+    if session.purpose == "roast":
+        return None
+
+    latest = server_context.session_store.get_latest_session()
+    if (
+        not session.active
+        or session.id != observation_source_session_id
+        or latest is None
+        or latest.id != session.id
+        or not latest.active
+        or latest.purpose != "cold_characterisation"
+    ):
+        return ColdCharacterisationObservation("not_eligible", None)
+    return observation
 
 
 def _record_polling_telemetry_for_active_session(
