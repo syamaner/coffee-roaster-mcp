@@ -239,6 +239,11 @@ The current MCP tool surface includes:
 
 ### Cold-characterisation finalisation
 
+For an active, latest `purpose="cold_characterisation"` session only,
+`get_roast_state.cold_characterisation_observation` reports the commanded roast-fan
+level as a typed, read-only observation; it does not report physical sensing or
+duplicate heat, main-fan, or cooling state.
+
 `finalise_cold_characterisation_session` is a non-actuating teardown tool for an
 active, latest session started with `purpose="cold_characterisation"`; it is not
 for normal roasts. It only admits known connected safe-zero driver evidence,

@@ -37,6 +37,7 @@ _EXPECTED_ROAST_STATE_KEYS = {
     "cooling_started_monotonic_seconds",
     "cooling_stopped_at_utc",
     "cooling_stopped_monotonic_seconds",
+    "cold_characterisation_observation",
     "created_at_utc",
     "development_percent",
     "development_time_seconds",
@@ -210,6 +211,39 @@ def test_stdio_server_starts_and_exposes_bootstrap_tools(tmp_path: Path) -> None
 def test_stdio_cold_session_finalisation_has_exact_schema_and_is_idempotent(tmp_path: Path) -> None:
     """The public stdio path finalises only an explicit cold session."""
     asyncio.run(_assert_stdio_cold_session_finalisation(tmp_path))
+
+
+def test_stdio_cold_session_exposes_roast_fan_observation(tmp_path: Path) -> None:
+    """The public stdio path exposes only the cold-session commanded roast fan."""
+    asyncio.run(_assert_stdio_cold_session_roast_fan_observation(tmp_path))
+
+
+async def _assert_stdio_cold_session_roast_fan_observation(tmp_path: Path) -> None:
+    """Exercise the additive cold-session output through the stdio server."""
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "coffee_roaster_mcp.cli", "serve"],
+        env=_build_clean_server_env(),
+        cwd=tmp_path,
+    )
+    async with stdio_client(server_params) as (read, write), ClientSession(read, write) as session:
+        await _call_with_timeout(session.initialize())
+        started = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool("start_roast_session", {"purpose": "cold_characterisation"})
+            ),
+        ).structuredContent["session"]
+        state = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool("get_roast_state", {"session_id": started["session_id"]})
+            ),
+        ).structuredContent
+        observation = state["cold_characterisation_observation"]
+        assert set(observation) == {"outcome", "roast_fan_level_percent"}
+        assert observation == {"outcome": "observed", "roast_fan_level_percent": 0}
+        assert type(observation["roast_fan_level_percent"]) is int
 
 
 async def _assert_stdio_cold_session_finalisation(tmp_path: Path) -> None:
@@ -525,6 +559,7 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert state_content["heat_level_percent"] == 0
         assert state_content["fan_level_percent"] == 100
         assert state_content["cooling_on"] is False
+        assert state_content["cold_characterisation_observation"] is None
         assert state_content["roast_elapsed_seconds"] is not None
         assert state_content["development_time_seconds"] is not None
         assert state_content["development_percent"] is not None
