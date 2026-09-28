@@ -8,10 +8,9 @@
 - Repository: `syamaner/coffee-roaster-mcp`
 - Package: `coffee-roaster-mcp`
 - MCP Registry name: `io.github.syamaner/coffee-roaster-mcp`
-- Current phase: #218 is complete. #222's typed, roast-fan-only cold-session
-  `get_roast_state` observation is implemented by this delivery and closes on
-  merge as a D197 software prerequisite for Agent #954. #157 and #194 remain
-  separate open hardware/component acceptance work.
+- Current phase: #218 and #222 are complete. #225 is the current
+  release-preparation story for the unpublished `0.2.2` candidate. #157 and
+  #194 remain separate open hardware/component acceptance work.
 
 ## Working Rules
 
@@ -29,11 +28,10 @@ The released baseline is `v0.2.1` at
 `ac6df37be6c3f5fd91b726c2eec8f272ead76f63`, per OWNER #220 comment
 `5742280072`. D184 governance issue #206 completed through PR #207,
 squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`.
-Issue #218 is complete. Issue #222's typed, roast-fan-only cold-session
-`get_roast_state` observation is implemented by this delivery and closes on
-merge as a D197 software prerequisite for Agent #954. #157 and #194 remain
-separate open hardware/component acceptance work; this state update makes no
-hardware or readiness claim, and consumer release is separately authorised.
+Issues #218 and #222 are complete. Issue #225 is the current release-preparation
+story for the unpublished `0.2.2` candidate. #157 and #194 remain separate open
+hardware/component acceptance work; this state update makes no hardware or
+readiness claim, and consumer release is separately authorised.
 
 ## Historical Narrative (Superseded For Current Delivery)
 

@@ -11,11 +11,11 @@ verification.
 
 ## Current Scope
 
-- `v0.1.16` is published on PyPI and in the MCP Registry.
+- `v0.2.1` is published on PyPI and in the MCP Registry.
 - `docs/release.md` is the current release authority and preserves historical
   outcomes.
 - Tags, release-environment approval, publication, and live verification are
-  human-operator-only. The intended future `0.2.0` line is not authority to
+  human-operator-only. The unpublished `0.2.2` candidate is not authority to
   tag or publish.
 
 ## Release Targets

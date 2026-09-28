@@ -12,10 +12,10 @@ Current released baseline: `v0.2.1` at
 
 - #218: complete; non-actuating cold-characterisation session-finalisation
   prerequisite.
-- #222: current; typed, roast-fan-only cold-session `get_roast_state`
-  observation, implemented by this delivery and closes on merge as a D197
-  software prerequisite for Agent #954. Consumer release is separately
-  authorised; no hardware or readiness claim follows.
+- #222: complete; typed, roast-fan-only cold-session `get_roast_state`
+  observation and D197 software prerequisite for Agent #954. Consumer release
+  is separately authorised; no hardware or readiness claim follows.
+- #225: current; release preparation for the unpublished `0.2.2` candidate.
 - #157: open; separate hardware/component acceptance work.
 - #210: complete; standalone Torch-free NumPy/SciPy mel frontend parity slice.
 - #212: complete; MCP-owned frontend integration and local package readiness slice.
