@@ -27,14 +27,14 @@ drops were executed, with no failed command events or safety alerts in either
 completed run.
 
 Those roasts used the pinned `coffee-roaster-mcp` 0.1.13 runtime. Versions
-0.1.14-0.1.16 were metadata/docs releases. `0.2.0` is the published baseline
-until `0.2.1` publication completes. The unpublished `0.2.1` candidate carries
-the already-merged #218/#219 additive, non-actuating cold-characterisation
-session-purpose and finalisation contract. This release-preparation PR makes no
-runtime, detector, model, dependency, configuration, safety, workflow, or
-hardware-control change. Its `safe_zero` and finalisation evidence are commanded-driver/software
-evidence only, never physical proof. It is Agent #954's dependency prerequisite
-only: it does not implement #954, authorise hardware, or authorise beans.
+0.1.14-0.1.16 were metadata/docs releases. `0.2.1` is the published PyPI and
+MCP Registry baseline. The unpublished `0.2.2` candidate carries #222's
+additive, typed, roast-fan-only cold-session `get_roast_state` observation. It
+reports commanded roast-fan state only, never physical, link, or freshness
+proof. This release-preparation PR makes no runtime, detector, model,
+dependency, configuration, safety, workflow, or hardware-control change. It is
+Agent #954's upstream prerequisite only: it does not implement #954, authorise
+hardware, or authorise beans.
 
 D191's ratified limits remain `N = 1` and `X = 200 ms`; the production fatal
 streak remains `30`. D190 was MCP-only component characterisation with

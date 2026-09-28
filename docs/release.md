@@ -10,20 +10,16 @@ The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 ## Current Release Authority
 
-Per D193, `v0.2.0` is the current published PyPI and MCP Registry baseline. Its
-tag `v0.2.0` points to `be1be35f44f76a2057a3f5f3a334420bcf8bfb99`.
+`v0.2.1` is the current published PyPI and MCP Registry baseline. Its tag
+`v0.2.1` points to `ac6df37be6c3f5fd91b726c2eec8f272ead76f63`.
 
-`0.2.1` is an unpublished release candidate bound to plan SHA
-`d3e2de88f42c8d73a0ed6a6b91ddf0008865630f`, base/merge
-`3e0938649bff59f8c12a822b2fc77b2e08bed299`, and reviewed source head
-`642a81b4406bb61d48c6d5b73f7fcce0b999ebe5`. It carries the already-merged
-#218/#219 additive, non-actuating cold-characterisation session-purpose and
-finalisation contract. This release-preparation PR changes no runtime, detector,
-model, dependency, configuration, safety, workflow, or hardware-control
-behaviour. `safe_zero`
-and finalisation are commanded-driver/software evidence only, never physical
-proof. This candidate is Agent #954's dependency prerequisite only: it does
-not implement #954, authorise hardware, or authorise beans.
+`0.2.2` is an unpublished release candidate. It carries #222's additive,
+typed, roast-fan-only cold-session `get_roast_state` observation. It reports
+commanded roast-fan state only, never physical, link, or freshness proof. This
+release-preparation PR changes no runtime, detector, model, dependency,
+configuration, safety, workflow, or hardware-control behaviour. This candidate
+is Agent #954's upstream prerequisite only: it does not implement #954,
+authorise hardware, or authorise beans.
 
 D191's ratified limits remain `N = 1` and `X = 200 ms`; the production fatal
 streak remains `30`. D190, D192, and the open #157 and #194 acceptance work
@@ -39,7 +35,17 @@ neither authorises nor performs those actions.
 
 ## Changelog
 
-### 0.2.1 (release candidate; not published)
+### 0.2.2 (release candidate; not published)
+
+- Carries #222's additive, typed, roast-fan-only cold-session
+  `get_roast_state` observation. It reports commanded roast-fan state only,
+  never physical, link, or freshness proof.
+- Is Agent #954's upstream prerequisite only; it does not implement #954,
+  authorise hardware, or authorise beans.
+- This release-preparation PR makes no runtime, detector, model, dependency,
+  configuration, safety, workflow, or hardware-control change.
+
+### 0.2.1 (published)
 
 - Carries the already-merged #218/#219 additive, non-actuating
   cold-characterisation session-purpose and finalisation contract. It is
@@ -228,13 +234,36 @@ The dry run:
 - Confirms both distribution artifacts exist.
 - Does not publish to PyPI or the MCP Registry.
 
-## v0.2.1 Release Checklist
+## v0.2.2 Release Checklist
 
-Use this checklist for the unpublished `0.2.1` candidate after its
-release-preparation PR merges to `main`. `0.2.0` remains the published baseline
-until `0.2.1` publication completes. The first-crack artifact pin is unchanged:
+Use this checklist for the unpublished `0.2.2` candidate after its
+release-preparation PR merges to `main`. `0.2.1` remains the published baseline
+until `0.2.2` publication completes. The first-crack artifact pin is unchanged:
 `syamaner/coffee-first-crack-detection` revision
 `b349a919c34b6130472da97c01817be404e4f629`, precision `int8`.
+
+1. Confirm exact version alignment at `0.2.2` for
+   `coffee_roaster_mcp.__version__`, `server.json.version`, and
+   `server.json.packages[0].version`, and confirm the installed CLI reports
+   `coffee-roaster-mcp 0.2.2`.
+2. Run the required hardware-free checks and the release-workflow dry run before
+   any tag is created or pushed.
+3. After the dry run succeeds, the human release operator may create and push
+   the matching protected tag `v0.2.2` from updated `main`.
+4. Only after publication makes the version available, run the published-package
+   smoke:
+
+   ```bash
+   uvx --refresh-package coffee-roaster-mcp --from coffee-roaster-mcp==0.2.2 coffee-roaster-mcp --version
+   ```
+
+Tagging, publication, protected-environment approval, and live PyPI/MCP
+Registry verification remain human-only actions.
+
+## v0.2.1 Release Checklist (Historical)
+
+This historical checklist records the `0.2.1` candidate that is now published
+at `v0.2.1`.
 
 1. Confirm exact version alignment at `0.2.1` for
    `coffee_roaster_mcp.__version__`, `server.json.version`, and
@@ -436,11 +465,11 @@ After all prerequisites are confirmed:
 2. Push the matching version tag:
 
    ```bash
-   git tag v0.2.1
-   git push origin v0.2.1
+   git tag v0.2.2
+   git push origin v0.2.2
    ```
 
-   `v0.2.1` is the selected candidate version, not tagging or publication
+   `v0.2.2` is the selected candidate version, not tagging or publication
    authority; a human operator still authorises tagging and publication.
 
 3. Approve the `release` environment deployment in GitHub Actions.
