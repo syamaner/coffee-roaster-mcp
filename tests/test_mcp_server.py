@@ -4350,6 +4350,53 @@ def test_cold_temperature_projection_reconciles_final_session_snapshot(
     assert driver.lifecycle_evidence_calls == expected_lifecycle_calls
 
 
+def test_cold_temperature_projection_fails_closed_on_same_id_purpose_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C4: initial roast becoming the same-id final cold session is `not_eligible`."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = ColdTemperatureCountingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    initial = context.session_store.start_session(purpose="roast")
+    original_observe = mcp_server._observe_cold_characterisation_roast_fan  # pyright: ignore[reportPrivateUsage]
+
+    def observe_then_change_purpose(
+        server_context: ServerContext,
+        *,
+        session: RoastSession,
+        driver_state: RoasterState,
+    ) -> ColdCharacterisationObservation | None:
+        """Switch the same active, latest session to cold after the projection step."""
+        observation = original_observe(
+            server_context,
+            session=session,
+            driver_state=driver_state,
+        )
+        initial.purpose = "cold_characterisation"
+        return observation
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_observe_cold_characterisation_roast_fan",
+        observe_then_change_purpose,
+    )
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context))
+
+    assert state.session_id == initial.id
+    assert state.active is True
+    assert state.session_purpose == "cold_characterisation"
+    projection = state.cold_temperature_projection
+    assert projection == COLD_TEMPERATURE_NOT_ELIGIBLE
+    assert projection.projection_version == 1
+    assert projection.outcome == "not_eligible"
+    for field in dataclasses.fields(ColdTemperatureProjection):
+        if field.name not in {"projection_version", "outcome"}:
+            assert getattr(projection, field.name) is None, field.name
+    assert driver.read_state_calls == 1
+    assert driver.lifecycle_evidence_calls == 0
+
+
 def test_cold_temperature_projection_keeps_roast_fan_ordering(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1724,7 +1724,9 @@ def _reconcile_cold_temperature_projection(
     """Keep a cold temperature projection bound to the final returned session snapshot."""
     if session.purpose == "roast":
         return None
-    if not _is_cold_observation_readmissible(
+    # A final cold session with no initial projection (initial purpose was roast)
+    # fails closed rather than returning a stale outer `None`.
+    if projection is None or not _is_cold_observation_readmissible(
         server_context,
         session=session,
         observation_source_session_id=observation_source_session_id,
