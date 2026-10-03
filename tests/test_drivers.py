@@ -7,12 +7,14 @@ from typing import cast
 
 import pytest
 
+from coffee_roaster_mcp.cold_temperature import ColdTemperatureProjection, project_cold_temperature
 from coffee_roaster_mcp.drivers import (
     HOTTOP_PACKET_LENGTH,
     HOTTOP_PACKET_PREFIX,
     CommandStreaming,
     DriverLifecycleEvidence,
     HottopRoasterDriver,
+    HottopTemperatureUnit,
     MockRoasterDriver,
     RoasterDriver,
     RoasterState,
@@ -1919,3 +1921,178 @@ def test_hottop_lifecycle_evidence_reports_stuck_loop_after_disconnect_timeout()
     finally:
         driver.release_command_loop()
         driver.disconnect()
+
+
+def _cold_temperature_counters(state: RoasterState) -> tuple[object, ...]:
+    """Return the four counters the projection must copy from the same snapshot."""
+    return tuple(
+        state.raw_vendor_data[name]
+        for name in (
+            "status_packet_count",
+            "ignored_temperature_packet_count",
+            "status_read_error_count",
+            "command_loop_error_count",
+        )
+    )
+
+
+def test_hottop_cold_temperature_projection_awaits_first_packet_before_status() -> None:
+    """A fresh Hottop snapshot with no counted packet projects ordinary startup absence."""
+    driver = HottopRoasterDriver(port="/dev/test-hottop", serial_factory=FakeSerialFactory())
+
+    projection = project_cold_temperature(driver.read_state())
+
+    assert projection == ColdTemperatureProjection(
+        projection_version=1,
+        outcome="awaiting_first_packet",
+        configured_temperature_unit="celsius",
+        last_packet_valid=False,
+        value_agreement="indeterminate",
+        status_packet_count=0,
+        ignored_temperature_packet_count=0,
+        status_read_error_count=0,
+        command_loop_error_count=0,
+    )
+
+
+def test_hottop_cold_temperature_projection_reports_genuine_celsius_packet() -> None:
+    """Real checksummed Celsius packets feed an observed, agreeing projection."""
+    serial_factory = FakeSerialFactory()
+    serial_factory.transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=22, raw_bean_temperature=21)
+    )
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+
+    driver.connect()
+    try:
+        state = _wait_for_hottop_status_count(driver, 1)
+    finally:
+        driver.disconnect()
+    projection = project_cold_temperature(state)
+
+    assert projection.outcome == "observed"
+    assert projection.configured_temperature_unit == "celsius"
+    assert projection.reported_temperature_unit == "celsius"
+    assert projection.last_packet_valid is True
+    assert projection.last_packet_bean_temp_c == 21.0
+    assert projection.last_packet_env_temp_c == 22.0
+    assert projection.retained_bean_temp_c == state.bean_temp_c == 21.0
+    assert projection.retained_env_temp_c == state.env_temp_c == 22.0
+    assert projection.value_agreement == "agree"
+    assert (
+        projection.status_packet_count,
+        projection.ignored_temperature_packet_count,
+        projection.status_read_error_count,
+        projection.command_loop_error_count,
+    ) == _cold_temperature_counters(state)
+    assert projection.status_packet_count == 1
+
+
+@pytest.mark.parametrize("temperature_unit", ["fahrenheit", "auto"])
+def test_hottop_cold_temperature_projection_never_exposes_fahrenheit_numerics(
+    temperature_unit: HottopTemperatureUnit,
+) -> None:
+    """A genuine Fahrenheit packet projects retained Celsius only, never raw numerics."""
+    serial_factory = FakeSerialFactory()
+    serial_factory.transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=72, raw_bean_temperature=70)
+    )
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        temperature_unit=temperature_unit,
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+
+    driver.connect()
+    try:
+        # 70 and 72 are plausible Celsius, so `auto` would resolve Celsius; use
+        # values only plausible as Fahrenheit for the `auto` case.
+        if temperature_unit == "auto":
+            serial_factory.transport.queue_read_data(
+                _build_hottop_status_packet(raw_env_temperature=401, raw_bean_temperature=386)
+            )
+            state = _wait_for_hottop_status_count(driver, 2)
+        else:
+            state = _wait_for_hottop_status_count(driver, 1)
+    finally:
+        driver.disconnect()
+    projection = project_cold_temperature(state)
+
+    assert state.raw_vendor_data["resolved_temperature_unit"] == "fahrenheit"
+    assert projection.outcome == "observed"
+    assert projection.configured_temperature_unit == temperature_unit
+    assert projection.reported_temperature_unit == "fahrenheit"
+    assert projection.last_packet_valid is True
+    assert projection.last_packet_bean_temp_c is None
+    assert projection.last_packet_env_temp_c is None
+    assert projection.retained_bean_temp_c == state.bean_temp_c
+    assert projection.retained_env_temp_c == state.env_temp_c
+    assert projection.value_agreement == "indeterminate"
+
+
+def test_hottop_cold_temperature_projection_reports_ignored_latest_packet() -> None:
+    """An ignored latest packet after an accepted one keeps retained Celsius history."""
+    serial_factory = FakeSerialFactory()
+    serial_factory.transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=23, raw_bean_temperature=22)
+    )
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        temperature_unit="auto",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+
+    driver.connect()
+    try:
+        _wait_for_hottop_status_count(driver, 1)
+        serial_factory.transport.queue_read_data(
+            _build_hottop_status_packet(raw_env_temperature=0, raw_bean_temperature=0)
+        )
+        state = _wait_for_hottop_status_count(driver, 2)
+    finally:
+        driver.disconnect()
+    projection = project_cold_temperature(state)
+
+    assert projection.outcome == "observed"
+    assert projection.configured_temperature_unit == "auto"
+    assert projection.reported_temperature_unit == "unknown"
+    assert projection.last_packet_valid is False
+    assert projection.last_packet_bean_temp_c is None
+    assert projection.last_packet_env_temp_c is None
+    assert projection.retained_bean_temp_c == 22.0
+    assert projection.retained_env_temp_c == 23.0
+    assert projection.value_agreement == "indeterminate"
+    assert (projection.status_packet_count, projection.ignored_temperature_packet_count) == (2, 1)
+
+
+def test_hottop_cold_temperature_projection_reports_all_ignored_packets() -> None:
+    """Only ignored packets leave the projection observed with no retained history."""
+    serial_factory = FakeSerialFactory()
+    serial_factory.transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=0, raw_bean_temperature=0)
+    )
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+    )
+
+    driver.connect()
+    try:
+        state = _wait_for_hottop_status_count(driver, 1)
+    finally:
+        driver.disconnect()
+    projection = project_cold_temperature(state)
+
+    assert projection.outcome == "observed"
+    assert projection.reported_temperature_unit == "unknown"
+    assert projection.last_packet_valid is False
+    assert projection.retained_bean_temp_c is None
+    assert projection.retained_env_temp_c is None
+    assert (projection.status_packet_count, projection.ignored_temperature_packet_count) == (1, 1)

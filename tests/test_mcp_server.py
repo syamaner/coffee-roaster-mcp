@@ -21,12 +21,17 @@ import coffee_roaster_mcp.mcp_server as mcp_server
 from coffee_roaster_mcp.ambient_runtime import AmbientRuntimeSnapshot, AmbientRuntimeState
 from coffee_roaster_mcp.artifacts import ResolvedArtifact, ResolvedDetectorArtifacts
 from coffee_roaster_mcp.audio import AudioCaptureSnapshot, AudioWindow
+from coffee_roaster_mcp.cold_temperature import (
+    COLD_TEMPERATURE_NOT_ELIGIBLE,
+    ColdTemperatureProjection,
+)
 from coffee_roaster_mcp.config import AppConfig, FirstCrackConfig
 from coffee_roaster_mcp.detector import (
     FirstCrackDetectorOutput,
     build_first_crack_detector_adapter,
 )
 from coffee_roaster_mcp.drivers import (
+    HOTTOP_DRIVER_NAME,
     DriverLifecycleEvidence,
     EmergencyStopResult,
     HottopRoasterDriver,
@@ -4127,3 +4132,335 @@ class BlockingFinalisationRuntime(FakeFirstCrackRuntime):
         """Return no recording plan for a disabled first-crack configuration."""
         del session_id
         return None, None
+
+
+_COLD_TEMPERATURE_VENDOR: dict[str, str | int | float | bool | None] = {
+    "temperature_unit": "celsius",
+    "resolved_temperature_unit": "celsius",
+    "raw_bean_temperature": 21,
+    "raw_env_temperature": 22,
+    "status_packet_count": 7,
+    "ignored_temperature_packet_count": 2,
+    "status_read_error_count": 1,
+    "command_loop_error_count": 3,
+}
+_COLD_TEMPERATURE_OBSERVED = ColdTemperatureProjection(
+    projection_version=1,
+    outcome="observed",
+    configured_temperature_unit="celsius",
+    reported_temperature_unit="celsius",
+    last_packet_valid=True,
+    last_packet_bean_temp_c=21.0,
+    last_packet_env_temp_c=22.0,
+    retained_bean_temp_c=21.0,
+    retained_env_temp_c=22.0,
+    value_agreement="agree",
+    status_packet_count=7,
+    ignored_temperature_packet_count=2,
+    status_read_error_count=1,
+    command_loop_error_count=3,
+)
+
+
+class ColdTemperatureCountingDriver(LifecycleRecordingDriver):
+    """Hottop-named lifecycle double that counts state reads and discriminates sources."""
+
+    name = HOTTOP_DRIVER_NAME
+
+    def __init__(self) -> None:
+        """Initialize valid Celsius Hottop facts and a disagreeing lifecycle source."""
+        super().__init__()
+        self.bean_temp_c = 21.0
+        self.env_temp_c = 22.0
+        self.raw_vendor_data = dict(_COLD_TEMPERATURE_VENDOR)
+        self.read_state_calls = 0
+        evidence = _valid_lifecycle_evidence(HOTTOP_DRIVER_NAME)
+        # Lifecycle counters deliberately disagree with the state snapshot.
+        object.__setattr__(evidence, "status_packet_count", 99)
+        object.__setattr__(evidence, "status_read_error_count", 98)
+        object.__setattr__(evidence, "command_loop_error_count", 97)
+        self.lifecycle_evidence_override = evidence
+
+    def read_state(self) -> RoasterState:
+        """Count every driver-state read."""
+        self.read_state_calls += 1
+        state = super().read_state()
+        # Later reads would disagree, so any second read is visible in the projection.
+        self.raw_vendor_data["status_packet_count"] = 8
+        return state
+
+
+def test_cold_temperature_projection_uses_single_state_snapshot(tmp_path: Path) -> None:
+    """M7: one `read_state` and one lifecycle read; counters equal the same response."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = ColdTemperatureCountingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert driver.read_state_calls == 1
+    assert driver.lifecycle_evidence_calls == 1
+    assert state.cold_temperature_projection == _COLD_TEMPERATURE_OBSERVED
+    assert state.cold_characterisation_observation == ColdCharacterisationObservation("observed", 0)
+    raw = state.device_state.raw_vendor_data
+    projection = state.cold_temperature_projection
+    assert (
+        projection.status_packet_count,
+        projection.ignored_temperature_packet_count,
+        projection.status_read_error_count,
+        projection.command_loop_error_count,
+    ) == (
+        raw["status_packet_count"],
+        raw["ignored_temperature_packet_count"],
+        raw["status_read_error_count"],
+        raw["command_loop_error_count"],
+    )
+
+
+def test_cold_temperature_projection_is_null_for_roast_sessions(tmp_path: Path) -> None:
+    """A9: normal roasts get an outer `None` with no lifecycle read."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = ColdTemperatureCountingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="roast")
+
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert state.cold_temperature_projection is None
+    assert state.cold_characterisation_observation is None
+    assert driver.read_state_calls == 1
+    assert driver.lifecycle_evidence_calls == 0
+
+
+def test_cold_temperature_projection_is_not_eligible_for_stale_or_inactive_sessions(
+    tmp_path: Path,
+) -> None:
+    """Ineligible cold sessions project `not_eligible` with no lifecycle read."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = ColdTemperatureCountingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    first = context.session_store.start_session(purpose="cold_characterisation")
+    first.monotonic_stop = first.monotonic_start
+
+    inactive = _call_tool(server, "get_roast_state", _ctx(context), session_id=first.id)
+    context.session_store.start_session(purpose="cold_characterisation")
+    older = _call_tool(server, "get_roast_state", _ctx(context), session_id=first.id)
+
+    assert inactive.cold_temperature_projection == COLD_TEMPERATURE_NOT_ELIGIBLE
+    assert older.cold_temperature_projection == COLD_TEMPERATURE_NOT_ELIGIBLE
+    assert driver.read_state_calls == 2
+    assert driver.lifecycle_evidence_calls == 0
+
+
+def test_cold_temperature_projection_is_unsupported_for_non_hottop_driver(
+    tmp_path: Path,
+) -> None:
+    """M10: a non-Hottop driver keeps the roast-fan observation and is unsupported."""
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "roaster_driver", LifecycleRecordingDriver())
+    session = context.session_store.start_session(purpose="cold_characterisation")
+
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert state.cold_temperature_projection is not None
+    assert state.cold_temperature_projection.outcome == "unsupported"
+    assert state.cold_characterisation_observation == ColdCharacterisationObservation("observed", 0)
+
+
+def test_cold_temperature_projection_is_malformed_without_breaking_polling(
+    tmp_path: Path,
+) -> None:
+    """A malformed Hottop snapshot leaves the tool and roast-fan observation working."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = ColdTemperatureCountingDriver()
+    driver.raw_vendor_data["status_packet_count"] = True
+    object.__setattr__(context, "roaster_driver", driver)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert state.cold_temperature_projection is not None
+    assert dataclasses.asdict(state.cold_temperature_projection) == dataclasses.asdict(
+        ColdTemperatureProjection(projection_version=1, outcome="malformed")
+    )
+    assert state.cold_characterisation_observation == ColdCharacterisationObservation("observed", 0)
+
+
+@pytest.mark.parametrize(
+    ("initial_purpose", "replacement_purpose", "stop_initial", "expected"),
+    (
+        ("cold_characterisation", None, True, "not_eligible"),
+        ("cold_characterisation", "cold_characterisation", True, "not_eligible"),
+        ("cold_characterisation", "roast", True, None),
+        ("roast", "cold_characterisation", True, "not_eligible"),
+        ("roast", None, False, None),
+        ("cold_characterisation", None, False, "observed"),
+    ),
+)
+def test_cold_temperature_projection_reconciles_final_session_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_purpose: SessionPurpose,
+    replacement_purpose: SessionPurpose | None,
+    stop_initial: bool,
+    expected: str | None,
+) -> None:
+    """C4/M8: the projection re-admits against the final session with the shared predicate."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = ColdTemperatureCountingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    initial = context.session_store.start_session(purpose=initial_purpose)
+    original_observe = mcp_server._observe_cold_characterisation_roast_fan  # pyright: ignore[reportPrivateUsage]
+
+    def observe_then_transition(
+        server_context: ServerContext,
+        *,
+        session: RoastSession,
+        driver_state: RoasterState,
+    ) -> ColdCharacterisationObservation | None:
+        """Finalise or replace the observed session after the projection is computed."""
+        observation = original_observe(
+            server_context,
+            session=session,
+            driver_state=driver_state,
+        )
+        if stop_initial:
+            initial.monotonic_stop = initial.monotonic_start
+        if replacement_purpose is not None:
+            context.session_store.start_session(purpose=replacement_purpose)
+        return observation
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_observe_cold_characterisation_roast_fan",
+        observe_then_transition,
+    )
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context))
+
+    if expected is None:
+        assert state.cold_temperature_projection is None
+    elif expected == "observed":
+        assert state.cold_temperature_projection == _COLD_TEMPERATURE_OBSERVED
+    else:
+        assert state.cold_temperature_projection == COLD_TEMPERATURE_NOT_ELIGIBLE
+    assert driver.read_state_calls == 1
+    expected_lifecycle_calls = 1 if initial_purpose == "cold_characterisation" else 0
+    assert driver.lifecycle_evidence_calls == expected_lifecycle_calls
+
+
+def test_cold_temperature_projection_fails_closed_on_same_id_purpose_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C4: initial roast becoming the same-id final cold session is `not_eligible`."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = ColdTemperatureCountingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    initial = context.session_store.start_session(purpose="roast")
+    original_observe = mcp_server._observe_cold_characterisation_roast_fan  # pyright: ignore[reportPrivateUsage]
+
+    def observe_then_change_purpose(
+        server_context: ServerContext,
+        *,
+        session: RoastSession,
+        driver_state: RoasterState,
+    ) -> ColdCharacterisationObservation | None:
+        """Switch the same active, latest session to cold after the projection step."""
+        observation = original_observe(
+            server_context,
+            session=session,
+            driver_state=driver_state,
+        )
+        initial.purpose = "cold_characterisation"
+        return observation
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_observe_cold_characterisation_roast_fan",
+        observe_then_change_purpose,
+    )
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context))
+
+    assert state.session_id == initial.id
+    assert state.active is True
+    assert state.session_purpose == "cold_characterisation"
+    projection = state.cold_temperature_projection
+    assert projection == COLD_TEMPERATURE_NOT_ELIGIBLE
+    assert projection.projection_version == 1
+    assert projection.outcome == "not_eligible"
+    for field in dataclasses.fields(ColdTemperatureProjection):
+        if field.name not in {"projection_version", "outcome"}:
+            assert getattr(projection, field.name) is None, field.name
+    assert driver.read_state_calls == 1
+    assert driver.lifecycle_evidence_calls == 0
+
+
+def test_cold_temperature_projection_keeps_roast_fan_ordering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M9: the projection adds no read and leaves the poll ordering unchanged."""
+    order: list[str] = []
+
+    class OrderedDriver(ColdTemperatureCountingDriver):
+        """Counting double that retains read ordering."""
+
+        def read_state(self) -> RoasterState:
+            """Record the ordinary driver-state read."""
+            order.append("read_state")
+            return super().read_state()
+
+        def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
+            """Record the read-only lifecycle evidence call."""
+            order.append("read_lifecycle_evidence")
+            return super().read_lifecycle_evidence()
+
+    context = _cold_finalisation_context(tmp_path)
+    driver = OrderedDriver()
+    runtime = FakeFirstCrackRuntime()
+    object.__setattr__(context, "roaster_driver", driver)
+    _set_first_crack_runtime(context, runtime)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    original_telemetry = context.session_store.record_active_telemetry_sample
+    original_detector = runtime.process_available_windows
+
+    def record_telemetry(*args: object, **kwargs: object) -> RoastSession | None:
+        """Record telemetry side-effect position while preserving store behaviour."""
+        order.append("telemetry")
+        return original_telemetry(*args, **kwargs)
+
+    def process_detector(*args: object, **kwargs: object) -> FirstCrackRuntimeSnapshot:
+        """Record detector side-effect position while preserving fake behaviour."""
+        order.append("detector")
+        return original_detector(*args, **kwargs)
+
+    monkeypatch.setattr(context.session_store, "record_active_telemetry_sample", record_telemetry)
+    monkeypatch.setattr(runtime, "process_available_windows", process_detector)
+
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert order == ["read_state", "read_lifecycle_evidence", "telemetry", "detector"]
+    assert state.cold_temperature_projection == _COLD_TEMPERATURE_OBSERVED
+    assert state.cold_characterisation_observation == ColdCharacterisationObservation("observed", 0)
+
+
+def test_cold_temperature_projection_schema_is_additive_and_closed() -> None:
+    """The output schema adds one optional projection with the closed outcome enum."""
+    tool = create_mcp_server()._tool_manager.get_tool("get_roast_state")  # pyright: ignore[reportPrivateUsage]
+    assert tool is not None
+    schema = cast(dict[str, object], tool.output_schema)
+    definitions = cast(dict[str, object], schema["$defs"])
+    projection = cast(dict[str, object], definitions["ColdTemperatureProjection"])
+    properties = cast(dict[str, object], projection["properties"])
+    outcome = cast(dict[str, object], properties["outcome"])
+    expected = {field.name for field in dataclasses.fields(ColdTemperatureProjection)}
+    assert set(properties) == expected
+    assert outcome["enum"] == [
+        "observed",
+        "awaiting_first_packet",
+        "not_eligible",
+        "unsupported",
+        "malformed",
+    ]
+    assert "cold_temperature_projection" not in cast(list[str], schema.get("required", []))

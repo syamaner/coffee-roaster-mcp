@@ -38,6 +38,7 @@ _EXPECTED_ROAST_STATE_KEYS = {
     "cooling_stopped_at_utc",
     "cooling_stopped_monotonic_seconds",
     "cold_characterisation_observation",
+    "cold_temperature_projection",
     "created_at_utc",
     "development_percent",
     "development_time_seconds",
@@ -61,6 +62,22 @@ _EXPECTED_ROAST_STATE_KEYS = {
     "session_purpose",
     "stopped_at_utc",
     "t0_status",
+}
+_EXPECTED_COLD_TEMPERATURE_PROJECTION_KEYS = {
+    "projection_version",
+    "outcome",
+    "configured_temperature_unit",
+    "reported_temperature_unit",
+    "last_packet_valid",
+    "last_packet_bean_temp_c",
+    "last_packet_env_temp_c",
+    "retained_bean_temp_c",
+    "retained_env_temp_c",
+    "value_agreement",
+    "status_packet_count",
+    "ignored_temperature_packet_count",
+    "status_read_error_count",
+    "command_loop_error_count",
 }
 _EXPECTED_DEVICE_STATE_KEYS = {
     "bean_temp_c",
@@ -244,6 +261,14 @@ async def _assert_stdio_cold_session_roast_fan_observation(tmp_path: Path) -> No
         assert set(observation) == {"outcome", "roast_fan_level_percent"}
         assert observation == {"outcome": "observed", "roast_fan_level_percent": 0}
         assert type(observation["roast_fan_level_percent"]) is int
+        assert set(state) == _EXPECTED_ROAST_STATE_KEYS
+        projection = state["cold_temperature_projection"]
+        assert set(projection) == _EXPECTED_COLD_TEMPERATURE_PROJECTION_KEYS
+        # The packaged default mock driver is not a supported projection source.
+        assert projection == {key: None for key in _EXPECTED_COLD_TEMPERATURE_PROJECTION_KEYS} | {
+            "projection_version": 1,
+            "outcome": "unsupported",
+        }
 
 
 async def _assert_stdio_cold_session_finalisation(tmp_path: Path) -> None:
@@ -560,6 +585,7 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert state_content["fan_level_percent"] == 100
         assert state_content["cooling_on"] is False
         assert state_content["cold_characterisation_observation"] is None
+        assert state_content["cold_temperature_projection"] is None
         assert state_content["roast_elapsed_seconds"] is not None
         assert state_content["development_time_seconds"] is not None
         assert state_content["development_percent"] is not None
