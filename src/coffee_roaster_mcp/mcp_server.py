@@ -23,6 +23,11 @@ from coffee_roaster_mcp.ambient_runtime import (
     AmbientSessionRuntime,
     build_ambient_session_runtime,
 )
+from coffee_roaster_mcp.cold_temperature import (
+    COLD_TEMPERATURE_NOT_ELIGIBLE,
+    ColdTemperatureProjection,
+    project_cold_temperature,
+)
 from coffee_roaster_mcp.config import (
     AmbientMode,
     AppConfig,
@@ -494,6 +499,7 @@ class RoastSessionState:
     log_dir: str | None
     session_purpose: SessionPurpose = "roast"
     cold_characterisation_observation: ColdCharacterisationObservation | None = None
+    cold_temperature_projection: ColdTemperatureProjection | None = None
 
 
 @dataclass(frozen=True)
@@ -935,6 +941,11 @@ def create_mcp_server(
         observation_source_session_id = session.id
         driver_state = _read_current_driver_state(server_context)
         device_state = _serialize_device_state(driver_state)
+        cold_temperature_projection = _project_cold_temperature_for_session(
+            server_context,
+            session=session,
+            driver_state=driver_state,
+        )
         cold_characterisation_observation = _observe_cold_characterisation_roast_fan(
             server_context,
             session=session,
@@ -965,6 +976,12 @@ def create_mcp_server(
             observation_source_session_id=observation_source_session_id,
             observation=cold_characterisation_observation,
         )
+        cold_temperature_projection = _reconcile_cold_temperature_projection(
+            server_context,
+            session=session,
+            observation_source_session_id=observation_source_session_id,
+            projection=cold_temperature_projection,
+        )
         return _serialize_session_state(
             session,
             config=server_context.config,
@@ -972,6 +989,7 @@ def create_mcp_server(
             first_crack_runtime=server_context.first_crack_runtime.snapshot(),
             ambient_runtime=server_context.ambient_runtime.snapshot(),
             cold_characterisation_observation=cold_characterisation_observation,
+            cold_temperature_projection=cold_temperature_projection,
         )
 
     @mcp.tool()
@@ -1609,13 +1627,7 @@ def _observe_cold_characterisation_roast_fan(
     if session.purpose == "roast":
         return None
 
-    latest = server_context.session_store.get_latest_session()
-    if (
-        latest is None
-        or latest.id != session.id
-        or not latest.active
-        or latest.purpose != "cold_characterisation"
-    ):
+    if not _is_latest_active_cold_session(server_context, session=session):
         return ColdCharacterisationObservation("not_eligible", None)
 
     driver = server_context.roaster_driver
@@ -1650,17 +1662,75 @@ def _reconcile_cold_characterisation_observation(
     if session.purpose == "roast":
         return None
 
-    latest = server_context.session_store.get_latest_session()
-    if (
-        not session.active
-        or session.id != observation_source_session_id
-        or latest is None
-        or latest.id != session.id
-        or not latest.active
-        or latest.purpose != "cold_characterisation"
+    if not _is_cold_observation_readmissible(
+        server_context,
+        session=session,
+        observation_source_session_id=observation_source_session_id,
     ):
         return ColdCharacterisationObservation("not_eligible", None)
     return observation
+
+
+def _is_latest_active_cold_session(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+) -> bool:
+    """Return whether the session is the latest active cold-characterisation session."""
+    latest = server_context.session_store.get_latest_session()
+    return (
+        latest is not None
+        and latest.id == session.id
+        and latest.active
+        and latest.purpose == "cold_characterisation"
+    )
+
+
+def _is_cold_observation_readmissible(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    observation_source_session_id: str,
+) -> bool:
+    """Return whether a cold observation still binds to the final session snapshot."""
+    return (
+        session.active
+        and session.id == observation_source_session_id
+        and _is_latest_active_cold_session(server_context, session=session)
+    )
+
+
+def _project_cold_temperature_for_session(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    driver_state: RoasterState,
+) -> ColdTemperatureProjection | None:
+    """Project cold temperature facts from the already-read driver snapshot."""
+    if session.purpose == "roast":
+        return None
+    if not _is_latest_active_cold_session(server_context, session=session):
+        return COLD_TEMPERATURE_NOT_ELIGIBLE
+    return project_cold_temperature(driver_state)
+
+
+def _reconcile_cold_temperature_projection(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    observation_source_session_id: str,
+    projection: ColdTemperatureProjection | None,
+) -> ColdTemperatureProjection | None:
+    """Keep a cold temperature projection bound to the final returned session snapshot."""
+    if session.purpose == "roast":
+        return None
+    if not _is_cold_observation_readmissible(
+        server_context,
+        session=session,
+        observation_source_session_id=observation_source_session_id,
+    ):
+        return COLD_TEMPERATURE_NOT_ELIGIBLE
+    return projection
 
 
 def _record_polling_telemetry_for_active_session(
@@ -2349,6 +2419,7 @@ def _serialize_session_state(
     first_crack_runtime: FirstCrackRuntimeSnapshot | None = None,
     ambient_runtime: AmbientRuntimeSnapshot | None = None,
     cold_characterisation_observation: ColdCharacterisationObservation | None = None,
+    cold_temperature_projection: ColdTemperatureProjection | None = None,
 ) -> RoastSessionState:
     """Convert one in-memory session into an MCP-safe snapshot."""
     metrics = compute_roast_metrics(
@@ -2402,6 +2473,7 @@ def _serialize_session_state(
         else None,
         session_purpose=session.purpose,
         cold_characterisation_observation=cold_characterisation_observation,
+        cold_temperature_projection=cold_temperature_projection,
     )
 
 
