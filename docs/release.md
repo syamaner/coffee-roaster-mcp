@@ -494,6 +494,8 @@ contract and the human operator's tag and publication decision remain
 separately required. Nothing in this generic policy verifies that any of these
 steps ran for published `0.2.2`.
 
+MCP Registry publishing runs only after the PyPI publish job succeeds.
+
 ## MCP Registry Verification
 
 The MCP Registry is preview. Before a future live release, use the current
