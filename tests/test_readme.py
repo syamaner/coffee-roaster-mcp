@@ -168,6 +168,31 @@ def test_release_0_2_2_first_publication_instructions_are_historical() -> None:
         assert forbidden not in live_release
 
 
+def test_future_live_release_preserves_minimum_prerequisites() -> None:
+    """Keep generic publication safeguards after retiring the 0.2.2 procedure."""
+    release_text = (REPOSITORY_ROOT / "docs/release.md").read_text(encoding="utf-8")
+    live_release = " ".join(
+        _section(release_text, "## Live Release", "## MCP Registry Verification").split()
+    )
+
+    minimum_guards = (
+        "The release-preparation PR is merged",
+        "Applicable protected checks are green and all conversations are resolved",
+        "A release-workflow dry run has succeeded",
+        "The human release operator explicitly approves the protected release environment",
+    )
+    for guard in minimum_guards:
+        assert guard in live_release
+
+    assert "These prerequisites are necessary, not sufficient" in live_release
+    assert "future version-specific contract" in live_release
+    assert (
+        "human operator's tag and publication decision remain separately required" in live_release
+    )
+    assert "Nothing in this generic policy verifies" in live_release
+    assert "published `0.2.2`" in live_release
+
+
 def test_release_history_is_preserved() -> None:
     """Keep the older published release evidence explicitly historical."""
     release_text = (REPOSITORY_ROOT / "docs/release.md").read_text(encoding="utf-8")

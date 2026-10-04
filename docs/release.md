@@ -480,6 +480,20 @@ version-specific contract that establishes its own tag, workflow, environment,
 publication, verification, and installation evidence. Do not infer that
 process from the presence of published `0.2.2` metadata.
 
+For every future version-specific release, the following minimum prerequisites
+apply before publication:
+
+- The release-preparation PR is merged.
+- Applicable protected checks are green and all conversations are resolved.
+- A release-workflow dry run has succeeded.
+- The human release operator explicitly approves the protected release
+  environment.
+
+These prerequisites are necessary, not sufficient. The future version-specific
+contract and the human operator's tag and publication decision remain
+separately required. Nothing in this generic policy verifies that any of these
+steps ran for published `0.2.2`.
+
 ## MCP Registry Verification
 
 The MCP Registry is preview. Before a future live release, use the current
