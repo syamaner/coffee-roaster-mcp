@@ -26,7 +26,13 @@ def test_cold_setup_docs_distinguish_published_candidate_and_installed_bytes() -
         "does not contain D209's cold-temperature projection",
         "reviewed, unreleased candidate",
         "also reports version `0.2.2`",
-        "adds that typed projection",
+        "adds D209's typed cold-only temperature and packet projection alongside #222's "
+        "roast-fan-only cold-session `get_roast_state` observation",
+        "The #222 observation reports commanded roast-fan state only",
+        "The D209 projection reports telemetry, packet validity and counters, and raw and "
+        "typed temperature information",
+        "Packet progress screening is an Agent comparison between observations, not a "
+        "continuous freshness or link watchdog",
         "cannot attest which bytes the intended interpreter imports",
         "Verifying that installed bytes correspond to a selected artifact is a separate, "
         "operator-authorised gate",
