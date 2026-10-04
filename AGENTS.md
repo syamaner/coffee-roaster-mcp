@@ -124,10 +124,16 @@
   package-readiness #212 are complete. #157 remains open for Pi and combined
   acceptance, and #194's instrumentation software slice is implemented while
   #194 remains open for later operator characterisation and supervised acceptance.
-- `v0.2.1` is the current published package and MCP Registry baseline.
-  `0.2.2` is an unpublished candidate. Tagging, publication,
-  release-environment approval, and live artefact verification are
-  human-operator actions; the candidate is not authorisation to tag or publish.
+- The published PyPI and MCP Registry distribution is `0.2.2`, and it lacks
+  D209's cold-temperature projection. The reviewed, unreleased candidate at
+  source revision `96f8916407ec8d31bbed9637e824c3cd2b0cf24a` reports the same
+  `0.2.2` version and includes the typed projection. A version string, wheel
+  name, or declared command-line digest does not attest the bytes imported by
+  the intended interpreter. Installed-byte verification is a separate,
+  operator-authorised gate; this repository guidance does not perform it or
+  claim that either distribution is installed. Tagging, publication,
+  release-environment approval, and live artefact verification remain
+  human-operator actions.
 
 ```text
 src/coffee_roaster_mcp/

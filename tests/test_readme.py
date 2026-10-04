@@ -13,6 +13,47 @@ def test_readme_includes_mcp_verification_string() -> None:
     assert readme_text.count(verification_string) == 1
 
 
+def test_cold_setup_docs_distinguish_published_candidate_and_installed_bytes() -> None:
+    """Keep the three cold-test package identities distinct in setup authority."""
+    repository_root = Path(__file__).resolve().parents[1]
+    readme_text = (repository_root / "README.md").read_text(encoding="utf-8")
+    agents_text = (repository_root / "AGENTS.md").read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme_text.split())
+    normalized_agents = " ".join(agents_text.split())
+
+    readme_requirements = (
+        "published PyPI and MCP Registry distribution is `0.2.2`",
+        "does not contain D209's cold-temperature projection",
+        "reviewed, unreleased candidate",
+        "also reports version `0.2.2`",
+        "adds that typed projection",
+        "cannot attest which bytes the intended interpreter imports",
+        "Verifying that installed bytes correspond to a selected artifact is a separate, "
+        "operator-authorised gate",
+        "does not perform that gate or claim that either distribution is installed",
+    )
+    agents_requirements = (
+        "published PyPI and MCP Registry distribution is `0.2.2`",
+        "lacks D209's cold-temperature projection",
+        "reviewed, unreleased candidate",
+        "reports the same `0.2.2` version",
+        "includes the typed projection",
+        "does not attest the bytes imported by the intended interpreter",
+        "Installed-byte verification is a separate, operator-authorised gate",
+        "does not perform it or claim that either distribution is installed",
+    )
+
+    for phrase in readme_requirements:
+        assert phrase in normalized_readme
+    for phrase in agents_requirements:
+        assert phrase in normalized_agents
+
+    for docs_text in (readme_text, agents_text):
+        assert "`v0.2.1` is the current published package" not in docs_text
+        assert "`0.2.1` is the published PyPI and MCP Registry baseline" not in docs_text
+        assert "`0.2.2` is an unpublished candidate" not in docs_text
+
+
 def test_install_and_hardware_setup_docs_cover_required_topics() -> None:
     """Check the E6-S7 setup docs cover the required operator topics."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"
