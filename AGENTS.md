@@ -127,13 +127,22 @@
 - The published PyPI and MCP Registry distribution is `0.2.2`, and it lacks
   D209's cold-temperature projection. The reviewed, unreleased candidate at
   source revision `96f8916407ec8d31bbed9637e824c3cd2b0cf24a` reports the same
-  `0.2.2` version and includes the typed projection. A version string, wheel
-  name, or declared command-line digest does not attest the bytes imported by
-  the intended interpreter. Installed-byte verification is a separate,
+  `0.2.2` version and includes the typed cold-only temperature and packet
+  projection. #222 reports commanded roast-fan state only. D209 reports
+  telemetry, packet validity and counters, and raw and typed temperature
+  information; Agent-side comparison between observations owns packet-progress
+  screening. Neither surface proves physical state, calibration, continuous
+  freshness, link health, or readiness. A version string, wheel name, or
+  declared command-line digest does not attest the bytes imported by the
+  intended interpreter. Installed-byte verification is a separate,
   operator-authorised gate; this repository guidance does not perform it or
   claim that either distribution is installed. Tagging, publication,
   release-environment approval, and live artefact verification remain
   human-operator actions.
+- Current PyPI and MCP Registry metadata verifies publication of `0.2.2`, but
+  no `v0.2.2` tag SHA or release-workflow receipt is verified. Issue #225
+  remains open for release-process reconciliation, while issue #227 is closed
+  for the D209 software projection.
 
 ```text
 src/coffee_roaster_mcp/

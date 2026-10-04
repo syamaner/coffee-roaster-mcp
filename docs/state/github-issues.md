@@ -4,18 +4,27 @@ Repository: `syamaner/coffee-roaster-mcp`
 
 Milestone: `v0.2`
 
-Current released baseline: `v0.2.1` at
-`ac6df37be6c3f5fd91b726c2eec8f272ead76f63`, per OWNER #220 comment
-`5742280072`
+Current published distribution: production PyPI and MCP Registry metadata
+verifies `0.2.2`. No `v0.2.2` tag SHA or release-workflow receipt is verified,
+and installed bytes remain unverified.
 
 ## Current Stories
 
 - #218: complete; non-actuating cold-characterisation session-finalisation
   prerequisite.
 - #222: complete; typed, roast-fan-only cold-session `get_roast_state`
-  observation and D197 software prerequisite for Agent #954. Consumer release
-  is separately authorised; no hardware or readiness claim follows.
-- #225: current; release preparation for the unpublished `0.2.2` candidate.
+  commanded-state observation and D197 software prerequisite for Agent #954.
+  It is separate from the D209 temperature and packet projection.
+- #225: open; release-process reconciliation. Its checklist, dry run, tag,
+  workflow, environment approval, and human verification are not recorded as
+  complete.
+- #227: closed; D209 projection software. Published `0.2.2` lacks the typed
+  cold-only temperature and packet projection; the reviewed, unreleased
+  same-version candidate includes it. Agent-side comparison between
+  observations owns packet-progress screening. Neither surface proves physical
+  state, calibration, continuous freshness, link health, or readiness;
+  installed bytes remain unverified, and candidate release and installation
+  remain separately authorised.
 - #157: open; separate hardware/component acceptance work.
 - #210: complete; standalone Torch-free NumPy/SciPy mel frontend parity slice.
 - #212: complete; MCP-owned frontend integration and local package readiness slice.

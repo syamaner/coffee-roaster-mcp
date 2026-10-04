@@ -15,14 +15,17 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Active Context
 
-- Current released baseline: `v0.2.1` at
-  `ac6df37be6c3f5fd91b726c2eec8f272ead76f63`, per OWNER #220 comment
-  `5742280072`
-- #218 and #222 are complete. #225 is the current release-preparation story for
-  the unpublished `0.2.2` candidate. #222's typed, roast-fan-only cold-session
-  `get_roast_state` observation is a D197 software prerequisite for Agent #954;
-  it reports commanded state, not physical proof, and consumer release is
-  separately authorised
+- Current published distribution: production PyPI and MCP Registry metadata
+  verifies `0.2.2`; no `v0.2.2` tag SHA or release-workflow receipt is verified
+- #218 and #222 are complete. #225 remains open for release-process
+  reconciliation, and #227 is closed for the D209 software projection.
+  Published `0.2.2` lacks D209; the reviewed, unreleased same-version candidate
+  adds its typed cold-only temperature and packet projection. #222's separate
+  roast-fan-only `get_roast_state` observation reports commanded state only.
+  Agent-side comparison between observations owns packet-progress screening;
+  neither surface proves physical state, calibration, continuous freshness,
+  link health, readiness, or installed bytes. Candidate release or installation
+  is separately authorised
 - Separate open acceptance work: #157 and #194 remain open for their respective
   hardware/component acceptance. Do not infer microphone, serial, Hottop, or
   readiness authority from this delivery
@@ -41,14 +44,18 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
 - D184 governance baseline is active. Issue #206 completed through PR #207,
   squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`.
-  The released baseline is `v0.2.1` at
-  `ac6df37be6c3f5fd91b726c2eec8f272ead76f63`, per OWNER #220 comment
-  `5742280072`. #218 and #222 are complete. #225 is the current
-  release-preparation story for the unpublished `0.2.2` candidate. #222's
-  typed, roast-fan-only cold-session `get_roast_state` observation is a D197
-  software prerequisite for Agent #954. #157 and #194 remain separate open
-  hardware/component acceptance work; no hardware or readiness claim follows,
-  and consumer release is separately authorised.
+  Production PyPI and MCP Registry metadata verifies publication of `0.2.2`;
+  no `v0.2.2` tag SHA, release-workflow receipt, or completed checklist is
+  verified. #218 and #222 are complete. #225 remains open for release-process
+  reconciliation, and #227 is closed for the D209 software projection.
+  Published `0.2.2` lacks D209, while the reviewed, unreleased same-version
+  candidate includes its typed cold-only temperature and packet projection.
+  #222 remains a separate commanded roast-fan observation. Agent-side
+  between-observation comparison owns packet-progress screening. Neither
+  surface proves physical state, calibration, continuous freshness, link
+  health, readiness, or installed bytes. #157 and #194 remain separate open
+  hardware/component acceptance work, and candidate release or installation
+  is separately authorised.
 - `E7-S1` keeps broad mock-safe validation on the public stdio MCP tool path:
   a default-config server uses the mock driver, first-crack mode remains
   disabled, auto-T0 remains disabled, and exported JSONL, CSV, and

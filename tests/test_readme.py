@@ -2,6 +2,13 @@
 
 from pathlib import Path
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _section(text: str, heading: str, next_heading: str) -> str:
+    """Return one bounded Markdown section."""
+    return text.split(heading, 1)[1].split(next_heading, 1)[0]
+
 
 def test_readme_includes_mcp_verification_string() -> None:
     """Check the README includes the MCP Registry package-name proof."""
@@ -43,7 +50,13 @@ def test_cold_setup_docs_distinguish_published_candidate_and_installed_bytes() -
         "lacks D209's cold-temperature projection",
         "reviewed, unreleased candidate",
         "reports the same `0.2.2` version",
-        "includes the typed projection",
+        "includes the typed cold-only temperature and packet projection",
+        "#222 reports commanded roast-fan state only",
+        "D209 reports telemetry, packet validity and counters, and raw and typed temperature "
+        "information",
+        "Agent-side comparison between observations owns packet-progress screening",
+        "Neither surface proves physical state, calibration, continuous freshness, link health, "
+        "or readiness",
         "does not attest the bytes imported by the intended interpreter",
         "Installed-byte verification is a separate, operator-authorised gate",
         "does not perform it or claim that either distribution is installed",
@@ -58,6 +71,128 @@ def test_cold_setup_docs_distinguish_published_candidate_and_installed_bytes() -
         assert "`v0.2.1` is the current published package" not in docs_text
         assert "`0.2.1` is the published PyPI and MCP Registry baseline" not in docs_text
         assert "`0.2.2` is an unpublished candidate" not in docs_text
+
+
+def test_current_authority_surfaces_agree_on_published_0_2_2() -> None:
+    """Keep current release authority distinct from candidate and install state."""
+    paths_and_bounds = (
+        ("README.md", "## Status", "## Related Project Artifacts"),
+        ("AGENTS.md", "## Current authority and repository map", "```text"),
+        ("docs/state/registry.md", "## Active Epic", "## Historical Narrative"),
+        (
+            "docs/state/epics/coffee-roaster-mcp-v0.1.md",
+            "## Active Context",
+            "- `E7-S1`",
+        ),
+        ("docs/state/github-issues.md", "# RoastPilot GitHub Issue Index", "## Epics"),
+        ("docs/release.md", "## Current Release Authority", "## Changelog"),
+        (
+            ".claude/skills/release-registry/SKILL.md",
+            "## Current Scope",
+            "## Release Targets",
+        ),
+    )
+
+    for relative_path, heading, next_heading in paths_and_bounds:
+        text = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+        current = " ".join(_section(text, heading, next_heading).split())
+        assert "0.2.2" in current
+        assert "PyPI" in current
+        assert "MCP Registry" in current
+        assert "reviewed, unreleased" in current
+        assert "installed" in current
+        assert "v0.2.1` is the current" not in current
+        assert "released baseline is `v0.2.1" not in current
+        assert "unpublished `0.2.2" not in current
+        assert "`0.2.2` is an unpublished" not in current
+        assert "verified `v0.2.2` tag SHA" not in current
+        assert "verified release-workflow receipt" not in current
+
+
+def test_current_issue_state_keeps_225_open_and_227_closed() -> None:
+    """Keep release reconciliation open and the D209 software story closed."""
+    paths_and_bounds = (
+        (
+            "docs/state/registry.md",
+            "## Active Epic",
+            "## Historical Narrative",
+            "#225 remains open",
+            "#227 is closed",
+        ),
+        (
+            "docs/state/epics/coffee-roaster-mcp-v0.1.md",
+            "## Active Context",
+            "- `E7-S1`",
+            "#225 remains open",
+            "#227 is closed",
+        ),
+        (
+            "docs/state/github-issues.md",
+            "## Current Stories",
+            "## Epics",
+            "#225: open",
+            "#227: closed",
+        ),
+    )
+
+    for relative_path, heading, next_heading, open_phrase, closed_phrase in paths_and_bounds:
+        text = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+        current = " ".join(_section(text, heading, next_heading).split())
+        assert open_phrase in current
+        assert closed_phrase in current
+        assert "#225 complete" not in current
+        assert "#225 closed" not in current
+        assert "#225 checklist completed" not in current
+
+
+def test_release_0_2_2_first_publication_instructions_are_historical() -> None:
+    """Prevent the superseded 0.2.2 procedure from becoming executable again."""
+    release_text = (REPOSITORY_ROOT / "docs/release.md").read_text(encoding="utf-8")
+    checklist = _section(
+        release_text,
+        "## v0.2.2 Release Checklist",
+        "## v0.2.1 Release Checklist",
+    )
+    live_release = _section(release_text, "## Live Release", "## MCP Registry Verification")
+
+    assert "Historical/Superseded — Non-Executable" in checklist
+    assert "does not prove that any listed step ran" in checklist
+    assert "does not currently authorise or instruct a live release" in live_release
+    for forbidden in (
+        "git tag v0.2.2",
+        "git push origin v0.2.2",
+        "Use this checklist",
+        "Run this checklist",
+    ):
+        assert forbidden not in checklist
+        assert forbidden not in live_release
+
+
+def test_release_history_is_preserved() -> None:
+    """Keep the older published release evidence explicitly historical."""
+    release_text = (REPOSITORY_ROOT / "docs/release.md").read_text(encoding="utf-8")
+    registry_text = (REPOSITORY_ROOT / "docs/state/registry.md").read_text(encoding="utf-8")
+
+    assert "### 0.2.1 (published)" in release_text
+    assert "## v0.2.1 Release Checklist (Historical Record Only)" in release_text
+    assert "## Historical Narrative (Superseded For Current Delivery)" in registry_text
+
+
+def test_release_skill_fails_closed_on_unknown_current_release_evidence() -> None:
+    """Keep the release skill read-only when current evidence is incomplete."""
+    skill_text = (REPOSITORY_ROOT / ".claude/skills/release-registry/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    current = " ".join(_section(skill_text, "## Current Scope", "## Release Targets").split())
+
+    assert "read-only" in skill_text
+    assert "`0.2.2`" in current
+    assert "#225 remains open" in current
+    assert "#227 is closed" in current
+    assert "reviewed, unreleased same-version candidate" in current
+    assert "Do not use it to recommend tagging or publication" in current
+    assert "recommend no release action" in current
+    assert "Agents do not tag, approve environments, publish" in skill_text
 
 
 def test_install_and_hardware_setup_docs_cover_required_topics() -> None:

@@ -39,6 +39,11 @@ surfaces do not prove physical actuation, calibration, accuracy, readiness, or
 safety. Packet progress screening is an Agent comparison between observations,
 not a continuous freshness or link watchdog.
 
+Current PyPI and MCP Registry metadata verifies that `0.2.2` is published,
+but the available evidence does not verify a `v0.2.2` tag SHA or release
+workflow receipt. Issue #225 remains open for release-process reconciliation;
+issue #227 is closed for the D209 software projection.
+
 Because both distributions report `0.2.2`, a version string, wheel name, or
 declared command-line digest cannot attest which bytes the intended interpreter
 imports. Verifying that installed bytes correspond to a selected artifact is a
