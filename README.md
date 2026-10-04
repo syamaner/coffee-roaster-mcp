@@ -27,14 +27,31 @@ drops were executed, with no failed command events or safety alerts in either
 completed run.
 
 Those roasts used the pinned `coffee-roaster-mcp` 0.1.13 runtime. Versions
-0.1.14-0.1.16 were metadata/docs releases. `0.2.1` is the published PyPI and
-MCP Registry baseline. The unpublished `0.2.2` candidate carries #222's
-additive, typed, roast-fan-only cold-session `get_roast_state` observation. It
-reports commanded roast-fan state only, never physical, link, or freshness
-proof. This release-preparation PR makes no runtime, detector, model,
-dependency, configuration, safety, workflow, or hardware-control change. It is
-Agent #954's upstream prerequisite only: it does not implement #954, authorise
-hardware, or authorise beans.
+0.1.14-0.1.16 were metadata/docs releases. The published PyPI and MCP Registry
+distribution is `0.2.2`; it does not contain D209's cold-temperature
+projection. The reviewed, unreleased candidate at source revision
+`96f8916407ec8d31bbed9637e824c3cd2b0cf24a` also reports version `0.2.2` and
+adds D209's typed cold-only temperature and packet projection alongside #222's
+roast-fan-only cold-session `get_roast_state` observation. The #222 observation
+reports commanded roast-fan state only. The D209 projection reports telemetry,
+packet validity and counters, and raw and typed temperature information. Those
+surfaces do not prove physical actuation, calibration, accuracy, readiness, or
+safety. Packet progress screening is an Agent comparison between observations,
+not a continuous freshness or link watchdog.
+
+Current PyPI and MCP Registry metadata verifies that `0.2.2` is published,
+but the available evidence does not verify a `v0.2.2` tag SHA or release
+workflow receipt. Issue #225 remains open for release-process reconciliation;
+issue #227 is closed for the D209 software projection.
+
+Because both distributions report `0.2.2`, a version string, wheel name, or
+declared command-line digest cannot attest which bytes the intended interpreter
+imports. Verifying that installed bytes correspond to a selected artifact is a
+separate, operator-authorised gate; this documentation does not perform that
+gate or claim that either distribution is installed. This preparation change
+makes no runtime, detector, model, dependency, configuration, safety, workflow,
+or hardware-control change. It is Agent #954's upstream prerequisite only: it
+does not implement #954, authorise hardware, or authorise beans.
 
 D191's ratified limits remain `N = 1` and `X = 200 ms`; the production fatal
 streak remains `30`. D190 was MCP-only component characterisation with

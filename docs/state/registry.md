@@ -8,9 +8,11 @@
 - Repository: `syamaner/coffee-roaster-mcp`
 - Package: `coffee-roaster-mcp`
 - MCP Registry name: `io.github.syamaner/coffee-roaster-mcp`
-- Current phase: #218 and #222 are complete. #225 is the current
-  release-preparation story for the unpublished `0.2.2` candidate. #157 and
-  #194 remain separate open hardware/component acceptance work.
+- Current phase: production PyPI and the MCP Registry publish `0.2.2`.
+  Publication metadata is verified, but no `v0.2.2` tag SHA or release-workflow
+  receipt is verified. #225 remains open for release-process reconciliation;
+  #227 is closed for the D209 software projection. #157 and #194 remain
+  separate open hardware/component acceptance work.
 
 ## Working Rules
 
@@ -24,14 +26,17 @@
 
 ## Active Context
 
-The released baseline is `v0.2.1` at
-`ac6df37be6c3f5fd91b726c2eec8f272ead76f63`, per OWNER #220 comment
-`5742280072`. D184 governance issue #206 completed through PR #207,
-squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`.
-Issues #218 and #222 are complete. Issue #225 is the current release-preparation
-story for the unpublished `0.2.2` candidate. #157 and #194 remain separate open
-hardware/component acceptance work; this state update makes no hardware or
-readiness claim, and consumer release is separately authorised.
+Production PyPI and MCP Registry metadata verifies publication of `0.2.2`.
+The available evidence does not verify a `v0.2.2` tag SHA, release-workflow
+receipt, or completion of the release checklist. Issue #225 remains open for
+release-process reconciliation. Issue #227 is closed for the D209 software:
+published `0.2.2` lacks its typed cold-only temperature and packet projection,
+while the reviewed, unreleased same-version candidate includes it. Agent-side
+comparison between observations owns packet-progress screening. Neither
+distribution proves physical state, calibration, continuous freshness, link
+health, readiness, or which installed bytes an intended interpreter imports.
+Releasing or installing the D209 candidate remains separately authorised. #157
+and #194 remain separate open hardware/component acceptance work.
 
 ## Historical Narrative (Superseded For Current Delivery)
 

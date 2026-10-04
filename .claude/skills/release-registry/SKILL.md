@@ -11,12 +11,21 @@ verification.
 
 ## Current Scope
 
-- `v0.2.1` is published on PyPI and in the MCP Registry.
+- Production PyPI and MCP Registry metadata verifies that `0.2.2` is
+  published. It does not verify a `v0.2.2` tag SHA, a release-workflow receipt,
+  checklist completion, or installed bytes.
+- Issue #225 remains open for release-process reconciliation. #227 is closed
+  for the D209 software projection. Published `0.2.2` lacks that
+  projection; the reviewed, unreleased same-version candidate includes it.
+  Releasing or installing the candidate remains separately authorised.
 - `docs/release.md` is the current release authority and preserves historical
   outcomes.
 - Tags, release-environment approval, publication, and live verification are
-  human-operator-only. The unpublished `0.2.2` candidate is not authority to
-  tag or publish.
+  human-operator-only.
+- The superseded `0.2.2` first-publication checklist is historical and
+  non-executable. Do not use it to recommend tagging or publication. If current
+  authority is absent or contradictory, report the inconsistency and recommend
+  no release action.
 
 ## Release Targets
 
