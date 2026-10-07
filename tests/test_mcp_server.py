@@ -8,6 +8,8 @@ import dataclasses
 import inspect
 import json
 import logging
+import os
+import sys
 import time
 from pathlib import Path
 from threading import Event, Lock, Thread, get_ident
@@ -15,6 +17,8 @@ from types import SimpleNamespace, TracebackType
 from typing import Any, cast
 
 import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
 
 import coffee_roaster_mcp.mcp_server as mcp_server
@@ -2992,6 +2996,38 @@ def test_server_info_session_presence_is_atomic_during_mock_start_and_fresh_cont
     assert (
         _call_tool(fresh_server, "get_server_info", _ctx(fresh_context)).session_presence == "none"
     )
+
+
+def test_fresh_mock_server_process_reports_no_session_presence(tmp_path: Path) -> None:
+    """A new mock stdio process reports no in-process session history."""
+    asyncio.run(_assert_fresh_mock_server_process_presence(tmp_path))
+
+
+async def _assert_fresh_mock_server_process_presence(tmp_path: Path) -> None:
+    """Call the public server-info tool through a fresh mock stdio process."""
+    repository_root = Path(__file__).resolve().parents[1]
+    pythonpath_parts = [str(repository_root / "src")]
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    if existing_pythonpath:
+        pythonpath_parts.append(existing_pythonpath)
+    environment = {"PYTHONPATH": os.pathsep.join(pythonpath_parts)}
+    for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT"):
+        value = os.environ.get(key)
+        if value is not None:
+            environment[key] = value
+
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "coffee_roaster_mcp.cli", "serve"],
+        env=environment,
+        cwd=tmp_path,
+    )
+    async with stdio_client(server_params) as (read, write), ClientSession(read, write) as session:
+        await asyncio.wait_for(session.initialize(), timeout=5.0)
+        server_info = await asyncio.wait_for(session.call_tool("get_server_info", {}), timeout=5.0)
+
+    assert server_info.structuredContent is not None
+    assert server_info.structuredContent["session_presence"] == "none"
 
 
 def test_guarded_emergency_stop_cancels_blocked_new_session_start(tmp_path: Path) -> None:
