@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import cast
 import pytest
 
 import coffee_roaster_mcp.session as session_module
+from coffee_roaster_mcp.exports import export_roast_snapshot
 from coffee_roaster_mcp.session import (
     RoastEventKind,
     RoastSession,
@@ -22,6 +24,7 @@ from coffee_roaster_mcp.session import (
     compute_env_temp_delta_60s_c,
     compute_roast_elapsed_seconds,
     compute_roast_metrics,
+    has_verified_emergency_containment,
 )
 
 EXPECTED_JSONL_EVENT_KEYS = {
@@ -57,6 +60,18 @@ class ClockHarness:
 
     def monotonic_now(self) -> float:
         return self.monotonic_value
+
+
+def test_verified_emergency_state_rejects_boolean_fan_payload() -> None:
+    """Boolean values cannot stand in for the required emergency fan percentage."""
+    assert not has_verified_emergency_containment(
+        safety_payload={
+            "driver_safety_method_called": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": True,
+            "cooling_on": True,
+        }
+    )
 
 
 def test_start_session_creates_active_roast_session() -> None:
@@ -384,9 +399,13 @@ def test_future_first_crack_detection_allows_later_events_without_inverted_metri
     assert compute_development_time_seconds(session) == 0.0
 
 
-def test_future_first_crack_detection_orders_fault_and_recovery_events() -> None:
+def test_future_first_crack_detection_orders_fault_and_recovery_events(tmp_path: Path) -> None:
     clock = ClockHarness()
-    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
     session = store.start_session()
 
     clock.monotonic_value = 105.0
@@ -402,10 +421,19 @@ def test_future_first_crack_detection_orders_fault_and_recovery_events() -> None
         safety_payload={
             "driver": "test-driver",
             "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
             "heat_level_percent": 0,
             "fan_level_percent": 100,
             "cooling_on": True,
         },
+    )
+    drop_reservation = store.reserve_driver_fault_recovery(session, kind="drop")
+    store.complete_reserved_driver_fault_recovery_snapshot(
+        session,
+        reservation=drop_reservation,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=True,
     )
     reservation = store.reserve_driver_stop_cooling_recovery(session)
     recovery, snapshot = store.complete_reserved_driver_stop_cooling_recovery_snapshot(
@@ -426,10 +454,23 @@ def test_future_first_crack_detection_orders_fault_and_recovery_events() -> None
         20.0,
         20.0,
         20.0,
+        20.0,
+        20.0,
     ]
     assert [event.recorded_at_utc for event in snapshot.event_timeline] == sorted(
         event.recorded_at_utc for event in snapshot.event_timeline
     )
+    export = export_roast_snapshot(snapshot)
+    with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    assert [row["event"] for row in rows] == [
+        "beans_added",
+        "first_crack_detected",
+        "fault",
+        "beans_dropped",
+        "cooling_started",
+        "cooling_stopped",
+    ]
 
 
 def test_event_log_write_failure_does_not_commit_event(tmp_path: Path) -> None:
@@ -775,6 +816,7 @@ def test_emergency_abort_releases_finalisation_reservation_for_recovery() -> Non
         safety_payload={
             "driver": "test",
             "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
             "heat_level_percent": 0,
             "fan_level_percent": 100,
             "cooling_on": True,
@@ -844,7 +886,18 @@ def test_emergency_stop_between_admission_and_attach_retains_truthful_abort() ->
         def __init__(self) -> None:
             self.reservation_generation = generation
 
-    store.emergency_stop(session, reason="window")
+    store.emergency_stop(
+        session,
+        reason="window",
+        safety_payload={
+            "driver": "test",
+            "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    )
     record = Record()
     store.attach_finalisation(session, record)
 
@@ -966,7 +1019,7 @@ def test_start_session_rejects_pending_post_fault_cooling_recovery() -> None:
     session = store.start_session()
     store.emergency_stop(session, reason="unit-test")
 
-    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
         store.start_session()
 
     assert store.get_latest_session() is session
@@ -983,7 +1036,7 @@ def test_reserve_session_start_rejects_pending_post_fault_cooling_recovery() -> 
     session = store.start_session()
     store.emergency_stop(session, reason="unit-test")
 
-    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
         store.reserve_session_start()
 
     assert store.get_latest_session() is session
@@ -1628,6 +1681,7 @@ def test_stop_cooling_recovery_records_new_event_after_completed_session_fault()
         safety_payload={
             "driver": "test-driver",
             "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
             "heat_level_percent": 0,
             "fan_level_percent": 100,
             "cooling_on": True,
@@ -1659,6 +1713,44 @@ def test_stop_cooling_recovery_records_new_event_after_completed_session_fault()
     assert cooling_events[1].recorded_at_utc == datetime(2026, 5, 4, 12, 3, tzinfo=UTC)
     assert snapshot.phase == "fault"
     assert snapshot.cooling_on is False
+
+
+def test_guarded_fault_recovery_reservation_blocks_new_session_start() -> None:
+    """A stopped-fault command reservation prevents a newer-session race."""
+    store = RoastSessionStore()
+    session = store.start_session()
+    store.emergency_stop(
+        session,
+        reason="test-fault",
+        safety_payload={
+            "driver_safety_method_called": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    )
+
+    reservation = store.reserve_driver_fault_recovery(session, kind="start_cooling")
+    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+        store.reserve_session_start()
+
+    store.complete_reserved_driver_fault_recovery_snapshot(
+        session,
+        reservation=reservation,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=True,
+    )
+    stop_reservation = store.reserve_driver_fault_recovery(session, kind="stop_cooling")
+    store.complete_reserved_driver_fault_recovery_snapshot(
+        session,
+        reservation=stop_reservation,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=False,
+    )
+    replacement = store.start_session()
+    assert replacement.id != session.id
 
 
 def test_emergency_stop_faults_active_complete_session() -> None:

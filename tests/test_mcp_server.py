@@ -10,14 +10,15 @@ import json
 import logging
 import time
 from pathlib import Path
-from threading import Event, Thread
-from types import SimpleNamespace
+from threading import Event, Lock, Thread, get_ident
+from types import SimpleNamespace, TracebackType
 from typing import Any, cast
 
 import pytest
 from mcp.server.fastmcp import FastMCP
 
 import coffee_roaster_mcp.mcp_server as mcp_server
+import coffee_roaster_mcp.session as session_module
 from coffee_roaster_mcp.ambient_runtime import AmbientRuntimeSnapshot, AmbientRuntimeState
 from coffee_roaster_mcp.artifacts import ResolvedArtifact, ResolvedDetectorArtifacts
 from coffee_roaster_mcp.audio import AudioCaptureSnapshot, AudioWindow
@@ -70,6 +71,7 @@ from coffee_roaster_mcp.mcp_server import (
 )
 from coffee_roaster_mcp.session import (
     DriverCommandReservation,
+    RoastEvent,
     RoastSession,
     RoastSessionStore,
     SessionLifecycleError,
@@ -2949,6 +2951,152 @@ def test_concurrent_session_start_reserves_before_driver_connect(tmp_path: Path)
     assert driver.actions == ["connect"]
 
 
+def test_guarded_emergency_stop_cancels_blocked_new_session_start(tmp_path: Path) -> None:
+    """Exact fault e-stop contains a blocked connect before it can create a session."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    connect_started = Event()
+    release_connect = Event()
+    driver.block_connect = (connect_started, release_connect)
+    results: list[object] = []
+    errors: list[BaseException] = []
+    start_thread = Thread(
+        target=_record_tool_result,
+        args=(results, errors, server, "start_roast_session", ctx),
+    )
+
+    start_thread.start()
+    assert connect_started.wait(timeout=1.0)
+
+    emergency = _call_tool(
+        server,
+        "emergency_stop",
+        ctx,
+        reason="cancel blocked start",
+        expected_session_id=session_id,
+    )
+
+    assert emergency.session_id == session_id
+    assert start_thread.is_alive()
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "stop_cooling",
+        "connect",
+        "emergency_stop:cancel blocked start",
+    ]
+    with pytest.raises(ValueError, match="start is in progress"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    release_connect.set()
+    start_thread.join(timeout=1.0)
+
+    assert not start_thread.is_alive()
+    assert results == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], SessionLifecycleError)
+    latest = ctx.request_context.lifespan_context.session_store.get_latest_session()
+    assert latest is not None and latest.id == session_id and latest.active is False
+
+
+def test_guarded_emergency_stop_serializes_start_completion_after_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed connect cannot commit a new session during guarded e-stop admission."""
+
+    class FinishRaceBarrier:
+        """Signal the start thread just before its completion lock acquisition."""
+
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self.start_thread_id: int | None = None
+            self.start_entries = 0
+            self.finish_attempted = Event()
+
+        def __enter__(self) -> FinishRaceBarrier:
+            if get_ident() == self.start_thread_id:
+                self.start_entries += 1
+                if self.start_entries == 2:
+                    self.finish_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            self._lock.release()
+
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    barrier = FinishRaceBarrier()
+    server_context = ctx.request_context.lifespan_context
+    object.__setattr__(server_context, "lifecycle_barrier", barrier)
+    connect_started = Event()
+    release_connect = Event()
+    cancellation_entered = Event()
+    release_cancellation = Event()
+    driver.block_connect = (connect_started, release_connect)
+    original_cancel = server_context.session_store.cancel_session_start_for_emergency_stop
+
+    def pause_cancellation() -> None:
+        cancellation_entered.set()
+        assert release_cancellation.wait(timeout=1.0)
+        original_cancel()
+
+    monkeypatch.setattr(
+        server_context.session_store,
+        "cancel_session_start_for_emergency_stop",
+        pause_cancellation,
+    )
+    start_results: list[object] = []
+    start_errors: list[BaseException] = []
+    emergency_results: list[object] = []
+    emergency_errors: list[BaseException] = []
+
+    def start_session() -> None:
+        barrier.start_thread_id = get_ident()
+        _record_tool_result(start_results, start_errors, server, "start_roast_session", ctx)
+
+    def emergency_stop() -> None:
+        try:
+            emergency_results.append(
+                _call_tool(
+                    server,
+                    "emergency_stop",
+                    ctx,
+                    reason="serialize finish race",
+                    expected_session_id=session_id,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - retain thread failure for assertion.
+            emergency_errors.append(exc)
+
+    start_thread = Thread(target=start_session)
+    start_thread.start()
+    assert connect_started.wait(timeout=1.0)
+    emergency_thread = Thread(target=emergency_stop)
+    emergency_thread.start()
+    assert cancellation_entered.wait(timeout=1.0)
+
+    release_connect.set()
+    assert barrier.finish_attempted.wait(timeout=1.0)
+    assert emergency_thread.is_alive()
+    release_cancellation.set()
+    emergency_thread.join(timeout=1.0)
+    start_thread.join(timeout=1.0)
+
+    assert not emergency_thread.is_alive() and not start_thread.is_alive()
+    assert emergency_errors == [] and len(emergency_results) == 1
+    assert start_results == [] and len(start_errors) == 1
+    assert isinstance(start_errors[0], SessionLifecycleError)
+    latest = server_context.session_store.get_latest_session()
+    assert latest is not None and latest.id == session_id and latest.active is False
+
+
 def test_stale_heat_command_fails_closed_after_emergency_stop(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
@@ -3381,12 +3529,12 @@ def test_stop_cooling_recovery_keeps_fault_when_driver_reports_cooling_on(
     assert state.phase == "fault"
     assert state.active is False
     assert state.cooling_on is True
-    assert [event.kind for event in state.events] == ["fault"]
+    assert [event.kind for event in state.events] == ["fault", "fault"]
     assert driver.actions == [
         "connect",
         "emergency_stop:unit-test",
         "stop_cooling",
-        "emergency_stop:stale driver command after session state changed",
+        "emergency_stop:guarded fault recovery stop_cooling failed",
     ]
 
 
@@ -3410,12 +3558,12 @@ def test_stop_cooling_recovery_rejects_driver_heat_after_fault(tmp_path: Path) -
     assert state.active is False
     assert state.heat_level_percent == 0
     assert state.cooling_on is True
-    assert [event.kind for event in state.events] == ["fault"]
+    assert [event.kind for event in state.events] == ["fault", "fault"]
     assert driver.actions == [
         "connect",
         "emergency_stop:unit-test",
         "stop_cooling",
-        "emergency_stop:stale driver command after session state changed",
+        "emergency_stop:guarded fault recovery stop_cooling failed",
     ]
 
 
@@ -3455,7 +3603,7 @@ def test_stale_stop_cooling_recovery_fails_closed(tmp_path: Path) -> None:
         "connect",
         "emergency_stop:unit-test",
         "stop_cooling",
-        "emergency_stop:stale driver command after session state changed",
+        "emergency_stop:guarded fault recovery stop_cooling failed",
     ]
 
 
@@ -3477,6 +3625,1075 @@ def test_stop_cooling_still_rejects_completed_inactive_session(tmp_path: Path) -
         _call_tool(server, "stop_cooling", ctx)
 
 
+def _faulted_recovery_server(
+    tmp_path: Path,
+    *,
+    beans_added: bool = False,
+) -> tuple[FastMCP, Any, RecordingRoasterDriver, str]:
+    """Build one stopped fault session for guarded recovery tests."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    started = _call_tool(server, "start_roast_session", ctx)
+    if beans_added:
+        _call_tool(server, "mark_beans_added", ctx)
+    _call_tool(server, "emergency_stop", ctx, reason="setup-fault")
+    return server, ctx, driver, started.session.session_id
+
+
+def test_guarded_fault_recovery_commands_preserve_fault_and_exact_result(tmp_path: Path) -> None:
+    """An exact stopped-fault ID admits each recovery command without heat."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+
+    dropped = _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="only allowed before beans are dropped"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    started = _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    stopped = _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    assert dropped.session_id == started.session_id == stopped.session_id == session_id
+    assert dropped.phase == started.phase == stopped.phase == "fault"
+    assert dropped.event.kind == "beans_dropped"
+    assert started.event.kind == "cooling_started"
+    assert stopped.event.kind == "cooling_stopped"
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.active is False
+    assert state.phase == "fault"
+    assert state.heat_level_percent == 0
+    assert state.cooling_on is False
+    replacement = _call_tool(server, "start_roast_session", ctx)
+    assert replacement.session.session_id != session_id
+    assert [event.kind for event in state.events] == [
+        "beans_added",
+        "fault",
+        "beans_dropped",
+        "cooling_started",
+        "cooling_started",
+        "cooling_stopped",
+    ]
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "drop_beans",
+        "start_cooling",
+        "stop_cooling",
+        "connect",
+    ]
+
+
+def test_guarded_drop_second_event_log_failure_preserves_recorded_drop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persisted recovery drop is not reclassified as ambiguous when cooling logging fails."""
+    server, ctx, _, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+    original_append = session_module._append_event_log_row  # pyright: ignore[reportPrivateUsage]
+
+    def fail_only_recovery_cooling(session: RoastSession, event: RoastEvent) -> None:
+        if event.kind == "cooling_started" and event.payload.get("recovery_after_fault") is True:
+            raise OSError("cooling row unavailable")
+        original_append(session, event)
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_only_recovery_cooling)
+    with pytest.raises(OSError, match="cooling row unavailable"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+
+    snapshot = ctx.request_context.lifespan_context.session_store.get_session_snapshot(
+        session_id=session_id
+    )
+    assert [event.kind for event in snapshot.event_timeline] == [
+        "beans_added",
+        "fault",
+        "beans_dropped",
+        "fault",
+    ]
+    with pytest.raises(SessionLifecycleError, match="only allowed before beans are dropped"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    replacement = _call_tool(server, "start_roast_session", ctx)
+    assert replacement.session.session_id != session_id
+
+
+def test_charged_fault_rejects_cooling_stop_until_recovery_drop(tmp_path: Path) -> None:
+    """A charged fault cannot clear cooling before bean-drop evidence exists."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+
+    with pytest.raises(SessionLifecycleError, match="Cooling cannot stop before beans are dropped"):
+        _call_tool(server, "stop_cooling", ctx)
+    with pytest.raises(SessionLifecycleError, match="Cooling cannot stop before beans are dropped"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    assert driver.actions == ["connect", "emergency_stop:setup-fault"]
+    _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    stopped = _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    assert stopped.event.kind == "cooling_stopped"
+
+
+def test_guarded_fault_recovery_rejects_empty_drop_before_driver_call(tmp_path: Path) -> None:
+    """An empty stopped fault session cannot actuate the bean-drop command."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+
+    with pytest.raises(SessionLifecycleError, match="requires beans to be added"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+
+    assert driver.actions == ["connect", "emergency_stop:setup-fault"]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_session_id", "error"),
+    [
+        ("start_cooling", "missing", "not the latest roast session"),
+        ("stop_cooling", "missing", "not the latest roast session"),
+        ("emergency_stop", "missing", "not the latest roast session"),
+    ],
+)
+def test_guarded_fault_recovery_rejects_wrong_id_before_driver_call(
+    tmp_path: Path,
+    tool_name: str,
+    expected_session_id: str,
+    error: str,
+) -> None:
+    """A stale or unknown recovery ID cannot select another session to actuate."""
+    server, ctx, driver, _ = _faulted_recovery_server(tmp_path)
+
+    with pytest.raises(ValueError, match=error):
+        _call_tool(server, tool_name, ctx, expected_session_id=expected_session_id)
+
+    assert driver.actions == ["connect", "emergency_stop:setup-fault"]
+
+
+def test_guarded_fault_recovery_rejects_active_id_before_driver_call(tmp_path: Path) -> None:
+    """The optional ID does not broaden active-session command admission."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    started = _call_tool(server, "start_roast_session", ctx)
+
+    with pytest.raises(ValueError, match="not a stopped fault session"):
+        _call_tool(
+            server,
+            "start_cooling",
+            ctx,
+            expected_session_id=started.session.session_id,
+        )
+
+    assert driver.actions == ["connect"]
+
+
+def test_guarded_fault_recovery_repeats_emergency_stop_after_cooling_stops(
+    tmp_path: Path,
+) -> None:
+    """A repeated guarded e-stop reasserts zero heat after cooling was stopped."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    repeated = _call_tool(
+        server,
+        "emergency_stop",
+        ctx,
+        reason="reassert-fault",
+        expected_session_id=session_id,
+    )
+
+    assert repeated.session_id == session_id
+    assert repeated.phase == "fault"
+    assert repeated.event.kind == "fault"
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.active is False and state.phase == "fault"
+    assert state.heat_level_percent == 0 and state.cooling_on is True
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "stop_cooling",
+        "emergency_stop:reassert-fault",
+    ]
+
+
+def test_guarded_emergency_stop_rejects_nonzero_heat_report(tmp_path: Path) -> None:
+    """A guarded e-stop blocks future starts if its driver reports heat on."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    driver.emergency_heat_level_percent = 10
+
+    with pytest.raises(
+        SessionLifecycleError,
+        match="reported retained heat",
+    ):
+        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.heat_level_percent == 10 and state.cooling_on is True
+    assert state.events[-1].payload["reason"] == "guarded emergency stop reported retained heat"
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    with pytest.raises(
+        SessionLifecycleError,
+        match="reported retained heat",
+    ):
+        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+    driver.emergency_heat_level_percent = 0
+    _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "emergency_stop:manual emergency stop",
+        "emergency_stop:manual emergency stop",
+        "emergency_stop:manual emergency stop",
+    ]
+
+
+def test_guarded_emergency_stop_retains_block_when_fault_recording_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected guarded e-stop remains blocked if fault persistence also fails."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    driver.emergency_heat_level_percent = 10
+    server_context = ctx.request_context.lifespan_context
+
+    def fail_fault_recording(*_args: object, **_kwargs: object) -> object:
+        raise OSError("log unavailable")
+
+    monkeypatch.setattr(
+        server_context.session_store,
+        "emergency_stop_snapshot",
+        fail_fault_recording,
+    )
+
+    with pytest.raises(
+        SessionLifecycleError,
+        match="reported retained heat",
+    ):
+        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.heat_level_percent == 10 and state.cooling_on is True
+
+
+def test_guarded_verified_emergency_stop_logging_failure_retains_admission_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified payload cannot clear admission before its fault event persists."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    original_append_event_log_row = session_module._append_event_log_row  # pyright: ignore[reportPrivateUsage]
+
+    def verified_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        driver.actions.append(f"emergency_stop:{reason}")
+        driver.heat_level_percent = 0
+        driver.fan_level_percent = 100
+        driver.cooling_on = True
+        return EmergencyStopResult(
+            driver=driver.name,
+            safety_method="emergency_stop",
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
+        )
+
+    def fail_fault_recording(*_args: object, **_kwargs: object) -> object:
+        raise OSError("log unavailable")
+
+    monkeypatch.setattr(driver, "emergency_stop", verified_emergency_stop)
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_fault_recording)
+
+    with pytest.raises(OSError, match="log unavailable"):
+        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.heat_level_percent == 0 and state.cooling_on is True
+    actions_before_rejections = list(driver.actions)
+    with pytest.raises(ValueError, match="verified emergency-stop containment"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+    assert driver.actions == actions_before_rejections
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", original_append_event_log_row)
+    _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    replacement = _call_tool(server, "start_roast_session", ctx)
+    assert replacement.session.session_id != session_id
+
+
+@pytest.mark.parametrize(
+    ("fan_level_percent", "cooling_on"),
+    ((100, False), (99, True)),
+    ids=("cooling-off", "fan-not-100"),
+)
+def test_guarded_emergency_stop_requires_complete_safe_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fan_level_percent: int,
+    cooling_on: bool,
+) -> None:
+    """Missing cooling or full-fan evidence keeps guarded admission blocked."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    def incomplete_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        driver.actions.append(f"emergency_stop:{reason}")
+        driver.heat_level_percent = 0
+        driver.fan_level_percent = fan_level_percent
+        driver.cooling_on = cooling_on
+        return EmergencyStopResult(
+            driver=driver.name,
+            safety_method="emergency_stop",
+            heat_level_percent=0,
+            fan_level_percent=fan_level_percent,
+            cooling_on=cooling_on,
+        )
+
+    monkeypatch.setattr(driver, "emergency_stop", incomplete_emergency_stop)
+    with pytest.raises(
+        SessionLifecycleError,
+        match="did not report complete emergency containment",
+    ):
+        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.fan_level_percent == fan_level_percent and state.cooling_on is cooling_on
+    assert state.events[-1].payload["reason"] == (
+        "guarded emergency stop reported incomplete containment"
+    )
+    actions_before_recovery = list(driver.actions)
+    with pytest.raises(ValueError, match="verified emergency-stop containment"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    assert driver.actions == actions_before_recovery
+
+    def verified_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        driver.actions.append(f"emergency_stop:{reason}")
+        driver.heat_level_percent = 0
+        driver.fan_level_percent = 100
+        driver.cooling_on = True
+        return EmergencyStopResult(
+            driver=driver.name,
+            safety_method="emergency_stop",
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
+        )
+
+    monkeypatch.setattr(driver, "emergency_stop", verified_emergency_stop)
+    _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    replacement = _call_tool(server, "start_roast_session", ctx)
+    assert replacement.session.session_id != session_id
+
+
+def test_guarded_emergency_stop_driver_error_requires_verified_containment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A guarded e-stop driver error cannot be treated as verified zero heat."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    def fail_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        del reason
+        raise RuntimeError("emergency stop unavailable")
+
+    monkeypatch.setattr(driver, "emergency_stop", fail_emergency_stop)
+    with pytest.raises(
+        SessionLifecycleError,
+        match="did not report complete emergency containment",
+    ):
+        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.heat_level_percent == 0 and state.cooling_on is True
+    with pytest.raises(SessionLifecycleError, match="verified emergency-stop containment"):
+        _call_tool(server, "stop_cooling", ctx)
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+
+def test_initial_emergency_stop_driver_error_blocks_fault_recovery_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unverified initial e-stop cannot admit any stopped-fault actuation."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    started = _call_tool(server, "start_roast_session", ctx)
+    session_id = started.session.session_id
+    _call_tool(server, "mark_beans_added", ctx)
+
+    def fail_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        del reason
+        raise RuntimeError("emergency stop unavailable")
+
+    monkeypatch.setattr(driver, "emergency_stop", fail_emergency_stop)
+    with pytest.raises(
+        SessionLifecycleError,
+        match="did not report verified emergency containment",
+    ):
+        _call_tool(server, "emergency_stop", ctx)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.events[-1].payload["driver_safety_method_called"] is False
+
+    for tool_name in ("drop_beans", "start_cooling", "stop_cooling"):
+        with pytest.raises(ValueError, match="verified emergency-stop containment"):
+            _call_tool(server, tool_name, ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+    assert driver.actions == ["connect"]
+
+
+def test_active_emergency_stop_recording_failure_retains_in_memory_fault_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Driver and logging failures still close active hardware control admission."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    started = _call_tool(server, "start_roast_session", ctx, purpose="cold_characterisation")
+    session_id = started.session.session_id
+    session, rejection, generation = server_context.session_store.begin_finalisation(session_id)
+    assert session is not None and rejection is None and generation is not None
+
+    class FinalisationRecord:
+        status = "partial"
+        abort_reason: str | None = None
+        retained = False
+        emergency_stop_ordering = "not_reached"
+        session_active_after = True
+        session_phase_after: str | None = None
+
+        def __init__(self) -> None:
+            self.reservation_generation = generation
+
+    record = FinalisationRecord()
+    assert server_context.session_store.attach_finalisation(session, record) is record
+
+    def fail_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        del reason
+        raise RuntimeError("emergency stop unavailable")
+
+    def fail_fault_recording(*_args: object, **_kwargs: object) -> object:
+        raise OSError("log unavailable")
+
+    cleanup_calls: list[tuple[str, str, str]] = []
+
+    def fail_first_crack_cleanup(session_id: str, *, reason: str) -> object:
+        cleanup_calls.append(("first_crack", session_id, reason))
+        raise RuntimeError("first-crack cleanup unavailable")
+
+    def record_telemetry_cleanup(session_id: str, *, reason: str) -> object:
+        cleanup_calls.append(("telemetry", session_id, reason))
+        return None
+
+    def record_ambient_cleanup(session_id: str, *, reason: str) -> object:
+        cleanup_calls.append(("ambient", session_id, reason))
+        return None
+
+    monkeypatch.setattr(driver, "emergency_stop", fail_emergency_stop)
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_fault_recording)
+    monkeypatch.setattr(
+        server_context.first_crack_runtime,
+        "stop_for_session",
+        fail_first_crack_cleanup,
+    )
+    monkeypatch.setattr(
+        server_context.telemetry_sampler,
+        "stop_for_session",
+        record_telemetry_cleanup,
+    )
+    monkeypatch.setattr(
+        server_context.ambient_runtime,
+        "stop_for_session",
+        record_ambient_cleanup,
+    )
+
+    with pytest.raises(SessionLifecycleError, match="fault recording failed") as failure:
+        _call_tool(server, "emergency_stop", ctx)
+
+    assert isinstance(failure.value.__cause__, OSError)
+    assert cleanup_calls == [
+        ("first_crack", session_id, "emergency stop"),
+        ("telemetry", session_id, "emergency stop"),
+        ("ambient", session_id, "emergency stop"),
+    ]
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.heat_level_percent == 0 and state.cooling_on is True
+    assert record.status == "aborted" and record.abort_reason == "emergency_stop"
+    assert record.emergency_stop_ordering == "emergency_stop_before_disconnect_commit"
+    assert record.retained is True
+    assert record.session_active_after is False and record.session_phase_after == "fault"
+    assert session.pending_driver_command_token is None
+    assert session.pending_driver_command_kind is None
+    with pytest.raises(ValueError, match="No active roast session exists"):
+        _call_tool(server, "set_heat", ctx, heat_level_percent=100)
+    with pytest.raises(ValueError, match="verified emergency-stop containment"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+    assert driver.actions == ["connect"]
+
+
+def test_fault_recovery_ambiguous_drop_blocks_new_start_after_cooling_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unconfirmed drop keeps retry and new-session admission closed."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+
+    def drop_without_cooling() -> RoasterState:
+        driver.actions.append("drop_beans")
+        driver.heat_level_percent = 0
+        driver.fan_level_percent = 100
+        driver.cooling_on = False
+        return RoasterState(
+            driver=driver.name,
+            connected=driver.connected,
+            bean_temp_c=driver.bean_temp_c,
+            env_temp_c=driver.env_temp_c,
+            heat_level_percent=driver.heat_level_percent,
+            fan_level_percent=driver.fan_level_percent,
+            cooling_on=driver.cooling_on,
+            raw_vendor_data=driver.raw_vendor_data,
+        )
+
+    monkeypatch.setattr(driver, "drop_beans", drop_without_cooling)
+    with pytest.raises(SessionLifecycleError, match="fan 100 and cooling active"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+
+    session = ctx.request_context.lifespan_context.session_store.get_session_snapshot(
+        session_id=session_id
+    )
+    assert all(event.kind != "beans_dropped" for event in session.event_timeline)
+    with pytest.raises(SessionLifecycleError, match="Recovery bean drop is ambiguous"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="ambiguous bean drop"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="Cooling cannot stop before beans are dropped"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="Recovery bean drop is ambiguous"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="ambiguous bean drop"):
+        _call_tool(server, "start_roast_session", ctx)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "driver_method", "event_kind", "beans_added"),
+    (
+        ("drop_beans", "drop_beans", "beans_dropped", True),
+        ("start_cooling", "start_cooling", "cooling_started", False),
+    ),
+)
+def test_guarded_recovery_rejects_partial_cooling_fan_before_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    driver_method: str,
+    event_kind: str,
+    beans_added: bool,
+) -> None:
+    """Guarded cooling recovery needs both cooling and the full main fan."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=beans_added)
+
+    def partial_cooling() -> RoasterState:
+        driver.actions.append(driver_method)
+        driver.heat_level_percent = 0
+        driver.fan_level_percent = 99
+        driver.cooling_on = True
+        return driver._state()  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(driver, driver_method, partial_cooling)
+    with pytest.raises(SessionLifecycleError, match="fan 100 and cooling active"):
+        _call_tool(server, tool_name, ctx, expected_session_id=session_id)
+
+    session = ctx.request_context.lifespan_context.session_store.get_session_snapshot(
+        session_id=session_id
+    )
+    assert not any(
+        event.kind == event_kind and event.payload.get("recovery_after_fault") is True
+        for event in session.event_timeline
+    )
+    assert session.phase == "fault"
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "driver_method", "event_kind", "beans_added", "cooling_on"),
+    (
+        ("drop_beans", "drop_beans", "beans_dropped", True, True),
+        ("start_cooling", "start_cooling", "cooling_started", False, True),
+        ("stop_cooling", "stop_cooling", "cooling_stopped", False, False),
+    ),
+)
+def test_guarded_recovery_rejects_disconnected_driver_state_before_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    driver_method: str,
+    event_kind: str,
+    beans_added: bool,
+    cooling_on: bool,
+) -> None:
+    """A disconnected result remains faulted and keeps admission closed."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=beans_added)
+
+    def disconnected_result() -> RoasterState:
+        driver.actions.append(driver_method)
+        return RoasterState(
+            driver=driver.name,
+            connected=False,
+            bean_temp_c=driver.bean_temp_c,
+            env_temp_c=driver.env_temp_c,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=cooling_on,
+            raw_vendor_data=driver.raw_vendor_data,
+        )
+
+    monkeypatch.setattr(driver, driver_method, disconnected_result)
+    with pytest.raises(SessionLifecycleError, match="Driver disconnected during fault recovery"):
+        _call_tool(server, tool_name, ctx, expected_session_id=session_id)
+
+    session = ctx.request_context.lifespan_context.session_store.get_session_snapshot(
+        session_id=session_id
+    )
+    assert session.phase == "fault"
+    assert not any(
+        event.kind == event_kind and event.payload.get("recovery_after_fault") is True
+        for event in session.event_timeline
+    )
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+
+def test_guarded_fault_recovery_clears_failed_command_reservation(tmp_path: Path) -> None:
+    """A driver failure leaves no reservation that blocks a later safe retry."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    driver.fail_start_cooling = True
+
+    with pytest.raises(RuntimeError, match="start cooling failed"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+
+    driver.fail_start_cooling = False
+    recovered = _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    assert recovered.event.kind == "cooling_started"
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "start_cooling",
+        "emergency_stop:guarded fault recovery start_cooling failed",
+        "start_cooling",
+    ]
+
+
+def test_guarded_fault_recovery_completion_failure_fails_closed_without_deadlock(
+    tmp_path: Path,
+) -> None:
+    """A rejected guarded completion reasserts safety without reentering its lock."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    driver.start_cooling_stays_off = True
+    errors: list[BaseException] = []
+    thread = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "start_cooling", ctx),
+        kwargs={"expected_session_id": session_id},
+    )
+
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], SessionLifecycleError)
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "start_cooling",
+        "emergency_stop:guarded fault recovery start_cooling failed",
+    ]
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.cooling_on is True and state.heat_level_percent == 0
+    assert state.events[-1].payload["driver_safety_method_called"] is True
+
+
+@pytest.mark.parametrize("tool_name", ["drop_beans", "start_cooling", "stop_cooling"])
+def test_failed_guarded_recovery_retains_nonzero_emergency_heat_as_hard_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+) -> None:
+    """A failed recovery cannot hide a nonzero re-e-stop heat report."""
+    server, ctx, driver, session_id = _faulted_recovery_server(
+        tmp_path,
+        beans_added=tool_name == "drop_beans",
+    )
+    driver.emergency_heat_level_percent = 10
+    if tool_name == "drop_beans":
+
+        def fail_drop() -> RoasterState:
+            raise RuntimeError("drop failed")
+
+        monkeypatch.setattr(driver, "drop_beans", fail_drop)
+    elif tool_name == "start_cooling":
+        driver.fail_start_cooling = True
+    else:
+        driver.stop_cooling_stays_on = True
+
+    with pytest.raises((RuntimeError, SessionLifecycleError)):
+        _call_tool(server, tool_name, ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.heat_level_percent == 10 and state.cooling_on is True
+    with pytest.raises(ValueError, match="does not have zero heat"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+
+def test_failed_guarded_recovery_retains_nonzero_block_when_fault_recording_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed re-e-stop remains hard-blocked when its fault write also fails."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    driver.fail_start_cooling = True
+    driver.emergency_heat_level_percent = 10
+    server_context = ctx.request_context.lifespan_context
+
+    def fail_fault_recording(*_args: object, **_kwargs: object) -> object:
+        raise OSError("log unavailable")
+
+    monkeypatch.setattr(
+        server_context.session_store,
+        "emergency_stop_snapshot",
+        fail_fault_recording,
+    )
+    with pytest.raises(RuntimeError, match="start cooling failed"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.heat_level_percent == 10 and state.cooling_on is True
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+
+def test_guarded_fault_recovery_partial_driver_failure_blocks_new_session(tmp_path: Path) -> None:
+    """Partial recovery actuation is retained as blocked even when the call raises."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    driver.partial_start_cooling_failure = True
+
+    with pytest.raises(RuntimeError, match="partial start cooling failure"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.cooling_on is True and state.heat_level_percent == 0
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "stop_cooling",
+        "start_cooling",
+        "emergency_stop:guarded fault recovery start_cooling failed",
+    ]
+
+
+def test_guarded_fault_recovery_retains_block_when_fault_recording_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An event-log failure cannot reopen admission after uncertain actuation."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    driver.partial_start_cooling_failure = True
+    server_context = ctx.request_context.lifespan_context
+
+    def fail_fault_recording(*_args: object, **_kwargs: object) -> object:
+        raise OSError("log unavailable")
+
+    monkeypatch.setattr(
+        server_context.session_store,
+        "emergency_stop_snapshot",
+        fail_fault_recording,
+    )
+    with pytest.raises(RuntimeError, match="partial start cooling failure"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.cooling_on is True and state.heat_level_percent == 0
+
+
+def test_guarded_fault_recovery_rejects_pending_new_session_before_actuation(
+    tmp_path: Path,
+) -> None:
+    """A blocked new-session connect cannot race an old recovery command."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    connect_started = Event()
+    release_connect = Event()
+    driver.block_connect = (connect_started, release_connect)
+    results: list[object] = []
+    errors: list[BaseException] = []
+    thread = Thread(
+        target=_record_tool_result,
+        args=(results, errors, server, "start_roast_session", ctx),
+    )
+    thread.start()
+    assert connect_started.wait(timeout=1.0)
+
+    with pytest.raises(ValueError, match="start is in progress"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+
+    release_connect.set()
+    thread.join(timeout=1.0)
+    assert not thread.is_alive() and errors == [] and len(results) == 1
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "stop_cooling",
+        "connect",
+    ]
+
+
+def test_guarded_fault_recovery_allows_emergency_stop_during_blocked_driver_call(
+    tmp_path: Path,
+) -> None:
+    """Emergency stop supersedes a blocked guarded recovery command promptly."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    started = Event()
+    release = Event()
+    driver.block_stop_cooling = (started, release)
+    errors: list[BaseException] = []
+    thread = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "stop_cooling", ctx),
+        kwargs={"expected_session_id": session_id},
+    )
+
+    thread.start()
+    assert started.wait(timeout=1.0)
+
+    _call_tool(
+        server,
+        "emergency_stop",
+        ctx,
+        reason="supersede blocked recovery",
+        expected_session_id=session_id,
+    )
+    with pytest.raises(ValueError, match="in flight"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="earlier fault recovery command is in flight"):
+        _call_tool(server, "stop_cooling", ctx)
+    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+        _call_tool(server, "start_roast_session", ctx)
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "stop_cooling",
+        "emergency_stop:supersede blocked recovery",
+    ]
+
+    release.set()
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], SessionLifecycleError)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.heat_level_percent == 0 and state.cooling_on is True
+    assert driver.actions[-1] == "emergency_stop:guarded fault recovery stop_cooling failed"
+
+
+def test_guarded_recovery_containment_serializes_late_direct_emergency_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late direct e-stop cannot be overwritten by older recovery containment."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    driver.fail_start_cooling = True
+    original_emergency_stop = driver.emergency_stop
+    server_context = ctx.request_context.lifespan_context
+    containment_started = Event()
+    release_containment = Event()
+    direct_barrier_attempted = Event()
+    direct_thread_id: list[int] = []
+    original_barrier = server_context.lifecycle_barrier
+
+    class BarrierProbe:
+        """Signal when the direct e-stop thread reaches the lifecycle barrier."""
+
+        def __enter__(self) -> BarrierProbe:
+            if direct_thread_id and get_ident() == direct_thread_id[0]:
+                direct_barrier_attempted.set()
+            original_barrier.acquire()
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            del exc_type, exc_value, traceback
+            original_barrier.release()
+
+    object.__setattr__(server_context, "lifecycle_barrier", BarrierProbe())
+
+    def block_recovery_containment(*, reason: str) -> EmergencyStopResult:
+        if reason == "guarded fault recovery start_cooling failed":
+            containment_started.set()
+            assert release_containment.wait(timeout=1.0)
+            return EmergencyStopResult(
+                driver=driver.name,
+                safety_method="emergency_stop",
+                heat_level_percent=0,
+                fan_level_percent=100,
+                cooling_on=True,
+            )
+        if reason == "manual emergency stop":
+            return EmergencyStopResult(
+                driver=driver.name,
+                safety_method="emergency_stop",
+                heat_level_percent=10,
+                fan_level_percent=100,
+                cooling_on=True,
+            )
+        return original_emergency_stop(reason=reason)
+
+    monkeypatch.setattr(driver, "emergency_stop", block_recovery_containment)
+    recovery_errors: list[BaseException] = []
+    recovery_thread = Thread(
+        target=_record_tool_error,
+        args=(recovery_errors, server, "start_cooling", ctx),
+        kwargs={"expected_session_id": session_id},
+    )
+    recovery_thread.start()
+    assert containment_started.wait(timeout=1.0)
+
+    direct_errors: list[BaseException] = []
+
+    def call_direct_emergency_stop() -> None:
+        direct_thread_id.append(get_ident())
+        _record_tool_error(
+            direct_errors,
+            server,
+            "emergency_stop",
+            ctx,
+            expected_session_id=session_id,
+        )
+
+    direct_thread = Thread(
+        target=call_direct_emergency_stop,
+    )
+    direct_thread.start()
+    assert direct_barrier_attempted.wait(timeout=1.0)
+    assert direct_thread.is_alive()
+
+    release_containment.set()
+    recovery_thread.join(timeout=1.0)
+    direct_thread.join(timeout=1.0)
+    assert not recovery_thread.is_alive() and not direct_thread.is_alive()
+    assert len(recovery_errors) == len(direct_errors) == 1
+    assert isinstance(recovery_errors[0], RuntimeError)
+    assert isinstance(direct_errors[0], SessionLifecycleError)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.heat_level_percent == 10 and state.cooling_on is True
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+
+def test_legacy_fault_recovery_fences_blocked_driver_io_until_containment(
+    tmp_path: Path,
+) -> None:
+    """Legacy cooling recovery cannot outlive a superseding guarded e-stop."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    started = Event()
+    release = Event()
+    driver.block_stop_cooling = (started, release)
+    errors: list[BaseException] = []
+    thread = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "stop_cooling", ctx),
+    )
+    thread.start()
+    assert started.wait(timeout=1.0)
+
+    _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="earlier fault recovery command is in flight"):
+        _call_tool(server, "stop_cooling", ctx)
+    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    release.set()
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], SessionLifecycleError)
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.heat_level_percent == 0 and state.cooling_on is True
+    assert driver.actions[-1] == "emergency_stop:guarded fault recovery stop_cooling failed"
+
+
+def test_guarded_start_cooling_records_each_reasserted_actuation(tmp_path: Path) -> None:
+    """Each actual guarded cooling start has a distinct recovery event/result."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+
+    first = _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    second = _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+
+    assert first.event.kind == second.event.kind == "cooling_started"
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert [event.kind for event in state.events] == [
+        "fault",
+        "cooling_started",
+        "cooling_stopped",
+        "cooling_started",
+    ]
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "start_cooling",
+        "stop_cooling",
+        "start_cooling",
+    ]
+
+
 class RecordingRoasterDriver:
     """Driver double that records MCP boundary calls."""
 
@@ -3487,6 +4704,10 @@ class RecordingRoasterDriver:
         *,
         fail_connect: bool = False,
         fail_heat: bool = False,
+        fail_start_cooling: bool = False,
+        start_cooling_stays_off: bool = False,
+        partial_start_cooling_failure: bool = False,
+        emergency_heat_level_percent: int = 0,
         fail_read: bool = False,
         block_connect: tuple[Event, Event] | None = None,
         block_heat: tuple[Event, Event] | None = None,
@@ -3502,6 +4723,10 @@ class RecordingRoasterDriver:
         self.actions: list[str] = []
         self.fail_connect = fail_connect
         self.fail_heat = fail_heat
+        self.fail_start_cooling = fail_start_cooling
+        self.start_cooling_stays_off = start_cooling_stays_off
+        self.partial_start_cooling_failure = partial_start_cooling_failure
+        self.emergency_heat_level_percent = emergency_heat_level_percent
         self.fail_read = fail_read
         self.block_connect = block_connect
         self.block_heat = block_heat
@@ -3577,7 +4802,11 @@ class RecordingRoasterDriver:
     def start_cooling(self) -> RoasterState:
         """Record cooling-start commands."""
         self.actions.append("start_cooling")
-        self.cooling_on = True
+        if self.fail_start_cooling:
+            raise RuntimeError("start cooling failed")
+        self.cooling_on = not self.start_cooling_stays_off
+        if self.partial_start_cooling_failure:
+            raise RuntimeError("partial start cooling failure")
         return self._state()
 
     def stop_cooling(self) -> RoasterState:
@@ -3594,7 +4823,7 @@ class RecordingRoasterDriver:
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
         """Record emergency-stop commands."""
         self.actions.append(f"emergency_stop:{reason}")
-        self.heat_level_percent = 0
+        self.heat_level_percent = self.emergency_heat_level_percent
         self.fan_level_percent = 100
         self.cooling_on = True
         return EmergencyStopResult(

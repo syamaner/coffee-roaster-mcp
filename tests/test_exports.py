@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -18,7 +19,12 @@ from coffee_roaster_mcp.detector import (
     integrate_first_crack_window_with_session,
 )
 from coffee_roaster_mcp.exports import export_roast_snapshot
-from coffee_roaster_mcp.session import EventPayloadValue, RoastSessionStore, TelemetrySample
+from coffee_roaster_mcp.session import (
+    EventPayloadValue,
+    RoastSessionStore,
+    TelemetrySample,
+    compute_roast_metrics,
+)
 
 
 class MockDetectorBackend:
@@ -730,12 +736,15 @@ def test_snapshot_export_csv_event_rows_use_transition_control_state(
     assert drop_row["cooling_on"] == "False"
     assert cooling_row["cooling_on"] == "True"
     assert cooling_stopped_row["cooling_on"] == "False"
+    assert drop_row["phase"] == "dropped"
+    assert cooling_row["phase"] == "cooling"
+    assert cooling_stopped_row["phase"] == "complete"
 
 
-def test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop(
+def test_snapshot_export_keeps_fault_phase_for_every_recovery_command(
     tmp_path: Path,
 ) -> None:
-    """Keep post-emergency recovery rows classified as faulted."""
+    """Keep every post-emergency recovery projection classified as faulted."""
     clock = ClockHarness()
     store = RoastSessionStore(
         utc_now=clock.utc_now,
@@ -743,6 +752,9 @@ def test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop(
         default_log_dir=tmp_path / "roasts",
     )
     session = store.start_session()
+    store.record_event(session, "beans_added")
+    clock.monotonic_value = 103.0
+    store.record_event(session, "first_crack_detected")
     clock.monotonic_value = 105.0
     store.emergency_stop(
         session,
@@ -750,19 +762,45 @@ def test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop(
         safety_payload={
             "driver": "mock",
             "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
             "heat_level_percent": 0,
             "fan_level_percent": 100,
             "cooling_on": True,
         },
     )
-    clock.monotonic_value = 110.0
-    reservation = store.reserve_driver_stop_cooling_recovery(session)
-    store.complete_reserved_driver_stop_cooling_recovery_snapshot(
+    expected_metrics = compute_roast_metrics(session)
+    recovery_commands: tuple[
+        tuple[Literal["drop", "start_cooling", "stop_cooling"], bool, float], ...
+    ] = (
+        ("drop", True, 110.0),
+        ("start_cooling", True, 115.0),
+        ("stop_cooling", False, 120.0),
+    )
+    for kind, cooling_on, monotonic_value in recovery_commands:
+        clock.monotonic_value = monotonic_value
+        clock.utc_value += timedelta(seconds=5)
+        reservation = store.reserve_driver_fault_recovery(session, kind=kind)
+        store.complete_reserved_driver_fault_recovery_snapshot(
+            session,
+            reservation=reservation,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=cooling_on,
+        )
+    clock.monotonic_value = 125.0
+    clock.utc_value += timedelta(seconds=5)
+    store.emergency_stop(
         session,
-        reservation=reservation,
-        heat_level_percent=0,
-        fan_level_percent=100,
-        cooling_on=False,
+        reason="reassert containment",
+        safety_payload={
+            "driver": "mock",
+            "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+        allow_stopped_latest=True,
     )
 
     export = export_roast_snapshot(session)
@@ -770,10 +808,55 @@ def test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop(
     with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
         rows = list(csv.DictReader(csv_file))
     fault_row = next(row for row in rows if row["event"] == "fault")
-    recovery_row = next(row for row in rows if row["event"] == "cooling_stopped")
+    recovery_rows = [
+        row
+        for row in rows
+        if row["event"] in {"beans_dropped", "cooling_started", "cooling_stopped"}
+        and row["timestamp_utc"] > fault_row["timestamp_utc"]
+    ]
     assert fault_row["phase"] == "fault"
-    assert recovery_row["phase"] == "fault"
-    assert recovery_row["cooling_on"] == "False"
+    assert [row["event"] for row in recovery_rows] == [
+        "beans_dropped",
+        "cooling_started",
+        "cooling_started",
+        "cooling_stopped",
+    ]
+    assert all(row["phase"] == "fault" for row in recovery_rows)
+    assert [row["elapsed_seconds"] for row in recovery_rows] == ["5.0"] * 4
+    assert all(
+        float(row["development_time_percent"]) == expected_metrics.development_percent
+        for row in recovery_rows
+    )
+    assert all(row["beans_dropped"] == "False" for row in recovery_rows)
+    assert recovery_rows[-1]["cooling_on"] == "False"
+    fault_rows = [row for row in rows if row["event"] == "fault"]
+    assert len(fault_rows) == 2
+    assert fault_rows[-1]["elapsed_seconds"] == "5.0"
+    assert float(fault_rows[-1]["development_time_percent"]) == expected_metrics.development_percent
+    jsonl_rows = [
+        json.loads(line) for line in export.jsonl_path.read_text(encoding="utf-8").splitlines()
+    ]
+    recovery_event_times = [
+        row["monotonic_seconds"]
+        for row in jsonl_rows
+        if row["payload"].get("recovery_after_fault") is True
+    ]
+    assert recovery_event_times == [10.0, 10.0, 15.0, 20.0]
+    assert [row["monotonic_seconds"] for row in jsonl_rows if row["kind"] == "fault"] == [5.0, 25.0]
+    assert [row["event"] for row in rows if row["event"]] == [
+        "beans_added",
+        "first_crack_detected",
+        "fault",
+        "beans_dropped",
+        "cooling_started",
+        "cooling_started",
+        "cooling_stopped",
+        "fault",
+    ]
+    summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
+    assert summary["phase"] == "fault"
+    assert summary["total_roast_seconds"] == expected_metrics.roast_elapsed_seconds
+    assert summary["development_time_percent"] == expected_metrics.development_percent
 
 
 def test_snapshot_export_csv_uses_driver_transition_payload_state(

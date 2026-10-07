@@ -349,7 +349,10 @@ def _csv_telemetry_row(
     fc_payload = _first_crack_payload_from(scoped_events)
     return {
         "timestamp_utc": sample.recorded_at_utc.isoformat(),
-        "elapsed_seconds": _roast_elapsed_at(scoped_events, sample.monotonic_seconds),
+        "elapsed_seconds": _roast_elapsed_at(
+            scoped_events,
+            _metric_monotonic_seconds(scoped_events, sample.monotonic_seconds),
+        ),
         "phase": _phase_from(scoped_events),
         "bean_temp_c": sample.bean_temp_c,
         "env_temp_c": sample.env_temp_c,
@@ -399,7 +402,10 @@ def _csv_event_row(
     fc_payload = _first_crack_payload_from(scoped_events)
     return {
         "timestamp_utc": event.recorded_at_utc.isoformat(),
-        "elapsed_seconds": _roast_elapsed_at(scoped_events, event.monotonic_seconds),
+        "elapsed_seconds": _roast_elapsed_at(
+            scoped_events,
+            _metric_monotonic_seconds(scoped_events, event.monotonic_seconds),
+        ),
         "phase": _phase_from(scoped_events),
         "bean_temp_c": None if telemetry is None else telemetry.bean_temp_c,
         "env_temp_c": None if telemetry is None else telemetry.env_temp_c,
@@ -438,6 +444,7 @@ def _session_view_at(
     current_sample: TelemetrySample | None = None,
 ) -> RoastSession:
     """Return a point-in-time session view for metric computation."""
+    metric_monotonic_seconds = _metric_monotonic_seconds(visible_events, monotonic_seconds)
     view = RoastSession(
         id=session.id,
         created_at_utc=session.created_at_utc,
@@ -451,7 +458,7 @@ def _session_view_at(
         ),
         log_writer=session.log_writer,
         stopped_at_utc=session.created_at_utc,
-        monotonic_stop=session.monotonic_start + monotonic_seconds,
+        monotonic_stop=session.monotonic_start + metric_monotonic_seconds,
     )
     for event in visible_events:
         _apply_view_event(view, event)
@@ -482,6 +489,8 @@ def _telemetry_visible_at(
 
 def _apply_view_event(session: RoastSession, event: RoastEvent) -> None:
     """Apply one visible event's timestamp fields to a point-in-time view."""
+    if event.payload.get("recovery_after_fault") is True:
+        return
     if event.kind == "beans_added":
         session.beans_added_at_utc = event.recorded_at_utc
         session.beans_added_monotonic_seconds = event.monotonic_seconds
@@ -506,7 +515,9 @@ def _phase_from(events: list[RoastEvent]) -> RoastPhase:
     """Return the lifecycle phase implied by visible events."""
     phase: RoastPhase = "pre_roast"
     for event in events:
-        if event.kind == "beans_added":
+        if event.payload.get("recovery_after_fault") is True:
+            phase = "fault"
+        elif event.kind == "beans_added":
             phase = "roasting"
         elif event.kind == "first_crack_detected":
             phase = "development"
@@ -514,12 +525,6 @@ def _phase_from(events: list[RoastEvent]) -> RoastPhase:
             phase = "dropped"
         elif event.kind == "cooling_started":
             phase = "cooling"
-        elif (
-            event.kind == "cooling_stopped"
-            and phase == "fault"
-            and event.payload.get("recovery_after_fault") is True
-        ):
-            phase = "fault"
         elif event.kind == "cooling_stopped":
             phase = "complete"
         elif event.kind == "fault":
@@ -541,9 +546,20 @@ def _roast_elapsed_at(events: list[RoastEvent], monotonic_seconds: float) -> flo
     return round(max(0.0, end_seconds - beans_added_seconds), 3)
 
 
+def _metric_monotonic_seconds(events: list[RoastEvent], monotonic_seconds: float) -> float:
+    """Freeze derived roast metrics at the first recorded fault event."""
+    for event in events:
+        if event.kind == "fault":
+            return min(monotonic_seconds, event.monotonic_seconds)
+    return monotonic_seconds
+
+
 def _event_seen_in(events: list[RoastEvent], kind: str) -> bool:
     """Return whether one event kind is visible for the current row."""
-    return any(event.kind == kind for event in events)
+    return any(
+        event.kind == kind and event.payload.get("recovery_after_fault") is not True
+        for event in events
+    )
 
 
 def _first_crack_payload_from(events: list[RoastEvent]) -> dict[str, EventPayloadValue]:
@@ -577,7 +593,7 @@ def _events_visible_at(
 def _event_monotonic_seconds(events: list[RoastEvent], kind: str) -> float | None:
     """Return the first visible monotonic timestamp for an event kind."""
     for event in events:
-        if event.kind == kind:
+        if event.kind == kind and event.payload.get("recovery_after_fault") is not True:
             return event.monotonic_seconds
     return None
 
@@ -631,8 +647,8 @@ def _event_cooling_value(event: RoastEvent, *, telemetry: TelemetrySample | None
 
 def _event_sort_key(event: RoastEvent) -> tuple[float, int]:
     """Return deterministic event ordering key for CSV export."""
-    if event.kind == "cooling_stopped" and event.payload.get("recovery_after_fault") is True:
-        return (event.monotonic_seconds, _event_order("fault") + 1)
+    if event.payload.get("recovery_after_fault") is True:
+        return (event.monotonic_seconds, _event_order("fault"))
     return (event.monotonic_seconds, _event_order(event.kind))
 
 
