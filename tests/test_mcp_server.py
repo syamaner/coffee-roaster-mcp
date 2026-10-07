@@ -8,6 +8,8 @@ import dataclasses
 import inspect
 import json
 import logging
+import os
+import sys
 import time
 from pathlib import Path
 from threading import Event, Lock, Thread, get_ident
@@ -15,6 +17,8 @@ from types import SimpleNamespace, TracebackType
 from typing import Any, cast
 
 import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
 
 import coffee_roaster_mcp.mcp_server as mcp_server
@@ -2949,6 +2953,81 @@ def test_concurrent_session_start_reserves_before_driver_connect(tmp_path: Path)
     assert errors == []
     assert len(results) == 1
     assert driver.actions == ["connect"]
+
+
+def test_server_info_session_presence_is_atomic_during_mock_start_and_fresh_context(
+    tmp_path: Path,
+) -> None:
+    """The public read-only field distinguishes mock start states and a fresh server."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    connect_started = Event()
+    release_connect = Event()
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(block_connect=(connect_started, release_connect))
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    assert _call_tool(server, "get_server_info", ctx).session_presence == "none"
+
+    start_thread = Thread(
+        target=_record_tool_result,
+        args=(results, errors, server, "start_roast_session", ctx),
+    )
+    start_thread.start()
+    assert connect_started.wait(timeout=1.0)
+    assert _call_tool(server, "get_server_info", ctx).session_presence == "starting"
+
+    release_connect.set()
+    start_thread.join(timeout=1.0)
+    assert not start_thread.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert _call_tool(server, "get_server_info", ctx).session_presence == "active"
+
+    server_context.session_store.stop_session()
+    assert _call_tool(server, "get_server_info", ctx).session_presence == "stopped"
+
+    fresh_context = build_server_context(config_path=config_path)
+    fresh_server = create_mcp_server(config_path=config_path)
+    assert (
+        _call_tool(fresh_server, "get_server_info", _ctx(fresh_context)).session_presence == "none"
+    )
+
+
+def test_fresh_mock_server_process_reports_no_session_presence(tmp_path: Path) -> None:
+    """A new mock stdio process reports no in-process session history."""
+    asyncio.run(_assert_fresh_mock_server_process_presence(tmp_path))
+
+
+async def _assert_fresh_mock_server_process_presence(tmp_path: Path) -> None:
+    """Call the public server-info tool through a fresh mock stdio process."""
+    repository_root = Path(__file__).resolve().parents[1]
+    pythonpath_parts = [str(repository_root / "src")]
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    if existing_pythonpath:
+        pythonpath_parts.append(existing_pythonpath)
+    environment = {"PYTHONPATH": os.pathsep.join(pythonpath_parts)}
+    for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT"):
+        value = os.environ.get(key)
+        if value is not None:
+            environment[key] = value
+
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "coffee_roaster_mcp.cli", "serve"],
+        env=environment,
+        cwd=tmp_path,
+    )
+    async with stdio_client(server_params) as (read, write), ClientSession(read, write) as session:
+        await asyncio.wait_for(session.initialize(), timeout=5.0)
+        server_info = await asyncio.wait_for(session.call_tool("get_server_info", {}), timeout=5.0)
+
+    assert server_info.structuredContent is not None
+    assert server_info.structuredContent["session_presence"] == "none"
 
 
 def test_guarded_emergency_stop_cancels_blocked_new_session_start(tmp_path: Path) -> None:

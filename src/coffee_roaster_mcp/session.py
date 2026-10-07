@@ -36,6 +36,7 @@ RoastEventKind = Literal[
 ]
 EventPayloadValue = str | int | float | bool | None
 SessionPurpose = Literal["roast", "cold_characterisation"]
+SessionPresence = Literal["none", "starting", "active", "stopped"]
 DriverCommandKind = Literal["control", "drop", "start_cooling", "stop_cooling", "finalisation"]
 
 _SINGLETON_EVENT_KINDS: frozenset[RoastEventKind] = frozenset(
@@ -2268,6 +2269,24 @@ class RoastSessionStore:
         """Return the latest session whether active or stopped."""
         with self._lock:
             return self._latest_session
+
+    def get_session_presence(self) -> SessionPresence:
+        """Return the closed session-presence snapshot without session details.
+
+        A pending or in-flight start remains visible as ``starting`` so callers
+        never mistake an incomplete start for an idle server.
+        """
+        with self._lock:
+            if (
+                self._pending_session_start_token is not None
+                or self._session_start_in_flight_token is not None
+            ):
+                return "starting"
+            if self._latest_session is None:
+                return "none"
+            if self._latest_session.active:
+                return "active"
+            return "stopped"
 
     def get_session_snapshot(
         self,
