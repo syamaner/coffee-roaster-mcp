@@ -59,6 +59,9 @@ intended interpreter imports; installed bytes remain unverified.
 - Carries D209's typed cold-only temperature and packet projection, which is
   absent from the published `0.2.2` distribution.
 - Carries #230's stopped-fault exact-session recovery semantics from PR #231.
+- Adds #230's typed, read-only `get_server_info.session_presence` summary of
+  in-process session state; it exposes no session identifiers, paths, driver
+  telemetry, or physical-state claim.
 - It is a software component candidate only. It does not authorise hardware,
   beans, or a hardware-readiness claim.
 
@@ -273,6 +276,10 @@ The dry run:
 checklist records the required evidence before a human release operator decides
 whether to publish it; it does not create a tag, approve an environment, or
 publish an artefact.
+
+The `session_presence` addition changes candidate bytes. Any earlier dry-run
+result or artefact hash is historical only and cannot satisfy this checklist.
+A fresh exact-head dry run is required after the release-preparation PR merges.
 
 1. Record successful full local and protected CI gates for the candidate,
    including version alignment, package build, and clean-wheel mock-safe smoke.
