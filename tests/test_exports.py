@@ -731,6 +731,9 @@ def test_snapshot_export_csv_event_rows_use_transition_control_state(
     assert drop_row["cooling_on"] == "False"
     assert cooling_row["cooling_on"] == "True"
     assert cooling_stopped_row["cooling_on"] == "False"
+    assert drop_row["phase"] == "dropped"
+    assert cooling_row["phase"] == "cooling"
+    assert cooling_stopped_row["phase"] == "complete"
 
 
 def test_snapshot_export_keeps_fault_phase_for_every_recovery_command(

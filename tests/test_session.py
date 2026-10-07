@@ -22,6 +22,7 @@ from coffee_roaster_mcp.session import (
     compute_env_temp_delta_60s_c,
     compute_roast_elapsed_seconds,
     compute_roast_metrics,
+    has_verified_zero_heat,
 )
 
 EXPECTED_JSONL_EVENT_KEYS = {
@@ -57,6 +58,18 @@ class ClockHarness:
 
     def monotonic_now(self) -> float:
         return self.monotonic_value
+
+
+def test_verified_emergency_state_rejects_boolean_fan_payload() -> None:
+    """Boolean values cannot stand in for the required emergency fan percentage."""
+    assert not has_verified_zero_heat(
+        safety_payload={
+            "driver_safety_method_called": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": True,
+            "cooling_on": True,
+        }
+    )
 
 
 def test_start_session_creates_active_roast_session() -> None:
@@ -1685,17 +1698,30 @@ def test_guarded_fault_recovery_reservation_blocks_new_session_start() -> None:
         safety_payload={
             "driver_safety_method_called": True,
             "heat_level_percent": 0,
-            "fan_level_percent": 0,
-            "cooling_on": False,
+            "fan_level_percent": 100,
+            "cooling_on": True,
         },
     )
 
     reservation = store.reserve_driver_fault_recovery(session, kind="start_cooling")
-    with pytest.raises(SessionLifecycleError, match="during fault recovery"):
+    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
         store.reserve_session_start()
 
-    store.clear_driver_command_reservation(session, reservation)
-    store.clear_fault_recovery_in_flight(session, reservation)
+    store.complete_reserved_driver_fault_recovery_snapshot(
+        session,
+        reservation=reservation,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=True,
+    )
+    stop_reservation = store.reserve_driver_fault_recovery(session, kind="stop_cooling")
+    store.complete_reserved_driver_fault_recovery_snapshot(
+        session,
+        reservation=stop_reservation,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=False,
+    )
     replacement = store.start_session()
     assert replacement.id != session.id
 

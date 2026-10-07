@@ -3686,13 +3686,13 @@ def test_guarded_verified_emergency_stop_logging_failure_retains_admission_block
         driver.actions.append(f"emergency_stop:{reason}")
         driver.heat_level_percent = 0
         driver.fan_level_percent = 100
-        driver.cooling_on = False
+        driver.cooling_on = True
         return EmergencyStopResult(
             driver=driver.name,
             safety_method="emergency_stop",
             heat_level_percent=0,
             fan_level_percent=100,
-            cooling_on=False,
+            cooling_on=True,
         )
 
     def fail_fault_recording(*_args: object, **_kwargs: object) -> object:
@@ -3706,7 +3706,7 @@ def test_guarded_verified_emergency_stop_logging_failure_retains_admission_block
 
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
     assert state.phase == "fault" and state.active is False
-    assert state.heat_level_percent == 0 and state.cooling_on is False
+    assert state.heat_level_percent == 0 and state.cooling_on is True
     actions_before_rejections = list(driver.actions)
     with pytest.raises(ValueError, match="verified emergency-stop containment"):
         _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
@@ -3716,6 +3716,66 @@ def test_guarded_verified_emergency_stop_logging_failure_retains_admission_block
 
     monkeypatch.setattr(session_module, "_append_event_log_row", original_append_event_log_row)
     _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    replacement = _call_tool(server, "start_roast_session", ctx)
+    assert replacement.session.session_id != session_id
+
+
+@pytest.mark.parametrize(
+    ("fan_level_percent", "cooling_on"),
+    ((100, False), (99, True)),
+    ids=("cooling-off", "fan-not-100"),
+)
+def test_guarded_emergency_stop_requires_complete_safe_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fan_level_percent: int,
+    cooling_on: bool,
+) -> None:
+    """Missing cooling or full-fan evidence keeps guarded admission blocked."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    def incomplete_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        driver.actions.append(f"emergency_stop:{reason}")
+        driver.heat_level_percent = 0
+        driver.fan_level_percent = fan_level_percent
+        driver.cooling_on = cooling_on
+        return EmergencyStopResult(
+            driver=driver.name,
+            safety_method="emergency_stop",
+            heat_level_percent=0,
+            fan_level_percent=fan_level_percent,
+            cooling_on=cooling_on,
+        )
+
+    monkeypatch.setattr(driver, "emergency_stop", incomplete_emergency_stop)
+    with pytest.raises(SessionLifecycleError, match="did not report zero heat"):
+        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.fan_level_percent == fan_level_percent and state.cooling_on is cooling_on
+    actions_before_recovery = list(driver.actions)
+    with pytest.raises(ValueError, match="verified emergency-stop containment"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    assert driver.actions == actions_before_recovery
+
+    def verified_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        driver.actions.append(f"emergency_stop:{reason}")
+        driver.heat_level_percent = 0
+        driver.fan_level_percent = 100
+        driver.cooling_on = True
+        return EmergencyStopResult(
+            driver=driver.name,
+            safety_method="emergency_stop",
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
+        )
+
+    monkeypatch.setattr(driver, "emergency_stop", verified_emergency_stop)
+    _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
     replacement = _call_tool(server, "start_roast_session", ctx)
     assert replacement.session.session_id != session_id
 

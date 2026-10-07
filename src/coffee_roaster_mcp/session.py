@@ -2866,13 +2866,19 @@ def default_emergency_safety_payload(
 
 
 def has_verified_zero_heat(*, safety_payload: Mapping[str, EventPayloadValue]) -> bool:
-    """Return whether a driver explicitly confirmed zero heat after emergency stop."""
+    """Return whether a driver confirmed the complete emergency-safe state."""
     heat_level_percent = safety_payload.get("heat_level_percent")
+    fan_level_percent = safety_payload.get("fan_level_percent")
+    cooling_on = safety_payload.get("cooling_on")
     return (
         safety_payload.get("driver_safety_method_called") is True
         and isinstance(heat_level_percent, int)
         and not isinstance(heat_level_percent, bool)
         and heat_level_percent == 0
+        and isinstance(fan_level_percent, int)
+        and not isinstance(fan_level_percent, bool)
+        and fan_level_percent == 100
+        and cooling_on is True
     )
 
 
