@@ -794,6 +794,7 @@ class RoastSessionStore:
         self._sessions_by_id: dict[str, RoastSession] = {}
         self._session_id_order: deque[str] = deque()
         self._pending_session_start_token: str | None = None
+        self._fault_recovery_in_flight_tokens: dict[str, str] = {}
         self._finalisation_generation = 0
         self._finalisation_tokens: dict[str, str] = {}
         self._finalisation_in_progress: set[str] = set()
@@ -1216,12 +1217,27 @@ class RoastSessionStore:
                     )
             elif kind == "stop_cooling" and not session.cooling_on:
                 raise SessionLifecycleError("Cooling must be active before it can be stopped.")
-            return self._reserve_driver_command_locked(session, kind=kind)
+            reservation = self._reserve_driver_command_locked(session, kind=kind)
+            self._fault_recovery_in_flight_tokens[session.id] = reservation.token
+            return reservation
 
     def assert_guarded_fault_recovery_admission(self, session: RoastSession) -> None:
         """Validate exact stopped-fault recovery admission without reserving a command."""
         with self._lock:
             self._assert_guarded_fault_recovery_admission_locked(session)
+
+    def assert_guarded_fault_emergency_stop_admission(self, session: RoastSession) -> None:
+        """Validate stopped-fault admission for an emergency-stop reassertion.
+
+        Emergency stop remains available while an earlier guarded recovery
+        driver call is still in flight.
+        """
+        with self._lock:
+            self._assert_stopped_fault_recovery_session_locked(session)
+            if self._pending_session_start_token is not None:
+                raise SessionLifecycleError(
+                    "Emergency stop cannot run while a roast session start is in progress."
+                )
 
     def complete_reserved_driver_control_snapshot(
         self,
@@ -1513,6 +1529,36 @@ class RoastSessionStore:
                 )
             self._clear_driver_command_reservation_locked(session, reservation)
 
+    def retain_fault_block(self, session: RoastSession) -> None:
+        """Retain a pessimistic stopped-fault state without a command reservation.
+
+        This is the final containment path when an emergency-stop result cannot
+        be recorded. It intentionally keeps new-session admission closed by
+        treating cooling as active or unknown.
+        """
+        with self._lock:
+            self._assert_latest_session(session)
+            if session.active:
+                raise SessionLifecycleError("Cannot retain a fault block for an active session.")
+            session.heat_level_percent = 0
+            session.fan_level_percent = 100
+            session.cooling_on = True
+            session.phase = "fault"
+            if session.faulted_at_utc is None:
+                session.faulted_at_utc = self._utc_now()
+                session.faulted_monotonic_seconds = session.elapsed_monotonic_seconds(
+                    self._monotonic_now
+                )
+
+    def clear_fault_recovery_in_flight(
+        self,
+        session: RoastSession,
+        reservation: DriverCommandReservation,
+    ) -> None:
+        """Retire a guarded recovery I/O fence after safe containment completes."""
+        with self._lock:
+            self._clear_fault_recovery_in_flight_locked(session, reservation)
+
     def complete_reserved_driver_fault_recovery_snapshot(
         self,
         session: RoastSession,
@@ -1544,6 +1590,7 @@ class RoastSessionStore:
             SessionLifecycleError: If the reservation/session is stale, heat is
                 non-zero, or the command did not establish its required state.
         """
+        completed = False
         with self._lock:
             try:
                 self._assert_stopped_fault_recovery_session_locked(session)
@@ -1608,9 +1655,12 @@ class RoastSessionStore:
                 session.fan_level_percent = validated_fan
                 session.cooling_on = cooling_on
                 session.phase = "fault"
+                completed = True
                 return event, _copy_session_for_read(session)
             finally:
                 self._clear_driver_command_reservation_locked(session, reservation)
+                if completed:
+                    self._clear_fault_recovery_in_flight_locked(session, reservation)
 
     def cancel_nonfinalisation_driver_command(self, session: RoastSession) -> None:
         """Atomically cancel a pending command unless finalisation owns it."""
@@ -2355,11 +2405,15 @@ class RoastSessionStore:
             raise SessionLifecycleError("Recovery command requires heat to be off.")
 
     def _assert_guarded_fault_recovery_admission_locked(self, session: RoastSession) -> None:
-        """Reject guarded recovery while a newer-session start is pending."""
+        """Reject guarded recovery while start or earlier recovery I/O is pending."""
         self._assert_stopped_fault_recovery_session_locked(session)
         if self._pending_session_start_token is not None:
             raise SessionLifecycleError(
                 "Recovery command cannot run while a roast session start is in progress."
+            )
+        if session.id in self._fault_recovery_in_flight_tokens:
+            raise SessionLifecycleError(
+                "Recovery command cannot run while an earlier fault recovery command is in flight."
             )
 
     def _record_stopped_session_event_locked(
@@ -2447,6 +2501,8 @@ class RoastSessionStore:
             and session.pending_driver_command_token is not None
         ):
             raise SessionLifecycleError("Cannot start a roast session during fault recovery.")
+        if session is not None and session.id in self._fault_recovery_in_flight_tokens:
+            raise SessionLifecycleError("Cannot start a roast session during fault recovery I/O.")
 
     def _assert_session_start_reservation(
         self,
@@ -2512,6 +2568,15 @@ class RoastSessionStore:
             return
         session.pending_driver_command_token = None
         session.pending_driver_command_kind = None
+
+    def _clear_fault_recovery_in_flight_locked(
+        self,
+        session: RoastSession,
+        reservation: DriverCommandReservation,
+    ) -> None:
+        """Retire one exact stopped-fault I/O fence while the store lock is held."""
+        if self._fault_recovery_in_flight_tokens.get(session.id) == reservation.token:
+            del self._fault_recovery_in_flight_tokens[session.id]
 
     def _prune_session_history_locked(self) -> None:
         """Evict oldest completed sessions once retained history exceeds the limit."""

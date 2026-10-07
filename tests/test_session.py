@@ -1680,6 +1680,7 @@ def test_guarded_fault_recovery_reservation_blocks_new_session_start() -> None:
         store.reserve_session_start()
 
     store.clear_driver_command_reservation(session, reservation)
+    store.clear_fault_recovery_in_flight(session, reservation)
     replacement = store.start_session()
     assert replacement.id != session.id
 

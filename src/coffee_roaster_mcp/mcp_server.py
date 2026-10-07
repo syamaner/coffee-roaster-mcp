@@ -1079,11 +1079,15 @@ def create_mcp_server(
                     server_context,
                     expected_session_id=expected_session_id,
                 )
-                event, snapshot = _run_reserved_driver_fault_recovery(
-                    server_context,
+                reservation = server_context.session_store.reserve_driver_fault_recovery(
                     session,
                     kind="drop",
                 )
+            event, snapshot = _run_reserved_driver_fault_recovery(
+                server_context,
+                session,
+                reservation=reservation,
+            )
             return _serialize_event_result(snapshot=snapshot, event=event)
         # coffee-roaster-mcp#191: classify any detector window captured BEFORE
         # this drop but not yet drained by the poll cadence, so a genuine
@@ -1125,11 +1129,15 @@ def create_mcp_server(
                     server_context,
                     expected_session_id=expected_session_id,
                 )
-                event, snapshot = _run_reserved_driver_fault_recovery(
-                    server_context,
+                reservation = server_context.session_store.reserve_driver_fault_recovery(
                     session,
                     kind="start_cooling",
                 )
+            event, snapshot = _run_reserved_driver_fault_recovery(
+                server_context,
+                session,
+                reservation=reservation,
+            )
         return _serialize_event_result(snapshot=snapshot, event=event)
 
     @mcp.tool()
@@ -1145,11 +1153,15 @@ def create_mcp_server(
                     server_context,
                     expected_session_id=expected_session_id,
                 )
-                event, snapshot = _run_reserved_driver_fault_recovery(
-                    server_context,
+                reservation = server_context.session_store.reserve_driver_fault_recovery(
                     session,
                     kind="stop_cooling",
                 )
+            event, snapshot = _run_reserved_driver_fault_recovery(
+                server_context,
+                session,
+                reservation=reservation,
+            )
         else:
             session = server_context.session_store.get_active_session()
             if session is None:
@@ -1213,10 +1225,16 @@ def create_mcp_server(
                 session = _require_guarded_fault_recovery_session(
                     server_context,
                     expected_session_id=expected_session_id,
+                    allow_in_flight=True,
                 )
             server_context.session_store.cancel_nonfinalisation_driver_command(session)
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
             if expected_session_id is not None and safety_payload.get("heat_level_percent") != 0:
+                _retain_guarded_emergency_stop_block(
+                    server_context,
+                    session=session,
+                    safety_payload=safety_payload,
+                )
                 raise SessionLifecycleError("Emergency stop did not report zero heat.")
             event, snapshot = server_context.session_store.emergency_stop_snapshot(
                 session,
@@ -1363,6 +1381,7 @@ def _require_guarded_fault_recovery_session(
     server_context: ServerContext,
     *,
     expected_session_id: str,
+    allow_in_flight: bool = False,
 ) -> RoastSession:
     """Return the exact latest stopped-fault session selected by an operator.
 
@@ -1378,7 +1397,10 @@ def _require_guarded_fault_recovery_session(
     if session.heat_level_percent != 0:
         raise ValueError("Expected fault session does not have zero heat.")
     try:
-        server_context.session_store.assert_guarded_fault_recovery_admission(session)
+        if allow_in_flight:
+            server_context.session_store.assert_guarded_fault_emergency_stop_admission(session)
+        else:
+            server_context.session_store.assert_guarded_fault_recovery_admission(session)
     except SessionLifecycleError as exc:
         raise ValueError(str(exc)) from exc
     return session
@@ -1623,17 +1645,28 @@ def _run_reserved_driver_fault_recovery(
     server_context: ServerContext,
     session: RoastSession,
     *,
-    kind: Literal["drop", "start_cooling", "stop_cooling"],
+    reservation: DriverCommandReservation,
 ) -> tuple[RoastEvent, RoastSession]:
-    """Run one exact stopped-fault command and retain the terminal fault state."""
-    reservation = server_context.session_store.reserve_driver_fault_recovery(session, kind=kind)
+    """Run a pre-reserved stopped-fault command and retain the terminal fault state.
+
+    The caller creates ``reservation`` while holding the lifecycle barrier, then
+    releases that barrier before this function calls the driver. The store
+    reservation fences new-session admission while allowing emergency stop to
+    cancel it and reach a blocked driver command promptly.
+    """
+    command: Literal["drop", "start_cooling", "stop_cooling"] = "stop_cooling"
     try:
-        if kind == "drop":
+        if reservation.kind == "drop":
+            command = "drop"
             driver_state = server_context.roaster_driver.drop_beans()
-        elif kind == "start_cooling":
+        elif reservation.kind == "start_cooling":
+            command = "start_cooling"
             driver_state = server_context.roaster_driver.start_cooling()
-        else:
+        elif reservation.kind == "stop_cooling":
+            command = "stop_cooling"
             driver_state = server_context.roaster_driver.stop_cooling()
+        else:
+            raise SessionLifecycleError("Unsupported stopped-fault recovery command.")
         return server_context.session_store.complete_reserved_driver_fault_recovery_snapshot(
             session,
             reservation=reservation,
@@ -1646,7 +1679,7 @@ def _run_reserved_driver_fault_recovery(
             server_context,
             session=session,
             reservation=reservation,
-            command=kind,
+            command=command,
         )
         raise
 
@@ -1660,9 +1693,9 @@ def _fail_closed_guarded_fault_recovery_command(
 ) -> None:
     """Fence uncertain guarded recovery after any driver or completion failure.
 
-    Callers hold ``lifecycle_barrier``. This function intentionally does not
-    reacquire it: doing so would deadlock the immediate safety response when a
-    completion rejects a stale or unsafe driver report.
+    This function runs after the lifecycle barrier was released for driver I/O.
+    The store reservation fences new-session admission until the emergency
+    safety result is retained or the pessimistic fallback below takes over.
     """
     attempted_payload = run_driver_emergency_stop(
         server_context,
@@ -1695,6 +1728,42 @@ def _fail_closed_guarded_fault_recovery_command(
         server_context.session_store.retain_fault_recovery_block(session, reservation=reservation)
     finally:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
+        server_context.session_store.clear_fault_recovery_in_flight(session, reservation)
+
+
+def _retain_guarded_emergency_stop_block(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    safety_payload: dict[str, EventPayloadValue],
+) -> None:
+    """Retain a pessimistic stopped-fault block after an invalid guarded e-stop.
+
+    A guarded emergency-stop response that reports retained heat cannot be
+    returned as success. Its driver result is also not evidence that cooling is
+    safely off, so preserve the conservative cooling-on state before raising.
+    The fallback must survive an event-recording failure.
+    """
+    blocked_payload = default_emergency_safety_payload(
+        driver=server_context.config.roaster.driver,
+    )
+    for key in (
+        "driver",
+        "driver_safety_method",
+        "driver_safety_method_called",
+        "driver_error",
+    ):
+        if key in safety_payload:
+            blocked_payload[key] = safety_payload[key]
+    try:
+        server_context.session_store.emergency_stop_snapshot(
+            session,
+            reason="guarded emergency stop reported retained heat",
+            safety_payload=blocked_payload,
+            allow_stopped_latest=True,
+        )
+    except Exception:  # noqa: BLE001 - the conservative admission block must survive logging.
+        server_context.session_store.retain_fault_block(session)
 
 
 def _complete_driver_control(
