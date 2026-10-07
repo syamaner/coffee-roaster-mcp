@@ -753,6 +753,8 @@ def test_snapshot_export_keeps_fault_phase_for_every_recovery_command(
     )
     session = store.start_session()
     store.record_event(session, "beans_added")
+    clock.monotonic_value = 103.0
+    store.record_event(session, "first_crack_detected")
     clock.monotonic_value = 105.0
     store.emergency_stop(
         session,
@@ -766,7 +768,7 @@ def test_snapshot_export_keeps_fault_phase_for_every_recovery_command(
             "cooling_on": True,
         },
     )
-    expected_roast_seconds = compute_roast_metrics(session).roast_elapsed_seconds
+    expected_metrics = compute_roast_metrics(session)
     recovery_commands: tuple[
         tuple[Literal["drop", "start_cooling", "stop_cooling"], bool, float], ...
     ] = (
@@ -795,7 +797,7 @@ def test_snapshot_export_keeps_fault_phase_for_every_recovery_command(
         row
         for row in rows
         if row["event"] in {"beans_dropped", "cooling_started", "cooling_stopped"}
-        and float(row["elapsed_seconds"]) > 5.0
+        and row["timestamp_utc"] > fault_row["timestamp_utc"]
     ]
     assert fault_row["phase"] == "fault"
     assert [row["event"] for row in recovery_rows] == [
@@ -805,17 +807,26 @@ def test_snapshot_export_keeps_fault_phase_for_every_recovery_command(
         "cooling_stopped",
     ]
     assert all(row["phase"] == "fault" for row in recovery_rows)
-    assert [row["elapsed_seconds"] for row in recovery_rows] == [
-        "10.0",
-        "10.0",
-        "15.0",
-        "20.0",
-    ]
+    assert [row["elapsed_seconds"] for row in recovery_rows] == ["5.0"] * 4
+    assert all(
+        float(row["development_time_percent"]) == expected_metrics.development_percent
+        for row in recovery_rows
+    )
     assert all(row["beans_dropped"] == "False" for row in recovery_rows)
     assert recovery_rows[-1]["cooling_on"] == "False"
+    jsonl_rows = [
+        json.loads(line) for line in export.jsonl_path.read_text(encoding="utf-8").splitlines()
+    ]
+    recovery_event_times = [
+        row["monotonic_seconds"]
+        for row in jsonl_rows
+        if row["payload"].get("recovery_after_fault") is True
+    ]
+    assert recovery_event_times == [10.0, 10.0, 15.0, 20.0]
     summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
     assert summary["phase"] == "fault"
-    assert summary["total_roast_seconds"] == expected_roast_seconds
+    assert summary["total_roast_seconds"] == expected_metrics.roast_elapsed_seconds
+    assert summary["development_time_percent"] == expected_metrics.development_percent
 
 
 def test_snapshot_export_csv_uses_driver_transition_payload_state(

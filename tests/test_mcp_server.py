@@ -3998,6 +3998,8 @@ def test_fault_recovery_ambiguous_drop_requires_post_failure_cooling_cycle(
 
     _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
     _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="Recovery bean drop is ambiguous"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
     replacement = _call_tool(server, "start_roast_session", ctx)
     assert replacement.session.session_id != session_id
 

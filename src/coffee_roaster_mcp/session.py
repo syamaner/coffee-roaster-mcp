@@ -798,6 +798,7 @@ class RoastSessionStore:
         self._fault_recovery_admission_blocks: set[str] = set()
         self._fault_drop_cooling_cycle_required: set[str] = set()
         self._fault_drop_ambiguity_required: set[str] = set()
+        self._fault_drop_ambiguity_cooling_cycle_required: set[str] = set()
         self._fault_drop_ambiguity_cooling_started: set[str] = set()
         self._finalisation_generation = 0
         self._finalisation_tokens: dict[str, str] = {}
@@ -1715,7 +1716,7 @@ class RoastSessionStore:
                     self._fault_drop_cooling_cycle_required.discard(session.id)
                     if session.id in self._fault_drop_ambiguity_cooling_started:
                         self._fault_drop_ambiguity_cooling_started.discard(session.id)
-                        self._fault_drop_ambiguity_required.discard(session.id)
+                        self._fault_drop_ambiguity_cooling_cycle_required.discard(session.id)
                 else:
                     raise SessionLifecycleError("Unsupported stopped-fault recovery command.")
                 session.heat_level_percent = validated_heat
@@ -1734,6 +1735,7 @@ class RoastSessionStore:
         with self._lock:
             self._assert_latest_session(session)
             self._fault_drop_ambiguity_required.add(session.id)
+            self._fault_drop_ambiguity_cooling_cycle_required.add(session.id)
             self._fault_drop_ambiguity_cooling_started.discard(session.id)
 
     def retain_fault_recovery_admission_block(self, session: RoastSession) -> None:
@@ -2588,7 +2590,7 @@ class RoastSessionStore:
             raise SessionLifecycleError(
                 "Cannot start a roast session until post-drop cooling is started and stopped."
             )
-        if session is not None and session.id in self._fault_drop_ambiguity_required:
+        if session is not None and session.id in self._fault_drop_ambiguity_cooling_cycle_required:
             raise SessionLifecycleError(
                 "Cannot start a roast session until ambiguous bean drop cooling is restarted "
                 "and stopped."

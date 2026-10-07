@@ -349,7 +349,10 @@ def _csv_telemetry_row(
     fc_payload = _first_crack_payload_from(scoped_events)
     return {
         "timestamp_utc": sample.recorded_at_utc.isoformat(),
-        "elapsed_seconds": _roast_elapsed_at(scoped_events, sample.monotonic_seconds),
+        "elapsed_seconds": _roast_elapsed_at(
+            scoped_events,
+            _metric_monotonic_seconds(scoped_events, sample.monotonic_seconds),
+        ),
         "phase": _phase_from(scoped_events),
         "bean_temp_c": sample.bean_temp_c,
         "env_temp_c": sample.env_temp_c,
@@ -399,7 +402,10 @@ def _csv_event_row(
     fc_payload = _first_crack_payload_from(scoped_events)
     return {
         "timestamp_utc": event.recorded_at_utc.isoformat(),
-        "elapsed_seconds": _roast_elapsed_at(scoped_events, event.monotonic_seconds),
+        "elapsed_seconds": _roast_elapsed_at(
+            scoped_events,
+            _metric_monotonic_seconds(scoped_events, event.monotonic_seconds),
+        ),
         "phase": _phase_from(scoped_events),
         "bean_temp_c": None if telemetry is None else telemetry.bean_temp_c,
         "env_temp_c": None if telemetry is None else telemetry.env_temp_c,
@@ -438,6 +444,7 @@ def _session_view_at(
     current_sample: TelemetrySample | None = None,
 ) -> RoastSession:
     """Return a point-in-time session view for metric computation."""
+    metric_monotonic_seconds = _metric_monotonic_seconds(visible_events, monotonic_seconds)
     view = RoastSession(
         id=session.id,
         created_at_utc=session.created_at_utc,
@@ -451,7 +458,7 @@ def _session_view_at(
         ),
         log_writer=session.log_writer,
         stopped_at_utc=session.created_at_utc,
-        monotonic_stop=session.monotonic_start + monotonic_seconds,
+        monotonic_stop=session.monotonic_start + metric_monotonic_seconds,
     )
     for event in visible_events:
         _apply_view_event(view, event)
@@ -537,6 +544,14 @@ def _roast_elapsed_at(events: list[RoastEvent], monotonic_seconds: float) -> flo
     if beans_dropped_seconds is not None and monotonic_seconds >= beans_dropped_seconds:
         end_seconds = beans_dropped_seconds
     return round(max(0.0, end_seconds - beans_added_seconds), 3)
+
+
+def _metric_monotonic_seconds(events: list[RoastEvent], monotonic_seconds: float) -> float:
+    """Freeze derived roast metrics at the first recorded fault event."""
+    for event in events:
+        if event.kind == "fault":
+            return min(monotonic_seconds, event.monotonic_seconds)
+    return monotonic_seconds
 
 
 def _event_seen_in(events: list[RoastEvent], kind: str) -> bool:
