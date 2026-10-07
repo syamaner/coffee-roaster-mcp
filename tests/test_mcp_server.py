@@ -3516,6 +3516,8 @@ def test_guarded_fault_recovery_commands_preserve_fault_and_exact_result(tmp_pat
     assert state.phase == "fault"
     assert state.heat_level_percent == 0
     assert state.cooling_on is False
+    replacement = _call_tool(server, "start_roast_session", ctx)
+    assert replacement.session.session_id != session_id
     assert [event.kind for event in state.events] == [
         "beans_added",
         "fault",
@@ -3530,6 +3532,7 @@ def test_guarded_fault_recovery_commands_preserve_fault_and_exact_result(tmp_pat
         "drop_beans",
         "start_cooling",
         "stop_cooling",
+        "connect",
     ]
 
 
