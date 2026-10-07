@@ -232,7 +232,7 @@ def test_0_2_3_candidate_checklist_requires_release_and_public_evidence() -> Non
         "same commit SHA",
         "`v0.2.3` is absent",
         "created at the exact commit SHA that passed the recorded dry run",
-        "tag name and package version must both be `0.2.3`",
+        "tag name must be `v0.2.3` and the package version must be `0.2.3`",
         "protected `release` environment",
         "D209's cold-only projection",
         "#230's stopped-fault exact-session recovery semantics",

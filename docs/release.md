@@ -281,7 +281,8 @@ publish an artefact.
    workflow result with the same commit SHA.
 3. Confirm that `v0.2.3` is absent before any authorised tag action, and that
    a later `v0.2.3` tag will be created at the exact commit SHA that passed the
-   recorded dry run. The tag name and package version must both be `0.2.3`.
+   recorded dry run. The tag name must be `v0.2.3` and the package version must
+   be `0.2.3`.
 4. Require the human release operator to approve the protected `release`
    environment before publication jobs run.
 
