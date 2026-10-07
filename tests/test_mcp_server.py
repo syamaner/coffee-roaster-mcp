@@ -3959,11 +3959,11 @@ def test_active_emergency_stop_recording_failure_retains_in_memory_fault_block(
     assert driver.actions == ["connect"]
 
 
-def test_fault_recovery_ambiguous_drop_requires_post_failure_cooling_cycle(
+def test_fault_recovery_ambiguous_drop_blocks_new_start_after_cooling_cycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unconfirmed drop cannot be retried or admit a session without cooling."""
+    """An unconfirmed drop keeps retry and new-session admission closed."""
     server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
     _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
 
@@ -3993,15 +3993,15 @@ def test_fault_recovery_ambiguous_drop_requires_post_failure_cooling_cycle(
     assert all(event.kind != "beans_dropped" for event in session.event_timeline)
     with pytest.raises(SessionLifecycleError, match="Recovery bean drop is ambiguous"):
         _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
-    with pytest.raises(SessionLifecycleError, match="ambiguous bean drop cooling"):
+    with pytest.raises(SessionLifecycleError, match="ambiguous bean drop"):
         _call_tool(server, "start_roast_session", ctx)
 
     _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
     _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
     with pytest.raises(SessionLifecycleError, match="Recovery bean drop is ambiguous"):
         _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
-    replacement = _call_tool(server, "start_roast_session", ctx)
-    assert replacement.session.session_id != session_id
+    with pytest.raises(SessionLifecycleError, match="ambiguous bean drop"):
+        _call_tool(server, "start_roast_session", ctx)
 
 
 @pytest.mark.parametrize(
