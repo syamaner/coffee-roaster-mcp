@@ -3690,6 +3690,8 @@ def test_guarded_emergency_stop_driver_error_requires_verified_containment(
 
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
     assert state.heat_level_percent == 0 and state.cooling_on is True
+    with pytest.raises(SessionLifecycleError, match="verified emergency-stop containment"):
+        _call_tool(server, "stop_cooling", ctx)
     with pytest.raises(SessionLifecycleError, match="containment is verified"):
         _call_tool(server, "start_roast_session", ctx)
 
@@ -3916,6 +3918,8 @@ def test_guarded_fault_recovery_allows_emergency_stop_during_blocked_driver_call
     )
     with pytest.raises(ValueError, match="in flight"):
         _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="earlier fault recovery command is in flight"):
+        _call_tool(server, "stop_cooling", ctx)
     with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
         _call_tool(server, "start_roast_session", ctx)
     assert driver.actions == [
@@ -3952,6 +3956,21 @@ def test_guarded_recovery_containment_serializes_late_direct_emergency_stop(
         if reason == "guarded fault recovery start_cooling failed":
             containment_started.set()
             assert release_containment.wait(timeout=1.0)
+            return EmergencyStopResult(
+                driver=driver.name,
+                safety_method="emergency_stop",
+                heat_level_percent=0,
+                fan_level_percent=100,
+                cooling_on=True,
+            )
+        if reason == "manual emergency stop":
+            return EmergencyStopResult(
+                driver=driver.name,
+                safety_method="emergency_stop",
+                heat_level_percent=10,
+                fan_level_percent=100,
+                cooling_on=True,
+            )
         return original_emergency_stop(reason=reason)
 
     monkeypatch.setattr(driver, "emergency_stop", block_recovery_containment)
@@ -3964,7 +3983,6 @@ def test_guarded_recovery_containment_serializes_late_direct_emergency_stop(
     recovery_thread.start()
     assert containment_started.wait(timeout=1.0)
 
-    driver.emergency_heat_level_percent = 10
     direct_errors: list[BaseException] = []
     direct_thread = Thread(
         target=_record_tool_error,

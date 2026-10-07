@@ -1175,13 +1175,7 @@ class RoastSessionStore:
             hardware state.
         """
         with self._lock:
-            self._assert_latest_session(session)
-            if session.active:
-                raise SessionLifecycleError("Recovery cooling stop requires a stopped session.")
-            if session.faulted_at_utc is None or session.phase != "fault":
-                raise SessionLifecycleError(
-                    "Recovery cooling stop is only allowed after an emergency stop."
-                )
+            self._assert_guarded_fault_recovery_admission_locked(session)
             if not session.cooling_on:
                 raise SessionLifecycleError("Cooling must be active before it can be stopped.")
             return self._reserve_driver_command_locked(session, kind="stop_cooling")
