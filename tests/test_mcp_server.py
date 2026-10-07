@@ -3503,6 +3503,8 @@ def test_guarded_fault_recovery_commands_preserve_fault_and_exact_result(tmp_pat
     server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
 
     dropped = _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="only allowed before beans are dropped"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
     started = _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
     stopped = _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
 
@@ -3534,6 +3536,19 @@ def test_guarded_fault_recovery_commands_preserve_fault_and_exact_result(tmp_pat
         "stop_cooling",
         "connect",
     ]
+
+
+def test_charged_fault_rejects_cooling_stop_until_recovery_drop(tmp_path: Path) -> None:
+    """A charged fault cannot clear cooling before bean-drop evidence exists."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+
+    with pytest.raises(SessionLifecycleError, match="Cooling cannot stop before beans are dropped"):
+        _call_tool(server, "stop_cooling", ctx)
+
+    assert driver.actions == ["connect", "emergency_stop:setup-fault"]
+    _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    stopped = _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    assert stopped.event.kind == "cooling_stopped"
 
 
 def test_guarded_fault_recovery_rejects_empty_drop_before_driver_call(tmp_path: Path) -> None:
@@ -3968,7 +3983,6 @@ def test_fault_recovery_ambiguous_drop_blocks_new_start_after_cooling_cycle(
 ) -> None:
     """An unconfirmed drop keeps retry and new-session admission closed."""
     server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
-    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
 
     def drop_without_cooling() -> RoasterState:
         driver.actions.append("drop_beans")

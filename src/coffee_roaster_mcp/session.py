@@ -1180,6 +1180,12 @@ class RoastSessionStore:
             self._assert_guarded_fault_recovery_admission_locked(session)
             if not session.cooling_on:
                 raise SessionLifecycleError("Cooling must be active before it can be stopped.")
+            if (
+                session.beans_added_at_utc is not None
+                and not _has_recorded_beans_dropped(session)
+                and session.id not in self._fault_drop_ambiguity_required
+            ):
+                raise SessionLifecycleError("Cooling cannot stop before beans are dropped.")
             return self._reserve_driver_command_locked(session, kind="stop_cooling")
 
     def reserve_driver_fault_recovery(
@@ -1208,16 +1214,23 @@ class RoastSessionStore:
             if kind == "drop":
                 if session.id in self._fault_drop_ambiguity_required:
                     raise SessionLifecycleError(
-                        "Recovery bean drop is ambiguous until cooling is restarted and stopped."
+                        "Recovery bean drop is ambiguous and cannot be retried."
                     )
                 if session.beans_added_at_utc is None:
                     raise SessionLifecycleError("Recovery bean drop requires beans to be added.")
-                if session.beans_dropped_at_utc is not None:
+                if _has_recorded_beans_dropped(session):
                     raise SessionLifecycleError(
                         "Recovery bean drop is only allowed before beans are dropped."
                     )
-            elif kind == "stop_cooling" and not session.cooling_on:
-                raise SessionLifecycleError("Cooling must be active before it can be stopped.")
+            elif kind == "stop_cooling":
+                if not session.cooling_on:
+                    raise SessionLifecycleError("Cooling must be active before it can be stopped.")
+                if (
+                    session.beans_added_at_utc is not None
+                    and not _has_recorded_beans_dropped(session)
+                    and session.id not in self._fault_drop_ambiguity_required
+                ):
+                    raise SessionLifecycleError("Cooling cannot stop before beans are dropped.")
             reservation = self._reserve_driver_command_locked(session, kind=kind)
             self._fault_recovery_in_flight_tokens[session.id] = reservation.token
             return reservation
@@ -2706,7 +2719,7 @@ class RoastSessionStore:
         if session.faulted_at_utc is None:
             _validate_event_transition(session, "fault")
         recorded_at_utc = self._utc_now()
-        monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+        monotonic_seconds = max(0.0, self._monotonic_now() - session.monotonic_start)
         monotonic_seconds = _normalize_event_monotonic_seconds(
             session,
             monotonic_seconds=monotonic_seconds,
@@ -2859,6 +2872,11 @@ def _has_recorded_first_crack(session: RoastSession) -> bool:
     return session.first_crack_monotonic_seconds is not None or any(
         event.kind == "first_crack_detected" for event in session.event_timeline
     )
+
+
+def _has_recorded_beans_dropped(session: RoastSession) -> bool:
+    """Return whether the timeline contains authoritative bean-drop evidence."""
+    return any(event.kind == "beans_dropped" for event in session.event_timeline)
 
 
 def _elapsed_since(

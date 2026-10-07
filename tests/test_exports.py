@@ -787,6 +787,21 @@ def test_snapshot_export_keeps_fault_phase_for_every_recovery_command(
             fan_level_percent=100,
             cooling_on=cooling_on,
         )
+    clock.monotonic_value = 125.0
+    clock.utc_value += timedelta(seconds=5)
+    store.emergency_stop(
+        session,
+        reason="reassert containment",
+        safety_payload={
+            "driver": "mock",
+            "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+        allow_stopped_latest=True,
+    )
 
     export = export_roast_snapshot(session)
 
@@ -823,6 +838,17 @@ def test_snapshot_export_keeps_fault_phase_for_every_recovery_command(
         if row["payload"].get("recovery_after_fault") is True
     ]
     assert recovery_event_times == [10.0, 10.0, 15.0, 20.0]
+    assert [row["monotonic_seconds"] for row in jsonl_rows if row["kind"] == "fault"] == [5.0, 25.0]
+    assert [row["event"] for row in rows if row["event"]] == [
+        "beans_added",
+        "first_crack_detected",
+        "fault",
+        "beans_dropped",
+        "cooling_started",
+        "cooling_started",
+        "cooling_stopped",
+        "fault",
+    ]
     summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
     assert summary["phase"] == "fault"
     assert summary["total_roast_seconds"] == expected_metrics.roast_elapsed_seconds

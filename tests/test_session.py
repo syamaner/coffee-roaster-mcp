@@ -421,6 +421,14 @@ def test_future_first_crack_detection_orders_fault_and_recovery_events() -> None
             "cooling_on": True,
         },
     )
+    drop_reservation = store.reserve_driver_fault_recovery(session, kind="drop")
+    store.complete_reserved_driver_fault_recovery_snapshot(
+        session,
+        reservation=drop_reservation,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=True,
+    )
     reservation = store.reserve_driver_stop_cooling_recovery(session)
     recovery, snapshot = store.complete_reserved_driver_stop_cooling_recovery_snapshot(
         session,
@@ -437,6 +445,8 @@ def test_future_first_crack_detection_orders_fault_and_recovery_events() -> None
     assert recovery.recorded_at_utc == session.first_crack_at_utc
     assert [event.monotonic_seconds for event in snapshot.event_timeline] == [
         5.0,
+        20.0,
+        20.0,
         20.0,
         20.0,
         20.0,
