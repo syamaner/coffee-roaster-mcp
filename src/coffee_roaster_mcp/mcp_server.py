@@ -1238,6 +1238,7 @@ def create_mcp_server(
                         expected_session_id=expected_session_id,
                         allow_in_flight=True,
                     )
+                    server_context.session_store.cancel_session_start_for_emergency_stop()
                 server_context.session_store.cancel_nonfinalisation_driver_command(session)
                 safety_payload = run_driver_emergency_stop(server_context, reason=reason)
                 has_verified_containment = has_verified_emergency_containment(

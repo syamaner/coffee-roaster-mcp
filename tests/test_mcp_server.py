@@ -2950,6 +2950,55 @@ def test_concurrent_session_start_reserves_before_driver_connect(tmp_path: Path)
     assert driver.actions == ["connect"]
 
 
+def test_guarded_emergency_stop_cancels_blocked_new_session_start(tmp_path: Path) -> None:
+    """Exact fault e-stop contains a blocked connect before it can create a session."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    connect_started = Event()
+    release_connect = Event()
+    driver.block_connect = (connect_started, release_connect)
+    results: list[object] = []
+    errors: list[BaseException] = []
+    start_thread = Thread(
+        target=_record_tool_result,
+        args=(results, errors, server, "start_roast_session", ctx),
+    )
+
+    start_thread.start()
+    assert connect_started.wait(timeout=1.0)
+
+    emergency = _call_tool(
+        server,
+        "emergency_stop",
+        ctx,
+        reason="cancel blocked start",
+        expected_session_id=session_id,
+    )
+
+    assert emergency.session_id == session_id
+    assert start_thread.is_alive()
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "stop_cooling",
+        "connect",
+        "emergency_stop:cancel blocked start",
+    ]
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="start is already in progress"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    release_connect.set()
+    start_thread.join(timeout=1.0)
+
+    assert not start_thread.is_alive()
+    assert results == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], SessionLifecycleError)
+    latest = ctx.request_context.lifespan_context.session_store.get_latest_session()
+    assert latest is not None and latest.id == session_id and latest.active is False
+
+
 def test_stale_heat_command_fails_closed_after_emergency_stop(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
@@ -4277,7 +4326,7 @@ def test_guarded_fault_recovery_retains_block_when_fault_recording_fails(
 def test_guarded_fault_recovery_rejects_pending_new_session_before_actuation(
     tmp_path: Path,
 ) -> None:
-    """A blocked new-session connect cannot race an old fault recovery command."""
+    """A blocked new-session connect cannot race an old recovery command."""
     server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
     _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
     connect_started = Event()
@@ -4293,7 +4342,7 @@ def test_guarded_fault_recovery_rejects_pending_new_session_before_actuation(
     assert connect_started.wait(timeout=1.0)
 
     with pytest.raises(ValueError, match="start is in progress"):
-        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
 
     release_connect.set()
     thread.join(timeout=1.0)

@@ -794,6 +794,7 @@ class RoastSessionStore:
         self._sessions_by_id: dict[str, RoastSession] = {}
         self._session_id_order: deque[str] = deque()
         self._pending_session_start_token: str | None = None
+        self._session_start_in_flight_token: str | None = None
         self._fault_recovery_in_flight_tokens: dict[str, str] = {}
         self._fault_recovery_admission_blocks: set[str] = set()
         self._fault_drop_cooling_cycle_required: set[str] = set()
@@ -814,7 +815,10 @@ class RoastSessionStore:
                 faulted stopped session still has cooling active.
         """
         with self._lock:
-            if self._pending_session_start_token is not None:
+            if (
+                self._pending_session_start_token is not None
+                or self._session_start_in_flight_token is not None
+            ):
                 raise SessionLifecycleError("A roast session start is already in progress.")
             return self._start_session_locked(purpose=purpose)
 
@@ -830,10 +834,14 @@ class RoastSessionStore:
             self._assert_no_pending_fault_cooling_recovery_locked()
             if self._latest_session is not None and self._latest_session.active:
                 raise SessionLifecycleError("An active roast session already exists.")
-            if self._pending_session_start_token is not None:
+            if (
+                self._pending_session_start_token is not None
+                or self._session_start_in_flight_token is not None
+            ):
                 raise SessionLifecycleError("A roast session start is already in progress.")
             reservation = SessionStartReservation(token=_generate_session_id())
             self._pending_session_start_token = reservation.token
+            self._session_start_in_flight_token = reservation.token
             return reservation
 
     def complete_session_start_snapshot(
@@ -849,6 +857,8 @@ class RoastSessionStore:
                 session = self._start_session_locked(purpose=purpose)
             finally:
                 self._pending_session_start_token = None
+                if self._session_start_in_flight_token == reservation.token:
+                    self._session_start_in_flight_token = None
             return _copy_session_for_read(session)
 
     def clear_session_start_reservation(
@@ -859,6 +869,13 @@ class RoastSessionStore:
         with self._lock:
             if self._pending_session_start_token == reservation.token:
                 self._pending_session_start_token = None
+            if self._session_start_in_flight_token == reservation.token:
+                self._session_start_in_flight_token = None
+
+    def cancel_session_start_for_emergency_stop(self) -> None:
+        """Invalidate pending start admission while its driver connect remains in flight."""
+        with self._lock:
+            self._pending_session_start_token = None
 
     def stop_session(self, *, phase: RoastPhase = "complete") -> RoastSession | None:
         """Stop the active session if one exists.
@@ -1253,10 +1270,6 @@ class RoastSessionStore:
             if session.faulted_at_utc is None or session.phase != "fault":
                 raise SessionLifecycleError(
                     "Recovery command is only allowed after an emergency stop."
-                )
-            if self._pending_session_start_token is not None:
-                raise SessionLifecycleError(
-                    "Emergency stop cannot run while a roast session start is in progress."
                 )
 
     def complete_reserved_driver_control_snapshot(
