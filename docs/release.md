@@ -276,19 +276,28 @@ publish an artefact.
 
 1. Record successful full local and protected CI gates for the candidate,
    including version alignment, package build, and clean-wheel mock-safe smoke.
-2. After the release-preparation PR merges, run `dry_run: true` against the
-   exact merged `main` head and retain its successful result.
+2. After the release-preparation PR merges, record the exact merged `main` head
+   commit SHA, run `dry_run: true` for that commit, and retain its successful
+   workflow result with the same commit SHA.
 3. Confirm that `v0.2.3` is absent before any authorised tag action, and that
-   any later release tag maps exactly to package version `0.2.3`.
+   a later `v0.2.3` tag will be created at the exact commit SHA that passed the
+   recorded dry run. The tag name and package version must both be `0.2.3`.
 4. Require the human release operator to approve the protected `release`
    environment before publication jobs run.
-5. Independently verify the public PyPI wheel and source-distribution hashes,
-   an installed mock-safe smoke, and the MCP Registry version and `isLatest`
-   state before reconciling published-state documentation.
 
 The candidate includes D209's cold-only projection and #230's stopped-fault
 exact-session recovery semantics. It remains a software component candidate
 and does not establish hardware readiness or authorise beans.
+
+## v0.2.3 Post-Publication Verification
+
+Only after the human release operator has created the recorded tag, approved
+the protected environment, and the release workflow has completed publication:
+
+1. Independently verify the public PyPI wheel and source-distribution hashes.
+2. Run the installed mock-safe smoke against the selected public PyPI artifact.
+3. Verify the MCP Registry version and `isLatest` state.
+4. Reconcile published-state documentation with those retained public checks.
 
 ## v0.2.2 Release Checklist (Historical/Superseded — Non-Executable)
 

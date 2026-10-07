@@ -40,8 +40,8 @@ def test_cold_setup_docs_distinguish_published_candidate_and_installed_bytes() -
         "typed temperature information",
         "Packet progress screening is an Agent comparison between observations, not a "
         "continuous freshness or link watchdog",
-        "candidate version, wheel name, or declared command-line digest can attest which bytes "
-        "the intended interpreter imports",
+        "Neither the `0.2.2` publication nor the `0.2.3` candidate version, wheel name, or "
+        "declared command-line digest can attest which bytes the intended interpreter imports",
         "Verifying that installed bytes correspond to a selected artifact is a separate, "
         "operator-authorised gate",
         "does not perform that gate or claim that either distribution is installed",
@@ -213,9 +213,15 @@ def test_0_2_3_candidate_checklist_requires_release_and_public_evidence() -> Non
     checklist = _section(
         release_text,
         "## v0.2.3 Candidate Checklist",
+        "## v0.2.3 Post-Publication Verification",
+    )
+    post_publication = _section(
+        release_text,
+        "## v0.2.3 Post-Publication Verification",
         "## v0.2.2 Release Checklist",
     )
     normalized_checklist = " ".join(checklist.split())
+    normalized_post_publication = " ".join(post_publication.split())
 
     required_phrases = (
         "reviewed release candidate, not a published distribution",
@@ -223,18 +229,26 @@ def test_0_2_3_candidate_checklist_requires_release_and_public_evidence() -> Non
         "clean-wheel mock-safe smoke",
         "dry_run: true",
         "exact merged `main` head",
+        "same commit SHA",
         "`v0.2.3` is absent",
-        "maps exactly to package version `0.2.3`",
+        "created at the exact commit SHA that passed the recorded dry run",
+        "tag name and package version must both be `0.2.3`",
         "protected `release` environment",
-        "public PyPI wheel and source-distribution hashes",
-        "installed mock-safe smoke",
-        "MCP Registry version and `isLatest` state",
         "D209's cold-only projection",
         "#230's stopped-fault exact-session recovery semantics",
         "does not establish hardware readiness or authorise beans",
     )
     for phrase in required_phrases:
         assert phrase in normalized_checklist
+
+    post_publication_phrases = (
+        "Only after the human release operator has created the recorded tag",
+        "public PyPI wheel and source-distribution hashes",
+        "installed mock-safe smoke",
+        "MCP Registry version and `isLatest` state",
+    )
+    for phrase in post_publication_phrases:
+        assert phrase in normalized_post_publication
 
 
 def test_release_history_is_preserved() -> None:
