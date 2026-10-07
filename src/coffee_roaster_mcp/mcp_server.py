@@ -60,6 +60,7 @@ from coffee_roaster_mcp.session import (
     SessionPurpose,
     compute_roast_metrics,
     default_emergency_safety_payload,
+    has_verified_zero_heat,
 )
 
 
@@ -1394,7 +1395,7 @@ def _require_guarded_fault_recovery_session(
         raise ValueError("Expected session is not the latest roast session.")
     if session.active or session.phase != "fault" or session.faulted_at_utc is None:
         raise ValueError("Expected session is not a stopped fault session.")
-    if session.heat_level_percent != 0:
+    if session.heat_level_percent != 0 and not allow_in_flight:
         raise ValueError("Expected fault session does not have zero heat.")
     try:
         if allow_in_flight:
@@ -1701,31 +1702,26 @@ def _fail_closed_guarded_fault_recovery_command(
         server_context,
         reason=f"guarded fault recovery {command} failed",
     )
-    attempted_error = attempted_payload.get("driver_error")
-    blocked_payload = default_emergency_safety_payload(
-        driver=server_context.config.roaster.driver,
-        driver_error=attempted_error if isinstance(attempted_error, str) else None,
-    )
-    for key in (
-        "driver",
-        "driver_safety_method",
-        "driver_safety_method_called",
-        "driver_error",
-    ):
-        if key in attempted_payload:
-            blocked_payload[key] = attempted_payload[key]
-    blocked_payload["heat_level_percent"] = 0
-    blocked_payload["fan_level_percent"] = 100
-    blocked_payload["cooling_on"] = True
     try:
         server_context.session_store.emergency_stop_snapshot(
             session,
             reason=f"guarded fault recovery {command} failed",
-            safety_payload=blocked_payload,
+            safety_payload=attempted_payload,
             allow_stopped_latest=True,
         )
     except Exception:  # noqa: BLE001 - containment must survive result-recording failure.
-        server_context.session_store.retain_fault_recovery_block(session, reservation=reservation)
+        server_context.session_store.retain_fault_recovery_block(
+            session,
+            reservation=reservation,
+            safety_payload=attempted_payload,
+        )
+    else:
+        if not has_verified_zero_heat(safety_payload=attempted_payload):
+            server_context.session_store.retain_fault_recovery_block(
+                session,
+                reservation=reservation,
+                safety_payload=attempted_payload,
+            )
     finally:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
         server_context.session_store.clear_fault_recovery_in_flight(session, reservation)
@@ -1744,26 +1740,23 @@ def _retain_guarded_emergency_stop_block(
     safely off, so preserve the conservative cooling-on state before raising.
     The fallback must survive an event-recording failure.
     """
-    blocked_payload = default_emergency_safety_payload(
-        driver=server_context.config.roaster.driver,
-    )
-    for key in (
-        "driver",
-        "driver_safety_method",
-        "driver_safety_method_called",
-        "driver_error",
-    ):
-        if key in safety_payload:
-            blocked_payload[key] = safety_payload[key]
     try:
         server_context.session_store.emergency_stop_snapshot(
             session,
             reason="guarded emergency stop reported retained heat",
-            safety_payload=blocked_payload,
+            safety_payload=safety_payload,
             allow_stopped_latest=True,
         )
     except Exception:  # noqa: BLE001 - the conservative admission block must survive logging.
-        server_context.session_store.retain_fault_block(session)
+        server_context.session_store.retain_fault_block(
+            session,
+            safety_payload=safety_payload,
+        )
+    else:
+        server_context.session_store.retain_fault_block(
+            session,
+            safety_payload=safety_payload,
+        )
 
 
 def _complete_driver_control(

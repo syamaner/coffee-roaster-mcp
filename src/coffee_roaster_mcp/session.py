@@ -795,6 +795,7 @@ class RoastSessionStore:
         self._session_id_order: deque[str] = deque()
         self._pending_session_start_token: str | None = None
         self._fault_recovery_in_flight_tokens: dict[str, str] = {}
+        self._fault_recovery_admission_blocks: set[str] = set()
         self._finalisation_generation = 0
         self._finalisation_tokens: dict[str, str] = {}
         self._finalisation_in_progress: set[str] = set()
@@ -1233,7 +1234,13 @@ class RoastSessionStore:
         driver call is still in flight.
         """
         with self._lock:
-            self._assert_stopped_fault_recovery_session_locked(session)
+            self._assert_latest_session(session)
+            if session.active:
+                raise SessionLifecycleError("Recovery command requires a stopped session.")
+            if session.faulted_at_utc is None or session.phase != "fault":
+                raise SessionLifecycleError(
+                    "Recovery command is only allowed after an emergency stop."
+                )
             if self._pending_session_start_token is not None:
                 raise SessionLifecycleError(
                     "Emergency stop cannot run while a roast session start is in progress."
@@ -1506,6 +1513,7 @@ class RoastSessionStore:
         session: RoastSession,
         *,
         reservation: DriverCommandReservation,
+        safety_payload: Mapping[str, EventPayloadValue] | None = None,
     ) -> None:
         """Pessimistically retain a stopped fault block after recovery uncertainty.
 
@@ -1518,10 +1526,12 @@ class RoastSessionStore:
             self._assert_latest_session(session)
             if session.active:
                 raise SessionLifecycleError("Cannot retain a fault block for an active session.")
-            session.heat_level_percent = 0
-            session.fan_level_percent = 100
-            session.cooling_on = True
+            _apply_emergency_safety_payload(
+                session,
+                default_emergency_safety_payload() if safety_payload is None else safety_payload,
+            )
             session.phase = "fault"
+            self._fault_recovery_admission_blocks.add(session.id)
             if session.faulted_at_utc is None:
                 session.faulted_at_utc = self._utc_now()
                 session.faulted_monotonic_seconds = session.elapsed_monotonic_seconds(
@@ -1529,7 +1539,12 @@ class RoastSessionStore:
                 )
             self._clear_driver_command_reservation_locked(session, reservation)
 
-    def retain_fault_block(self, session: RoastSession) -> None:
+    def retain_fault_block(
+        self,
+        session: RoastSession,
+        *,
+        safety_payload: Mapping[str, EventPayloadValue] | None = None,
+    ) -> None:
         """Retain a pessimistic stopped-fault state without a command reservation.
 
         This is the final containment path when an emergency-stop result cannot
@@ -1540,10 +1555,12 @@ class RoastSessionStore:
             self._assert_latest_session(session)
             if session.active:
                 raise SessionLifecycleError("Cannot retain a fault block for an active session.")
-            session.heat_level_percent = 0
-            session.fan_level_percent = 100
-            session.cooling_on = True
+            _apply_emergency_safety_payload(
+                session,
+                default_emergency_safety_payload() if safety_payload is None else safety_payload,
+            )
             session.phase = "fault"
+            self._fault_recovery_admission_blocks.add(session.id)
             if session.faulted_at_utc is None:
                 session.faulted_at_utc = self._utc_now()
                 session.faulted_monotonic_seconds = session.elapsed_monotonic_seconds(
@@ -2110,6 +2127,8 @@ class RoastSessionStore:
                 )
             else:
                 session.phase = "fault"
+            if has_verified_zero_heat(safety_payload=normalized_safety_payload):
+                self._fault_recovery_admission_blocks.discard(session.id)
             if session.id in self._nonterminal_finalisations:
                 record = session.finalisation
                 if record is not None:
@@ -2407,6 +2426,10 @@ class RoastSessionStore:
     def _assert_guarded_fault_recovery_admission_locked(self, session: RoastSession) -> None:
         """Reject guarded recovery while start or earlier recovery I/O is pending."""
         self._assert_stopped_fault_recovery_session_locked(session)
+        if session.id in self._fault_recovery_admission_blocks:
+            raise SessionLifecycleError(
+                "Recovery command requires a verified emergency-stop containment result."
+            )
         if self._pending_session_start_token is not None:
             raise SessionLifecycleError(
                 "Recovery command cannot run while a roast session start is in progress."
@@ -2483,6 +2506,10 @@ class RoastSessionStore:
     def _assert_no_pending_fault_cooling_recovery_locked(self) -> None:
         """Reject new sessions while stopped fault cooling still needs recovery."""
         session = self._latest_session
+        if session is not None and session.id in self._fault_recovery_admission_blocks:
+            raise SessionLifecycleError(
+                "Cannot start a roast session until emergency-stop containment is verified."
+            )
         if (
             session is not None
             and not session.active
@@ -2799,6 +2826,17 @@ def default_emergency_safety_payload(
     if driver_error is not None:
         payload["driver_error"] = driver_error
     return payload
+
+
+def has_verified_zero_heat(*, safety_payload: Mapping[str, EventPayloadValue]) -> bool:
+    """Return whether a driver explicitly confirmed zero heat after emergency stop."""
+    heat_level_percent = safety_payload.get("heat_level_percent")
+    return (
+        safety_payload.get("driver_safety_method_called") is True
+        and isinstance(heat_level_percent, int)
+        and not isinstance(heat_level_percent, bool)
+        and heat_level_percent == 0
+    )
 
 
 def _apply_emergency_safety_payload(

@@ -3625,13 +3625,22 @@ def test_guarded_emergency_stop_rejects_nonzero_heat_report(tmp_path: Path) -> N
         _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
 
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
-    assert state.heat_level_percent == 0 and state.cooling_on is True
+    assert state.heat_level_percent == 10 and state.cooling_on is True
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    with pytest.raises(SessionLifecycleError, match="did not report zero heat"):
+        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+    driver.emergency_heat_level_percent = 0
+    _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
     with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
         _call_tool(server, "start_roast_session", ctx)
 
     assert driver.actions == [
         "connect",
         "emergency_stop:setup-fault",
+        "emergency_stop:manual emergency stop",
+        "emergency_stop:manual emergency stop",
         "emergency_stop:manual emergency stop",
     ]
 
@@ -3656,11 +3665,11 @@ def test_guarded_emergency_stop_retains_block_when_fault_recording_fails(
 
     with pytest.raises(SessionLifecycleError, match="did not report zero heat"):
         _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
-    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
         _call_tool(server, "start_roast_session", ctx)
 
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
-    assert state.heat_level_percent == 0 and state.cooling_on is True
+    assert state.heat_level_percent == 10 and state.cooling_on is True
 
 
 def test_guarded_fault_recovery_clears_failed_command_reservation(tmp_path: Path) -> None:
@@ -3714,6 +3723,67 @@ def test_guarded_fault_recovery_completion_failure_fails_closed_without_deadlock
     assert state.events[-1].payload["driver_safety_method_called"] is True
 
 
+@pytest.mark.parametrize("tool_name", ["drop_beans", "start_cooling", "stop_cooling"])
+def test_failed_guarded_recovery_retains_nonzero_emergency_heat_as_hard_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+) -> None:
+    """A failed recovery cannot hide a nonzero re-e-stop heat report."""
+    server, ctx, driver, session_id = _faulted_recovery_server(
+        tmp_path,
+        beans_added=tool_name == "drop_beans",
+    )
+    driver.emergency_heat_level_percent = 10
+    if tool_name == "drop_beans":
+
+        def fail_drop() -> RoasterState:
+            raise RuntimeError("drop failed")
+
+        monkeypatch.setattr(driver, "drop_beans", fail_drop)
+    elif tool_name == "start_cooling":
+        driver.fail_start_cooling = True
+    else:
+        driver.stop_cooling_stays_on = True
+
+    with pytest.raises((RuntimeError, SessionLifecycleError)):
+        _call_tool(server, tool_name, ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.heat_level_percent == 10 and state.cooling_on is True
+    with pytest.raises(ValueError, match="does not have zero heat"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+
+def test_failed_guarded_recovery_retains_nonzero_block_when_fault_recording_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed re-e-stop remains hard-blocked when its fault write also fails."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    driver.fail_start_cooling = True
+    driver.emergency_heat_level_percent = 10
+    server_context = ctx.request_context.lifespan_context
+
+    def fail_fault_recording(*_args: object, **_kwargs: object) -> object:
+        raise OSError("log unavailable")
+
+    monkeypatch.setattr(
+        server_context.session_store,
+        "emergency_stop_snapshot",
+        fail_fault_recording,
+    )
+    with pytest.raises(RuntimeError, match="start cooling failed"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.heat_level_percent == 10 and state.cooling_on is True
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+
 def test_guarded_fault_recovery_partial_driver_failure_blocks_new_session(tmp_path: Path) -> None:
     """Partial recovery actuation is retained as blocked even when the call raises."""
     server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
@@ -3757,7 +3827,7 @@ def test_guarded_fault_recovery_retains_block_when_fault_recording_fails(
     )
     with pytest.raises(RuntimeError, match="partial start cooling failure"):
         _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
-    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
         _call_tool(server, "start_roast_session", ctx)
 
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
