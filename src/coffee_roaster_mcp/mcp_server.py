@@ -1250,7 +1250,7 @@ def create_mcp_server(
                         safety_payload=safety_payload,
                     )
                     raise SessionLifecycleError(
-                        "Emergency stop did not report verified emergency containment."
+                        _guarded_emergency_stop_failure_message(safety_payload)
                     )
                 try:
                     event, snapshot = server_context.session_store.emergency_stop_snapshot(
@@ -1764,12 +1764,9 @@ def _retain_guarded_emergency_stop_block(
     cannot be returned as success. Its truthful result is retained while the
     fallback preserves a hard admission block through recording failure.
     """
-    heat_level_percent = safety_payload.get("heat_level_percent")
     reason = (
         "guarded emergency stop reported retained heat"
-        if isinstance(heat_level_percent, int)
-        and not isinstance(heat_level_percent, bool)
-        and heat_level_percent != 0
+        if _guarded_emergency_stop_reported_retained_heat(safety_payload)
         else "guarded emergency stop reported incomplete containment"
     )
     try:
@@ -1789,6 +1786,27 @@ def _retain_guarded_emergency_stop_block(
             session,
             safety_payload=safety_payload,
         )
+
+
+def _guarded_emergency_stop_failure_message(
+    safety_payload: dict[str, EventPayloadValue],
+) -> str:
+    """Describe the containment evidence missing from a guarded emergency stop."""
+    if _guarded_emergency_stop_reported_retained_heat(safety_payload):
+        return "Emergency stop reported retained heat."
+    return "Emergency stop did not report complete emergency containment."
+
+
+def _guarded_emergency_stop_reported_retained_heat(
+    safety_payload: dict[str, EventPayloadValue],
+) -> bool:
+    """Return whether a guarded emergency-stop payload explicitly retains heat."""
+    heat_level_percent = safety_payload.get("heat_level_percent")
+    return (
+        isinstance(heat_level_percent, int)
+        and not isinstance(heat_level_percent, bool)
+        and heat_level_percent != 0
+    )
 
 
 def _complete_driver_control(
