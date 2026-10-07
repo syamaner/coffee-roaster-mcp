@@ -10,7 +10,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from threading import Event, Thread, get_ident
+from threading import Event, Lock, Thread, get_ident
 from types import SimpleNamespace, TracebackType
 from typing import Any, cast
 
@@ -2999,6 +2999,104 @@ def test_guarded_emergency_stop_cancels_blocked_new_session_start(tmp_path: Path
     assert latest is not None and latest.id == session_id and latest.active is False
 
 
+def test_guarded_emergency_stop_serializes_start_completion_after_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed connect cannot commit a new session during guarded e-stop admission."""
+
+    class FinishRaceBarrier:
+        """Signal the start thread just before its completion lock acquisition."""
+
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self.start_thread_id: int | None = None
+            self.start_entries = 0
+            self.finish_attempted = Event()
+
+        def __enter__(self) -> FinishRaceBarrier:
+            if get_ident() == self.start_thread_id:
+                self.start_entries += 1
+                if self.start_entries == 2:
+                    self.finish_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            self._lock.release()
+
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    barrier = FinishRaceBarrier()
+    server_context = ctx.request_context.lifespan_context
+    object.__setattr__(server_context, "lifecycle_barrier", barrier)
+    connect_started = Event()
+    release_connect = Event()
+    cancellation_entered = Event()
+    release_cancellation = Event()
+    driver.block_connect = (connect_started, release_connect)
+    original_cancel = server_context.session_store.cancel_session_start_for_emergency_stop
+
+    def pause_cancellation() -> None:
+        cancellation_entered.set()
+        assert release_cancellation.wait(timeout=1.0)
+        original_cancel()
+
+    monkeypatch.setattr(
+        server_context.session_store,
+        "cancel_session_start_for_emergency_stop",
+        pause_cancellation,
+    )
+    start_results: list[object] = []
+    start_errors: list[BaseException] = []
+    emergency_results: list[object] = []
+    emergency_errors: list[BaseException] = []
+
+    def start_session() -> None:
+        barrier.start_thread_id = get_ident()
+        _record_tool_result(start_results, start_errors, server, "start_roast_session", ctx)
+
+    def emergency_stop() -> None:
+        try:
+            emergency_results.append(
+                _call_tool(
+                    server,
+                    "emergency_stop",
+                    ctx,
+                    reason="serialize finish race",
+                    expected_session_id=session_id,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - retain thread failure for assertion.
+            emergency_errors.append(exc)
+
+    start_thread = Thread(target=start_session)
+    start_thread.start()
+    assert connect_started.wait(timeout=1.0)
+    emergency_thread = Thread(target=emergency_stop)
+    emergency_thread.start()
+    assert cancellation_entered.wait(timeout=1.0)
+
+    release_connect.set()
+    assert barrier.finish_attempted.wait(timeout=1.0)
+    assert emergency_thread.is_alive()
+    release_cancellation.set()
+    emergency_thread.join(timeout=1.0)
+    start_thread.join(timeout=1.0)
+
+    assert not emergency_thread.is_alive() and not start_thread.is_alive()
+    assert emergency_errors == [] and len(emergency_results) == 1
+    assert start_results == [] and len(start_errors) == 1
+    assert isinstance(start_errors[0], SessionLifecycleError)
+    latest = server_context.session_store.get_latest_session()
+    assert latest is not None and latest.id == session_id and latest.active is False
+
+
 def test_stale_heat_command_fails_closed_after_emergency_stop(tmp_path: Path) -> None:
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
@@ -3593,6 +3691,8 @@ def test_charged_fault_rejects_cooling_stop_until_recovery_drop(tmp_path: Path) 
 
     with pytest.raises(SessionLifecycleError, match="Cooling cannot stop before beans are dropped"):
         _call_tool(server, "stop_cooling", ctx)
+    with pytest.raises(SessionLifecycleError, match="Cooling cannot stop before beans are dropped"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
 
     assert driver.actions == ["connect", "emergency_stop:setup-fault"]
     _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
@@ -4063,7 +4163,8 @@ def test_fault_recovery_ambiguous_drop_blocks_new_start_after_cooling_cycle(
         _call_tool(server, "start_roast_session", ctx)
 
     _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
-    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="Cooling cannot stop before beans are dropped"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
     with pytest.raises(SessionLifecycleError, match="Recovery bean drop is ambiguous"):
         _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
     with pytest.raises(SessionLifecycleError, match="ambiguous bean drop"):

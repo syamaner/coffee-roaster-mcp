@@ -903,9 +903,10 @@ def create_mcp_server(
             reservation = server_context.session_store.reserve_session_start()
         try:
             server_context.roaster_driver.connect()
-            session = server_context.session_store.complete_session_start_snapshot(
-                reservation, purpose=purpose
-            )
+            with server_context.lifecycle_barrier:
+                session = server_context.session_store.complete_session_start_snapshot(
+                    reservation, purpose=purpose
+                )
         except Exception:
             server_context.session_store.clear_session_start_reservation(reservation)
             raise

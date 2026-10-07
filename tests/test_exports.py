@@ -829,6 +829,10 @@ def test_snapshot_export_keeps_fault_phase_for_every_recovery_command(
     )
     assert all(row["beans_dropped"] == "False" for row in recovery_rows)
     assert recovery_rows[-1]["cooling_on"] == "False"
+    fault_rows = [row for row in rows if row["event"] == "fault"]
+    assert len(fault_rows) == 2
+    assert fault_rows[-1]["elapsed_seconds"] == "5.0"
+    assert float(fault_rows[-1]["development_time_percent"]) == expected_metrics.development_percent
     jsonl_rows = [
         json.loads(line) for line in export.jsonl_path.read_text(encoding="utf-8").splitlines()
     ]

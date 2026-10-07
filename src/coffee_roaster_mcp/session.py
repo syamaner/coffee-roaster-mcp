@@ -1197,11 +1197,7 @@ class RoastSessionStore:
             self._assert_guarded_fault_recovery_admission_locked(session)
             if not session.cooling_on:
                 raise SessionLifecycleError("Cooling must be active before it can be stopped.")
-            if (
-                session.beans_added_at_utc is not None
-                and not _has_recorded_beans_dropped(session)
-                and session.id not in self._fault_drop_ambiguity_required
-            ):
+            if session.beans_added_at_utc is not None and not _has_recorded_beans_dropped(session):
                 raise SessionLifecycleError("Cooling cannot stop before beans are dropped.")
             return self._reserve_driver_command_locked(session, kind="stop_cooling")
 
@@ -1242,10 +1238,8 @@ class RoastSessionStore:
             elif kind == "stop_cooling":
                 if not session.cooling_on:
                     raise SessionLifecycleError("Cooling must be active before it can be stopped.")
-                if (
-                    session.beans_added_at_utc is not None
-                    and not _has_recorded_beans_dropped(session)
-                    and session.id not in self._fault_drop_ambiguity_required
+                if session.beans_added_at_utc is not None and not _has_recorded_beans_dropped(
+                    session
                 ):
                     raise SessionLifecycleError("Cooling cannot stop before beans are dropped.")
             reservation = self._reserve_driver_command_locked(session, kind=kind)
