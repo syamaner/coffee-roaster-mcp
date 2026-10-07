@@ -18,12 +18,12 @@ verification. Issue #225 remains open to reconcile that release-process record.
 Published `0.2.2` carries #222's additive, typed, roast-fan-only cold-session
 `get_roast_state` observation. It reports commanded roast-fan state only. Issue
 #227 is closed for the separate D209 software projection: the reviewed,
-unreleased same-version candidate adds typed cold-only telemetry, packet
-validity and counters, and raw and typed temperature information that published
-`0.2.2` lacks. Agent-side comparison between observations owns packet-progress
-screening; the projection is not a continuous freshness or link watchdog.
-Neither surface proves physical state, calibration, accuracy, readiness, or
-safety.
+unreleased `0.2.3` candidate adds typed cold-only telemetry, packet validity
+and counters, and raw and typed temperature information that published `0.2.2`
+lacks. It also carries #230's stopped-fault exact-session recovery semantics.
+Agent-side comparison between observations owns packet-progress screening; the
+projection is not a continuous freshness or link watchdog. Neither surface
+proves physical state, calibration, accuracy, readiness, or safety.
 
 Release-candidate traceability records #222's implementation merge
 `6b8c6f8922df02adc147719f1e8c91b824d13783` and D197's plan merge
@@ -47,22 +47,30 @@ remain subject to their stated limitations below.
 Only the human release operator may create or push tags, approve the release
 environment, publish packages, or verify live PyPI and MCP Registry artefacts.
 The metadata evidence above does not establish that those operator steps ran
-for `0.2.2`. Releasing or installing the D209 candidate requires a separately
-authorised future decision. A version string, artefact name, or declared digest
-does not attest which distribution an intended interpreter imports; installed
-bytes remain unverified.
+for `0.2.2`. Releasing or installing the `0.2.3` candidate requires the
+candidate checklist below and a separately authorised human decision. A version
+string, artefact name, or declared digest does not attest which distribution an
+intended interpreter imports; installed bytes remain unverified.
 
 ## Changelog
 
-### 0.2.2 (published distribution; D209 candidate remains unreleased)
+### 0.2.3 (release candidate; unpublished)
+
+- Carries D209's typed cold-only temperature and packet projection, which is
+  absent from the published `0.2.2` distribution.
+- Carries #230's stopped-fault exact-session recovery semantics from PR #231.
+- It is a software component candidate only. It does not authorise hardware,
+  beans, or a hardware-readiness claim.
+
+### 0.2.2 (published distribution)
 
 - The published distribution carries #222's additive, typed, roast-fan-only cold-session
   `get_roast_state` observation. It reports commanded roast-fan state only,
   never physical-state proof.
-- The reviewed, unreleased same-version D209 candidate adds the separate typed
-  cold-only temperature and packet projection. Agent-side comparison between
-  observations owns packet-progress screening; the projection is not a
-  continuous freshness or link watchdog.
+- The reviewed, unreleased `0.2.3` candidate adds the separate typed cold-only
+  temperature and packet projection. Agent-side comparison between observations
+  owns packet-progress screening; the projection is not a continuous freshness
+  or link watchdog.
 - Neither distribution authorises hardware or beans, proves readiness, or
   verifies installed bytes.
 
@@ -258,6 +266,29 @@ The dry run:
 - Builds the wheel and source distribution.
 - Confirms both distribution artifacts exist.
 - Does not publish to PyPI or the MCP Registry.
+
+## v0.2.3 Candidate Checklist (Pre-Publication)
+
+`0.2.3` is a reviewed release candidate, not a published distribution. This
+checklist records the required evidence before a human release operator decides
+whether to publish it; it does not create a tag, approve an environment, or
+publish an artefact.
+
+1. Record successful full local and protected CI gates for the candidate,
+   including version alignment, package build, and clean-wheel mock-safe smoke.
+2. After the release-preparation PR merges, run `dry_run: true` against the
+   exact merged `main` head and retain its successful result.
+3. Confirm that `v0.2.3` is absent before any authorised tag action, and that
+   any later release tag maps exactly to package version `0.2.3`.
+4. Require the human release operator to approve the protected `release`
+   environment before publication jobs run.
+5. Independently verify the public PyPI wheel and source-distribution hashes,
+   an installed mock-safe smoke, and the MCP Registry version and `isLatest`
+   state before reconciling published-state documentation.
+
+The candidate includes D209's cold-only projection and #230's stopped-fault
+exact-session recovery semantics. It remains a software component candidate
+and does not establish hardware readiness or authorise beans.
 
 ## v0.2.2 Release Checklist (Historical/Superseded — Non-Executable)
 

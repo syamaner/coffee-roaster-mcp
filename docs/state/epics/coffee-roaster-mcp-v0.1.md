@@ -16,11 +16,15 @@ The first implementation milestone is a mock vertical slice that requires no roa
 ## Active Context
 
 - Current published distribution: production PyPI and MCP Registry metadata
-  verifies `0.2.2`; no `v0.2.2` tag SHA or release-workflow receipt is verified
+  verifies `0.2.2`; no `v0.2.2` tag SHA or release-workflow receipt is verified.
+  The reviewed, unreleased `0.2.3` candidate includes D209's typed cold-only
+  temperature and packet projection and PR #231's stopped-fault exact-session
+  recovery semantics.
 - #218 and #222 are complete. #225 remains open for release-process
   reconciliation, and #227 is closed for the D209 software projection.
-  Published `0.2.2` lacks D209; the reviewed, unreleased same-version candidate
-  adds its typed cold-only temperature and packet projection. #222's separate
+  Published `0.2.2` lacks D209; the reviewed, unreleased `0.2.3` candidate
+  adds its typed cold-only temperature and packet projection and PR #231's
+  stopped-fault exact-session recovery semantics. #222's separate
   roast-fan-only `get_roast_state` observation reports commanded state only.
   Agent-side comparison between observations owns packet-progress screening;
   neither surface proves physical state, calibration, continuous freshness,
@@ -48,9 +52,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
   no `v0.2.2` tag SHA, release-workflow receipt, or completed checklist is
   verified. #218 and #222 are complete. #225 remains open for release-process
   reconciliation, and #227 is closed for the D209 software projection.
-  Published `0.2.2` lacks D209, while the reviewed, unreleased same-version
-  candidate includes its typed cold-only temperature and packet projection.
-  #222 remains a separate commanded roast-fan observation. Agent-side
+  Published `0.2.2` lacks D209, while the reviewed, unreleased `0.2.3`
+  candidate includes its typed cold-only temperature and packet projection and
+  PR #231's stopped-fault exact-session recovery semantics. #222 remains a
+  separate commanded roast-fan observation. Agent-side
   between-observation comparison owns packet-progress screening. Neither
   surface proves physical state, calibration, continuous freshness, link
   health, readiness, or installed bytes. #157 and #194 remain separate open
