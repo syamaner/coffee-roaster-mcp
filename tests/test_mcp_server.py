@@ -2951,6 +2951,49 @@ def test_concurrent_session_start_reserves_before_driver_connect(tmp_path: Path)
     assert driver.actions == ["connect"]
 
 
+def test_server_info_session_presence_is_atomic_during_mock_start_and_fresh_context(
+    tmp_path: Path,
+) -> None:
+    """The public read-only field distinguishes mock start states and a fresh server."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    connect_started = Event()
+    release_connect = Event()
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(block_connect=(connect_started, release_connect))
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    assert _call_tool(server, "get_server_info", ctx).session_presence == "none"
+
+    start_thread = Thread(
+        target=_record_tool_result,
+        args=(results, errors, server, "start_roast_session", ctx),
+    )
+    start_thread.start()
+    assert connect_started.wait(timeout=1.0)
+    assert _call_tool(server, "get_server_info", ctx).session_presence == "starting"
+
+    release_connect.set()
+    start_thread.join(timeout=1.0)
+    assert not start_thread.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert _call_tool(server, "get_server_info", ctx).session_presence == "active"
+
+    server_context.session_store.stop_session()
+    assert _call_tool(server, "get_server_info", ctx).session_presence == "stopped"
+
+    fresh_context = build_server_context(config_path=config_path)
+    fresh_server = create_mcp_server(config_path=config_path)
+    assert (
+        _call_tool(fresh_server, "get_server_info", _ctx(fresh_context)).session_presence == "none"
+    )
+
+
 def test_guarded_emergency_stop_cancels_blocked_new_session_start(tmp_path: Path) -> None:
     """Exact fault e-stop contains a blocked connect before it can create a session."""
     server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)

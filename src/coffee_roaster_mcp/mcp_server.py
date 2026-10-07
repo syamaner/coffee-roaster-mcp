@@ -57,6 +57,7 @@ from coffee_roaster_mcp.session import (
     RoastSession,
     RoastSessionStore,
     SessionLifecycleError,
+    SessionPresence,
     SessionPurpose,
     compute_roast_metrics,
     default_emergency_safety_payload,
@@ -225,6 +226,7 @@ class ServerInfo:
         roaster_driver: Configured roaster driver.
         first_crack_mode: Configured first-crack mode.
         bootstrap_safe: Whether the current defaults stay hardware-free.
+        session_presence: Closed, detail-free summary of in-process session state.
         available_bootstrap_tools: Tools available while RoastPilot stays on the
             bootstrap-safe mock path.
         started_at_utc: UTC timestamp when this server process started.
@@ -238,6 +240,7 @@ class ServerInfo:
     roaster_driver: str
     first_crack_mode: str
     bootstrap_safe: bool
+    session_presence: SessionPresence
     available_bootstrap_tools: tuple[str, ...]
     started_at_utc: str
 
@@ -848,6 +851,7 @@ def create_mcp_server(
             roaster_driver=config.roaster.driver,
             first_crack_mode=config.first_crack.mode,
             bootstrap_safe=_is_bootstrap_safe(config),
+            session_presence=server_context.session_store.get_session_presence(),
             available_bootstrap_tools=(
                 "get_server_info",
                 "get_runtime_config",

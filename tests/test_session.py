@@ -142,6 +142,22 @@ def test_stop_session_is_clean_when_no_session_exists() -> None:
     assert store.stop_session() is None
 
 
+def test_session_presence_tracks_pending_active_and_stopped_lifecycle() -> None:
+    """The detail-free snapshot distinguishes every closed session state."""
+    store = RoastSessionStore()
+
+    assert store.get_session_presence() == "none"
+
+    reservation = store.reserve_session_start()
+    assert store.get_session_presence() == "starting"
+
+    store.complete_session_start_snapshot(reservation)
+    assert store.get_session_presence() == "active"
+
+    store.stop_session()
+    assert store.get_session_presence() == "stopped"
+
+
 def test_negative_telemetry_buffer_limit_is_rejected() -> None:
     with pytest.raises(ValueError, match="telemetry_buffer_limit"):
         RoastSessionStore(telemetry_buffer_limit=-1)
