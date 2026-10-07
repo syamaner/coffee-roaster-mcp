@@ -10,8 +10,8 @@ import json
 import logging
 import time
 from pathlib import Path
-from threading import Event, Thread
-from types import SimpleNamespace
+from threading import Event, Thread, get_ident
+from types import SimpleNamespace, TracebackType
 from typing import Any, cast
 
 import pytest
@@ -3949,8 +3949,32 @@ def test_guarded_recovery_containment_serializes_late_direct_emergency_stop(
     server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
     driver.fail_start_cooling = True
     original_emergency_stop = driver.emergency_stop
+    server_context = ctx.request_context.lifespan_context
     containment_started = Event()
     release_containment = Event()
+    direct_barrier_attempted = Event()
+    direct_thread_id: list[int] = []
+    original_barrier = server_context.lifecycle_barrier
+
+    class BarrierProbe:
+        """Signal when the direct e-stop thread reaches the lifecycle barrier."""
+
+        def __enter__(self) -> BarrierProbe:
+            if direct_thread_id and get_ident() == direct_thread_id[0]:
+                direct_barrier_attempted.set()
+            original_barrier.acquire()
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            del exc_type, exc_value, traceback
+            original_barrier.release()
+
+    object.__setattr__(server_context, "lifecycle_barrier", BarrierProbe())
 
     def block_recovery_containment(*, reason: str) -> EmergencyStopResult:
         if reason == "guarded fault recovery start_cooling failed":
@@ -3984,10 +4008,9 @@ def test_guarded_recovery_containment_serializes_late_direct_emergency_stop(
     assert containment_started.wait(timeout=1.0)
 
     direct_errors: list[BaseException] = []
-    direct_entered = Event()
 
     def call_direct_emergency_stop() -> None:
-        direct_entered.set()
+        direct_thread_id.append(get_ident())
         _record_tool_error(
             direct_errors,
             server,
@@ -4000,7 +4023,7 @@ def test_guarded_recovery_containment_serializes_late_direct_emergency_stop(
         target=call_direct_emergency_stop,
     )
     direct_thread.start()
-    assert direct_entered.wait(timeout=1.0)
+    assert direct_barrier_attempted.wait(timeout=1.0)
     assert direct_thread.is_alive()
 
     release_containment.set()
