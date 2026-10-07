@@ -1184,6 +1184,40 @@ class RoastSessionStore:
                 raise SessionLifecycleError("Cooling must be active before it can be stopped.")
             return self._reserve_driver_command_locked(session, kind="stop_cooling")
 
+    def reserve_driver_fault_recovery(
+        self,
+        session: RoastSession,
+        *,
+        kind: Literal["drop", "start_cooling", "stop_cooling"],
+    ) -> DriverCommandReservation:
+        """Reserve one exact stopped-fault recovery driver command.
+
+        Args:
+            session: The latest stopped fault session selected by its exact ID.
+            kind: Recovery command to run.
+
+        Returns:
+            A reservation that must be completed with
+            :meth:`complete_reserved_driver_fault_recovery_snapshot` or cleared.
+
+        Raises:
+            SessionLifecycleError: If the session is not the latest stopped fault
+                session, retained heat is non-zero, command admission is unsafe,
+                or the requested recovery action has no valid precondition.
+        """
+        with self._lock:
+            self._assert_stopped_fault_recovery_session_locked(session)
+            if kind == "drop":
+                if session.beans_added_at_utc is None:
+                    raise SessionLifecycleError("Recovery bean drop requires beans to be added.")
+                if session.beans_dropped_at_utc is not None:
+                    raise SessionLifecycleError(
+                        "Recovery bean drop is only allowed before beans are dropped."
+                    )
+            elif kind == "stop_cooling" and not session.cooling_on:
+                raise SessionLifecycleError("Cooling must be active before it can be stopped.")
+            return self._reserve_driver_command_locked(session, kind=kind)
+
     def complete_reserved_driver_control_snapshot(
         self,
         session: RoastSession,
@@ -1444,6 +1478,105 @@ class RoastSessionStore:
         """Clear a pending driver command reservation if it is still current."""
         with self._lock:
             if session.pending_driver_command_token == reservation.token:
+                self._clear_driver_command_reservation_locked(session, reservation)
+
+    def complete_reserved_driver_fault_recovery_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> tuple[RoastEvent, RoastSession]:
+        """Complete one guarded stopped-fault recovery command.
+
+        The completion records only the command's actual lifecycle event while
+        retaining the terminal fault state. It rejects a non-zero heat report,
+        so a recovery command cannot report success after the driver reports
+        heat enabled.
+
+        Args:
+            session: Latest stopped fault session that owns the reservation.
+            reservation: Reservation returned by
+                :meth:`reserve_driver_fault_recovery`.
+            heat_level_percent: Driver-reported heat after the command.
+            fan_level_percent: Driver-reported fan after the command.
+            cooling_on: Driver-reported cooling state after the command.
+
+        Returns:
+            The authoritative event and an atomic session snapshot.
+
+        Raises:
+            SessionLifecycleError: If the reservation/session is stale, heat is
+                non-zero, or the command did not establish its required state.
+        """
+        with self._lock:
+            try:
+                self._assert_stopped_fault_recovery_session_locked(session)
+                if (
+                    reservation.session_id != session.id
+                    or session.pending_driver_command_token != reservation.token
+                    or session.pending_driver_command_kind != reservation.kind
+                ):
+                    raise SessionLifecycleError("Driver command reservation is no longer active.")
+                validated_heat = validate_control_percent(
+                    heat_level_percent,
+                    label="heat_level_percent",
+                )
+                validated_fan = validate_control_percent(
+                    fan_level_percent,
+                    label="fan_level_percent",
+                )
+                if validated_heat != 0:
+                    raise SessionLifecycleError("Heat must be off after fault recovery.")
+
+                payload: dict[str, EventPayloadValue] = {
+                    "heat_level_percent": validated_heat,
+                    "fan_level_percent": validated_fan,
+                    "cooling_on": cooling_on,
+                    "recovery_after_fault": True,
+                }
+                if reservation.kind == "drop":
+                    event = self._record_stopped_session_event_locked(
+                        session,
+                        "beans_dropped",
+                        payload=payload,
+                    )
+                    if cooling_on:
+                        self._record_stopped_session_event_locked(
+                            session,
+                            "cooling_started",
+                            payload=payload,
+                        )
+                elif reservation.kind == "start_cooling":
+                    if not cooling_on:
+                        raise SessionLifecycleError(
+                            "Driver still reports cooling inactive after start_cooling."
+                        )
+                    event = self._record_stopped_session_event_locked(
+                        session,
+                        "cooling_started",
+                        payload=payload,
+                    )
+                elif reservation.kind == "stop_cooling":
+                    if cooling_on:
+                        raise SessionLifecycleError(
+                            "Driver still reports cooling active after stop_cooling."
+                        )
+                    event = self._record_stopped_session_event_locked(
+                        session,
+                        "cooling_stopped",
+                        payload=payload,
+                    )
+                else:
+                    raise SessionLifecycleError("Unsupported stopped-fault recovery command.")
+                session.heat_level_percent = validated_heat
+                session.fan_level_percent = validated_fan
+                session.cooling_on = cooling_on
+                session.phase = "fault"
+                return event, _copy_session_for_read(session)
+            finally:
                 self._clear_driver_command_reservation_locked(session, reservation)
 
     def cancel_nonfinalisation_driver_command(self, session: RoastSession) -> None:
@@ -2178,6 +2311,16 @@ class RoastSessionStore:
         if self._latest_session is not session:
             raise SessionLifecycleError("Only the latest session can be mutated.")
 
+    def _assert_stopped_fault_recovery_session_locked(self, session: RoastSession) -> None:
+        """Validate the closed stopped-fault recovery admission state."""
+        self._assert_latest_session(session)
+        if session.active:
+            raise SessionLifecycleError("Recovery command requires a stopped session.")
+        if session.faulted_at_utc is None or session.phase != "fault":
+            raise SessionLifecycleError("Recovery command is only allowed after an emergency stop.")
+        if session.heat_level_percent != 0:
+            raise SessionLifecycleError("Recovery command requires heat to be off.")
+
     def _record_stopped_session_event_locked(
         self,
         session: RoastSession,
@@ -2188,7 +2331,8 @@ class RoastSessionStore:
         """Record a narrowly allowed event for a stopped latest session."""
         existing_event = self._get_existing_singleton_event(session, kind)
         is_post_fault_recovery = (
-            kind == "cooling_stopped" and payload.get("recovery_after_fault") is True
+            kind in {"cooling_started", "cooling_stopped"}
+            and payload.get("recovery_after_fault") is True
         )
         if existing_event is not None and not is_post_fault_recovery:
             return existing_event
@@ -2254,6 +2398,14 @@ class RoastSessionStore:
             raise SessionLifecycleError(
                 "Cannot start a new roast session while post-fault cooling recovery is pending."
             )
+        if (
+            session is not None
+            and not session.active
+            and session.faulted_at_utc is not None
+            and session.phase == "fault"
+            and session.pending_driver_command_token is not None
+        ):
+            raise SessionLifecycleError("Cannot start a roast session during fault recovery.")
 
     def _assert_session_start_reservation(
         self,

@@ -3477,6 +3477,204 @@ def test_stop_cooling_still_rejects_completed_inactive_session(tmp_path: Path) -
         _call_tool(server, "stop_cooling", ctx)
 
 
+def _faulted_recovery_server(
+    tmp_path: Path,
+    *,
+    beans_added: bool = False,
+) -> tuple[FastMCP, object, RecordingRoasterDriver, str]:
+    """Build one stopped fault session for guarded recovery tests."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    started = _call_tool(server, "start_roast_session", ctx)
+    if beans_added:
+        _call_tool(server, "mark_beans_added", ctx)
+    _call_tool(server, "emergency_stop", ctx, reason="setup-fault")
+    return server, ctx, driver, started.session.session_id
+
+
+def test_guarded_fault_recovery_commands_preserve_fault_and_exact_result(tmp_path: Path) -> None:
+    """An exact stopped-fault ID admits each recovery command without heat."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+
+    dropped = _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    started = _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    stopped = _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    assert dropped.session_id == started.session_id == stopped.session_id == session_id
+    assert dropped.phase == started.phase == stopped.phase == "fault"
+    assert dropped.event.kind == "beans_dropped"
+    assert started.event.kind == "cooling_started"
+    assert stopped.event.kind == "cooling_stopped"
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.active is False
+    assert state.phase == "fault"
+    assert state.heat_level_percent == 0
+    assert state.cooling_on is False
+    assert [event.kind for event in state.events] == [
+        "beans_added",
+        "fault",
+        "beans_dropped",
+        "cooling_started",
+        "cooling_started",
+        "cooling_stopped",
+    ]
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "drop_beans",
+        "start_cooling",
+        "stop_cooling",
+    ]
+
+
+def test_guarded_fault_recovery_rejects_empty_drop_before_driver_call(tmp_path: Path) -> None:
+    """An empty stopped fault session cannot actuate the bean-drop command."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+
+    with pytest.raises(SessionLifecycleError, match="requires beans to be added"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+
+    assert driver.actions == ["connect", "emergency_stop:setup-fault"]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_session_id", "error"),
+    [
+        ("start_cooling", "missing", "not the latest roast session"),
+        ("stop_cooling", "missing", "not the latest roast session"),
+        ("emergency_stop", "missing", "not the latest roast session"),
+    ],
+)
+def test_guarded_fault_recovery_rejects_wrong_id_before_driver_call(
+    tmp_path: Path,
+    tool_name: str,
+    expected_session_id: str,
+    error: str,
+) -> None:
+    """A stale or unknown recovery ID cannot select another session to actuate."""
+    server, ctx, driver, _ = _faulted_recovery_server(tmp_path)
+
+    with pytest.raises(ValueError, match=error):
+        _call_tool(server, tool_name, ctx, expected_session_id=expected_session_id)
+
+    assert driver.actions == ["connect", "emergency_stop:setup-fault"]
+
+
+def test_guarded_fault_recovery_rejects_active_id_before_driver_call(tmp_path: Path) -> None:
+    """The optional ID does not broaden active-session command admission."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    started = _call_tool(server, "start_roast_session", ctx)
+
+    with pytest.raises(ValueError, match="not a stopped fault session"):
+        _call_tool(
+            server,
+            "start_cooling",
+            ctx,
+            expected_session_id=started.session.session_id,
+        )
+
+    assert driver.actions == ["connect"]
+
+
+def test_guarded_fault_recovery_repeats_emergency_stop_after_cooling_stops(
+    tmp_path: Path,
+) -> None:
+    """A repeated guarded e-stop reasserts zero heat after cooling was stopped."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    repeated = _call_tool(
+        server,
+        "emergency_stop",
+        ctx,
+        reason="reassert-fault",
+        expected_session_id=session_id,
+    )
+
+    assert repeated.session_id == session_id
+    assert repeated.phase == "fault"
+    assert repeated.event.kind == "fault"
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.active is False and state.phase == "fault"
+    assert state.heat_level_percent == 0 and state.cooling_on is True
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "stop_cooling",
+        "emergency_stop:reassert-fault",
+    ]
+
+
+def test_guarded_emergency_stop_rejects_nonzero_heat_report(tmp_path: Path) -> None:
+    """A guarded e-stop cannot return success if the driver reports heat on."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    driver.emergency_heat_level_percent = 10
+
+    with pytest.raises(SessionLifecycleError, match="did not report zero heat"):
+        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "emergency_stop:manual emergency stop",
+    ]
+
+
+def test_guarded_fault_recovery_clears_failed_command_reservation(tmp_path: Path) -> None:
+    """A driver failure leaves no reservation that blocks a later safe retry."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    driver.fail_start_cooling = True
+
+    with pytest.raises(RuntimeError, match="start cooling failed"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+
+    driver.fail_start_cooling = False
+    recovered = _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    assert recovered.event.kind == "cooling_started"
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "start_cooling",
+        "start_cooling",
+    ]
+
+
+def test_guarded_start_cooling_records_each_reasserted_actuation(tmp_path: Path) -> None:
+    """Each actual guarded cooling start has a distinct recovery event/result."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+
+    first = _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    second = _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+
+    assert first.event.kind == second.event.kind == "cooling_started"
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert [event.kind for event in state.events] == [
+        "fault",
+        "cooling_started",
+        "cooling_stopped",
+        "cooling_started",
+    ]
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "start_cooling",
+        "stop_cooling",
+        "start_cooling",
+    ]
+
+
 class RecordingRoasterDriver:
     """Driver double that records MCP boundary calls."""
 
@@ -3487,6 +3685,8 @@ class RecordingRoasterDriver:
         *,
         fail_connect: bool = False,
         fail_heat: bool = False,
+        fail_start_cooling: bool = False,
+        emergency_heat_level_percent: int = 0,
         fail_read: bool = False,
         block_connect: tuple[Event, Event] | None = None,
         block_heat: tuple[Event, Event] | None = None,
@@ -3502,6 +3702,8 @@ class RecordingRoasterDriver:
         self.actions: list[str] = []
         self.fail_connect = fail_connect
         self.fail_heat = fail_heat
+        self.fail_start_cooling = fail_start_cooling
+        self.emergency_heat_level_percent = emergency_heat_level_percent
         self.fail_read = fail_read
         self.block_connect = block_connect
         self.block_heat = block_heat
@@ -3577,6 +3779,8 @@ class RecordingRoasterDriver:
     def start_cooling(self) -> RoasterState:
         """Record cooling-start commands."""
         self.actions.append("start_cooling")
+        if self.fail_start_cooling:
+            raise RuntimeError("start cooling failed")
         self.cooling_on = True
         return self._state()
 
@@ -3594,7 +3798,7 @@ class RecordingRoasterDriver:
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
         """Record emergency-stop commands."""
         self.actions.append(f"emergency_stop:{reason}")
-        self.heat_level_percent = 0
+        self.heat_level_percent = self.emergency_heat_level_percent
         self.fan_level_percent = 100
         self.cooling_on = True
         return EmergencyStopResult(

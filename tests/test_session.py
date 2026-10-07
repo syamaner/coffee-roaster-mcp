@@ -1661,6 +1661,29 @@ def test_stop_cooling_recovery_records_new_event_after_completed_session_fault()
     assert snapshot.cooling_on is False
 
 
+def test_guarded_fault_recovery_reservation_blocks_new_session_start() -> None:
+    """A stopped-fault command reservation prevents a newer-session race."""
+    store = RoastSessionStore()
+    session = store.start_session()
+    store.emergency_stop(
+        session,
+        reason="test-fault",
+        safety_payload={
+            "heat_level_percent": 0,
+            "fan_level_percent": 0,
+            "cooling_on": False,
+        },
+    )
+
+    reservation = store.reserve_driver_fault_recovery(session, kind="start_cooling")
+    with pytest.raises(SessionLifecycleError, match="during fault recovery"):
+        store.reserve_session_start()
+
+    store.clear_driver_command_reservation(session, reservation)
+    replacement = store.start_session()
+    assert replacement.id != session.id
+
+
 def test_emergency_stop_faults_active_complete_session() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(

@@ -1065,11 +1065,25 @@ def create_mcp_server(
     @mcp.tool()
     def drop_beans(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
+        expected_session_id: str | None = None,
     ) -> EventCommandResult:
         """Drop beans through the driver and record the cooling transition."""
         server_context = ctx.request_context.lifespan_context
-        session = _require_active_session(server_context)
-        event, snapshot = _run_reserved_driver_drop(server_context, session)
+        if expected_session_id is None:
+            session = _require_active_session(server_context)
+            event, snapshot = _run_reserved_driver_drop(server_context, session)
+        else:
+            with server_context.lifecycle_barrier:
+                session = _require_guarded_fault_recovery_session(
+                    server_context,
+                    expected_session_id=expected_session_id,
+                )
+                event, snapshot = _run_reserved_driver_fault_recovery(
+                    server_context,
+                    session,
+                    kind="drop",
+                )
+            return _serialize_event_result(snapshot=snapshot, event=event)
         # coffee-roaster-mcp#191: classify any detector window captured BEFORE
         # this drop but not yet drained by the poll cadence, so a genuine
         # pre-drop first crack is not silently lost from the RECORDING'S
@@ -1097,28 +1111,54 @@ def create_mcp_server(
     @mcp.tool()
     def start_cooling(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
+        expected_session_id: str | None = None,
     ) -> EventCommandResult:
         """Start cooling through the driver as an explicit recovery command."""
         server_context = ctx.request_context.lifespan_context
-        session = _require_active_session(server_context)
-        event, snapshot = _run_reserved_driver_start_cooling(server_context, session)
+        if expected_session_id is None:
+            session = _require_active_session(server_context)
+            event, snapshot = _run_reserved_driver_start_cooling(server_context, session)
+        else:
+            with server_context.lifecycle_barrier:
+                session = _require_guarded_fault_recovery_session(
+                    server_context,
+                    expected_session_id=expected_session_id,
+                )
+                event, snapshot = _run_reserved_driver_fault_recovery(
+                    server_context,
+                    session,
+                    kind="start_cooling",
+                )
         return _serialize_event_result(snapshot=snapshot, event=event)
 
     @mcp.tool()
     def stop_cooling(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
+        expected_session_id: str | None = None,
     ) -> EventCommandResult:
         """Stop cooling through the configured driver boundary."""
         server_context = ctx.request_context.lifespan_context
-        session = server_context.session_store.get_active_session()
-        if session is None:
-            session = _require_faulted_cooling_session(server_context)
-            event, snapshot = _run_reserved_driver_stop_cooling_recovery(
-                server_context,
-                session,
-            )
+        if expected_session_id is not None:
+            with server_context.lifecycle_barrier:
+                session = _require_guarded_fault_recovery_session(
+                    server_context,
+                    expected_session_id=expected_session_id,
+                )
+                event, snapshot = _run_reserved_driver_fault_recovery(
+                    server_context,
+                    session,
+                    kind="stop_cooling",
+                )
         else:
-            event, snapshot = _run_reserved_driver_stop_cooling(server_context, session)
+            session = server_context.session_store.get_active_session()
+            if session is None:
+                session = _require_faulted_cooling_session(server_context)
+                event, snapshot = _run_reserved_driver_stop_cooling_recovery(
+                    server_context,
+                    session,
+                )
+            else:
+                event, snapshot = _run_reserved_driver_stop_cooling(server_context, session)
         server_context.first_crack_runtime.stop_for_session(
             snapshot.id,
             reason="cooling stopped",
@@ -1161,13 +1201,22 @@ def create_mcp_server(
     def emergency_stop(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
         reason: str = "manual emergency stop",
+        expected_session_id: str | None = None,
     ) -> EventCommandResult:
         """Call the configured driver safety method and record a fault event."""
         server_context = ctx.request_context.lifespan_context
         with server_context.lifecycle_barrier:
-            session = _require_active_session(server_context)
+            if expected_session_id is None:
+                session = _require_active_session(server_context)
+            else:
+                session = _require_guarded_fault_recovery_session(
+                    server_context,
+                    expected_session_id=expected_session_id,
+                )
             server_context.session_store.cancel_nonfinalisation_driver_command(session)
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
+            if expected_session_id is not None and safety_payload.get("heat_level_percent") != 0:
+                raise SessionLifecycleError("Emergency stop did not report zero heat.")
             event, snapshot = server_context.session_store.emergency_stop_snapshot(
                 session,
                 reason=reason,
@@ -1306,6 +1355,27 @@ def _require_faulted_cooling_session(server_context: ServerContext) -> RoastSess
         or not session.cooling_on
     ):
         raise ValueError("No active roast session exists.")
+    return session
+
+
+def _require_guarded_fault_recovery_session(
+    server_context: ServerContext,
+    *,
+    expected_session_id: str,
+) -> RoastSession:
+    """Return the exact latest stopped-fault session selected by an operator.
+
+    The session store repeats the stopped-fault and latest-session checks when it
+    reserves the command. This helper keeps the MCP boundary's identity check
+    adjacent to the lifecycle barrier so a mismatch cannot reach a driver call.
+    """
+    session = server_context.session_store.get_latest_session()
+    if session is None or session.id != expected_session_id:
+        raise ValueError("Expected session is not the latest roast session.")
+    if session.active or session.phase != "fault" or session.faulted_at_utc is None:
+        raise ValueError("Expected session is not a stopped fault session.")
+    if session.heat_level_percent != 0:
+        raise ValueError("Expected fault session does not have zero heat.")
     return session
 
 
@@ -1530,6 +1600,37 @@ def _run_reserved_driver_stop_cooling_recovery(
                 server_context.session_store.complete_reserved_driver_stop_cooling_recovery_snapshot
             )
             return complete_recovery(
+                session,
+                reservation=reservation,
+                heat_level_percent=driver_state.heat_level_percent,
+                fan_level_percent=driver_state.fan_level_percent,
+                cooling_on=driver_state.cooling_on,
+            )
+        except SessionLifecycleError:
+            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
+            raise
+    except Exception:
+        server_context.session_store.clear_driver_command_reservation(session, reservation)
+        raise
+
+
+def _run_reserved_driver_fault_recovery(
+    server_context: ServerContext,
+    session: RoastSession,
+    *,
+    kind: Literal["drop", "start_cooling", "stop_cooling"],
+) -> tuple[RoastEvent, RoastSession]:
+    """Run one exact stopped-fault command and retain the terminal fault state."""
+    reservation = server_context.session_store.reserve_driver_fault_recovery(session, kind=kind)
+    try:
+        if kind == "drop":
+            driver_state = server_context.roaster_driver.drop_beans()
+        elif kind == "start_cooling":
+            driver_state = server_context.roaster_driver.start_cooling()
+        else:
+            driver_state = server_context.roaster_driver.stop_cooling()
+        try:
+            return server_context.session_store.complete_reserved_driver_fault_recovery_snapshot(
                 session,
                 reservation=reservation,
                 heat_level_percent=driver_state.heat_level_percent,
