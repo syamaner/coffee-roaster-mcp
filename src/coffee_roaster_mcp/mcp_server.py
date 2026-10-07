@@ -1236,9 +1236,8 @@ def create_mcp_server(
                 )
             server_context.session_store.cancel_nonfinalisation_driver_command(session)
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
-            if expected_session_id is not None and not has_verified_zero_heat(
-                safety_payload=safety_payload
-            ):
+            has_verified_containment = has_verified_zero_heat(safety_payload=safety_payload)
+            if expected_session_id is not None and not has_verified_containment:
                 _retain_guarded_emergency_stop_block(
                     server_context,
                     session=session,
@@ -1263,6 +1262,8 @@ def create_mcp_server(
             snapshot.id,
             reason="emergency stop",
         )
+        if not has_verified_containment:
+            raise SessionLifecycleError("Emergency stop did not report verified zero heat.")
         return _serialize_event_result(snapshot=snapshot, event=event)
 
     @mcp.tool()

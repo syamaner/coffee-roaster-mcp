@@ -3717,7 +3717,12 @@ def test_initial_emergency_stop_driver_error_blocks_fault_recovery_commands(
         raise RuntimeError("emergency stop unavailable")
 
     monkeypatch.setattr(driver, "emergency_stop", fail_emergency_stop)
-    _call_tool(server, "emergency_stop", ctx)
+    with pytest.raises(SessionLifecycleError, match="did not report verified zero heat"):
+        _call_tool(server, "emergency_stop", ctx)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.events[-1].payload["driver_safety_method_called"] is False
 
     for tool_name in ("drop_beans", "start_cooling", "stop_cooling"):
         with pytest.raises(ValueError, match="verified emergency-stop containment"):
