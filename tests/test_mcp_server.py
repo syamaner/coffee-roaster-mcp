@@ -3755,17 +3755,54 @@ def test_active_emergency_stop_recording_failure_retains_in_memory_fault_block(
     def fail_fault_recording(*_args: object, **_kwargs: object) -> object:
         raise OSError("log unavailable")
 
+    cleanup_calls: list[tuple[str, str, str]] = []
+
+    def fail_first_crack_cleanup(session_id: str, *, reason: str) -> object:
+        cleanup_calls.append(("first_crack", session_id, reason))
+        raise RuntimeError("first-crack cleanup unavailable")
+
+    def record_telemetry_cleanup(session_id: str, *, reason: str) -> object:
+        cleanup_calls.append(("telemetry", session_id, reason))
+        return None
+
+    def record_ambient_cleanup(session_id: str, *, reason: str) -> object:
+        cleanup_calls.append(("ambient", session_id, reason))
+        return None
+
     monkeypatch.setattr(driver, "emergency_stop", fail_emergency_stop)
     monkeypatch.setattr(session_module, "_append_event_log_row", fail_fault_recording)
+    monkeypatch.setattr(
+        server_context.first_crack_runtime,
+        "stop_for_session",
+        fail_first_crack_cleanup,
+    )
+    monkeypatch.setattr(
+        server_context.telemetry_sampler,
+        "stop_for_session",
+        record_telemetry_cleanup,
+    )
+    monkeypatch.setattr(
+        server_context.ambient_runtime,
+        "stop_for_session",
+        record_ambient_cleanup,
+    )
 
-    with pytest.raises(SessionLifecycleError, match="fault recording failed"):
+    with pytest.raises(SessionLifecycleError, match="fault recording failed") as failure:
         _call_tool(server, "emergency_stop", ctx)
 
+    assert isinstance(failure.value.__cause__, OSError)
+    assert cleanup_calls == [
+        ("first_crack", session_id, "emergency stop"),
+        ("telemetry", session_id, "emergency stop"),
+        ("ambient", session_id, "emergency stop"),
+    ]
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
     assert state.phase == "fault" and state.active is False
     assert state.heat_level_percent == 0 and state.cooling_on is True
     with pytest.raises(ValueError, match="No active roast session exists"):
         _call_tool(server, "set_heat", ctx, heat_level_percent=100)
+    with pytest.raises(ValueError, match="verified emergency-stop containment"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
     with pytest.raises(SessionLifecycleError, match="containment is verified"):
         _call_tool(server, "start_roast_session", ctx)
     assert driver.actions == ["connect"]
