@@ -1594,6 +1594,7 @@ class RoastSessionStore:
                 session.faulted_monotonic_seconds = session.elapsed_monotonic_seconds(
                     self._monotonic_now
                 )
+            self._abort_finalisation_for_emergency_stop_locked(session)
 
     def clear_fault_recovery_in_flight(
         self,
@@ -2162,26 +2163,30 @@ class RoastSessionStore:
                 self._fault_recovery_admission_blocks.discard(session.id)
             else:
                 self._fault_recovery_admission_blocks.add(session.id)
-            if session.id in self._nonterminal_finalisations:
-                record = session.finalisation
-                if record is not None:
-                    # Result models are server-owned. Preserve their append-only
-                    # data and only apply the lifecycle fields common to all
-                    # finalisation records.
-                    object.__setattr__(record, "status", "aborted")
-                    object.__setattr__(record, "abort_reason", "emergency_stop")
-                    attempted = getattr(getattr(record, "disconnect", None), "attempt_count", 0)
-                    ordering = (
-                        "emergency_stop_after_disconnect_attempt"
-                        if attempted
-                        else "emergency_stop_before_disconnect_commit"
-                    )
-                    object.__setattr__(record, "emergency_stop_ordering", ordering)
-                    object.__setattr__(record, "retained", True)
-                    object.__setattr__(record, "session_active_after", session.active)
-                    object.__setattr__(record, "session_phase_after", session.phase)
-                self._clear_finalisation_locked(session)
+            self._abort_finalisation_for_emergency_stop_locked(session)
             return event
+
+    def _abort_finalisation_for_emergency_stop_locked(self, session: RoastSession) -> None:
+        """Retain an emergency-aborted finalisation and release its reservation."""
+        if session.id not in self._nonterminal_finalisations:
+            return
+        record = session.finalisation
+        if record is not None:
+            # Result models are server-owned. Preserve their append-only data
+            # and only apply the lifecycle fields common to all finalisation records.
+            object.__setattr__(record, "status", "aborted")
+            object.__setattr__(record, "abort_reason", "emergency_stop")
+            attempted = getattr(getattr(record, "disconnect", None), "attempt_count", 0)
+            ordering = (
+                "emergency_stop_after_disconnect_attempt"
+                if attempted
+                else "emergency_stop_before_disconnect_commit"
+            )
+            object.__setattr__(record, "emergency_stop_ordering", ordering)
+            object.__setattr__(record, "retained", True)
+            object.__setattr__(record, "session_active_after", session.active)
+            object.__setattr__(record, "session_phase_after", session.phase)
+        self._clear_finalisation_locked(session)
 
     def emergency_stop_snapshot(
         self,

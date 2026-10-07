@@ -1598,7 +1598,7 @@ def test_mock_driver_telemetry_responds_to_heat_and_cooling() -> None:
     driver.start_cooling()
     cooling_state = driver.read_state()
     assert cooling_state.cooling_on is True
-    assert cooling_state.env_temp_c == 21.0
+    assert cooling_state.env_temp_c == 20.5
     assert cooling_state.bean_temp_c == 20.6
 
 
@@ -1696,6 +1696,17 @@ def test_mock_driver_emergency_stop_returns_safe_session_state() -> None:
     assert driver.read_state().heat_level_percent == 0
     assert driver.read_state().fan_level_percent == 100
     assert driver.read_state().cooling_on is True
+
+
+def test_mock_driver_start_cooling_restores_main_fan_after_stop() -> None:
+    """Mock cooling restart matches the Hottop main-fan safety state."""
+    driver = MockRoasterDriver()
+    driver.stop_cooling()
+
+    state = driver.start_cooling()
+
+    assert state.cooling_on is True
+    assert state.fan_level_percent == 100
 
 
 @pytest.mark.parametrize(

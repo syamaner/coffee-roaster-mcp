@@ -729,6 +729,7 @@ class MockRoasterDriver:
     def start_cooling(self) -> RoasterState:
         """Start mock cooling and return normalized state."""
         self._cooling_on = True
+        self._fan_level_percent = 100
         return self._state_snapshot()
 
     def stop_cooling(self) -> RoasterState:

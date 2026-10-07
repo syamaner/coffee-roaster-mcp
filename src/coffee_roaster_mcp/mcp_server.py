@@ -1760,15 +1760,22 @@ def _retain_guarded_emergency_stop_block(
 ) -> None:
     """Retain a pessimistic stopped-fault block after an invalid guarded e-stop.
 
-    A guarded emergency-stop response that reports retained heat cannot be
-    returned as success. Its driver result is also not evidence that cooling is
-    safely off, so preserve the conservative cooling-on state before raising.
-    The fallback must survive an event-recording failure.
+    A guarded emergency-stop response that reports incomplete containment
+    cannot be returned as success. Its truthful result is retained while the
+    fallback preserves a hard admission block through recording failure.
     """
+    heat_level_percent = safety_payload.get("heat_level_percent")
+    reason = (
+        "guarded emergency stop reported retained heat"
+        if isinstance(heat_level_percent, int)
+        and not isinstance(heat_level_percent, bool)
+        and heat_level_percent != 0
+        else "guarded emergency stop reported incomplete containment"
+    )
     try:
         server_context.session_store.emergency_stop_snapshot(
             session,
-            reason="guarded emergency stop reported retained heat",
+            reason=reason,
             safety_payload=safety_payload,
             allow_stopped_latest=True,
         )

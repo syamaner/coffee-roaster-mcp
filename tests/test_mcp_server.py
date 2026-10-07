@@ -3630,6 +3630,7 @@ def test_guarded_emergency_stop_rejects_nonzero_heat_report(tmp_path: Path) -> N
 
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
     assert state.heat_level_percent == 10 and state.cooling_on is True
+    assert state.events[-1].payload["reason"] == "guarded emergency stop reported retained heat"
     with pytest.raises(SessionLifecycleError, match="containment is verified"):
         _call_tool(server, "start_roast_session", ctx)
 
@@ -3767,6 +3768,9 @@ def test_guarded_emergency_stop_requires_complete_safe_state(
 
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
     assert state.fan_level_percent == fan_level_percent and state.cooling_on is cooling_on
+    assert state.events[-1].payload["reason"] == (
+        "guarded emergency stop reported incomplete containment"
+    )
     actions_before_recovery = list(driver.actions)
     with pytest.raises(ValueError, match="verified emergency-stop containment"):
         _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
@@ -3870,8 +3874,24 @@ def test_active_emergency_stop_recording_failure_retains_in_memory_fault_block(
     object.__setattr__(server_context, "roaster_driver", driver)
     server = create_mcp_server(config_path=config_path)
     ctx = _ctx(server_context)
-    started = _call_tool(server, "start_roast_session", ctx)
+    started = _call_tool(server, "start_roast_session", ctx, purpose="cold_characterisation")
     session_id = started.session.session_id
+    session, rejection, generation = server_context.session_store.begin_finalisation(session_id)
+    assert session is not None and rejection is None and generation is not None
+
+    class FinalisationRecord:
+        status = "partial"
+        abort_reason: str | None = None
+        retained = False
+        emergency_stop_ordering = "not_reached"
+        session_active_after = True
+        session_phase_after: str | None = None
+
+        def __init__(self) -> None:
+            self.reservation_generation = generation
+
+    record = FinalisationRecord()
+    assert server_context.session_store.attach_finalisation(session, record) is record
 
     def fail_emergency_stop(*, reason: str) -> EmergencyStopResult:
         del reason
@@ -3924,6 +3944,12 @@ def test_active_emergency_stop_recording_failure_retains_in_memory_fault_block(
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
     assert state.phase == "fault" and state.active is False
     assert state.heat_level_percent == 0 and state.cooling_on is True
+    assert record.status == "aborted" and record.abort_reason == "emergency_stop"
+    assert record.emergency_stop_ordering == "emergency_stop_before_disconnect_commit"
+    assert record.retained is True
+    assert record.session_active_after is False and record.session_phase_after == "fault"
+    assert session.pending_driver_command_token is None
+    assert session.pending_driver_command_kind is None
     with pytest.raises(ValueError, match="No active roast session exists"):
         _call_tool(server, "set_heat", ctx, heat_level_percent=100)
     with pytest.raises(ValueError, match="verified emergency-stop containment"):
