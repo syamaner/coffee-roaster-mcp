@@ -3381,12 +3381,12 @@ def test_stop_cooling_recovery_keeps_fault_when_driver_reports_cooling_on(
     assert state.phase == "fault"
     assert state.active is False
     assert state.cooling_on is True
-    assert [event.kind for event in state.events] == ["fault"]
+    assert [event.kind for event in state.events] == ["fault", "fault"]
     assert driver.actions == [
         "connect",
         "emergency_stop:unit-test",
         "stop_cooling",
-        "emergency_stop:stale driver command after session state changed",
+        "emergency_stop:guarded fault recovery stop_cooling failed",
     ]
 
 
@@ -3410,12 +3410,12 @@ def test_stop_cooling_recovery_rejects_driver_heat_after_fault(tmp_path: Path) -
     assert state.active is False
     assert state.heat_level_percent == 0
     assert state.cooling_on is True
-    assert [event.kind for event in state.events] == ["fault"]
+    assert [event.kind for event in state.events] == ["fault", "fault"]
     assert driver.actions == [
         "connect",
         "emergency_stop:unit-test",
         "stop_cooling",
-        "emergency_stop:stale driver command after session state changed",
+        "emergency_stop:guarded fault recovery stop_cooling failed",
     ]
 
 
@@ -3455,7 +3455,7 @@ def test_stale_stop_cooling_recovery_fails_closed(tmp_path: Path) -> None:
         "connect",
         "emergency_stop:unit-test",
         "stop_cooling",
-        "emergency_stop:stale driver command after session state changed",
+        "emergency_stop:guarded fault recovery stop_cooling failed",
     ]
 
 
@@ -3984,13 +3984,23 @@ def test_guarded_recovery_containment_serializes_late_direct_emergency_stop(
     assert containment_started.wait(timeout=1.0)
 
     direct_errors: list[BaseException] = []
+    direct_entered = Event()
+
+    def call_direct_emergency_stop() -> None:
+        direct_entered.set()
+        _record_tool_error(
+            direct_errors,
+            server,
+            "emergency_stop",
+            ctx,
+            expected_session_id=session_id,
+        )
+
     direct_thread = Thread(
-        target=_record_tool_error,
-        args=(direct_errors, server, "emergency_stop", ctx),
-        kwargs={"expected_session_id": session_id},
+        target=call_direct_emergency_stop,
     )
     direct_thread.start()
-    direct_thread.join(timeout=0.05)
+    assert direct_entered.wait(timeout=1.0)
     assert direct_thread.is_alive()
 
     release_containment.set()
@@ -4005,6 +4015,38 @@ def test_guarded_recovery_containment_serializes_late_direct_emergency_stop(
     assert state.heat_level_percent == 10 and state.cooling_on is True
     with pytest.raises(SessionLifecycleError, match="containment is verified"):
         _call_tool(server, "start_roast_session", ctx)
+
+
+def test_legacy_fault_recovery_fences_blocked_driver_io_until_containment(
+    tmp_path: Path,
+) -> None:
+    """Legacy cooling recovery cannot outlive a superseding guarded e-stop."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    started = Event()
+    release = Event()
+    driver.block_stop_cooling = (started, release)
+    errors: list[BaseException] = []
+    thread = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "stop_cooling", ctx),
+    )
+    thread.start()
+    assert started.wait(timeout=1.0)
+
+    _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="earlier fault recovery command is in flight"):
+        _call_tool(server, "stop_cooling", ctx)
+    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    release.set()
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], SessionLifecycleError)
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.heat_level_percent == 0 and state.cooling_on is True
+    assert driver.actions[-1] == "emergency_stop:guarded fault recovery stop_cooling failed"
 
 
 def test_guarded_start_cooling_records_each_reasserted_actuation(tmp_path: Path) -> None:

@@ -766,7 +766,9 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
 
         recovery_stop_result = cast(
             Any,
-            await _call_with_timeout(session.call_tool("stop_cooling", {})),
+            await _call_with_timeout(
+                session.call_tool("stop_cooling", {"expected_session_id": second_session_id})
+            ),
         )
         assert recovery_stop_result.structuredContent["session_id"] == second_session_id
         assert recovery_stop_result.structuredContent["event"]["kind"] == "cooling_stopped"

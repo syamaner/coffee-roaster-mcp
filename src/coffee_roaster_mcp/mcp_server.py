@@ -1166,10 +1166,16 @@ def create_mcp_server(
         else:
             session = server_context.session_store.get_active_session()
             if session is None:
-                session = _require_faulted_cooling_session(server_context)
-                event, snapshot = _run_reserved_driver_stop_cooling_recovery(
+                with server_context.lifecycle_barrier:
+                    session = _require_faulted_cooling_session(server_context)
+                    reservation = server_context.session_store.reserve_driver_fault_recovery(
+                        session,
+                        kind="stop_cooling",
+                    )
+                event, snapshot = _run_reserved_driver_fault_recovery(
                     server_context,
                     session,
+                    reservation=reservation,
                 )
             else:
                 event, snapshot = _run_reserved_driver_stop_cooling(server_context, session)
@@ -1603,33 +1609,6 @@ def _run_reserved_driver_stop_cooling(
         driver_state = server_context.roaster_driver.stop_cooling()
         try:
             return server_context.session_store.complete_reserved_driver_stop_cooling_snapshot(
-                session,
-                reservation=reservation,
-                heat_level_percent=driver_state.heat_level_percent,
-                fan_level_percent=driver_state.fan_level_percent,
-                cooling_on=driver_state.cooling_on,
-            )
-        except SessionLifecycleError:
-            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
-            raise
-    except Exception:
-        server_context.session_store.clear_driver_command_reservation(session, reservation)
-        raise
-
-
-def _run_reserved_driver_stop_cooling_recovery(
-    server_context: ServerContext,
-    session: RoastSession,
-) -> tuple[RoastEvent, RoastSession]:
-    """Run a reserved cooling-stop command for a faulted stopped session."""
-    reservation = server_context.session_store.reserve_driver_stop_cooling_recovery(session)
-    try:
-        driver_state = server_context.roaster_driver.stop_cooling()
-        try:
-            complete_recovery = (
-                server_context.session_store.complete_reserved_driver_stop_cooling_recovery_snapshot
-            )
-            return complete_recovery(
                 session,
                 reservation=reservation,
                 heat_level_percent=driver_state.heat_level_percent,
