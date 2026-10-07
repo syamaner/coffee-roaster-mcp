@@ -582,7 +582,7 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert state_content["active"] is False
         assert state_content["phase"] == "complete"
         assert state_content["heat_level_percent"] == 0
-        assert state_content["fan_level_percent"] == 100
+        assert state_content["fan_level_percent"] == 0
         assert state_content["cooling_on"] is False
         assert state_content["cold_characterisation_observation"] is None
         assert state_content["cold_temperature_projection"] is None
@@ -597,7 +597,7 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         assert device_state["bean_temp_c"] is not None
         assert device_state["env_temp_c"] is not None
         assert device_state["heat_level_percent"] == 0
-        assert device_state["fan_level_percent"] == 100
+        assert device_state["fan_level_percent"] == 0
         assert device_state["cooling_on"] is False
         assert isinstance(device_state["raw_vendor_data"], dict)
 

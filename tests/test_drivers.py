@@ -362,6 +362,7 @@ def _assert_roaster_driver_contract(driver: RoasterDriver) -> None:
 
     stopped_cooling_state = driver.stop_cooling()
     assert stopped_cooling_state.cooling_on is False
+    assert stopped_cooling_state.fan_level_percent == 0
 
     driver.disconnect()
     disconnected_state = driver.read_state()
@@ -1818,7 +1819,7 @@ def test_mock_lifecycle_evidence_tracks_heat_drop_cooling_and_emergency_stop() -
     heated = driver.read_lifecycle_evidence()
     driver.drop_beans()
     driver.stop_cooling()
-    assert driver.read_lifecycle_evidence().main_fan_level_percent == 100
+    assert driver.read_lifecycle_evidence().main_fan_level_percent == 0
     driver.set_fan(fan_level_percent=0)
     stopped = driver.read_lifecycle_evidence()
     driver.emergency_stop(reason="test")

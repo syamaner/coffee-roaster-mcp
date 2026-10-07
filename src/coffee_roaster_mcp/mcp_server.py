@@ -898,7 +898,8 @@ def create_mcp_server(
     ) -> StartRoastSessionResult:
         """Start one new authoritative roast session and prepare the driver."""
         server_context = ctx.request_context.lifespan_context
-        reservation = server_context.session_store.reserve_session_start()
+        with server_context.lifecycle_barrier:
+            reservation = server_context.session_store.reserve_session_start()
         try:
             server_context.roaster_driver.connect()
             session = server_context.session_store.complete_session_start_snapshot(
@@ -1376,6 +1377,10 @@ def _require_guarded_fault_recovery_session(
         raise ValueError("Expected session is not a stopped fault session.")
     if session.heat_level_percent != 0:
         raise ValueError("Expected fault session does not have zero heat.")
+    try:
+        server_context.session_store.assert_guarded_fault_recovery_admission(session)
+    except SessionLifecycleError as exc:
+        raise ValueError(str(exc)) from exc
     return session
 
 
@@ -1629,20 +1634,67 @@ def _run_reserved_driver_fault_recovery(
             driver_state = server_context.roaster_driver.start_cooling()
         else:
             driver_state = server_context.roaster_driver.stop_cooling()
-        try:
-            return server_context.session_store.complete_reserved_driver_fault_recovery_snapshot(
-                session,
-                reservation=reservation,
-                heat_level_percent=driver_state.heat_level_percent,
-                fan_level_percent=driver_state.fan_level_percent,
-                cooling_on=driver_state.cooling_on,
-            )
-        except SessionLifecycleError:
-            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
-            raise
+        return server_context.session_store.complete_reserved_driver_fault_recovery_snapshot(
+            session,
+            reservation=reservation,
+            heat_level_percent=driver_state.heat_level_percent,
+            fan_level_percent=driver_state.fan_level_percent,
+            cooling_on=driver_state.cooling_on,
+        )
     except Exception:
-        server_context.session_store.clear_driver_command_reservation(session, reservation)
+        _fail_closed_guarded_fault_recovery_command(
+            server_context,
+            session=session,
+            reservation=reservation,
+            command=kind,
+        )
         raise
+
+
+def _fail_closed_guarded_fault_recovery_command(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    reservation: DriverCommandReservation,
+    command: Literal["drop", "start_cooling", "stop_cooling"],
+) -> None:
+    """Fence uncertain guarded recovery after any driver or completion failure.
+
+    Callers hold ``lifecycle_barrier``. This function intentionally does not
+    reacquire it: doing so would deadlock the immediate safety response when a
+    completion rejects a stale or unsafe driver report.
+    """
+    attempted_payload = run_driver_emergency_stop(
+        server_context,
+        reason=f"guarded fault recovery {command} failed",
+    )
+    attempted_error = attempted_payload.get("driver_error")
+    blocked_payload = default_emergency_safety_payload(
+        driver=server_context.config.roaster.driver,
+        driver_error=attempted_error if isinstance(attempted_error, str) else None,
+    )
+    for key in (
+        "driver",
+        "driver_safety_method",
+        "driver_safety_method_called",
+        "driver_error",
+    ):
+        if key in attempted_payload:
+            blocked_payload[key] = attempted_payload[key]
+    blocked_payload["heat_level_percent"] = 0
+    blocked_payload["fan_level_percent"] = 100
+    blocked_payload["cooling_on"] = True
+    try:
+        server_context.session_store.emergency_stop_snapshot(
+            session,
+            reason=f"guarded fault recovery {command} failed",
+            safety_payload=blocked_payload,
+            allow_stopped_latest=True,
+        )
+    except Exception:  # noqa: BLE001 - containment must survive result-recording failure.
+        server_context.session_store.retain_fault_recovery_block(session, reservation=reservation)
+    finally:
+        server_context.session_store.clear_driver_command_reservation(session, reservation)
 
 
 def _complete_driver_control(

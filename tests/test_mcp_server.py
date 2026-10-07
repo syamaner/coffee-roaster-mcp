@@ -3481,7 +3481,7 @@ def _faulted_recovery_server(
     tmp_path: Path,
     *,
     beans_added: bool = False,
-) -> tuple[FastMCP, object, RecordingRoasterDriver, str]:
+) -> tuple[FastMCP, Any, RecordingRoasterDriver, str]:
     """Build one stopped fault session for guarded recovery tests."""
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
@@ -3646,7 +3646,122 @@ def test_guarded_fault_recovery_clears_failed_command_reservation(tmp_path: Path
         "connect",
         "emergency_stop:setup-fault",
         "start_cooling",
+        "emergency_stop:guarded fault recovery start_cooling failed",
         "start_cooling",
+    ]
+
+
+def test_guarded_fault_recovery_completion_failure_fails_closed_without_deadlock(
+    tmp_path: Path,
+) -> None:
+    """A rejected guarded completion reasserts safety without reentering its lock."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    driver.start_cooling_stays_off = True
+    errors: list[BaseException] = []
+    thread = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "start_cooling", ctx),
+        kwargs={"expected_session_id": session_id},
+    )
+
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], SessionLifecycleError)
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "start_cooling",
+        "emergency_stop:guarded fault recovery start_cooling failed",
+    ]
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.cooling_on is True and state.heat_level_percent == 0
+    assert state.events[-1].payload["driver_safety_method_called"] is True
+
+
+def test_guarded_fault_recovery_partial_driver_failure_blocks_new_session(tmp_path: Path) -> None:
+    """Partial recovery actuation is retained as blocked even when the call raises."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    driver.partial_start_cooling_failure = True
+
+    with pytest.raises(RuntimeError, match="partial start cooling failure"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.cooling_on is True and state.heat_level_percent == 0
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "stop_cooling",
+        "start_cooling",
+        "emergency_stop:guarded fault recovery start_cooling failed",
+    ]
+
+
+def test_guarded_fault_recovery_retains_block_when_fault_recording_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An event-log failure cannot reopen admission after uncertain actuation."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    driver.partial_start_cooling_failure = True
+    server_context = ctx.request_context.lifespan_context
+
+    def fail_fault_recording(*_args: object, **_kwargs: object) -> object:
+        raise OSError("log unavailable")
+
+    monkeypatch.setattr(
+        server_context.session_store,
+        "emergency_stop_snapshot",
+        fail_fault_recording,
+    )
+    with pytest.raises(RuntimeError, match="partial start cooling failure"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.cooling_on is True and state.heat_level_percent == 0
+
+
+def test_guarded_fault_recovery_rejects_pending_new_session_before_actuation(
+    tmp_path: Path,
+) -> None:
+    """A blocked new-session connect cannot race an old fault recovery command."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    connect_started = Event()
+    release_connect = Event()
+    driver.block_connect = (connect_started, release_connect)
+    results: list[object] = []
+    errors: list[BaseException] = []
+    thread = Thread(
+        target=_record_tool_result,
+        args=(results, errors, server, "start_roast_session", ctx),
+    )
+    thread.start()
+    assert connect_started.wait(timeout=1.0)
+
+    with pytest.raises(ValueError, match="start is in progress"):
+        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+
+    release_connect.set()
+    thread.join(timeout=1.0)
+    assert not thread.is_alive() and errors == [] and len(results) == 1
+    assert driver.actions == [
+        "connect",
+        "emergency_stop:setup-fault",
+        "stop_cooling",
+        "connect",
     ]
 
 
@@ -3686,6 +3801,8 @@ class RecordingRoasterDriver:
         fail_connect: bool = False,
         fail_heat: bool = False,
         fail_start_cooling: bool = False,
+        start_cooling_stays_off: bool = False,
+        partial_start_cooling_failure: bool = False,
         emergency_heat_level_percent: int = 0,
         fail_read: bool = False,
         block_connect: tuple[Event, Event] | None = None,
@@ -3703,6 +3820,8 @@ class RecordingRoasterDriver:
         self.fail_connect = fail_connect
         self.fail_heat = fail_heat
         self.fail_start_cooling = fail_start_cooling
+        self.start_cooling_stays_off = start_cooling_stays_off
+        self.partial_start_cooling_failure = partial_start_cooling_failure
         self.emergency_heat_level_percent = emergency_heat_level_percent
         self.fail_read = fail_read
         self.block_connect = block_connect
@@ -3781,7 +3900,9 @@ class RecordingRoasterDriver:
         self.actions.append("start_cooling")
         if self.fail_start_cooling:
             raise RuntimeError("start cooling failed")
-        self.cooling_on = True
+        self.cooling_on = not self.start_cooling_stays_off
+        if self.partial_start_cooling_failure:
+            raise RuntimeError("partial start cooling failure")
         return self._state()
 
     def stop_cooling(self) -> RoasterState:

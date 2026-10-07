@@ -1206,7 +1206,7 @@ class RoastSessionStore:
                 or the requested recovery action has no valid precondition.
         """
         with self._lock:
-            self._assert_stopped_fault_recovery_session_locked(session)
+            self._assert_guarded_fault_recovery_admission_locked(session)
             if kind == "drop":
                 if session.beans_added_at_utc is None:
                     raise SessionLifecycleError("Recovery bean drop requires beans to be added.")
@@ -1217,6 +1217,11 @@ class RoastSessionStore:
             elif kind == "stop_cooling" and not session.cooling_on:
                 raise SessionLifecycleError("Cooling must be active before it can be stopped.")
             return self._reserve_driver_command_locked(session, kind=kind)
+
+    def assert_guarded_fault_recovery_admission(self, session: RoastSession) -> None:
+        """Validate exact stopped-fault recovery admission without reserving a command."""
+        with self._lock:
+            self._assert_guarded_fault_recovery_admission_locked(session)
 
     def complete_reserved_driver_control_snapshot(
         self,
@@ -1479,6 +1484,34 @@ class RoastSessionStore:
         with self._lock:
             if session.pending_driver_command_token == reservation.token:
                 self._clear_driver_command_reservation_locked(session, reservation)
+
+    def retain_fault_recovery_block(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+    ) -> None:
+        """Pessimistically retain a stopped fault block after recovery uncertainty.
+
+        This narrow fallback is used only when recording the emergency-stop
+        result itself fails after a guarded driver command may have actuated.
+        It keeps new-session admission closed without claiming a successful
+        recovery action.
+        """
+        with self._lock:
+            self._assert_latest_session(session)
+            if session.active:
+                raise SessionLifecycleError("Cannot retain a fault block for an active session.")
+            session.heat_level_percent = 0
+            session.fan_level_percent = 100
+            session.cooling_on = True
+            session.phase = "fault"
+            if session.faulted_at_utc is None:
+                session.faulted_at_utc = self._utc_now()
+                session.faulted_monotonic_seconds = session.elapsed_monotonic_seconds(
+                    self._monotonic_now
+                )
+            self._clear_driver_command_reservation_locked(session, reservation)
 
     def complete_reserved_driver_fault_recovery_snapshot(
         self,
@@ -2320,6 +2353,14 @@ class RoastSessionStore:
             raise SessionLifecycleError("Recovery command is only allowed after an emergency stop.")
         if session.heat_level_percent != 0:
             raise SessionLifecycleError("Recovery command requires heat to be off.")
+
+    def _assert_guarded_fault_recovery_admission_locked(self, session: RoastSession) -> None:
+        """Reject guarded recovery while a newer-session start is pending."""
+        self._assert_stopped_fault_recovery_session_locked(session)
+        if self._pending_session_start_token is not None:
+            raise SessionLifecycleError(
+                "Recovery command cannot run while a roast session start is in progress."
+            )
 
     def _record_stopped_session_event_locked(
         self,
