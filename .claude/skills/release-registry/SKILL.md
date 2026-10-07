@@ -16,8 +16,9 @@ verification.
   checklist completion, or installed bytes.
 - Issue #225 remains open for release-process reconciliation. #227 is closed
   for the D209 software projection. Published `0.2.2` lacks that
-  projection; the reviewed, unreleased same-version candidate includes it.
-  Releasing or installing the candidate remains separately authorised.
+  projection; the reviewed, unreleased `0.2.3` candidate includes it and
+  #230's stopped-fault exact-session recovery semantics. Releasing or
+  installing the candidate remains separately authorised.
 - `docs/release.md` is the current release authority and preserves historical
   outcomes.
 - Tags, release-environment approval, publication, and live verification are

@@ -6,7 +6,9 @@ Milestone: `v0.2`
 
 Current published distribution: production PyPI and MCP Registry metadata
 verifies `0.2.2`. No `v0.2.2` tag SHA or release-workflow receipt is verified,
-and installed bytes remain unverified.
+and installed bytes remain unverified. The reviewed, unreleased `0.2.3`
+candidate includes the D209 projection and PR #231's stopped-fault
+exact-session recovery semantics.
 
 ## Current Stories
 
@@ -20,11 +22,14 @@ and installed bytes remain unverified.
   complete.
 - #227: closed; D209 projection software. Published `0.2.2` lacks the typed
   cold-only temperature and packet projection; the reviewed, unreleased
-  same-version candidate includes it. Agent-side comparison between
+  `0.2.3` candidate includes it. Agent-side comparison between
   observations owns packet-progress screening. Neither surface proves physical
   state, calibration, continuous freshness, link health, or readiness;
   installed bytes remain unverified, and candidate release and installation
   remain separately authorised.
+- #230: open; `0.2.3` release candidate carrying the stopped-fault
+  exact-session recovery semantics from PR #231. It is a software component
+  candidate and makes no hardware-readiness claim.
 - #157: open; separate hardware/component acceptance work.
 - #210: complete; standalone Torch-free NumPy/SciPy mel frontend parity slice.
 - #212: complete; MCP-owned frontend integration and local package readiness slice.
