@@ -1225,46 +1225,76 @@ def create_mcp_server(
     ) -> EventCommandResult:
         """Call the configured driver safety method and record a fault event."""
         server_context = ctx.request_context.lifespan_context
-        with server_context.lifecycle_barrier:
-            if expected_session_id is None:
-                session = _require_active_session(server_context)
-            else:
-                session = _require_guarded_fault_recovery_session(
-                    server_context,
-                    expected_session_id=expected_session_id,
-                    allow_in_flight=True,
-                )
-            server_context.session_store.cancel_nonfinalisation_driver_command(session)
-            safety_payload = run_driver_emergency_stop(server_context, reason=reason)
-            has_verified_containment = has_verified_zero_heat(safety_payload=safety_payload)
-            if expected_session_id is not None and not has_verified_containment:
-                _retain_guarded_emergency_stop_block(
-                    server_context,
-                    session=session,
-                    safety_payload=safety_payload,
-                )
-                raise SessionLifecycleError("Emergency stop did not report zero heat.")
-            event, snapshot = server_context.session_store.emergency_stop_snapshot(
-                session,
-                reason=reason,
-                safety_payload=safety_payload,
-                allow_stopped_latest=True,
-            )
-        server_context.first_crack_runtime.stop_for_session(
-            snapshot.id,
-            reason="emergency stop",
-        )
-        server_context.telemetry_sampler.stop_for_session(
-            snapshot.id,
-            reason="emergency stop",
-        )
-        server_context.ambient_runtime.stop_for_session(
-            snapshot.id,
-            reason="emergency stop",
-        )
-        if not has_verified_containment:
-            raise SessionLifecycleError("Emergency stop did not report verified zero heat.")
-        return _serialize_event_result(snapshot=snapshot, event=event)
+        session: RoastSession | None = None
+        has_verified_containment = False
+        primary_error: BaseException | None = None
+        try:
+            with server_context.lifecycle_barrier:
+                if expected_session_id is None:
+                    session = _require_active_session(server_context)
+                else:
+                    session = _require_guarded_fault_recovery_session(
+                        server_context,
+                        expected_session_id=expected_session_id,
+                        allow_in_flight=True,
+                    )
+                server_context.session_store.cancel_nonfinalisation_driver_command(session)
+                safety_payload = run_driver_emergency_stop(server_context, reason=reason)
+                has_verified_containment = has_verified_zero_heat(safety_payload=safety_payload)
+                if expected_session_id is not None and not has_verified_containment:
+                    _retain_guarded_emergency_stop_block(
+                        server_context,
+                        session=session,
+                        safety_payload=safety_payload,
+                    )
+                    raise SessionLifecycleError("Emergency stop did not report zero heat.")
+                try:
+                    event, snapshot = server_context.session_store.emergency_stop_snapshot(
+                        session,
+                        reason=reason,
+                        safety_payload=safety_payload,
+                        allow_stopped_latest=True,
+                    )
+                except Exception as exc:
+                    if expected_session_id is not None:
+                        raise
+                    server_context.session_store.retain_active_fault_block(
+                        session,
+                        safety_payload=safety_payload,
+                    )
+                    raise SessionLifecycleError(
+                        "Emergency stop fault recording failed; containment is unverified."
+                    ) from exc
+            if not has_verified_containment:
+                raise SessionLifecycleError("Emergency stop did not report verified zero heat.")
+            return _serialize_event_result(snapshot=snapshot, event=event)
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if session is not None:
+                cleanup_error: Exception | None = None
+                for stop_runtime in (
+                    lambda: server_context.first_crack_runtime.stop_for_session(
+                        session.id,
+                        reason="emergency stop",
+                    ),
+                    lambda: server_context.telemetry_sampler.stop_for_session(
+                        session.id,
+                        reason="emergency stop",
+                    ),
+                    lambda: server_context.ambient_runtime.stop_for_session(
+                        session.id,
+                        reason="emergency stop",
+                    ),
+                ):
+                    try:
+                        stop_runtime()
+                    except Exception as exc:  # noqa: BLE001 - finish every containment cleanup.
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                if cleanup_error is not None and primary_error is None:
+                    raise cleanup_error
 
     @mcp.tool()
     def set_recording_metadata(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]

@@ -1562,6 +1562,39 @@ class RoastSessionStore:
                     self._monotonic_now
                 )
 
+    def retain_active_fault_block(
+        self,
+        session: RoastSession,
+        *,
+        safety_payload: Mapping[str, EventPayloadValue] | None = None,
+    ) -> None:
+        """Fail closed when an active emergency-stop fault cannot be recorded.
+
+        This in-memory fallback preserves the driver safety payload and closes
+        active control, recovery, and new-session admission without claiming
+        that event persistence succeeded.
+        """
+        with self._lock:
+            self._assert_latest_session(session)
+            _apply_emergency_safety_payload(
+                session,
+                default_emergency_safety_payload() if safety_payload is None else safety_payload,
+            )
+            if session.active:
+                session.stop(
+                    utc_now=self._utc_now,
+                    monotonic_now=self._monotonic_now,
+                    phase="fault",
+                )
+            else:
+                session.phase = "fault"
+            self._fault_recovery_admission_blocks.add(session.id)
+            if session.faulted_at_utc is None:
+                session.faulted_at_utc = self._utc_now()
+                session.faulted_monotonic_seconds = session.elapsed_monotonic_seconds(
+                    self._monotonic_now
+                )
+
     def clear_fault_recovery_in_flight(
         self,
         session: RoastSession,

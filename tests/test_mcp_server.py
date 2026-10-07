@@ -18,6 +18,7 @@ import pytest
 from mcp.server.fastmcp import FastMCP
 
 import coffee_roaster_mcp.mcp_server as mcp_server
+import coffee_roaster_mcp.session as session_module
 from coffee_roaster_mcp.ambient_runtime import AmbientRuntimeSnapshot, AmbientRuntimeState
 from coffee_roaster_mcp.artifacts import ResolvedArtifact, ResolvedDetectorArtifacts
 from coffee_roaster_mcp.audio import AudioCaptureSnapshot, AudioWindow
@@ -3727,6 +3728,44 @@ def test_initial_emergency_stop_driver_error_blocks_fault_recovery_commands(
     for tool_name in ("drop_beans", "start_cooling", "stop_cooling"):
         with pytest.raises(ValueError, match="verified emergency-stop containment"):
             _call_tool(server, tool_name, ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+    assert driver.actions == ["connect"]
+
+
+def test_active_emergency_stop_recording_failure_retains_in_memory_fault_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Driver and logging failures still close active hardware control admission."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    started = _call_tool(server, "start_roast_session", ctx)
+    session_id = started.session.session_id
+
+    def fail_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        del reason
+        raise RuntimeError("emergency stop unavailable")
+
+    def fail_fault_recording(*_args: object, **_kwargs: object) -> object:
+        raise OSError("log unavailable")
+
+    monkeypatch.setattr(driver, "emergency_stop", fail_emergency_stop)
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_fault_recording)
+
+    with pytest.raises(SessionLifecycleError, match="fault recording failed"):
+        _call_tool(server, "emergency_stop", ctx)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.heat_level_percent == 0 and state.cooling_on is True
+    with pytest.raises(ValueError, match="No active roast session exists"):
+        _call_tool(server, "set_heat", ctx, heat_level_percent=100)
     with pytest.raises(SessionLifecycleError, match="containment is verified"):
         _call_tool(server, "start_roast_session", ctx)
     assert driver.actions == ["connect"]
