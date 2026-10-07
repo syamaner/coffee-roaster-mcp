@@ -71,6 +71,7 @@ from coffee_roaster_mcp.mcp_server import (
 )
 from coffee_roaster_mcp.session import (
     DriverCommandReservation,
+    RoastEvent,
     RoastSession,
     RoastSessionStore,
     SessionLifecycleError,
@@ -3682,6 +3683,38 @@ def test_guarded_fault_recovery_commands_preserve_fault_and_exact_result(tmp_pat
         "stop_cooling",
         "connect",
     ]
+
+
+def test_guarded_drop_second_event_log_failure_preserves_recorded_drop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persisted recovery drop is not reclassified as ambiguous when cooling logging fails."""
+    server, ctx, _, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+    original_append = session_module._append_event_log_row  # pyright: ignore[reportPrivateUsage]
+
+    def fail_only_recovery_cooling(session: RoastSession, event: RoastEvent) -> None:
+        if event.kind == "cooling_started" and event.payload.get("recovery_after_fault") is True:
+            raise OSError("cooling row unavailable")
+        original_append(session, event)
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_only_recovery_cooling)
+    with pytest.raises(OSError, match="cooling row unavailable"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+
+    snapshot = ctx.request_context.lifespan_context.session_store.get_session_snapshot(
+        session_id=session_id
+    )
+    assert [event.kind for event in snapshot.event_timeline] == [
+        "beans_added",
+        "fault",
+        "beans_dropped",
+        "fault",
+    ]
+    with pytest.raises(SessionLifecycleError, match="only allowed before beans are dropped"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    replacement = _call_tool(server, "start_roast_session", ctx)
+    assert replacement.session.session_id != session_id
 
 
 def test_charged_fault_rejects_cooling_stop_until_recovery_drop(tmp_path: Path) -> None:

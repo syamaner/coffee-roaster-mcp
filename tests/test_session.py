@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import cast
 import pytest
 
 import coffee_roaster_mcp.session as session_module
+from coffee_roaster_mcp.exports import export_roast_snapshot
 from coffee_roaster_mcp.session import (
     RoastEventKind,
     RoastSession,
@@ -397,9 +399,13 @@ def test_future_first_crack_detection_allows_later_events_without_inverted_metri
     assert compute_development_time_seconds(session) == 0.0
 
 
-def test_future_first_crack_detection_orders_fault_and_recovery_events() -> None:
+def test_future_first_crack_detection_orders_fault_and_recovery_events(tmp_path: Path) -> None:
     clock = ClockHarness()
-    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path / "roasts",
+    )
     session = store.start_session()
 
     clock.monotonic_value = 105.0
@@ -454,6 +460,17 @@ def test_future_first_crack_detection_orders_fault_and_recovery_events() -> None
     assert [event.recorded_at_utc for event in snapshot.event_timeline] == sorted(
         event.recorded_at_utc for event in snapshot.event_timeline
     )
+    export = export_roast_snapshot(snapshot)
+    with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
+        rows = list(csv.DictReader(csv_file))
+    assert [row["event"] for row in rows] == [
+        "beans_added",
+        "first_crack_detected",
+        "fault",
+        "beans_dropped",
+        "cooling_started",
+        "cooling_stopped",
+    ]
 
 
 def test_event_log_write_failure_does_not_commit_event(tmp_path: Path) -> None:
