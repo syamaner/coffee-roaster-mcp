@@ -1230,7 +1230,9 @@ def create_mcp_server(
                 )
             server_context.session_store.cancel_nonfinalisation_driver_command(session)
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
-            if expected_session_id is not None and safety_payload.get("heat_level_percent") != 0:
+            if expected_session_id is not None and not has_verified_zero_heat(
+                safety_payload=safety_payload
+            ):
                 _retain_guarded_emergency_stop_block(
                     server_context,
                     session=session,
@@ -1694,37 +1696,39 @@ def _fail_closed_guarded_fault_recovery_command(
 ) -> None:
     """Fence uncertain guarded recovery after any driver or completion failure.
 
-    This function runs after the lifecycle barrier was released for driver I/O.
-    The store reservation fences new-session admission until the emergency
-    safety result is retained or the pessimistic fallback below takes over.
+    This function reacquires the lifecycle barrier only after the original
+    guarded driver call returns. It serializes the replacement emergency stop
+    and its stored result with a concurrent direct emergency stop, while the
+    store reservation fences new-session admission.
     """
-    attempted_payload = run_driver_emergency_stop(
-        server_context,
-        reason=f"guarded fault recovery {command} failed",
-    )
-    try:
-        server_context.session_store.emergency_stop_snapshot(
-            session,
+    with server_context.lifecycle_barrier:
+        attempted_payload = run_driver_emergency_stop(
+            server_context,
             reason=f"guarded fault recovery {command} failed",
-            safety_payload=attempted_payload,
-            allow_stopped_latest=True,
         )
-    except Exception:  # noqa: BLE001 - containment must survive result-recording failure.
-        server_context.session_store.retain_fault_recovery_block(
-            session,
-            reservation=reservation,
-            safety_payload=attempted_payload,
-        )
-    else:
-        if not has_verified_zero_heat(safety_payload=attempted_payload):
+        try:
+            server_context.session_store.emergency_stop_snapshot(
+                session,
+                reason=f"guarded fault recovery {command} failed",
+                safety_payload=attempted_payload,
+                allow_stopped_latest=True,
+            )
+        except Exception:  # noqa: BLE001 - containment must survive result-recording failure.
             server_context.session_store.retain_fault_recovery_block(
                 session,
                 reservation=reservation,
                 safety_payload=attempted_payload,
             )
-    finally:
-        server_context.session_store.clear_driver_command_reservation(session, reservation)
-        server_context.session_store.clear_fault_recovery_in_flight(session, reservation)
+        else:
+            if not has_verified_zero_heat(safety_payload=attempted_payload):
+                server_context.session_store.retain_fault_recovery_block(
+                    session,
+                    reservation=reservation,
+                    safety_payload=attempted_payload,
+                )
+        finally:
+            server_context.session_store.clear_driver_command_reservation(session, reservation)
+            server_context.session_store.clear_fault_recovery_in_flight(session, reservation)
 
 
 def _retain_guarded_emergency_stop_block(

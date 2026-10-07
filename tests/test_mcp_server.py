@@ -3672,6 +3672,28 @@ def test_guarded_emergency_stop_retains_block_when_fault_recording_fails(
     assert state.heat_level_percent == 10 and state.cooling_on is True
 
 
+def test_guarded_emergency_stop_driver_error_requires_verified_containment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A guarded e-stop driver error cannot be treated as verified zero heat."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    def fail_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        del reason
+        raise RuntimeError("emergency stop unavailable")
+
+    monkeypatch.setattr(driver, "emergency_stop", fail_emergency_stop)
+    with pytest.raises(SessionLifecycleError, match="did not report zero heat"):
+        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.heat_level_percent == 0 and state.cooling_on is True
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+
 def test_guarded_fault_recovery_clears_failed_command_reservation(tmp_path: Path) -> None:
     """A driver failure leaves no reservation that blocks a later safe retry."""
     server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
@@ -3913,6 +3935,58 @@ def test_guarded_fault_recovery_allows_emergency_stop_during_blocked_driver_call
     assert state.phase == "fault" and state.active is False
     assert state.heat_level_percent == 0 and state.cooling_on is True
     assert driver.actions[-1] == "emergency_stop:guarded fault recovery stop_cooling failed"
+
+
+def test_guarded_recovery_containment_serializes_late_direct_emergency_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late direct e-stop cannot be overwritten by older recovery containment."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    driver.fail_start_cooling = True
+    original_emergency_stop = driver.emergency_stop
+    containment_started = Event()
+    release_containment = Event()
+
+    def block_recovery_containment(*, reason: str) -> EmergencyStopResult:
+        if reason == "guarded fault recovery start_cooling failed":
+            containment_started.set()
+            assert release_containment.wait(timeout=1.0)
+        return original_emergency_stop(reason=reason)
+
+    monkeypatch.setattr(driver, "emergency_stop", block_recovery_containment)
+    recovery_errors: list[BaseException] = []
+    recovery_thread = Thread(
+        target=_record_tool_error,
+        args=(recovery_errors, server, "start_cooling", ctx),
+        kwargs={"expected_session_id": session_id},
+    )
+    recovery_thread.start()
+    assert containment_started.wait(timeout=1.0)
+
+    driver.emergency_heat_level_percent = 10
+    direct_errors: list[BaseException] = []
+    direct_thread = Thread(
+        target=_record_tool_error,
+        args=(direct_errors, server, "emergency_stop", ctx),
+        kwargs={"expected_session_id": session_id},
+    )
+    direct_thread.start()
+    direct_thread.join(timeout=0.05)
+    assert direct_thread.is_alive()
+
+    release_containment.set()
+    recovery_thread.join(timeout=1.0)
+    direct_thread.join(timeout=1.0)
+    assert not recovery_thread.is_alive() and not direct_thread.is_alive()
+    assert len(recovery_errors) == len(direct_errors) == 1
+    assert isinstance(recovery_errors[0], RuntimeError)
+    assert isinstance(direct_errors[0], SessionLifecycleError)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.heat_level_percent == 10 and state.cooling_on is True
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
 
 
 def test_guarded_start_cooling_records_each_reasserted_actuation(tmp_path: Path) -> None:
