@@ -1749,6 +1749,13 @@ class RoastSessionStore:
             self._assert_latest_session(session)
             self._fault_drop_ambiguity_required.add(session.id)
 
+    def retain_fault_drop_ambiguity_if_unrecorded(self, session: RoastSession) -> None:
+        """Fence a failed drop only when no durable drop event was recorded."""
+        with self._lock:
+            self._assert_latest_session(session)
+            if not _has_recorded_beans_dropped(session):
+                self._fault_drop_ambiguity_required.add(session.id)
+
     def retain_fault_recovery_admission_block(self, session: RoastSession) -> None:
         """Keep recovery admission closed until explicit verified containment."""
         with self._lock:
@@ -2512,7 +2519,10 @@ class RoastSessionStore:
             raise SessionLifecycleError(
                 "Recovery command requires a verified emergency-stop containment result."
             )
-        if self._pending_session_start_token is not None:
+        if (
+            self._pending_session_start_token is not None
+            or self._session_start_in_flight_token is not None
+        ):
             raise SessionLifecycleError(
                 "Recovery command cannot run while a roast session start is in progress."
             )

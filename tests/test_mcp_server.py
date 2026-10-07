@@ -2984,9 +2984,8 @@ def test_guarded_emergency_stop_cancels_blocked_new_session_start(tmp_path: Path
         "connect",
         "emergency_stop:cancel blocked start",
     ]
-    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
-    with pytest.raises(SessionLifecycleError, match="start is already in progress"):
-        _call_tool(server, "start_roast_session", ctx)
+    with pytest.raises(ValueError, match="start is in progress"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
 
     release_connect.set()
     start_thread.join(timeout=1.0)

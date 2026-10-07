@@ -1704,7 +1704,7 @@ def _run_reserved_driver_fault_recovery(
         )
     except Exception:
         if command == "drop":
-            server_context.session_store.retain_fault_drop_ambiguity(session)
+            server_context.session_store.retain_fault_drop_ambiguity_if_unrecorded(session)
         _fail_closed_guarded_fault_recovery_command(
             server_context,
             session=session,

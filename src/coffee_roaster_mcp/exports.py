@@ -647,8 +647,8 @@ def _event_cooling_value(event: RoastEvent, *, telemetry: TelemetrySample | None
 
 def _event_sort_key(event: RoastEvent) -> tuple[float, int]:
     """Return deterministic event ordering key for CSV export."""
-    if event.kind == "cooling_stopped" and event.payload.get("recovery_after_fault") is True:
-        return (event.monotonic_seconds, _event_order("fault") + 1)
+    if event.payload.get("recovery_after_fault") is True:
+        return (event.monotonic_seconds, _event_order("fault"))
     return (event.monotonic_seconds, _event_order(event.kind))
 
 
