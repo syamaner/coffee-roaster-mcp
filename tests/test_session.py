@@ -22,7 +22,7 @@ from coffee_roaster_mcp.session import (
     compute_env_temp_delta_60s_c,
     compute_roast_elapsed_seconds,
     compute_roast_metrics,
-    has_verified_zero_heat,
+    has_verified_emergency_containment,
 )
 
 EXPECTED_JSONL_EVENT_KEYS = {
@@ -62,7 +62,7 @@ class ClockHarness:
 
 def test_verified_emergency_state_rejects_boolean_fan_payload() -> None:
     """Boolean values cannot stand in for the required emergency fan percentage."""
-    assert not has_verified_zero_heat(
+    assert not has_verified_emergency_containment(
         safety_payload={
             "driver_safety_method_called": True,
             "heat_level_percent": 0,

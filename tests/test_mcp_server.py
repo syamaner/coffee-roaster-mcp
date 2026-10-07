@@ -3622,7 +3622,10 @@ def test_guarded_emergency_stop_rejects_nonzero_heat_report(tmp_path: Path) -> N
     server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
     driver.emergency_heat_level_percent = 10
 
-    with pytest.raises(SessionLifecycleError, match="did not report zero heat"):
+    with pytest.raises(
+        SessionLifecycleError,
+        match="did not report verified emergency containment",
+    ):
         _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
 
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
@@ -3630,7 +3633,10 @@ def test_guarded_emergency_stop_rejects_nonzero_heat_report(tmp_path: Path) -> N
     with pytest.raises(SessionLifecycleError, match="containment is verified"):
         _call_tool(server, "start_roast_session", ctx)
 
-    with pytest.raises(SessionLifecycleError, match="did not report zero heat"):
+    with pytest.raises(
+        SessionLifecycleError,
+        match="did not report verified emergency containment",
+    ):
         _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
     driver.emergency_heat_level_percent = 0
     _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
@@ -3664,7 +3670,10 @@ def test_guarded_emergency_stop_retains_block_when_fault_recording_fails(
         fail_fault_recording,
     )
 
-    with pytest.raises(SessionLifecycleError, match="did not report zero heat"):
+    with pytest.raises(
+        SessionLifecycleError,
+        match="did not report verified emergency containment",
+    ):
         _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
     with pytest.raises(SessionLifecycleError, match="containment is verified"):
         _call_tool(server, "start_roast_session", ctx)
@@ -3750,7 +3759,10 @@ def test_guarded_emergency_stop_requires_complete_safe_state(
         )
 
     monkeypatch.setattr(driver, "emergency_stop", incomplete_emergency_stop)
-    with pytest.raises(SessionLifecycleError, match="did not report zero heat"):
+    with pytest.raises(
+        SessionLifecycleError,
+        match="did not report verified emergency containment",
+    ):
         _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
 
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
@@ -3793,7 +3805,10 @@ def test_guarded_emergency_stop_driver_error_requires_verified_containment(
         raise RuntimeError("emergency stop unavailable")
 
     monkeypatch.setattr(driver, "emergency_stop", fail_emergency_stop)
-    with pytest.raises(SessionLifecycleError, match="did not report zero heat"):
+    with pytest.raises(
+        SessionLifecycleError,
+        match="did not report verified emergency containment",
+    ):
         _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
 
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
@@ -3825,7 +3840,10 @@ def test_initial_emergency_stop_driver_error_blocks_fault_recovery_commands(
         raise RuntimeError("emergency stop unavailable")
 
     monkeypatch.setattr(driver, "emergency_stop", fail_emergency_stop)
-    with pytest.raises(SessionLifecycleError, match="did not report verified zero heat"):
+    with pytest.raises(
+        SessionLifecycleError,
+        match="did not report verified emergency containment",
+    ):
         _call_tool(server, "emergency_stop", ctx)
 
     state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)

@@ -60,7 +60,7 @@ from coffee_roaster_mcp.session import (
     SessionPurpose,
     compute_roast_metrics,
     default_emergency_safety_payload,
-    has_verified_zero_heat,
+    has_verified_emergency_containment,
 )
 
 
@@ -1240,14 +1240,18 @@ def create_mcp_server(
                     )
                 server_context.session_store.cancel_nonfinalisation_driver_command(session)
                 safety_payload = run_driver_emergency_stop(server_context, reason=reason)
-                has_verified_containment = has_verified_zero_heat(safety_payload=safety_payload)
+                has_verified_containment = has_verified_emergency_containment(
+                    safety_payload=safety_payload
+                )
                 if expected_session_id is not None and not has_verified_containment:
                     _retain_guarded_emergency_stop_block(
                         server_context,
                         session=session,
                         safety_payload=safety_payload,
                     )
-                    raise SessionLifecycleError("Emergency stop did not report zero heat.")
+                    raise SessionLifecycleError(
+                        "Emergency stop did not report verified emergency containment."
+                    )
                 try:
                     event, snapshot = server_context.session_store.emergency_stop_snapshot(
                         session,
@@ -1271,7 +1275,9 @@ def create_mcp_server(
                         "Emergency stop fault recording failed; containment is unverified."
                     ) from exc
             if not has_verified_containment:
-                raise SessionLifecycleError("Emergency stop did not report verified zero heat.")
+                raise SessionLifecycleError(
+                    "Emergency stop did not report verified emergency containment."
+                )
             return _serialize_event_result(snapshot=snapshot, event=event)
         except BaseException as exc:
             primary_error = exc
@@ -1735,7 +1741,7 @@ def _fail_closed_guarded_fault_recovery_command(
                 safety_payload=attempted_payload,
             )
         else:
-            if not has_verified_zero_heat(safety_payload=attempted_payload):
+            if not has_verified_emergency_containment(safety_payload=attempted_payload):
                 server_context.session_store.retain_fault_recovery_block(
                     session,
                     reservation=reservation,

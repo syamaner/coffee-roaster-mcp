@@ -2158,7 +2158,7 @@ class RoastSessionStore:
                 )
             else:
                 session.phase = "fault"
-            if has_verified_zero_heat(safety_payload=normalized_safety_payload):
+            if has_verified_emergency_containment(safety_payload=normalized_safety_payload):
                 self._fault_recovery_admission_blocks.discard(session.id)
             else:
                 self._fault_recovery_admission_blocks.add(session.id)
@@ -2865,7 +2865,7 @@ def default_emergency_safety_payload(
     return payload
 
 
-def has_verified_zero_heat(*, safety_payload: Mapping[str, EventPayloadValue]) -> bool:
+def has_verified_emergency_containment(*, safety_payload: Mapping[str, EventPayloadValue]) -> bool:
     """Return whether a driver confirmed the complete emergency-safe state."""
     heat_level_percent = safety_payload.get("heat_level_percent")
     fan_level_percent = safety_payload.get("fan_level_percent")
