@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -19,7 +19,12 @@ from coffee_roaster_mcp.detector import (
     integrate_first_crack_window_with_session,
 )
 from coffee_roaster_mcp.exports import export_roast_snapshot
-from coffee_roaster_mcp.session import EventPayloadValue, RoastSessionStore, TelemetrySample
+from coffee_roaster_mcp.session import (
+    EventPayloadValue,
+    RoastSessionStore,
+    TelemetrySample,
+    compute_roast_metrics,
+)
 
 
 class MockDetectorBackend:
@@ -761,13 +766,17 @@ def test_snapshot_export_keeps_fault_phase_for_every_recovery_command(
             "cooling_on": True,
         },
     )
-    clock.monotonic_value = 110.0
-    recovery_commands: tuple[tuple[Literal["drop", "start_cooling", "stop_cooling"], bool], ...] = (
-        ("drop", False),
-        ("start_cooling", True),
-        ("stop_cooling", False),
+    expected_roast_seconds = compute_roast_metrics(session).roast_elapsed_seconds
+    recovery_commands: tuple[
+        tuple[Literal["drop", "start_cooling", "stop_cooling"], bool, float], ...
+    ] = (
+        ("drop", True, 110.0),
+        ("start_cooling", True, 115.0),
+        ("stop_cooling", False, 120.0),
     )
-    for kind, cooling_on in recovery_commands:
+    for kind, cooling_on, monotonic_value in recovery_commands:
+        clock.monotonic_value = monotonic_value
+        clock.utc_value += timedelta(seconds=5)
         reservation = store.reserve_driver_fault_recovery(session, kind=kind)
         store.complete_reserved_driver_fault_recovery_snapshot(
             session,
@@ -786,13 +795,27 @@ def test_snapshot_export_keeps_fault_phase_for_every_recovery_command(
         row
         for row in rows
         if row["event"] in {"beans_dropped", "cooling_started", "cooling_stopped"}
+        and float(row["elapsed_seconds"]) > 5.0
     ]
     assert fault_row["phase"] == "fault"
-    assert len(recovery_rows) == 3
+    assert [row["event"] for row in recovery_rows] == [
+        "beans_dropped",
+        "cooling_started",
+        "cooling_started",
+        "cooling_stopped",
+    ]
     assert all(row["phase"] == "fault" for row in recovery_rows)
+    assert [row["elapsed_seconds"] for row in recovery_rows] == [
+        "10.0",
+        "10.0",
+        "15.0",
+        "20.0",
+    ]
+    assert all(row["beans_dropped"] == "False" for row in recovery_rows)
     assert recovery_rows[-1]["cooling_on"] == "False"
     summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
     assert summary["phase"] == "fault"
+    assert summary["total_roast_seconds"] == expected_roast_seconds
 
 
 def test_snapshot_export_csv_uses_driver_transition_payload_state(

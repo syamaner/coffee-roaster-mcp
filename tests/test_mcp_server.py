@@ -3959,11 +3959,11 @@ def test_active_emergency_stop_recording_failure_retains_in_memory_fault_block(
     assert driver.actions == ["connect"]
 
 
-def test_fault_recovery_drop_without_cooling_requires_post_drop_cooling_cycle(
+def test_fault_recovery_ambiguous_drop_requires_post_failure_cooling_cycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A cooling-off drop needs a new cooling cycle before another session starts."""
+    """An unconfirmed drop cannot be retried or admit a session without cooling."""
     server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
     _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
 
@@ -3984,15 +3984,112 @@ def test_fault_recovery_drop_without_cooling_requires_post_drop_cooling_cycle(
         )
 
     monkeypatch.setattr(driver, "drop_beans", drop_without_cooling)
-    dropped = _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
-    assert dropped.event.kind == "beans_dropped"
-    with pytest.raises(SessionLifecycleError, match="post-drop cooling is started and stopped"):
+    with pytest.raises(SessionLifecycleError, match="fan 100 and cooling active"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+
+    session = ctx.request_context.lifespan_context.session_store.get_session_snapshot(
+        session_id=session_id
+    )
+    assert all(event.kind != "beans_dropped" for event in session.event_timeline)
+    with pytest.raises(SessionLifecycleError, match="Recovery bean drop is ambiguous"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="ambiguous bean drop cooling"):
         _call_tool(server, "start_roast_session", ctx)
 
     _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
     _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
     replacement = _call_tool(server, "start_roast_session", ctx)
     assert replacement.session.session_id != session_id
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "driver_method", "event_kind", "beans_added"),
+    (
+        ("drop_beans", "drop_beans", "beans_dropped", True),
+        ("start_cooling", "start_cooling", "cooling_started", False),
+    ),
+)
+def test_guarded_recovery_rejects_partial_cooling_fan_before_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    driver_method: str,
+    event_kind: str,
+    beans_added: bool,
+) -> None:
+    """Guarded cooling recovery needs both cooling and the full main fan."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=beans_added)
+
+    def partial_cooling() -> RoasterState:
+        driver.actions.append(driver_method)
+        driver.heat_level_percent = 0
+        driver.fan_level_percent = 99
+        driver.cooling_on = True
+        return driver._state()  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(driver, driver_method, partial_cooling)
+    with pytest.raises(SessionLifecycleError, match="fan 100 and cooling active"):
+        _call_tool(server, tool_name, ctx, expected_session_id=session_id)
+
+    session = ctx.request_context.lifespan_context.session_store.get_session_snapshot(
+        session_id=session_id
+    )
+    assert not any(
+        event.kind == event_kind and event.payload.get("recovery_after_fault") is True
+        for event in session.event_timeline
+    )
+    assert session.phase == "fault"
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "driver_method", "event_kind", "beans_added", "cooling_on"),
+    (
+        ("drop_beans", "drop_beans", "beans_dropped", True, True),
+        ("start_cooling", "start_cooling", "cooling_started", False, True),
+        ("stop_cooling", "stop_cooling", "cooling_stopped", False, False),
+    ),
+)
+def test_guarded_recovery_rejects_disconnected_driver_state_before_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    driver_method: str,
+    event_kind: str,
+    beans_added: bool,
+    cooling_on: bool,
+) -> None:
+    """A disconnected result remains faulted and keeps admission closed."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=beans_added)
+
+    def disconnected_result() -> RoasterState:
+        driver.actions.append(driver_method)
+        return RoasterState(
+            driver=driver.name,
+            connected=False,
+            bean_temp_c=driver.bean_temp_c,
+            env_temp_c=driver.env_temp_c,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=cooling_on,
+            raw_vendor_data=driver.raw_vendor_data,
+        )
+
+    monkeypatch.setattr(driver, driver_method, disconnected_result)
+    with pytest.raises(SessionLifecycleError, match="Driver disconnected during fault recovery"):
+        _call_tool(server, tool_name, ctx, expected_session_id=session_id)
+
+    session = ctx.request_context.lifespan_context.session_store.get_session_snapshot(
+        session_id=session_id
+    )
+    assert session.phase == "fault"
+    assert not any(
+        event.kind == event_kind and event.payload.get("recovery_after_fault") is True
+        for event in session.event_timeline
+    )
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
 
 
 def test_guarded_fault_recovery_clears_failed_command_reservation(tmp_path: Path) -> None:

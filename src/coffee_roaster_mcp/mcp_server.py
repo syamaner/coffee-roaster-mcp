@@ -1679,6 +1679,7 @@ def _run_reserved_driver_fault_recovery(
     cancel it and reach a blocked driver command promptly.
     """
     command: Literal["drop", "start_cooling", "stop_cooling"] = "stop_cooling"
+    driver_state: RoasterState | None = None
     try:
         if reservation.kind == "drop":
             command = "drop"
@@ -1697,14 +1698,22 @@ def _run_reserved_driver_fault_recovery(
             heat_level_percent=driver_state.heat_level_percent,
             fan_level_percent=driver_state.fan_level_percent,
             cooling_on=driver_state.cooling_on,
+            connected=driver_state.connected,
         )
     except Exception:
+        if command == "drop":
+            server_context.session_store.retain_fault_drop_ambiguity(session)
         _fail_closed_guarded_fault_recovery_command(
             server_context,
             session=session,
             reservation=reservation,
             command=command,
         )
+        if driver_state is not None and (
+            not driver_state.connected
+            or (command in {"drop", "start_cooling"} and driver_state.fan_level_percent != 100)
+        ):
+            server_context.session_store.retain_fault_recovery_admission_block(session)
         raise
 
 

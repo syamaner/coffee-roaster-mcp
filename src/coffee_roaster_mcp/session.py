@@ -797,6 +797,8 @@ class RoastSessionStore:
         self._fault_recovery_in_flight_tokens: dict[str, str] = {}
         self._fault_recovery_admission_blocks: set[str] = set()
         self._fault_drop_cooling_cycle_required: set[str] = set()
+        self._fault_drop_ambiguity_required: set[str] = set()
+        self._fault_drop_ambiguity_cooling_started: set[str] = set()
         self._finalisation_generation = 0
         self._finalisation_tokens: dict[str, str] = {}
         self._finalisation_in_progress: set[str] = set()
@@ -1205,6 +1207,10 @@ class RoastSessionStore:
         with self._lock:
             self._assert_guarded_fault_recovery_admission_locked(session)
             if kind == "drop":
+                if session.id in self._fault_drop_ambiguity_required:
+                    raise SessionLifecycleError(
+                        "Recovery bean drop is ambiguous until cooling is restarted and stopped."
+                    )
                 if session.beans_added_at_utc is None:
                     raise SessionLifecycleError("Recovery bean drop requires beans to be added.")
                 if session.beans_dropped_at_utc is not None:
@@ -1613,6 +1619,7 @@ class RoastSessionStore:
         heat_level_percent: int,
         fan_level_percent: int,
         cooling_on: bool,
+        connected: bool = True,
     ) -> tuple[RoastEvent, RoastSession]:
         """Complete one guarded stopped-fault recovery command.
 
@@ -1628,6 +1635,7 @@ class RoastSessionStore:
             heat_level_percent: Driver-reported heat after the command.
             fan_level_percent: Driver-reported fan after the command.
             cooling_on: Driver-reported cooling state after the command.
+            connected: Whether the driver remained connected after the command.
 
         Returns:
             The authoritative event and an atomic session snapshot.
@@ -1656,6 +1664,14 @@ class RoastSessionStore:
                 )
                 if validated_heat != 0:
                     raise SessionLifecycleError("Heat must be off after fault recovery.")
+                if not connected:
+                    raise SessionLifecycleError("Driver disconnected during fault recovery.")
+                if reservation.kind in ("drop", "start_cooling") and (
+                    not cooling_on or validated_fan != 100
+                ):
+                    raise SessionLifecycleError(
+                        "Fault recovery cooling requires fan 100 and cooling active."
+                    )
 
                 payload: dict[str, EventPayloadValue] = {
                     "heat_level_percent": validated_heat,
@@ -1669,14 +1685,11 @@ class RoastSessionStore:
                         "beans_dropped",
                         payload=payload,
                     )
-                    if cooling_on:
-                        self._record_stopped_session_event_locked(
-                            session,
-                            "cooling_started",
-                            payload=payload,
-                        )
-                    else:
-                        self._fault_drop_cooling_cycle_required.add(session.id)
+                    self._record_stopped_session_event_locked(
+                        session,
+                        "cooling_started",
+                        payload=payload,
+                    )
                 elif reservation.kind == "start_cooling":
                     if not cooling_on:
                         raise SessionLifecycleError(
@@ -1687,6 +1700,8 @@ class RoastSessionStore:
                         "cooling_started",
                         payload=payload,
                     )
+                    if session.id in self._fault_drop_ambiguity_required:
+                        self._fault_drop_ambiguity_cooling_started.add(session.id)
                 elif reservation.kind == "stop_cooling":
                     if cooling_on:
                         raise SessionLifecycleError(
@@ -1698,6 +1713,9 @@ class RoastSessionStore:
                         payload=payload,
                     )
                     self._fault_drop_cooling_cycle_required.discard(session.id)
+                    if session.id in self._fault_drop_ambiguity_cooling_started:
+                        self._fault_drop_ambiguity_cooling_started.discard(session.id)
+                        self._fault_drop_ambiguity_required.discard(session.id)
                 else:
                     raise SessionLifecycleError("Unsupported stopped-fault recovery command.")
                 session.heat_level_percent = validated_heat
@@ -1710,6 +1728,19 @@ class RoastSessionStore:
                 self._clear_driver_command_reservation_locked(session, reservation)
                 if completed:
                     self._clear_fault_recovery_in_flight_locked(session, reservation)
+
+    def retain_fault_drop_ambiguity(self, session: RoastSession) -> None:
+        """Fence admission after a drop may have actuated without durable evidence."""
+        with self._lock:
+            self._assert_latest_session(session)
+            self._fault_drop_ambiguity_required.add(session.id)
+            self._fault_drop_ambiguity_cooling_started.discard(session.id)
+
+    def retain_fault_recovery_admission_block(self, session: RoastSession) -> None:
+        """Keep recovery admission closed until explicit verified containment."""
+        with self._lock:
+            self._assert_latest_session(session)
+            self._fault_recovery_admission_blocks.add(session.id)
 
     def cancel_nonfinalisation_driver_command(self, session: RoastSession) -> None:
         """Atomically cancel a pending command unless finalisation owns it."""
@@ -2493,7 +2524,11 @@ class RoastSessionStore:
         if existing_event is not None and not is_post_fault_recovery:
             return existing_event
         recorded_at_utc = self._utc_now()
-        monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+        monotonic_seconds = (
+            max(0.0, self._monotonic_now() - session.monotonic_start)
+            if payload.get("recovery_after_fault") is True
+            else session.elapsed_monotonic_seconds(self._monotonic_now)
+        )
         monotonic_seconds = _normalize_event_monotonic_seconds(
             session,
             monotonic_seconds=monotonic_seconds,
@@ -2515,7 +2550,8 @@ class RoastSessionStore:
         )
         _append_event_log_row(session, event)
         session.event_timeline.append(event)
-        _apply_event_timestamp(session, event)
+        if payload.get("recovery_after_fault") is not True:
+            _apply_event_timestamp(session, event)
         return event
 
     def _start_session_locked(self, *, purpose: SessionPurpose = "roast") -> RoastSession:
@@ -2551,6 +2587,11 @@ class RoastSessionStore:
         if session is not None and session.id in self._fault_drop_cooling_cycle_required:
             raise SessionLifecycleError(
                 "Cannot start a roast session until post-drop cooling is started and stopped."
+            )
+        if session is not None and session.id in self._fault_drop_ambiguity_required:
+            raise SessionLifecycleError(
+                "Cannot start a roast session until ambiguous bean drop cooling is restarted "
+                "and stopped."
             )
         if (
             session is not None

@@ -482,6 +482,8 @@ def _telemetry_visible_at(
 
 def _apply_view_event(session: RoastSession, event: RoastEvent) -> None:
     """Apply one visible event's timestamp fields to a point-in-time view."""
+    if event.payload.get("recovery_after_fault") is True:
+        return
     if event.kind == "beans_added":
         session.beans_added_at_utc = event.recorded_at_utc
         session.beans_added_monotonic_seconds = event.monotonic_seconds
@@ -539,7 +541,10 @@ def _roast_elapsed_at(events: list[RoastEvent], monotonic_seconds: float) -> flo
 
 def _event_seen_in(events: list[RoastEvent], kind: str) -> bool:
     """Return whether one event kind is visible for the current row."""
-    return any(event.kind == kind for event in events)
+    return any(
+        event.kind == kind and event.payload.get("recovery_after_fault") is not True
+        for event in events
+    )
 
 
 def _first_crack_payload_from(events: list[RoastEvent]) -> dict[str, EventPayloadValue]:
@@ -573,7 +578,7 @@ def _events_visible_at(
 def _event_monotonic_seconds(events: list[RoastEvent], kind: str) -> float | None:
     """Return the first visible monotonic timestamp for an event kind."""
     for event in events:
-        if event.kind == kind:
+        if event.kind == kind and event.payload.get("recovery_after_fault") is not True:
             return event.monotonic_seconds
     return None
 
