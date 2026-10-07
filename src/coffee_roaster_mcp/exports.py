@@ -506,7 +506,9 @@ def _phase_from(events: list[RoastEvent]) -> RoastPhase:
     """Return the lifecycle phase implied by visible events."""
     phase: RoastPhase = "pre_roast"
     for event in events:
-        if event.kind == "beans_added":
+        if event.payload.get("recovery_after_fault") is True:
+            phase = "fault"
+        elif event.kind == "beans_added":
             phase = "roasting"
         elif event.kind == "first_crack_detected":
             phase = "development"
@@ -514,12 +516,6 @@ def _phase_from(events: list[RoastEvent]) -> RoastPhase:
             phase = "dropped"
         elif event.kind == "cooling_started":
             phase = "cooling"
-        elif (
-            event.kind == "cooling_stopped"
-            and phase == "fault"
-            and event.payload.get("recovery_after_fault") is True
-        ):
-            phase = "fault"
         elif event.kind == "cooling_stopped":
             phase = "complete"
         elif event.kind == "fault":

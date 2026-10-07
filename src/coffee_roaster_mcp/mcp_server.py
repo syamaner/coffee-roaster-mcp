@@ -7,7 +7,7 @@ import dataclasses
 import logging
 import time
 from collections.abc import AsyncGenerator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1257,6 +1257,11 @@ def create_mcp_server(
                     )
                 except Exception as exc:
                     if expected_session_id is not None:
+                        with suppress(Exception):  # Preserve the persistence failure.
+                            server_context.session_store.retain_fault_block(
+                                session,
+                                safety_payload=safety_payload,
+                            )
                         raise
                     server_context.session_store.retain_active_fault_block(
                         session,

@@ -6,6 +6,7 @@ import csv
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -732,10 +733,10 @@ def test_snapshot_export_csv_event_rows_use_transition_control_state(
     assert cooling_stopped_row["cooling_on"] == "False"
 
 
-def test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop(
+def test_snapshot_export_keeps_fault_phase_for_every_recovery_command(
     tmp_path: Path,
 ) -> None:
-    """Keep post-emergency recovery rows classified as faulted."""
+    """Keep every post-emergency recovery projection classified as faulted."""
     clock = ClockHarness()
     store = RoastSessionStore(
         utc_now=clock.utc_now,
@@ -743,6 +744,7 @@ def test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop(
         default_log_dir=tmp_path / "roasts",
     )
     session = store.start_session()
+    store.record_event(session, "beans_added")
     clock.monotonic_value = 105.0
     store.emergency_stop(
         session,
@@ -757,24 +759,37 @@ def test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop(
         },
     )
     clock.monotonic_value = 110.0
-    reservation = store.reserve_driver_stop_cooling_recovery(session)
-    store.complete_reserved_driver_stop_cooling_recovery_snapshot(
-        session,
-        reservation=reservation,
-        heat_level_percent=0,
-        fan_level_percent=100,
-        cooling_on=False,
+    recovery_commands: tuple[tuple[Literal["drop", "start_cooling", "stop_cooling"], bool], ...] = (
+        ("drop", False),
+        ("start_cooling", True),
+        ("stop_cooling", False),
     )
+    for kind, cooling_on in recovery_commands:
+        reservation = store.reserve_driver_fault_recovery(session, kind=kind)
+        store.complete_reserved_driver_fault_recovery_snapshot(
+            session,
+            reservation=reservation,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=cooling_on,
+        )
 
     export = export_roast_snapshot(session)
 
     with export.csv_path.open(encoding="utf-8", newline="") as csv_file:
         rows = list(csv.DictReader(csv_file))
     fault_row = next(row for row in rows if row["event"] == "fault")
-    recovery_row = next(row for row in rows if row["event"] == "cooling_stopped")
+    recovery_rows = [
+        row
+        for row in rows
+        if row["event"] in {"beans_dropped", "cooling_started", "cooling_stopped"}
+    ]
     assert fault_row["phase"] == "fault"
-    assert recovery_row["phase"] == "fault"
-    assert recovery_row["cooling_on"] == "False"
+    assert len(recovery_rows) == 3
+    assert all(row["phase"] == "fault" for row in recovery_rows)
+    assert recovery_rows[-1]["cooling_on"] == "False"
+    summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
+    assert summary["phase"] == "fault"
 
 
 def test_snapshot_export_csv_uses_driver_transition_payload_state(

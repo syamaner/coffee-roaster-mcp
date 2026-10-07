@@ -3673,6 +3673,53 @@ def test_guarded_emergency_stop_retains_block_when_fault_recording_fails(
     assert state.heat_level_percent == 10 and state.cooling_on is True
 
 
+def test_guarded_verified_emergency_stop_logging_failure_retains_admission_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified payload cannot clear admission before its fault event persists."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    original_append_event_log_row = session_module._append_event_log_row  # pyright: ignore[reportPrivateUsage]
+
+    def verified_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        driver.actions.append(f"emergency_stop:{reason}")
+        driver.heat_level_percent = 0
+        driver.fan_level_percent = 100
+        driver.cooling_on = False
+        return EmergencyStopResult(
+            driver=driver.name,
+            safety_method="emergency_stop",
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=False,
+        )
+
+    def fail_fault_recording(*_args: object, **_kwargs: object) -> object:
+        raise OSError("log unavailable")
+
+    monkeypatch.setattr(driver, "emergency_stop", verified_emergency_stop)
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_fault_recording)
+
+    with pytest.raises(OSError, match="log unavailable"):
+        _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.active is False
+    assert state.heat_level_percent == 0 and state.cooling_on is False
+    actions_before_rejections = list(driver.actions)
+    with pytest.raises(ValueError, match="verified emergency-stop containment"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+    assert driver.actions == actions_before_rejections
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", original_append_event_log_row)
+    _call_tool(server, "emergency_stop", ctx, expected_session_id=session_id)
+    replacement = _call_tool(server, "start_roast_session", ctx)
+    assert replacement.session.session_id != session_id
+
+
 def test_guarded_emergency_stop_driver_error_requires_verified_containment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
