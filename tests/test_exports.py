@@ -750,6 +750,7 @@ def test_snapshot_export_csv_keeps_fault_phase_for_recovery_cooling_stop(
         safety_payload={
             "driver": "mock",
             "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
             "heat_level_percent": 0,
             "fan_level_percent": 100,
             "cooling_on": True,

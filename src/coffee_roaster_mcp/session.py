@@ -796,6 +796,7 @@ class RoastSessionStore:
         self._pending_session_start_token: str | None = None
         self._fault_recovery_in_flight_tokens: dict[str, str] = {}
         self._fault_recovery_admission_blocks: set[str] = set()
+        self._fault_drop_cooling_cycle_required: set[str] = set()
         self._finalisation_generation = 0
         self._finalisation_tokens: dict[str, str] = {}
         self._finalisation_in_progress: set[str] = set()
@@ -1640,6 +1641,8 @@ class RoastSessionStore:
                             "cooling_started",
                             payload=payload,
                         )
+                    else:
+                        self._fault_drop_cooling_cycle_required.add(session.id)
                 elif reservation.kind == "start_cooling":
                     if not cooling_on:
                         raise SessionLifecycleError(
@@ -1660,6 +1663,7 @@ class RoastSessionStore:
                         "cooling_stopped",
                         payload=payload,
                     )
+                    self._fault_drop_cooling_cycle_required.discard(session.id)
                 else:
                     raise SessionLifecycleError("Unsupported stopped-fault recovery command.")
                 session.heat_level_percent = validated_heat
@@ -2123,6 +2127,8 @@ class RoastSessionStore:
                 session.phase = "fault"
             if has_verified_zero_heat(safety_payload=normalized_safety_payload):
                 self._fault_recovery_admission_blocks.discard(session.id)
+            else:
+                self._fault_recovery_admission_blocks.add(session.id)
             if session.id in self._nonterminal_finalisations:
                 record = session.finalisation
                 if record is not None:
@@ -2503,6 +2509,10 @@ class RoastSessionStore:
         if session is not None and session.id in self._fault_recovery_admission_blocks:
             raise SessionLifecycleError(
                 "Cannot start a roast session until emergency-stop containment is verified."
+            )
+        if session is not None and session.id in self._fault_drop_cooling_cycle_required:
+            raise SessionLifecycleError(
+                "Cannot start a roast session until post-drop cooling is started and stopped."
             )
         if (
             session is not None

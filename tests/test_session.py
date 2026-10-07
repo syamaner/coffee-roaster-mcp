@@ -402,6 +402,7 @@ def test_future_first_crack_detection_orders_fault_and_recovery_events() -> None
         safety_payload={
             "driver": "test-driver",
             "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
             "heat_level_percent": 0,
             "fan_level_percent": 100,
             "cooling_on": True,
@@ -775,6 +776,7 @@ def test_emergency_abort_releases_finalisation_reservation_for_recovery() -> Non
         safety_payload={
             "driver": "test",
             "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
             "heat_level_percent": 0,
             "fan_level_percent": 100,
             "cooling_on": True,
@@ -844,7 +846,18 @@ def test_emergency_stop_between_admission_and_attach_retains_truthful_abort() ->
         def __init__(self) -> None:
             self.reservation_generation = generation
 
-    store.emergency_stop(session, reason="window")
+    store.emergency_stop(
+        session,
+        reason="window",
+        safety_payload={
+            "driver": "test",
+            "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    )
     record = Record()
     store.attach_finalisation(session, record)
 
@@ -966,7 +979,7 @@ def test_start_session_rejects_pending_post_fault_cooling_recovery() -> None:
     session = store.start_session()
     store.emergency_stop(session, reason="unit-test")
 
-    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
         store.start_session()
 
     assert store.get_latest_session() is session
@@ -983,7 +996,7 @@ def test_reserve_session_start_rejects_pending_post_fault_cooling_recovery() -> 
     session = store.start_session()
     store.emergency_stop(session, reason="unit-test")
 
-    with pytest.raises(SessionLifecycleError, match="post-fault cooling recovery"):
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
         store.reserve_session_start()
 
     assert store.get_latest_session() is session
@@ -1628,6 +1641,7 @@ def test_stop_cooling_recovery_records_new_event_after_completed_session_fault()
         safety_payload={
             "driver": "test-driver",
             "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
             "heat_level_percent": 0,
             "fan_level_percent": 100,
             "cooling_on": True,
@@ -1669,6 +1683,7 @@ def test_guarded_fault_recovery_reservation_blocks_new_session_start() -> None:
         session,
         reason="test-fault",
         safety_payload={
+            "driver_safety_method_called": True,
             "heat_level_percent": 0,
             "fan_level_percent": 0,
             "cooling_on": False,

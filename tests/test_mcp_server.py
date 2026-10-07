@@ -3696,6 +3696,73 @@ def test_guarded_emergency_stop_driver_error_requires_verified_containment(
         _call_tool(server, "start_roast_session", ctx)
 
 
+def test_initial_emergency_stop_driver_error_blocks_fault_recovery_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unverified initial e-stop cannot admit any stopped-fault actuation."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    started = _call_tool(server, "start_roast_session", ctx)
+    session_id = started.session.session_id
+    _call_tool(server, "mark_beans_added", ctx)
+
+    def fail_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        del reason
+        raise RuntimeError("emergency stop unavailable")
+
+    monkeypatch.setattr(driver, "emergency_stop", fail_emergency_stop)
+    _call_tool(server, "emergency_stop", ctx)
+
+    for tool_name in ("drop_beans", "start_cooling", "stop_cooling"):
+        with pytest.raises(ValueError, match="verified emergency-stop containment"):
+            _call_tool(server, tool_name, ctx, expected_session_id=session_id)
+    with pytest.raises(SessionLifecycleError, match="containment is verified"):
+        _call_tool(server, "start_roast_session", ctx)
+    assert driver.actions == ["connect"]
+
+
+def test_fault_recovery_drop_without_cooling_requires_post_drop_cooling_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cooling-off drop needs a new cooling cycle before another session starts."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    def drop_without_cooling() -> RoasterState:
+        driver.actions.append("drop_beans")
+        driver.heat_level_percent = 0
+        driver.fan_level_percent = 100
+        driver.cooling_on = False
+        return RoasterState(
+            driver=driver.name,
+            connected=driver.connected,
+            bean_temp_c=driver.bean_temp_c,
+            env_temp_c=driver.env_temp_c,
+            heat_level_percent=driver.heat_level_percent,
+            fan_level_percent=driver.fan_level_percent,
+            cooling_on=driver.cooling_on,
+            raw_vendor_data=driver.raw_vendor_data,
+        )
+
+    monkeypatch.setattr(driver, "drop_beans", drop_without_cooling)
+    dropped = _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    assert dropped.event.kind == "beans_dropped"
+    with pytest.raises(SessionLifecycleError, match="post-drop cooling is started and stopped"):
+        _call_tool(server, "start_roast_session", ctx)
+
+    _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+    replacement = _call_tool(server, "start_roast_session", ctx)
+    assert replacement.session.session_id != session_id
+
+
 def test_guarded_fault_recovery_clears_failed_command_reservation(tmp_path: Path) -> None:
     """A driver failure leaves no reservation that blocks a later safe retry."""
     server, ctx, driver, session_id = _faulted_recovery_server(tmp_path)
