@@ -33,6 +33,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - Separate open acceptance work: #157 and #194 remain open for their respective
   hardware/component acceptance. Do not infer microphone, serial, Hottop, or
   readiness authority from this delivery
+- #234 S1 is complete: the mandatory SciPy import is deferred until
+  `MelFrontend` constructs its symmetric Hann window. #234 remains open for a
+  separately contracted dependency-bound release slice and separate Agent
+  pin/nested-suite work; no version bump or publication occurred.
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`

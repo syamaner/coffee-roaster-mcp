@@ -6,6 +6,8 @@ import ast
 import hashlib
 import importlib
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -75,6 +77,65 @@ def _write_config(tmp_path: Path, content: str) -> Path:
     config_path = tmp_path / "preprocessor_config.json"
     config_path.write_text(content, encoding="utf-8")
     return tmp_path
+
+
+def test_module_has_no_top_level_scipy_import() -> None:
+    """The frontend defers its mandatory SciPy import until window construction."""
+    frontend_path = Path(__file__).parents[1] / "src" / "coffee_roaster_mcp" / "mel_frontend.py"
+    module = ast.parse(frontend_path.read_text(encoding="utf-8"))
+    top_level_imports: list[str] = []
+    for node in module.body:
+        if isinstance(node, ast.Import):
+            top_level_imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            top_level_imports.append(node.module)
+    assert all(imported_name.split(".")[0] != "scipy" for imported_name in top_level_imports)
+
+
+def test_cli_import_graph_defers_scipy(tmp_path: Path) -> None:
+    """The CLI's import graph does not load SciPy before frontend construction."""
+    source_parent = Path(__file__).parents[1] / "src"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(source_parent)
+    import_graph_probe = "\n".join(
+        (
+            "import importlib",
+            "import sys",
+            "for module_name in (",
+            "    'coffee_roaster_mcp.cli',",
+            "    'coffee_roaster_mcp.mcp_server',",
+            "    'coffee_roaster_mcp.detector',",
+            "    'coffee_roaster_mcp.mel_frontend',",
+            "): ",
+            "    importlib.import_module(module_name)",
+            "scipy_loaded = any(",
+            "    name == 'scipy' or name.startswith('scipy.') for name in sys.modules",
+            ")",
+            "print(f'scipy_loaded={scipy_loaded}')",
+        )
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", import_graph_probe],
+        capture_output=True,
+        check=False,
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "scipy_loaded=False\n"
+
+
+def test_frontend_construction_preserves_scipy_symmetric_hann_window() -> None:
+    """Construction retains SciPy's symmetric float32 Hann window exactly."""
+    from scipy.signal import get_window  # type: ignore[reportMissingTypeStubs]
+
+    expected_window: Any = get_window("hann", 400, fftbins=False)  # type: ignore[reportUnknownVariableType]
+    frontend = _frontend()
+    expected = np.asarray(expected_window, dtype=np.float32)
+    assert frontend._window.shape == (400,)  # noqa: SLF001  # type: ignore[reportPrivateUsage]
+    assert frontend._window.dtype == np.float32  # noqa: SLF001  # type: ignore[reportPrivateUsage]
+    assert np.array_equal(frontend._window, expected)  # noqa: SLF001  # type: ignore[reportPrivateUsage]
 
 
 def test_golden_fixture_provenance_and_strict_parity() -> None:

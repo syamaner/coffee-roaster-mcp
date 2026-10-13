@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
-from scipy.signal import get_window  # type: ignore[reportMissingTypeStubs]
 
 _FRAME_LENGTH = 400
 _HOP_LENGTH = 160
@@ -91,12 +90,17 @@ def _build_kaldi_mel_filters(
 def _hann_window_symmetric(length: int) -> np.ndarray:
     """Return the symmetric Hann window used by AST's NumPy path.
 
+    SciPy is imported only when constructing this mandatory window so importing
+    the detector graph does not load it.
+
     Args:
         length: Window length in samples.
 
     Returns:
         A float32 symmetric Hann window.
     """
+    from scipy.signal import get_window  # type: ignore[reportMissingTypeStubs]
+
     window: Any = get_window("hann", length, fftbins=False)  # type: ignore[reportUnknownVariableType]
     return np.asarray(window, dtype=np.float32)
 
