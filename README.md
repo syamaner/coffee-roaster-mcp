@@ -27,29 +27,35 @@ drops were executed, with no failed command events or safety alerts in either
 completed run.
 
 Those roasts used the pinned `coffee-roaster-mcp` 0.1.13 runtime. Versions
-0.1.14-0.1.16 were metadata/docs releases. The published PyPI and MCP Registry
-distribution is `0.2.2`; it does not contain D209's cold-temperature
-projection. The reviewed, unreleased `0.2.3` candidate adds D209's typed
-cold-only temperature and packet projection alongside #222's roast-fan-only
-cold-session `get_roast_state` observation. It also includes PR #231's
-stopped-fault exact-session recovery semantics. The #222 observation reports
-commanded roast-fan state only. The D209 projection reports telemetry, packet
-validity and counters, and raw and typed temperature information. Those
-surfaces do not prove physical actuation, calibration, accuracy, readiness, or
-safety. Packet progress screening is an Agent comparison between observations,
-not a continuous freshness or link watchdog.
+0.1.14-0.1.16 were metadata/docs releases. Public PyPI metadata lists `0.2.3`,
+and the matching release workflow reports successful PyPI and MCP Registry
+publication; the current live MCP Registry listing is not independently checked.
+Those are public metadata and workflow observations, not independent verification
+of public artefact bytes, contents, tag provenance, or installed bytes.
 
-Current PyPI and MCP Registry metadata verifies that `0.2.2` is published,
-but the available evidence does not verify a `v0.2.2` tag SHA or release
-workflow receipt. Issue #225 remains open for release-process reconciliation;
-issue #227 is closed for the D209 software projection.
+The repository's `0.2.3` candidate record includes D209's typed cold-only
+temperature and packet projection alongside #222's roast-fan-only cold-session
+`get_roast_state` observation, and PR #231's stopped-fault exact-session
+recovery semantics. The #222 observation reports commanded roast-fan state
+only. The D209 projection reports telemetry, packet validity and counters, and
+raw and typed temperature information. Packet progress screening is an Agent
+comparison between observations, not a continuous freshness or link watchdog.
+Those source records and publication observations do not prove physical
+actuation, calibration, accuracy, continuous freshness, link health, readiness,
+or safety. Issue #225 remains open for release-process reconciliation; issue
+#227 is closed for the D209 software projection.
 
-Neither the `0.2.2` publication nor the `0.2.3` candidate version, wheel name,
-or declared command-line digest can attest which bytes the intended interpreter
-imports. Verifying that installed bytes correspond to a selected artifact is a
-separate, operator-authorised gate; this documentation does not perform that
-gate or claim that either distribution is installed. This release-candidate
-metadata change does not itself authorise hardware, beans, or a readiness claim.
+Relative to public current-tag source
+`3e40487686880825f93ae2015cc4253d9183623b`, the only new runtime content in
+`0.2.4` is S1's deferred local SciPy symmetric-Hann-window import. Numerical
+output and interfaces are unchanged. A version string, wheel name, or declared
+command-line digest does not attest which bytes the intended interpreter imports.
+Verifying installed bytes is a separate, operator-authorised gate that this
+documentation does not perform or claim for either distribution. `0.2.4`
+preparation is complete only up to the merged head and a successful
+non-publishing dry run; tag creation, protected `release` environment approval,
+publication, and live artefact verification remain human-operator actions. It
+does not authorise hardware, beans, or a readiness claim.
 
 D191's ratified limits remain `N = 1` and `X = 200 ms`; the production fatal
 streak remains `30`. D190 was MCP-only component characterisation with

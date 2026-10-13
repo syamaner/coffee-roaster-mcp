@@ -8,12 +8,13 @@
 - Repository: `syamaner/coffee-roaster-mcp`
 - Package: `coffee-roaster-mcp`
 - MCP Registry name: `io.github.syamaner/coffee-roaster-mcp`
-- Current phase: production PyPI and the MCP Registry publish `0.2.2`.
-  The reviewed, unreleased `0.2.3` candidate carries D209's cold-temperature
-  projection and PR #231's stopped-fault exact-session recovery semantics.
-  Publication metadata for `0.2.2` is verified, but no `v0.2.2` tag SHA or
-  release-workflow receipt is verified. #225 remains open for release-process
-  reconciliation; #227 is closed for the D209 software projection. #157 and
+- Current phase: public PyPI metadata lists `0.2.3`, and the matching release
+  workflow reports successful PyPI and MCP Registry publication. The current
+  live MCP Registry listing is not independently checked. These observations do
+  not independently verify public artefact bytes, contents, tag provenance, or
+  installed bytes. #225 remains open for release-process reconciliation; #227
+  is closed for the D209 software projection, whose repository candidate record
+  includes PR #231's stopped-fault exact-session recovery semantics. #157 and
   #194 remain separate open hardware/component acceptance work.
 
 ## Working Rules
@@ -28,23 +29,26 @@
 
 ## Active Context
 
-Production PyPI and MCP Registry metadata verifies publication of `0.2.2`.
-The available evidence does not verify a `v0.2.2` tag SHA, release-workflow
-receipt, or completion of the release checklist. Issue #225 remains open for
-release-process reconciliation. Issue #227 is closed for the D209 software:
-published `0.2.2` lacks its typed cold-only temperature and packet projection,
-while the reviewed, unreleased `0.2.3` candidate includes it and PR #231's
-stopped-fault exact-session recovery semantics. Agent-side comparison between
-observations owns packet-progress screening. Neither distribution proves
-physical state, calibration, continuous freshness, link health, readiness, or
-which installed bytes an intended interpreter imports. Releasing or installing
-the candidate remains separately authorised. #157 and #194 remain separate
-open hardware/component acceptance work.
+Public PyPI metadata lists `0.2.3`, and the matching release workflow reports
+successful PyPI and MCP Registry publication. The current live MCP Registry
+listing is not independently checked. These observations do not independently
+verify public artefact bytes, contents, a tag target, or installed bytes. Issue
+#225 remains open for release-process reconciliation and its closure remains a
+human-operator decision. Issue #227 is closed for the D209 software projection:
+the repository candidate record includes its typed cold-only temperature and
+packet projection and PR #231's stopped-fault exact-session recovery semantics.
+#222's roast-fan-only observation reports commanded state only. Agent-side
+comparison between observations owns packet-progress screening. Neither record
+nor observation proves physical state, calibration, continuous freshness, link
+health, readiness, or which bytes an intended interpreter imports. #157 and
+#194 remain separate open hardware/component acceptance work.
 
 Issue #234 S1 defers the mandatory SciPy import until `MelFrontend` constructs
-its symmetric Hann window. #234 remains open for its separately contracted
-dependency-bound release slice and the separate Agent pin/nested-suite work;
-no version bump or publication occurred.
+its symmetric Hann window. Its S2 release preparation declares `0.2.4` and is
+complete only up to the merged head and a successful non-publishing dry run;
+tag creation, protected `release` environment approval, publication, and live
+artefact verification remain human-operator actions. #234 remains open for the
+separately contracted Agent pin/nested-suite work.
 
 ## Historical Narrative (Superseded For Current Delivery)
 

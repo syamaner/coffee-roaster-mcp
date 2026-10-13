@@ -124,24 +124,26 @@
   package-readiness #212 are complete. #157 remains open for Pi and combined
   acceptance, and #194's instrumentation software slice is implemented while
   #194 remains open for later operator characterisation and supervised acceptance.
-- The published PyPI and MCP Registry distribution is `0.2.2`, and it lacks
-  D209's cold-temperature projection. The reviewed, unreleased `0.2.3`
-  candidate includes D209's typed cold-only temperature and packet projection
-  and PR #231's stopped-fault exact-session recovery semantics. #222 reports
-  commanded roast-fan state only. D209 reports telemetry, packet validity and
-  counters, and raw and typed temperature information; Agent-side comparison
-  between observations owns packet-progress screening. Neither surface proves
-  physical state, calibration, continuous freshness, link health, or readiness.
-  A version string, wheel name, or declared command-line digest does not attest
-  the bytes imported by the intended interpreter. Installed-byte verification
-  is a separate, operator-authorised gate; this repository guidance does not
-  perform it or claim that either distribution is installed. Tagging,
-  publication, release-environment approval, and live artefact verification
-  remain human-operator actions.
-- Current PyPI and MCP Registry metadata verifies publication of `0.2.2`, but
-  no `v0.2.2` tag SHA or release-workflow receipt is verified. Issue #225
-  remains open for release-process reconciliation, while issue #227 is closed
-  for the D209 software projection.
+- Public PyPI metadata lists `0.2.3`, and the matching release workflow reports
+  successful PyPI and MCP Registry publication. The current live MCP Registry
+  listing is not independently checked. These are public metadata and workflow
+  observations; they do not independently verify public artefact bytes,
+  contents, tag provenance, or installed bytes. The repository's `0.2.3`
+  candidate record includes D209's typed cold-only temperature and packet
+  projection and PR #231's stopped-fault exact-session recovery semantics.
+  #222 reports commanded roast-fan state only. D209 reports telemetry, packet
+  validity and counters, and raw and typed temperature information; Agent-side
+  comparison between observations owns packet-progress screening. Neither
+  record nor observation proves physical state, calibration, continuous
+  freshness, link health, or readiness. A version string, wheel name, or
+  declared command-line digest does not attest the bytes imported by the
+  intended interpreter. Installed-byte verification is a separate,
+  operator-authorised gate; this repository guidance does not perform it or
+  claim that either distribution is installed. Tagging, publication,
+  release-environment approval, and live artefact verification remain
+  human-operator actions. Issue #225 remains open for release-process
+  reconciliation and its closure remains a human-operator decision, while
+  issue #227 is closed for the D209 software projection.
 
 ```text
 src/coffee_roaster_mcp/

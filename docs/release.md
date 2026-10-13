@@ -10,20 +10,23 @@ The release workflow is `.github/workflows/release.yml`. It supports two paths:
 
 ## Current Release Authority
 
-Production PyPI and MCP Registry metadata verifies publication of `0.2.2`.
-The available evidence does not verify a `v0.2.2` tag SHA, release-workflow
-receipt, completed checklist, dry run, environment approval, or human live
-verification. Issue #225 remains open to reconcile that release-process record.
+Public PyPI metadata lists `0.2.3`, and the matching release workflow reports
+successful PyPI and MCP Registry publication. The current live MCP Registry
+listing is not independently checked. These are public metadata and workflow
+observations: they do not independently verify public artefact bytes, their
+contents, a `v0.2.3` tag target, or installed bytes. Issue #225 remains open to
+reconcile the release-process record.
 
-Published `0.2.2` carries #222's additive, typed, roast-fan-only cold-session
-`get_roast_state` observation. It reports commanded roast-fan state only. Issue
-#227 is closed for the separate D209 software projection: the reviewed,
-unreleased `0.2.3` candidate adds typed cold-only telemetry, packet validity
-and counters, and raw and typed temperature information that published `0.2.2`
-lacks. It also carries #230's stopped-fault exact-session recovery semantics.
-Agent-side comparison between observations owns packet-progress screening; the
-projection is not a continuous freshness or link watchdog. Neither surface
-proves physical state, calibration, accuracy, readiness, or safety.
+The repository's `0.2.3` candidate record carries #222's additive, typed,
+roast-fan-only cold-session `get_roast_state` observation, which reports
+commanded roast-fan state only. Issue #227 is closed for the separate D209
+software projection: that source record includes typed cold-only telemetry,
+packet validity and counters, raw and typed temperature information, and #230's
+stopped-fault exact-session recovery semantics. Agent-side comparison between
+observations owns packet-progress screening; the projection is not a continuous
+freshness or link watchdog. Neither source record nor publication observation
+proves physical state, calibration, accuracy, continuous freshness, link health,
+readiness, or safety.
 
 Release-candidate traceability records #222's implementation merge
 `6b8c6f8922df02adc147719f1e8c91b824d13783` and D197's plan merge
@@ -46,19 +49,36 @@ remain subject to their stated limitations below.
 
 Only the human release operator may create or push tags, approve the release
 environment, publish packages, or verify live PyPI and MCP Registry artefacts.
-The metadata evidence above does not establish that those operator steps ran
-for `0.2.2`. Releasing or installing the `0.2.3` candidate requires the
-candidate checklist below and a separately authorised human decision. A version
-string, artefact name, or declared digest does not attest which distribution an
-intended interpreter imports; installed bytes remain unverified.
+The observations above do not establish independent public-artefact or
+installed-byte verification. A version string, artefact name, or declared
+digest does not attest which distribution an intended interpreter imports;
+installed-byte verification remains a separate, operator-authorised gate that
+this repository guidance does not perform.
 
 ## Changelog
 
-### 0.2.3 (release candidate; unpublished)
+### 0.2.4 (release preparation; unpublished)
 
-- Carries D209's typed cold-only temperature and packet projection, which is
-  absent from the published `0.2.2` distribution.
-- Carries #230's stopped-fault exact-session recovery semantics from PR #231.
+- Relative to public current-tag source
+  `3e40487686880825f93ae2015cc4253d9183623b`, the only new runtime content is
+  S1's deferred local SciPy symmetric-Hann-window import. Numerical output and
+  interfaces are unchanged.
+- Preparation is complete only up to the merged head and a successful
+  non-publishing dry run. Tag creation, protected `release` environment
+  approval, publication, and live artefact verification remain human-operator
+  actions.
+- This declared version is not published, tagged, approved, released, or
+  `isLatest`.
+
+### 0.2.3 (public metadata and workflow observation; historical source record)
+
+- Public PyPI metadata lists `0.2.3`, and the matching release workflow reports
+  successful PyPI and MCP Registry publication. The current live MCP Registry
+  listing is not independently checked.
+- The repository candidate record carries D209's typed cold-only temperature
+  and packet projection and #230's stopped-fault exact-session recovery
+  semantics from PR #231. This is not independently verified provenance for
+  public artefact content.
 - Adds #230's typed, read-only `get_server_info.session_presence` summary of
   in-process session state; it exposes no session identifiers, paths, driver
   telemetry, or physical-state claim.
@@ -270,42 +290,29 @@ The dry run:
 - Confirms both distribution artifacts exist.
 - Does not publish to PyPI or the MCP Registry.
 
-## v0.2.3 Candidate Checklist (Pre-Publication)
+## v0.2.4 Preparation Checklist (Non-Publishing)
 
-`0.2.3` is a reviewed release candidate, not a published distribution. This
-checklist records the required evidence before a human release operator decides
-whether to publish it; it does not create a tag, approve an environment, or
-publish an artefact.
+`0.2.4` preparation is complete only after the release-preparation PR merges
+and a non-publishing `dry_run: true` succeeds at that exact merged `main` head.
+The record includes version alignment, package build, and clean-wheel mock-safe
+smoke. Tag creation, protected `release` environment approval, publication, and
+live artefact verification remain human-operator actions. This checklist does
+not authorise any of those actions and does not establish hardware readiness or
+authorise beans.
 
-The `session_presence` addition changes candidate bytes. Any earlier dry-run
-result or artefact hash is historical only and cannot satisfy this checklist.
-A fresh exact-head dry run is required after the release-preparation PR merges.
+## v0.2.3 Candidate Checklist (Historical Record — Not Independently Verified)
 
-1. Record successful full local and protected CI gates for the candidate,
-   including version alignment, package build, and clean-wheel mock-safe smoke.
-2. After the release-preparation PR merges, record the exact merged `main` head
-   commit SHA, run `dry_run: true` for that commit, and retain its successful
-   workflow result with the same commit SHA.
-3. Confirm that `v0.2.3` is absent before any authorised tag action, and that
-   a later `v0.2.3` tag will be created at the exact commit SHA that passed the
-   recorded dry run. The tag name must be `v0.2.3` and the package version must
-   be `0.2.3`.
-4. Require the human release operator to approve the protected `release`
-   environment before publication jobs run.
+This is a historical candidate-stage record. Public PyPI metadata lists
+`0.2.3`, and the matching release workflow reports successful PyPI and MCP
+Registry publication, but the current live Registry listing and public artefact
+bytes were not independently checked by this record. It does not prove that any
+listed candidate-stage step ran, nor does it establish installed bytes.
 
-The candidate includes D209's cold-only projection and #230's stopped-fault
-exact-session recovery semantics. It remains a software component candidate
-and does not establish hardware readiness or authorise beans.
+## v0.2.3 Post-Publication Verification (Historical Record — Not Independently Verified)
 
-## v0.2.3 Post-Publication Verification
-
-Only after the human release operator has created the recorded tag, approved
-the protected environment, and the release workflow has completed publication:
-
-1. Independently verify the public PyPI wheel and source-distribution hashes.
-2. Run the installed mock-safe smoke against the selected public PyPI artifact.
-3. Verify the MCP Registry version and `isLatest` state.
-4. Reconcile published-state documentation with those retained public checks.
+This historical record describes intended post-publication verification. It
+does not prove that public hashes, installed mock-safe smoke, or the MCP
+Registry version and `isLatest` state were independently verified.
 
 ## v0.2.2 Release Checklist (Historical/Superseded — Non-Executable)
 

@@ -133,7 +133,7 @@ _EXPECTED_AMBIENT_STATUS_KEYS = {
 
 
 def test_version_is_defined() -> None:
-    assert __version__ == "0.2.3"
+    assert __version__ == "0.2.4"
 
 
 def test_cli_parser_program_name() -> None:
