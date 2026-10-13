@@ -57,6 +57,10 @@ non-publishing dry run; tag creation, protected `release` environment approval,
 publication, and live artefact verification remain human-operator actions. It
 does not authorise hardware, beans, or a readiness claim.
 
+This packaged README Status is a preparation-time snapshot. It records the
+current source and public-metadata observations above, and makes no current
+publication claim for `0.2.4`.
+
 D191's ratified limits remain `N = 1` and `X = 200 ms`; the production fatal
 streak remains `30`. D190 was MCP-only component characterisation with
 artificial music: zero observed overflow does not establish headroom for other

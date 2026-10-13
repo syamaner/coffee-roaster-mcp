@@ -117,6 +117,8 @@ def test_current_authority_surfaces_distinguish_observation_and_install_state() 
         assert "published `0.2.4`" not in current
         assert "verified installed bytes" not in current
         assert "verified public artefact" not in current
+        assert "verified tag provenance" not in current
+        assert "verified release-workflow receipt" not in current
 
 
 def test_current_issue_state_keeps_225_and_230_open_and_227_closed() -> None:
@@ -128,7 +130,7 @@ def test_current_issue_state_keeps_225_and_230_open_and_227_closed() -> None:
             "## Historical Narrative",
             "#225 remains open",
             "#227 is closed",
-            "stopped-fault exact-session recovery semantics",
+            "PR #231's stopped-fault exact-session recovery semantics",
         ),
         (
             "docs/state/epics/coffee-roaster-mcp-v0.1.md",
@@ -136,7 +138,7 @@ def test_current_issue_state_keeps_225_and_230_open_and_227_closed() -> None:
             "- `E7-S1`",
             "#225 remains open",
             "#227 is closed",
-            "stopped-fault exact-session recovery semantics",
+            "PR #231's stopped-fault exact-session recovery semantics",
         ),
         (
             "docs/state/github-issues.md",
@@ -224,11 +226,17 @@ def test_0_2_4_preparation_and_0_2_3_history_preserve_release_boundaries() -> No
     )
     candidate_history = _section(
         release_text,
+        "## v0.2.3 Candidate Checklist",
+        "## v0.2.3 Post-Publication Verification",
+    )
+    post_publication_history = _section(
+        release_text,
         "## v0.2.3 Post-Publication Verification",
         "## v0.2.2 Release Checklist",
     )
     normalized_preparation = " ".join(preparation.split())
     normalized_candidate_history = " ".join(candidate_history.split())
+    normalized_post_publication_history = " ".join(post_publication_history.split())
 
     required_phrases = (
         "complete only after the release-preparation PR merges",
@@ -239,19 +247,37 @@ def test_0_2_4_preparation_and_0_2_3_history_preserve_release_boundaries() -> No
         "verification remain human-operator actions",
         "does not authorise any of those actions",
         "does not establish hardware readiness or authorise beans",
+        "operator-authorised `v0.2.4` tag requires confirming that the tag is absent",
+        "would point at the exact merged commit validated by the recorded non-publishing dry run",
+        "non-executable prerequisite, not a tagging instruction",
     )
     for phrase in required_phrases:
         assert phrase in normalized_preparation
 
-    historical_phrases = (
+    candidate_historical_phrases = (
         "Historical Record — Not Independently Verified",
         "Public PyPI metadata lists `0.2.3`",
         "matching release workflow reports successful PyPI and MCP Registry publication",
+        "does not prove that any listed candidate-stage step ran",
+        "reviewed release candidate, not a published distribution",
+        "full local and protected CI gates",
+        "created at the exact commit SHA that passed the recorded dry run",
+        "#230's stopped-fault exact-session recovery semantics",
+    )
+    for phrase in candidate_historical_phrases:
+        assert phrase in normalized_candidate_history
+
+    post_publication_historical_phrases = (
+        "Historical Record — Not Independently Verified",
         "does not prove that public hashes, installed mock-safe smoke, or the MCP Registry "
         "version and `isLatest` state were independently verified",
+        "Only after the human release operator has created the recorded tag",
+        "public PyPI wheel and source-distribution hashes",
+        "installed mock-safe smoke",
+        "MCP Registry version and `isLatest` state",
     )
-    for phrase in historical_phrases:
-        assert phrase in normalized_candidate_history or phrase in " ".join(release_text.split())
+    for phrase in post_publication_historical_phrases:
+        assert phrase in normalized_post_publication_history
 
 
 def test_0_2_4_preparation_does_not_claim_publication() -> None:
@@ -280,6 +306,48 @@ def test_0_2_4_preparation_does_not_claim_publication() -> None:
         "does not establish hardware readiness or authorise beans",
     ):
         assert required in preparation
+
+
+def test_readme_status_and_target_changelog_preserve_preparation_delta() -> None:
+    """Keep the source-level target delta and status snapshot explicit."""
+    readme_text = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+    release_text = (REPOSITORY_ROOT / "docs/release.md").read_text(encoding="utf-8")
+    readme_status = " ".join(
+        _section(readme_text, "## Status", "## Related Project Artifacts").split()
+    )
+    target_changelog = " ".join(_section(release_text, "### 0.2.4", "### 0.2.3").split())
+
+    for text in (readme_status, target_changelog):
+        assert "`3e40487686880825f93ae2015cc4253d9183623b`" in text
+        assert "only new runtime content" in text
+        assert "Numerical output and interfaces are unchanged" in text
+
+    assert "packaged README Status is a preparation-time snapshot" in readme_status
+    assert "current publication claim for `0.2.4`" in readme_status
+
+
+def test_s2_state_entries_require_a_recorded_post_merge_dry_run() -> None:
+    """Keep S2 completion conditional on its post-merge dry-run record."""
+    paths_and_bounds = (
+        ("docs/state/registry.md", "## Active Context", "## Historical Narrative"),
+        (
+            "docs/state/epics/coffee-roaster-mcp-v0.1.md",
+            "## Active Context",
+            "## Current Decisions",
+        ),
+        ("docs/state/epics/coffee-roaster-mcp-v0.1.md", "## Current Decisions", "- `E7-S1`"),
+        ("docs/state/github-issues.md", "## Current Stories", "## Epics"),
+    )
+
+    for relative_path, heading, next_heading in paths_and_bounds:
+        text = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+        current = " ".join(_section(text, heading, next_heading).split())
+        assert (
+            "S2 completion requires a successful non-publishing dry run recorded after merge"
+            in current
+        )
+        assert "exact merged head" in current
+        assert "no pending dry-run success is asserted here" in current
 
 
 def test_release_history_is_preserved() -> None:

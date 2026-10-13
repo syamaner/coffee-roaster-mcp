@@ -44,9 +44,10 @@ health, readiness, or which bytes an intended interpreter imports. #157 and
 #194 remain separate open hardware/component acceptance work.
 
 Issue #234 S1 defers the mandatory SciPy import until `MelFrontend` constructs
-its symmetric Hann window. Its S2 release preparation declares `0.2.4` and is
-complete only up to the merged head and a successful non-publishing dry run;
-tag creation, protected `release` environment approval, publication, and live
+its symmetric Hann window. Its S2 release preparation declares `0.2.4`; S2
+completion requires a successful non-publishing dry run recorded after merge at
+the exact merged head, and no pending dry-run success is asserted here. Tag
+creation, protected `release` environment approval, publication, and live
 artefact verification remain human-operator actions. #234 remains open for the
 separately contracted Agent pin/nested-suite work.
 

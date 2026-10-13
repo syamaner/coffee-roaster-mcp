@@ -90,10 +90,12 @@ this repository guidance does not perform.
 - The published distribution carries #222's additive, typed, roast-fan-only cold-session
   `get_roast_state` observation. It reports commanded roast-fan state only,
   never physical-state proof.
-- The reviewed, unreleased `0.2.3` candidate adds the separate typed cold-only
-  temperature and packet projection. Agent-side comparison between observations
-  owns packet-progress screening; the projection is not a continuous freshness
-  or link watchdog.
+- The `0.2.3` repository source record adds the separate typed cold-only
+  temperature and packet projection. Public PyPI metadata and the matching
+  release workflow are observations of publication, not independently verified
+  provenance for that source record's public artefact content. Agent-side
+  comparison between observations owns packet-progress screening; the
+  projection is not a continuous freshness or link watchdog.
 - Neither distribution authorises hardware or beans, proves readiness, or
   verifies installed bytes.
 
@@ -300,6 +302,11 @@ live artefact verification remain human-operator actions. This checklist does
 not authorise any of those actions and does not establish hardware readiness or
 authorise beans.
 
+Any later operator-authorised `v0.2.4` tag requires confirming that the tag is
+absent and that it would point at the exact merged commit validated by the
+recorded non-publishing dry run. This is a non-executable prerequisite, not a
+tagging instruction.
+
 ## v0.2.3 Candidate Checklist (Historical Record — Not Independently Verified)
 
 This is a historical candidate-stage record. Public PyPI metadata lists
@@ -308,11 +315,44 @@ Registry publication, but the current live Registry listing and public artefact
 bytes were not independently checked by this record. It does not prove that any
 listed candidate-stage step ran, nor does it establish installed bytes.
 
+`0.2.3` is a reviewed release candidate, not a published distribution. This
+checklist records the required evidence before a human release operator decides
+whether to publish it; it does not create a tag, approve an environment, or
+publish an artefact.
+
+The `session_presence` addition changes candidate bytes. Any earlier dry-run
+result or artefact hash is historical only and cannot satisfy this checklist.
+A fresh exact-head dry run is required after the release-preparation PR merges.
+
+1. Record successful full local and protected CI gates for the candidate,
+   including version alignment, package build, and clean-wheel mock-safe smoke.
+2. After the release-preparation PR merges, record the exact merged `main` head
+   commit SHA, run `dry_run: true` for that commit, and retain its successful
+   workflow result with the same commit SHA.
+3. Confirm that `v0.2.3` is absent before any authorised tag action, and that
+   a later `v0.2.3` tag will be created at the exact commit SHA that passed the
+   recorded dry run. The tag name must be `v0.2.3` and the package version must
+   be `0.2.3`.
+4. Require the human release operator to approve the protected `release`
+   environment before publication jobs run.
+
+The candidate includes D209's cold-only projection and #230's stopped-fault
+exact-session recovery semantics. It remains a software component candidate
+and does not establish hardware readiness or authorise beans.
+
 ## v0.2.3 Post-Publication Verification (Historical Record — Not Independently Verified)
 
 This historical record describes intended post-publication verification. It
 does not prove that public hashes, installed mock-safe smoke, or the MCP
 Registry version and `isLatest` state were independently verified.
+
+Only after the human release operator has created the recorded tag, approved
+the protected environment, and the release workflow has completed publication:
+
+1. Independently verify the public PyPI wheel and source-distribution hashes.
+2. Run the installed mock-safe smoke against the selected public PyPI artifact.
+3. Verify the MCP Registry version and `isLatest` state.
+4. Reconcile published-state documentation with those retained public checks.
 
 ## v0.2.2 Release Checklist (Historical/Superseded — Non-Executable)
 

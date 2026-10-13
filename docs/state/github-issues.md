@@ -36,10 +36,11 @@ semantics.
 - #212: complete; MCP-owned frontend integration and local package readiness slice.
 - #234: open; S1 software slice defers the mandatory SciPy import until
   `MelFrontend` constructs its symmetric Hann window. S2 release preparation
-  declares `0.2.4` and is complete only up to the merged head and a successful
-  non-publishing dry run; tag creation, protected `release` environment
-  approval, publication, and live artefact verification remain human-operator
-  actions. The separate Agent pin/nested-suite work remains.
+  declares `0.2.4`; S2 completion requires a successful non-publishing dry run
+  recorded after merge at the exact merged head, and no pending dry-run success
+  is asserted here. Tag creation, protected `release` environment approval,
+  publication, and live artefact verification remain human-operator actions.
+  The separate Agent pin/nested-suite work remains.
 - #194: open; separate hardware/component acceptance work, with no readiness
   claim.
 - #200: complete.

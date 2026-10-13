@@ -34,8 +34,9 @@ The first implementation milestone is a mock vertical slice that requires no roa
   readiness authority from this delivery
 - #234 S1 is complete: the mandatory SciPy import is deferred until
   `MelFrontend` constructs its symmetric Hann window. Its S2 release
-  preparation declares `0.2.4` and is complete only up to the merged head and
-  a successful non-publishing dry run; tag creation, protected `release`
+  preparation declares `0.2.4`; S2 completion requires a successful
+  non-publishing dry run recorded after merge at the exact merged head, and no
+  pending dry-run success is asserted here. Tag creation, protected `release`
   environment approval, publication, and live artefact verification remain
   human-operator actions. #234 remains open for separate Agent pin/nested-suite
   work.
@@ -50,11 +51,12 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 - #234 S1 defers the mandatory SciPy import until `MelFrontend` constructs its
   symmetric Hann window; the `get_window(..., fftbins=False)` float32 numerical
-  contract remains unchanged. Its S2 release preparation declares `0.2.4` and
-  is complete only up to the merged head and a successful non-publishing dry
-  run. Tag creation, protected `release` environment approval, publication,
-  and live artefact verification remain human-operator actions. #234 stays
-  open for separate Agent pin/nested-suite work.
+  contract remains unchanged. Its S2 release preparation declares `0.2.4`; S2
+  completion requires a successful non-publishing dry run recorded after merge
+  at the exact merged head, and no pending dry-run success is asserted here.
+  Tag creation, protected `release` environment approval, publication, and live
+  artefact verification remain human-operator actions. #234 stays open for
+  separate Agent pin/nested-suite work.
 - v0.1 uses local stdio MCP transport.
 - Agent and n8n orchestration are out of scope.
 - Default roaster driver is `mock`.
