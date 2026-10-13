@@ -4,11 +4,13 @@ Repository: `syamaner/coffee-roaster-mcp`
 
 Milestone: `v0.2`
 
-Current published distribution: production PyPI and MCP Registry metadata
-verifies `0.2.2`. No `v0.2.2` tag SHA or release-workflow receipt is verified,
-and installed bytes remain unverified. The reviewed, unreleased `0.2.3`
-candidate includes the D209 projection and PR #231's stopped-fault
-exact-session recovery semantics.
+Current published-state observation: public PyPI metadata lists `0.2.3`, and
+the matching release workflow reports successful PyPI and MCP Registry
+publication. The current live MCP Registry listing is not independently checked.
+These observations do not independently verify public artefact bytes, contents,
+tag provenance, or installed bytes. The repository's `0.2.3` candidate record
+includes the D209 projection and PR #231's stopped-fault exact-session recovery
+semantics.
 
 ## Current Stories
 
@@ -17,26 +19,28 @@ exact-session recovery semantics.
 - #222: complete; typed, roast-fan-only cold-session `get_roast_state`
   commanded-state observation and D197 software prerequisite for Agent #954.
   It is separate from the D209 temperature and packet projection.
-- #225: open; release-process reconciliation. Its checklist, dry run, tag,
-  workflow, environment approval, and human verification are not recorded as
-  complete.
-- #227: closed; D209 projection software. Published `0.2.2` lacks the typed
-  cold-only temperature and packet projection; the reviewed, unreleased
-  `0.2.3` candidate includes it. Agent-side comparison between
-  observations owns packet-progress screening. Neither surface proves physical
-  state, calibration, continuous freshness, link health, or readiness;
-  installed bytes remain unverified, and candidate release and installation
-  remain separately authorised.
-- #230: open; `0.2.3` release candidate carrying the stopped-fault
+- #225: open; release-process reconciliation. Its closure remains a
+  human-operator decision; the public observations do not independently verify
+  a checklist, dry run, tag target, environment approval, public artefact bytes,
+  or installed bytes.
+- #227: closed; D209 projection software. The repository's `0.2.3` candidate
+  record includes the typed cold-only temperature and packet projection.
+  Agent-side comparison between observations owns packet-progress screening.
+  Neither record nor observation proves physical state, calibration, continuous
+  freshness, link health, readiness, or installed bytes.
+- #230: open; the `0.2.3` repository candidate record carries the stopped-fault
   exact-session recovery semantics from PR #231. It is a software component
-  candidate and makes no hardware-readiness claim.
+  record and makes no hardware-readiness claim.
 - #157: open; separate hardware/component acceptance work.
 - #210: complete; standalone Torch-free NumPy/SciPy mel frontend parity slice.
 - #212: complete; MCP-owned frontend integration and local package readiness slice.
 - #234: open; S1 software slice defers the mandatory SciPy import until
-  `MelFrontend` constructs its symmetric Hann window. The separately contracted
-  dependency-bound release slice and separate Agent pin/nested-suite work remain;
-  no version bump or publication occurred.
+  `MelFrontend` constructs its symmetric Hann window. S2 release preparation
+  declares `0.2.4`; S2 completion requires a successful non-publishing dry run
+  recorded after merge at the exact merged head, and no pending dry-run success
+  is asserted here. Tag creation, protected `release` environment approval,
+  publication, and live artefact verification remain human-operator actions.
+  The separate Agent pin/nested-suite work remains.
 - #194: open; separate hardware/component acceptance work, with no readiness
   claim.
 - #200: complete.

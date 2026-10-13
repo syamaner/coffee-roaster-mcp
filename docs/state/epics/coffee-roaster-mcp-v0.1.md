@@ -15,28 +15,31 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Active Context
 
-- Current published distribution: production PyPI and MCP Registry metadata
-  verifies `0.2.2`; no `v0.2.2` tag SHA or release-workflow receipt is verified.
-  The reviewed, unreleased `0.2.3` candidate includes D209's typed cold-only
-  temperature and packet projection and PR #231's stopped-fault exact-session
-  recovery semantics.
+- Current published-state observation: public PyPI metadata lists `0.2.3`, and
+  the matching release workflow reports successful PyPI and MCP Registry
+  publication. The current live MCP Registry listing is not independently
+  checked. These observations do not independently verify public artefact bytes,
+  contents, tag provenance, or installed bytes.
 - #218 and #222 are complete. #225 remains open for release-process
-  reconciliation, and #227 is closed for the D209 software projection.
-  Published `0.2.2` lacks D209; the reviewed, unreleased `0.2.3` candidate
-  adds its typed cold-only temperature and packet projection and PR #231's
-  stopped-fault exact-session recovery semantics. #222's separate
+  reconciliation and its closure remains a human-operator decision; #227 is
+  closed for the D209 software projection. The repository's `0.2.3` candidate
+  record includes its typed cold-only temperature and packet projection and PR
+  #231's stopped-fault exact-session recovery semantics. #222's separate
   roast-fan-only `get_roast_state` observation reports commanded state only.
   Agent-side comparison between observations owns packet-progress screening;
-  neither surface proves physical state, calibration, continuous freshness,
-  link health, readiness, or installed bytes. Candidate release or installation
-  is separately authorised
+  neither record nor observation proves physical state, calibration, continuous
+  freshness, link health, readiness, or installed bytes.
 - Separate open acceptance work: #157 and #194 remain open for their respective
   hardware/component acceptance. Do not infer microphone, serial, Hottop, or
   readiness authority from this delivery
 - #234 S1 is complete: the mandatory SciPy import is deferred until
-  `MelFrontend` constructs its symmetric Hann window. #234 remains open for a
-  separately contracted dependency-bound release slice and separate Agent
-  pin/nested-suite work; no version bump or publication occurred.
+  `MelFrontend` constructs its symmetric Hann window. Its S2 release
+  preparation declares `0.2.4`; S2 completion requires a successful
+  non-publishing dry run recorded after merge at the exact merged head, and no
+  pending dry-run success is asserted here. Tag creation, protected `release`
+  environment approval, publication, and live artefact verification remain
+  human-operator actions. #234 remains open for separate Agent pin/nested-suite
+  work.
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -48,27 +51,32 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 - #234 S1 defers the mandatory SciPy import until `MelFrontend` constructs its
   symmetric Hann window; the `get_window(..., fftbins=False)` float32 numerical
-  contract remains unchanged. #234 stays open for separately contracted release
-  and Agent pin/nested-suite work; no version bump, publication, or hardware readiness.
+  contract remains unchanged. Its S2 release preparation declares `0.2.4`; S2
+  completion requires a successful non-publishing dry run recorded after merge
+  at the exact merged head, and no pending dry-run success is asserted here.
+  Tag creation, protected `release` environment approval, publication, and live
+  artefact verification remain human-operator actions. #234 stays open for
+  separate Agent pin/nested-suite work.
 - v0.1 uses local stdio MCP transport.
 - Agent and n8n orchestration are out of scope.
 - Default roaster driver is `mock`.
 - First-crack mode defaults to `disabled` so mock install and registry smoke tests do not require audio hardware or model download.
 - D184 governance baseline is active. Issue #206 completed through PR #207,
   squash-merged to `main` at `2c854d34bdb43f587db438436202b97e1dd01468`.
-  Production PyPI and MCP Registry metadata verifies publication of `0.2.2`;
-  no `v0.2.2` tag SHA, release-workflow receipt, or completed checklist is
-  verified. #218 and #222 are complete. #225 remains open for release-process
-  reconciliation, and #227 is closed for the D209 software projection.
-  Published `0.2.2` lacks D209, while the reviewed, unreleased `0.2.3`
-  candidate includes its typed cold-only temperature and packet projection and
-  PR #231's stopped-fault exact-session recovery semantics. #222 remains a
-  separate commanded roast-fan observation. Agent-side
+  Public PyPI metadata lists `0.2.3`, and the matching release workflow reports
+  successful PyPI and MCP Registry publication. The current live MCP Registry
+  listing is not independently checked. These observations do not independently
+  verify public artefact bytes, contents, tag provenance, or installed bytes.
+  #218 and #222 are complete. #225 remains open for release-process
+  reconciliation and its closure remains a human-operator decision, while #227
+  is closed for the D209 software projection. The repository's `0.2.3`
+  candidate record includes its typed cold-only temperature and packet
+  projection and PR #231's stopped-fault exact-session recovery semantics.
+  #222 remains a separate commanded roast-fan observation. Agent-side
   between-observation comparison owns packet-progress screening. Neither
-  surface proves physical state, calibration, continuous freshness, link
-  health, readiness, or installed bytes. #157 and #194 remain separate open
-  hardware/component acceptance work, and candidate release or installation
-  is separately authorised.
+  record nor observation proves physical state, calibration, continuous
+  freshness, link health, readiness, or installed bytes. #157 and #194 remain
+  separate open hardware/component acceptance work.
 - `E7-S1` keeps broad mock-safe validation on the public stdio MCP tool path:
   a default-config server uses the mock driver, first-crack mode remains
   disabled, auto-T0 remains disabled, and exported JSONL, CSV, and
