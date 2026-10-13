@@ -56,6 +56,8 @@ preparation is complete only up to the merged head and a successful
 non-publishing dry run; tag creation, protected `release` environment approval,
 publication, and live artefact verification remain human-operator actions. It
 does not authorise hardware, beans, or a readiness claim.
+A successful non-publishing dry run must be recorded after merge; no pending
+dry-run success is asserted here.
 
 This packaged README Status is a preparation-time snapshot. It records the
 current source and public-metadata observations above, and makes no current

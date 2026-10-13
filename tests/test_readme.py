@@ -256,10 +256,14 @@ def test_0_2_4_preparation_and_0_2_3_history_preserve_release_boundaries() -> No
 
     candidate_historical_phrases = (
         "Historical Record — Not Independently Verified",
+        "Non-Executable",
         "Public PyPI metadata lists `0.2.3`",
         "matching release workflow reports successful PyPI and MCP Registry publication",
         "does not prove that any listed candidate-stage step ran",
-        "reviewed release candidate, not a published distribution",
+        "preserved candidate-stage record described `0.2.3` as a reviewed release candidate "
+        "rather than a published distribution",
+        "numbered steps preserve candidate-stage intent only",
+        "do not instruct creation or pushing of the already-existing `v0.2.3` tag",
         "full local and protected CI gates",
         "created at the exact commit SHA that passed the recorded dry run",
         "#230's stopped-fault exact-session recovery semantics",
@@ -324,6 +328,9 @@ def test_readme_status_and_target_changelog_preserve_preparation_delta() -> None
 
     assert "packaged README Status is a preparation-time snapshot" in readme_status
     assert "current publication claim for `0.2.4`" in readme_status
+    for text in (readme_status, target_changelog):
+        assert "successful non-publishing dry run must be recorded after merge" in text
+        assert "no pending dry-run success is asserted here" in text
 
 
 def test_s2_state_entries_require_a_recorded_post_merge_dry_run() -> None:

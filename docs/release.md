@@ -66,7 +66,8 @@ this repository guidance does not perform.
 - Preparation is complete only up to the merged head and a successful
   non-publishing dry run. Tag creation, protected `release` environment
   approval, publication, and live artefact verification remain human-operator
-  actions.
+  actions. A successful non-publishing dry run must be recorded after merge;
+  no pending dry-run success is asserted here.
 - This declared version is not published, tagged, approved, released, or
   `isLatest`.
 
@@ -307,7 +308,7 @@ absent and that it would point at the exact merged commit validated by the
 recorded non-publishing dry run. This is a non-executable prerequisite, not a
 tagging instruction.
 
-## v0.2.3 Candidate Checklist (Historical Record — Not Independently Verified)
+## v0.2.3 Candidate Checklist (Historical Record — Not Independently Verified — Non-Executable)
 
 This is a historical candidate-stage record. Public PyPI metadata lists
 `0.2.3`, and the matching release workflow reports successful PyPI and MCP
@@ -315,10 +316,10 @@ Registry publication, but the current live Registry listing and public artefact
 bytes were not independently checked by this record. It does not prove that any
 listed candidate-stage step ran, nor does it establish installed bytes.
 
-`0.2.3` is a reviewed release candidate, not a published distribution. This
-checklist records the required evidence before a human release operator decides
-whether to publish it; it does not create a tag, approve an environment, or
-publish an artefact.
+This preserved candidate-stage record described `0.2.3` as a reviewed release
+candidate rather than a published distribution. The numbered steps preserve
+candidate-stage intent only; they do not instruct creation or pushing of the
+already-existing `v0.2.3` tag.
 
 The `session_presence` addition changes candidate bytes. Any earlier dry-run
 result or artefact hash is historical only and cannot satisfy this checklist.
