@@ -33,6 +33,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
 - Separate open acceptance work: #157 and #194 remain open for their respective
   hardware/component acceptance. Do not infer microphone, serial, Hottop, or
   readiness authority from this delivery
+- #234 S1 is complete: the mandatory SciPy import is deferred until
+  `MelFrontend` constructs its symmetric Hann window. #234 remains open for a
+  separately contracted dependency-bound release slice and separate Agent
+  pin/nested-suite work; no version bump or publication occurred.
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -42,6 +46,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Current Decisions
 
+- #234 S1 defers the mandatory SciPy import until `MelFrontend` constructs its
+  symmetric Hann window; the `get_window(..., fftbins=False)` float32 numerical
+  contract remains unchanged. #234 stays open for separately contracted release
+  and Agent pin/nested-suite work; no version bump, publication, or hardware readiness.
 - v0.1 uses local stdio MCP transport.
 - Agent and n8n orchestration are out of scope.
 - Default roaster driver is `mock`.

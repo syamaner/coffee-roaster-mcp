@@ -41,6 +41,11 @@ which installed bytes an intended interpreter imports. Releasing or installing
 the candidate remains separately authorised. #157 and #194 remain separate
 open hardware/component acceptance work.
 
+Issue #234 S1 defers the mandatory SciPy import until `MelFrontend` constructs
+its symmetric Hann window. #234 remains open for its separately contracted
+dependency-bound release slice and the separate Agent pin/nested-suite work;
+no version bump or publication occurred.
+
 ## Historical Narrative (Superseded For Current Delivery)
 
 The narrative below preserves prior evidence and release history. It is not

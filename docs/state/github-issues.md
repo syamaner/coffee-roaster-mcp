@@ -33,6 +33,10 @@ exact-session recovery semantics.
 - #157: open; separate hardware/component acceptance work.
 - #210: complete; standalone Torch-free NumPy/SciPy mel frontend parity slice.
 - #212: complete; MCP-owned frontend integration and local package readiness slice.
+- #234: open; S1 software slice defers the mandatory SciPy import until
+  `MelFrontend` constructs its symmetric Hann window. The separately contracted
+  dependency-bound release slice and separate Agent pin/nested-suite work remain;
+  no version bump or publication occurred.
 - #194: open; separate hardware/component acceptance work, with no readiness
   claim.
 - #200: complete.
