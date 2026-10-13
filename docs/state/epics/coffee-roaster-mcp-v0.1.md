@@ -46,6 +46,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
 
 ## Current Decisions
 
+- #234 S1 defers the mandatory SciPy import until `MelFrontend` constructs its
+  symmetric Hann window; the `get_window(..., fftbins=False)` float32 numerical
+  contract remains unchanged. #234 stays open for separately contracted release
+  and Agent pin/nested-suite work; no version bump, publication, or hardware readiness.
 - v0.1 uses local stdio MCP transport.
 - Agent and n8n orchestration are out of scope.
 - Default roaster driver is `mock`.
