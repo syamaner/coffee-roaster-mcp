@@ -2626,6 +2626,55 @@ def test_manual_mark_preserves_synthetic_recording_and_canonical_milestone(tmp_p
     assert session.first_crack_monotonic_seconds == event.monotonic_seconds
 
 
+def test_manual_recording_continues_during_pending_boundary_until_real_freeze(
+    tmp_path: Path,
+) -> None:
+    """A pending public boundary retains the owned synthetic recorder until it freezes."""
+    import wave
+    from types import SimpleNamespace
+
+    from coffee_roaster_mcp.mcp_server import build_server_context, create_mcp_server
+
+    runtime, captures, config = _manual_runtime_fixture(tmp_path)
+    path = tmp_path / "pending-recording-context.yaml"
+    path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    context = build_server_context(config_path=path)
+    object.__setattr__(context, "config", config)
+    object.__setattr__(context, "first_crack_runtime", runtime)
+    server = create_mcp_server(config_path=path)
+    ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=context))
+
+    def call(name: str, **arguments: object) -> Any:
+        tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
+        assert tool is not None
+        return tool.fn(ctx, **arguments)
+
+    started = call("start_roast_session", first_crack_observer_ack="manual/v1")
+    session = context.session_store.get_session_snapshot(session_id=started.session.session_id)
+    context.telemetry_sampler.stop_for_session(session.id, reason="synthetic test")
+    call("mark_beans_added")
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert observer is not None and len(captures) == 1
+    capture = cast(Any, captures[0])
+    recorder = cast(RoastRecorder, capture.recorder)
+    assert recorder is not None
+    ticket = runtime.begin_observation_boundary(session, reason="beans_dropped")
+    assert ticket is not None and not capture.stopped
+    # The capture-owned recorder keeps accepting synthetic samples while the
+    # canonical event has not accepted the ticket.
+    recorder.write_samples((0.0,) * 160)
+    assert not capture.stopped and observer.summary is None
+    runtime.freeze_observation_boundary(session, ticket, reason="synthetic_pending_cleanup")
+    observer.changed.set()
+    assert observer.reaped.wait(2)
+    retained_recorder, plan = runtime.recording_for_session(session.id)
+    assert retained_recorder is recorder and plan is not None
+    with wave.open(str(plan.primary_wav), "rb") as stream:
+        assert stream.getnframes() == 480
+    assert plan.recording_sidecar.is_file() and plan.annotation_session_sidecar.is_file()
+    assert observer.summary is not None and observer.summary.drop_cutoff.value is None
+
+
 def _manual_runtime_fixture(
     tmp_path: Path,
     *,
@@ -4551,6 +4600,91 @@ def test_public_drop_pending_timeout_keeps_owned_result_cutoff_unknown(
         if not observer.reaped.is_set():
             assert observer.reaped.wait(2)
     assert store.get_session_snapshot(session_id=session_id).first_crack_at_utc is None
+
+
+def test_manual_public_generic_drop_commit_failure_freezes_at_original_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain post-driver drop failure leaves the original boundary deadline authoritative."""
+    import threading
+    import time
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from coffee_roaster_mcp.first_crack_observer import coordinator
+    from coffee_roaster_mcp.mcp_server import build_server_context, create_mcp_server
+
+    runtime, captures, config = _manual_runtime_fixture(tmp_path)
+    base = time.monotonic()
+    clock = [base]
+    store = RoastSessionStore(
+        default_log_dir=tmp_path / "generic-drop",
+        monotonic_now=lambda: clock[0],
+        utc_now=lambda: datetime(2026, 11, 8, tzinfo=UTC) + timedelta(seconds=clock[0] - base),
+    )
+    runtime._monotonic_now = lambda: clock[0]  # pyright: ignore[reportPrivateUsage]
+    path = tmp_path / "generic-drop-context.yaml"
+    path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    context = build_server_context(config_path=path)
+    object.__setattr__(context, "config", config)
+    object.__setattr__(context, "session_store", store)
+    object.__setattr__(context, "first_crack_runtime", runtime)
+    server = create_mcp_server(config_path=path)
+    ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=context))
+
+    def call(name: str, **arguments: object) -> Any:
+        tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
+        assert tool is not None
+        return tool.fn(ctx, **arguments)
+
+    started = call("start_roast_session", first_crack_observer_ack="manual/v1")
+    session_id = started.session.session_id
+    context.telemetry_sampler.stop_for_session(session_id, reason="synthetic clock")
+    clock[0] = base + 1
+    call("mark_beans_added")
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert observer is not None and len(captures) == 1
+    driver_returned = Event()
+    original_drop = context.roaster_driver.drop_beans
+
+    def drop() -> Any:
+        result = original_drop()
+        driver_returned.set()
+        return result
+
+    monkeypatch.setattr(context.roaster_driver, "drop_beans", drop)
+
+    def failed_commit(*_args: Any, **_kwargs: Any) -> Any:
+        assert driver_returned.is_set()
+        raise RuntimeError("synthetic ordinary drop commit failure")
+
+    monkeypatch.setattr(store, "complete_reserved_driver_drop_snapshot", failed_commit)
+    clock[0] = base + 10
+    with pytest.raises(RuntimeError, match="synthetic ordinary drop commit failure"):
+        call("drop_beans")
+    assert observer.deadline is not None
+    original_deadline = observer.deadline
+    assert original_deadline == base + 10 + config.first_crack.observation_closing_timeout_seconds
+    checked = Event()
+    original_check = observer.check_deadline
+
+    def watched_check() -> None:
+        original_check()
+        if threading.current_thread().name == "fc-observation-supervisor":
+            checked.set()
+
+    monkeypatch.setattr(observer, "check_deadline", watched_check)
+    clock[0] = original_deadline
+    coordinator().wake.set()
+    assert checked.wait(2)
+    assert observer.summary is not None
+    assert observer.summary.drop_cutoff.value is None
+    assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
+    assert not observer.summary.coverage_complete
+    assert observer.summary.outcome in {"unavailable", "incomplete"}
+    assert store.get_session_snapshot(session_id=session_id).first_crack_at_utc is None
+    observer.changed.set()
+    assert observer.reaped.wait(2) and captures[0].stopped
 
 
 def _assert_empty_successor_capture(snapshot: FirstCrackRuntimeSnapshot) -> None:

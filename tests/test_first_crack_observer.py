@@ -1565,34 +1565,44 @@ def test_pending_closing_drain_masks_cutoff_and_clean_coverage(tmp_path: Path) -
 
 
 @pytest.mark.parametrize(
-    ("reason", "coverage_complete", "outcome"),
+    ("reason", "confirmed", "coverage_complete", "outcome"),
     [
-        ("beans_dropped", True, "no_confirmation"),
-        ("emergency_stop", False, "incomplete"),
-        ("autonomous_telemetry_sampler_failure", False, "incomplete"),
+        ("beans_dropped", False, True, "no_confirmation"),
+        ("emergency_stop", False, False, "incomplete"),
+        ("autonomous_telemetry_sampler_failure", False, False, "incomplete"),
+        ("beans_dropped", True, True, "confirmed"),
+        ("emergency_stop", True, False, "confirmed"),
+        ("autonomous_telemetry_sampler_failure", True, False, "confirmed"),
     ],
 )
 def test_first_boundary_reason_preserves_negative_prefix_coverage(
-    tmp_path: Path, reason: str, coverage_complete: bool, outcome: str
+    tmp_path: Path, reason: str, confirmed: bool, coverage_complete: bool, outcome: str
 ) -> None:
-    """Only a first ordinary drop can close a complete negative prefix."""
+    """Each first boundary preserves a processed prefix without masking fault coverage."""
 
     now = [10.0]
     observer, capture, sink, backend = setup_observer(tmp_path, now=now)
-    backend.detect = lambda window: FirstCrackDetectorOutput(confirmed=False, confidence=0.1)
+    window_recorded = Event()
+    original_append = sink.append
+
+    def append(record: Record) -> None:
+        original_append(record)
+        if isinstance(record, WindowRecord):
+            window_recorded.set()
+
+    sink.append = append
+    backend.detect = lambda window: FirstCrackDetectorOutput(
+        confirmed=confirmed, confidence=0.95 if confirmed else 0.1
+    )
     observer.update_boundaries(charge_at=1, human_at=None)
     capture.windows.append(window())
     assert observer.start()
     try:
-        assert sink.appended.wait(2)
-        if reason == "beans_dropped":
-            observer.close(cutoff=8.0, reason=reason)
-        else:
-            ticket = object()
-            observer.open_boundary(ticket, reason=reason)
-            observer.resolve_boundary(ticket, cutoff=8.0)
-            now[0] = 20.0
-            observer.check_deadline()
+        assert window_recorded.wait(2)
+        assert (sink.confirmed.is_set()) is confirmed
+        ticket = object()
+        observer.open_boundary(ticket, reason=reason)
+        observer.resolve_boundary(ticket, cutoff=8.0)
         assert observer.reaped.wait(2)
     finally:
         observer.changed.set()
@@ -1602,6 +1612,9 @@ def test_first_boundary_reason_preserves_negative_prefix_coverage(
     assert observer.summary.counts.eligible_windows == 1
     assert observer.summary.coverage_complete is coverage_complete
     assert observer.summary.outcome == outcome
+    if confirmed:
+        assert observer.confirmation is not None
+        assert sink.confirmed.is_set()
 
 
 def test_pending_boundary_before_stop_claim_defers_normal_capture_stop(

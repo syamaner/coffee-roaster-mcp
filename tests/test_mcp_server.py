@@ -6187,6 +6187,93 @@ def test_retained_roast_observation_survives_successor_state_and_reexport(tmp_pa
     asyncio.run(_historical_observation_stdio(tmp_path))
 
 
+def test_manual_shadow_real_stdio_normal_drop_export_retains_recording_sibling(
+    tmp_path: Path,
+) -> None:
+    """The real synthetic stdio child retains recording and shadow sidecars after normal drop."""
+    asyncio.run(_manual_shadow_stdio_normal_drop_export(tmp_path))
+
+
+async def _manual_shadow_stdio_normal_drop_export(tmp_path: Path) -> None:
+    import wave
+
+    root = Path(__file__).resolve().parents[1]
+    config = tmp_path / "normal-recording.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "none",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+
+        async def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            result = await asyncio.wait_for(client.call_tool(name, arguments), 5)
+            assert not result.isError, result
+            assert result.structuredContent is not None
+            return result.structuredContent
+
+        started = await call("start_roast_session", {"first_crack_observer_ack": "manual/v1"})
+        session_id = started["session"]["session_id"]
+        await call("mark_beans_added", {})
+        (tmp_path / "charge-ready").write_text("ready", encoding="utf-8")
+
+        async def confirmed() -> dict[str, Any]:
+            while True:
+                state = await call("get_roast_state", {"session_id": session_id})
+                if state["first_crack_observation"]["first_confirmation"]["value"] is not None:
+                    return state
+                await asyncio.sleep(0)
+
+        before_mark = await asyncio.wait_for(confirmed(), 5)
+        marked = await call("mark_first_crack", {})
+        canonical = marked["event"]
+        after_mark = await call("get_roast_state", {"session_id": session_id})
+        assert after_mark["first_crack_at_utc"] == canonical["recorded_at_utc"]
+        assert (
+            after_mark["first_crack_observation"]["first_confirmation"]
+            == before_mark["first_crack_observation"]["first_confirmation"]
+        )
+        assert not (tmp_path / "capture-stopped").exists()
+        await call("drop_beans", {})
+        await call("stop_cooling", {})
+
+        async def reaped() -> dict[str, Any]:
+            while True:
+                state = await call("get_roast_state", {"session_id": session_id})
+                if state["first_crack_observation"]["worker_reaped"]:
+                    return state
+                await asyncio.sleep(0)
+
+        final = await asyncio.wait_for(reaped(), 5)
+        exported = await call("export_roast_log", {"session_id": session_id})
+    wavs = list((tmp_path / "recordings").rglob("*.wav"))
+    assert len(wavs) == 1 and (tmp_path / "capture-starts").read_text().splitlines() == ["start"]
+    with wave.open(str(wavs[0]), "rb") as stream:
+        assert stream.getnframes() == 480
+    recording = next((tmp_path / "recordings").rglob("roast.recording.json"))
+    shadow = Path(final["log_dir"]) / "first_crack_observation.jsonl"
+    summary = json.loads(Path(exported["summary_path"]).read_text())
+    assert recording.is_file() and shadow.is_file()
+    assert session_id in shadow.read_text(encoding="utf-8")
+    assert summary["first_crack_observation"] == final["first_crack_observation"]
+    assert summary["session_id"] == session_id
+
+
 async def _historical_observation_stdio(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     config = tmp_path / "history.yaml"
