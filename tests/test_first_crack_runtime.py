@@ -3532,17 +3532,43 @@ def test_new_admission_compacts_all_retained_terminal_handles_without_lookup(
 def test_public_manual_emergency_cutoff_uses_this_accepted_event_not_cleanup_clock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _accepted_emergency_clock_witness(tmp_path, monkeypatch, trigger="public")
+    _accepted_emergency_clock_witness(
+        tmp_path, monkeypatch, trigger="public", expires_before_release=False
+    )
 
 
 def test_sampler_failure_cutoff_uses_this_accepted_event_not_cleanup_clock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _accepted_emergency_clock_witness(tmp_path, monkeypatch, trigger="sampler")
+    _accepted_emergency_clock_witness(
+        tmp_path, monkeypatch, trigger="sampler", expires_before_release=False
+    )
+
+
+def test_public_manual_emergency_clock_witness_freezes_expired_unaccepted_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An expired first-signal budget freezes work rather than inventing rows."""
+    _accepted_emergency_clock_witness(
+        tmp_path, monkeypatch, trigger="public", expires_before_release=True
+    )
+
+
+def test_sampler_failure_clock_witness_freezes_expired_unaccepted_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sampler faults use the same honest expired-work outcome as public faults."""
+    _accepted_emergency_clock_witness(
+        tmp_path, monkeypatch, trigger="sampler", expires_before_release=True
+    )
 
 
 def _accepted_emergency_clock_witness(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, trigger: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    trigger: str,
+    expires_before_release: bool,
 ) -> None:
     import time
     from datetime import timedelta
@@ -3637,7 +3663,11 @@ def _accepted_emergency_clock_witness(
     def accepted(*args: Any, **kwargs: Any):
         result = original_event(*args, **kwargs)
         trace.append("accepted_event")
-        clock[0] += 10  # Delay only after the real accepted event exists.
+        # The closing budget starts at the first driver-return boundary.  This
+        # deliberately tests both a later cleanup clock still within that
+        # original budget and a genuinely expired budget; it never stretches
+        # or disables the deadline.
+        clock[0] += 10 if expires_before_release else 1
         return result
 
     def resolve(
@@ -3667,13 +3697,26 @@ def _accepted_emergency_clock_witness(
         clock[0] = base + 10
         first = emergency_event()
         assert first.monotonic_seconds == 10
-        assert clock[0] == base + 20
+        assert clock[0] == base + (20 if expires_before_release else 11)
         assert cutoffs == [base + 10]
         assert owner.cutoff == base + 10
     finally:
         release.set()
         assert owner.reaped.wait(2)
-    assert rows == []
+    if expires_before_release:
+        # The model was still unaccepted at the real first-signal deadline:
+        # this is incomplete coverage, not a claim that the queued windows
+        # were classified.
+        assert rows == []
+        assert owner.summary is not None
+        assert owner.summary.coverage_complete is False
+    else:
+        assert [row.payload.eligibility for row in rows] == [
+            "eligible",
+            "ineligible_post_drop",
+            "ineligible_post_drop",
+        ]
+        assert all(row.payload.availability_class == "after_drop" for row in rows)
     assert owner.confirmation is None
     before = store.get_session_snapshot(session_id=session_id)
     assert before.first_crack_at_utc is None
@@ -3689,6 +3732,299 @@ def _accepted_emergency_clock_witness(
     assert after.faulted_monotonic_seconds == 10
     assert [event.kind for event in after.event_timeline] == ["beans_added", "fault", "fault"]
     assert trace == ["driver", "accepted_event", "resolve"] * 2
+
+
+def test_public_drop_pending_boundary_fences_post_accepted_positive_until_store_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real public drop fences a positive window before its Store return."""
+    import threading
+    import time
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from coffee_roaster_mcp.first_crack_observation import IdentityRecord, Record, WindowRecord
+    from coffee_roaster_mcp.first_crack_observer import JsonlObservationSink
+    from coffee_roaster_mcp.mcp_server import build_server_context, create_mcp_server
+
+    runtime, captures, config = _manual_runtime_fixture(tmp_path)
+    base = time.monotonic()
+    clock = [base]
+    store = RoastSessionStore(
+        default_log_dir=tmp_path / "public-drop-race",
+        monotonic_now=lambda: clock[0],
+        utc_now=lambda: datetime(2026, 11, 8, tzinfo=UTC) + timedelta(seconds=clock[0] - base),
+    )
+    runtime._monotonic_now = lambda: clock[0]  # pyright: ignore[reportPrivateUsage]
+    model_entered, model_release, identity_ready = Event(), Event(), Event()
+    accepted_return, release_return = Event(), Event()
+    queued, two_worker_cycles = Event(), Event()
+    rows: list[WindowRecord] = []
+    original_loader = runtime._observation_model_loader  # pyright: ignore[reportPrivateUsage]
+
+    class EvidenceSink(JsonlObservationSink):
+        def append(self, record: Record) -> None:
+            super().append(record)
+            if isinstance(record, IdentityRecord):
+                identity_ready.set()
+            if isinstance(record, WindowRecord):
+                rows.append(record)
+
+    def loader(fc: FirstCrackConfig):
+        model_entered.set()
+        assert model_release.wait(5)
+        loaded = original_loader(fc)
+        loaded.adapter.backend.detect = lambda window: FirstCrackDetectorOutput(
+            confirmed=True, confidence=0.95
+        )
+        return loaded
+
+    monkeypatch.setattr(runtime, "_observation_model_loader", loader)
+    monkeypatch.setattr(runtime, "_observation_sink_factory", EvidenceSink)
+    path = tmp_path / "public-drop-context.yaml"
+    path.write_text(f"logging:\n  log_dir: {tmp_path / 'context-logs'}\n", encoding="utf-8")
+    context = build_server_context(config_path=path)
+    object.__setattr__(context, "config", config)
+    object.__setattr__(context, "session_store", store)
+    object.__setattr__(context, "first_crack_runtime", runtime)
+    server = create_mcp_server(config_path=path)
+    ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=context))
+    driver_calls: list[str] = []
+    trace: list[str] = []
+    original_drop = context.roaster_driver.drop_beans
+    original_begin = runtime.begin_observation_boundary
+    original_resolve = runtime.resolve_observation_boundary
+
+    def dispatch_drop():
+        driver_calls.append("driver")
+        trace.append("driver")
+        return original_drop()
+
+    def begin(*args: Any, **kwargs: Any) -> object | None:
+        assert trace == ["driver"]
+        trace.append("begin")
+        return original_begin(*args, **kwargs)
+
+    def resolve(*args: Any, **kwargs: Any) -> None:
+        assert trace == ["driver", "begin", "accepted_event"]
+        trace.append("resolve")
+        original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(context.roaster_driver, "drop_beans", dispatch_drop)
+    monkeypatch.setattr(runtime, "begin_observation_boundary", begin)
+    monkeypatch.setattr(runtime, "resolve_observation_boundary", resolve)
+
+    def call(name: str, **arguments: object):
+        tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
+        assert tool is not None
+        return tool.fn(ctx, **arguments)
+
+    started = call("start_roast_session", first_crack_observer_ack="manual/v1")
+    session_id = started.session.session_id
+    context.telemetry_sampler.stop_for_session(session_id, reason="controlled synthetic clock")
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert observer is not None
+    drop_thread: threading.Thread | None = None
+    try:
+        assert model_entered.wait(2)
+        model_release.set()
+        assert identity_ready.wait(2)
+        clock[0] = base + 1
+        call("mark_beans_added")
+
+        original_complete = store.complete_reserved_driver_drop_snapshot
+
+        def held_complete(*args: Any, **kwargs: Any):
+            completed = original_complete(*args, **kwargs)
+            assert trace == ["driver", "begin"]
+            trace.append("accepted_event")
+            accepted_return.set()
+            assert release_return.wait(5)
+            return completed
+
+        monkeypatch.setattr(store, "complete_reserved_driver_drop_snapshot", held_complete)
+        original_wait = observer.changed.wait
+        cycles = [0]
+
+        def watched_wait(timeout: float | None = None) -> bool:
+            result = original_wait(timeout)
+            if queued.is_set():
+                cycles[0] += 1
+                if cycles[0] >= 2:
+                    two_worker_cycles.set()
+            return result
+
+        monkeypatch.setattr(observer.changed, "wait", watched_wait)
+        clock[0] = base + 10
+        result: list[object] = []
+        drop_thread = threading.Thread(target=lambda: result.append(call("drop_beans")))
+        drop_thread.start()
+        assert accepted_return.wait(2)
+        captures[0].add_window(
+            _audio_window(sequence_number=237, started_at_monotonic_seconds=base + 10)
+        )
+        queued.set()
+        # The current clock is strictly later than the post-cutoff window end
+        # while remaining inside the original closing budget.  The resolver
+        # must retain the accepted event scalar (10), never resample this 12.
+        clock[0] = base + 12
+        observer.changed.set()
+        # This is a positive causal guard, including an already-sampled empty
+        # worker iteration.  A missing fence confirms before this point.
+        assert two_worker_cycles.wait(2)
+        assert rows == [] and observer.confirmation is None
+        assert store.get_session_snapshot(session_id=session_id).first_crack_at_utc is None
+
+        release_return.set()
+        drop_thread.join(2)
+        assert not drop_thread.is_alive() and len(result) == 1
+        assert observer.reaped.wait(2)
+    finally:
+        release_return.set()
+        model_release.set()
+        observer.changed.set()
+        if drop_thread is not None:
+            drop_thread.join(2)
+        if not observer.reaped.is_set():
+            assert observer.reaped.wait(2)
+
+    assert [row.payload.eligibility for row in rows] == ["ineligible_post_drop"]
+    assert rows[0].payload.availability_class == "after_drop"
+    snapshot = store.get_session_snapshot(session_id=session_id)
+    assert snapshot.first_crack_at_utc is None
+    assert [event.kind for event in snapshot.event_timeline] == [
+        "beans_added",
+        "beans_dropped",
+        "cooling_started",
+    ]
+    assert snapshot.beans_dropped_monotonic_seconds == 10
+    assert driver_calls == ["driver"]
+    assert trace == ["driver", "begin", "accepted_event", "resolve"]
+    assert observer.cutoff == base + 10
+    assert observer.confirmation is None
+    assert captures[0].started and captures[0].stopped
+
+
+def test_public_drop_pending_timeout_keeps_owned_result_cutoff_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A public drop timeout does not count an owned result against an unknown cutoff."""
+    import threading
+    import time
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from coffee_roaster_mcp.first_crack_observer import coordinator
+    from coffee_roaster_mcp.mcp_server import build_server_context, create_mcp_server
+
+    runtime, captures, config = _manual_runtime_fixture(tmp_path)
+    base = time.monotonic()
+    clock = [base]
+    store = RoastSessionStore(
+        default_log_dir=tmp_path / "public-drop-timeout",
+        monotonic_now=lambda: clock[0],
+        utc_now=lambda: datetime(2026, 11, 8, tzinfo=UTC) + timedelta(seconds=clock[0] - base),
+    )
+    runtime._monotonic_now = lambda: clock[0]  # pyright: ignore[reportPrivateUsage]
+    detect_entered, detect_release = Event(), Event()
+    accepted_return, release_return, supervisor_checked = Event(), Event(), Event()
+    original_loader = runtime._observation_model_loader  # pyright: ignore[reportPrivateUsage]
+
+    def loader(fc: FirstCrackConfig):
+        loaded = original_loader(fc)
+
+        def blocked_positive(window: AudioWindow) -> FirstCrackDetectorOutput:
+            detect_entered.set()
+            assert detect_release.wait(5)
+            return FirstCrackDetectorOutput(confirmed=True, confidence=0.95)
+
+        loaded.adapter.backend.detect = blocked_positive
+        return loaded
+
+    monkeypatch.setattr(runtime, "_observation_model_loader", loader)
+    path = tmp_path / "public-drop-timeout-context.yaml"
+    path.write_text(f"logging:\n  log_dir: {tmp_path / 'context-logs'}\n", encoding="utf-8")
+    context = build_server_context(config_path=path)
+    object.__setattr__(context, "config", config)
+    object.__setattr__(context, "session_store", store)
+    object.__setattr__(context, "first_crack_runtime", runtime)
+    server = create_mcp_server(config_path=path)
+    ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=context))
+
+    def call(name: str, **arguments: object):
+        tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
+        assert tool is not None
+        return tool.fn(ctx, **arguments)
+
+    started = call("start_roast_session", first_crack_observer_ack="manual/v1")
+    session_id = started.session.session_id
+    context.telemetry_sampler.stop_for_session(session_id, reason="controlled synthetic clock")
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert observer is not None
+    drop_thread: threading.Thread | None = None
+    try:
+        clock[0] = base + 1
+        call("mark_beans_added")
+        clock[0] = base + 7
+        captures[0].add_window(
+            _audio_window(sequence_number=238, started_at_monotonic_seconds=base + 5)
+        )
+        observer.changed.set()
+        assert detect_entered.wait(2)
+
+        original_complete = store.complete_reserved_driver_drop_snapshot
+
+        def held_complete(*args: Any, **kwargs: Any):
+            completed = original_complete(*args, **kwargs)
+            accepted_return.set()
+            assert release_return.wait(5)
+            return completed
+
+        monkeypatch.setattr(store, "complete_reserved_driver_drop_snapshot", held_complete)
+        original_check = observer.check_deadline
+
+        def watched_check() -> None:
+            original_check()
+            if threading.current_thread().name == "fc-observation-supervisor":
+                supervisor_checked.set()
+
+        monkeypatch.setattr(observer, "check_deadline", watched_check)
+        clock[0] = base + 10
+        drop_thread = threading.Thread(target=lambda: call("drop_beans"))
+        drop_thread.start()
+        assert accepted_return.wait(2)
+        # Advance to the original first-signal deadline itself, not a value
+        # recomputed after the accepted event or held return.
+        assert observer.deadline is not None
+        original_deadline = observer.deadline
+        clock[0] = original_deadline
+        supervisor_checked.clear()
+        coordinator().wake.set()
+        assert supervisor_checked.wait(2)
+        assert observer.summary is not None
+        frozen = observer.summary.model_dump_json()
+        assert observer.summary.drop_cutoff.value is None
+        assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
+        assert observer.summary.coverage_complete is False
+        assert observer.summary.counts.undecided_eligible_windows == 0
+
+        release_return.set()
+        drop_thread.join(2)
+        assert not drop_thread.is_alive()
+        # A late accepted event and late model result cannot rewrite the
+        # already frozen unknown-boundary summary.
+        detect_release.set()
+        assert observer.reaped.wait(2)
+        assert observer.summary.model_dump_json() == frozen
+    finally:
+        release_return.set()
+        detect_release.set()
+        observer.changed.set()
+        if drop_thread is not None:
+            drop_thread.join(2)
+        if not observer.reaped.is_set():
+            assert observer.reaped.wait(2)
+    assert store.get_session_snapshot(session_id=session_id).first_crack_at_utc is None
 
 
 def _assert_empty_successor_capture(snapshot: FirstCrackRuntimeSnapshot) -> None:
