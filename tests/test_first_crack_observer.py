@@ -1434,13 +1434,15 @@ def test_running_worker_held_inference_retains_original_availability(tmp_path: P
         assert held.wait(2)
         assert observer.confirmation is None
         now[0] = 8.0
-        observer.resolve_boundary(ticket, cutoff=9.0)
+        observer.resolve_boundary(ticket, cutoff=7.5)
         assert sink.confirmed.wait(2)
         assert observer.confirmation is not None
         assert observer.confirmation.decision_available_at.session_relative_seconds.value == 7.0
+        row = next(row for row in sink.rows if isinstance(row, WindowRecord))
+        assert row.payload.availability_class == "before_drop"
     finally:
         backend.release.set()
-        observer.close(cutoff=9.0, reason="beans_dropped")
+        observer.close(cutoff=7.5, reason="beans_dropped")
         assert observer.reaped.wait(2)
 
 
@@ -1477,6 +1479,89 @@ def test_running_worker_mapped_clock_tie_holds_until_strictly_advanced(tmp_path:
     finally:
         observer.close(cutoff=16.0, reason="beans_dropped")
         assert observer.reaped.wait(2)
+
+
+def test_frozen_post_drain_window_cannot_claim_fresh_inference(tmp_path: Path) -> None:
+    """A drain returned after deadline freeze cannot begin a new backend call."""
+
+    drain_entered = Event()
+    release_drain = Event()
+
+    class DrainBlockedCapture(Capture):
+        def drain_windows(self, *, max_windows: int | None = None) -> tuple[AudioWindow, ...]:
+            drain_entered.set()
+            assert release_drain.wait(5)
+            return super().drain_windows(max_windows=max_windows)
+
+    now = [10.0]
+    observer, _, _, backend = setup_observer(tmp_path, now=now)
+    capture = DrainBlockedCapture()
+    capture.windows.append(window(start=5.0))
+    observer.pipeline = capture
+    backend.release.clear()
+    observer.update_boundaries(charge_at=1, human_at=None)
+    observer.close(cutoff=8.0, reason="beans_dropped")
+    assert observer.start()
+    try:
+        assert drain_entered.wait(2)
+        now[0] = 15.0
+        observer.check_deadline()
+        assert observer.summary is not None
+        release_drain.set()
+        assert observer.reaped.wait(2)
+        assert not backend.entered.is_set()
+    finally:
+        release_drain.set()
+        backend.release.set()
+        assert observer.reaped.wait(2)
+
+
+def test_pending_closing_drain_masks_cutoff_and_clean_coverage(tmp_path: Path) -> None:
+    """A pending ticket during the claimed closing drain preserves unknown evidence."""
+
+    first_window_recorded = Event()
+    drain_entered = Event()
+    release_drain = Event()
+
+    class ClosingDrainCapture(Capture):
+        def drain_windows(self, *, max_windows: int | None = None) -> tuple[AudioWindow, ...]:
+            if self.stopped:
+                drain_entered.set()
+                assert release_drain.wait(5)
+            return super().drain_windows(max_windows=max_windows)
+
+    class NegativeSink(Sink):
+        def append(self, record: Record) -> None:
+            super().append(record)
+            if isinstance(record, WindowRecord):
+                first_window_recorded.set()
+
+    sink = NegativeSink()
+    observer, _, _, backend = setup_observer(tmp_path, sink=sink)
+    capture = ClosingDrainCapture()
+    observer.pipeline = capture
+    backend.detect = lambda window: FirstCrackDetectorOutput(confirmed=False, confidence=0.1)
+    observer.update_boundaries(charge_at=1, human_at=None)
+    capture.windows.append(window(start=5.0))
+    assert observer.start()
+    try:
+        assert first_window_recorded.wait(2)
+        observer.close(cutoff=8.0, reason="beans_dropped")
+        assert drain_entered.wait(2)
+        ticket = object()
+        observer.open_boundary(ticket, reason="emergency_stop")
+        release_drain.set()
+        assert observer.reaped.wait(2)
+    finally:
+        release_drain.set()
+        assert observer.reaped.wait(2)
+    assert observer.summary is not None
+    assert observer.summary.drop_cutoff.value is None
+    assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
+    assert not observer.summary.coverage_complete
+    assert observer.summary.outcome == "incomplete"
+    assert observer.summary.counts.eligible_windows == 1
+    assert observer.summary.counts.undecided_eligible_windows == 0
 
 
 def test_pending_freeze_hides_provisional_cutoff_and_clean_coverage(tmp_path: Path) -> None:

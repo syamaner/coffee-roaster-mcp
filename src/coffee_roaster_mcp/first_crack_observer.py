@@ -844,21 +844,21 @@ class FirstCrackObserver:
                     )
                     with self.lock:
                         self._owned_windows.extend(windows)
-                with self.lock:
-                    window = self._owned_windows.pop(0) if self._owned_windows else None
-                if window is None:
-                    if closing:
-                        with self.lock:
-                            self._drain_complete = True
-                            self._freeze_locked()
-                        break
-                    self.changed.wait(0.05)
-                    self.changed.clear()
-                    continue
                 cutoff: float | None = None
                 end = 0.0
+                deferred = False
                 with self.lock:
-                    if window.sequence_number in self._seen_windows:
+                    # Capture calls above are external I/O.  Their return does
+                    # not preserve a prior work claim: a close, invalidation or
+                    # deadline may have frozen admission while they ran.
+                    self._freeze_if_due_locked()
+                    if not self.valid or self.summary is not None or self._supervision_failed:
+                        window = None
+                    else:
+                        window = self._owned_windows.pop(0) if self._owned_windows else None
+                    if window is None:
+                        pass
+                    elif window.sequence_number in self._seen_windows:
                         if (
                             self.confirmation is not None
                             and self.confirmation.confirming_window_sequence
@@ -866,10 +866,11 @@ class FirstCrackObserver:
                         ):
                             self._count(duplicate_confirmations_rejected=1)
                         continue
-                    if self._pending_boundaries:
+                    elif self._pending_boundaries:
                         self._owned_windows.insert(0, window)
                         window = None
-                    if window is not None:
+                        deferred = True
+                    else:
                         self._seen_windows.add(window.sequence_number)
                         cutoff = self.cutoff
                         charge = self.charge_at
@@ -887,6 +888,16 @@ class FirstCrackObserver:
                                 and (cutoff is None or end < cutoff)
                             )
                 if window is None:
+                    if deferred:
+                        self.changed.wait(0.05)
+                        self.changed.clear()
+                        continue
+                    if closing:
+                        with self.lock:
+                            if self.summary is None:
+                                self._drain_complete = True
+                                self._freeze_locked()
+                        break
                     self.changed.wait(0.05)
                     self.changed.clear()
                     continue
