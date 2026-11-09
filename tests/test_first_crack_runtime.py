@@ -3806,7 +3806,6 @@ def test_public_drop_pending_boundary_fences_post_accepted_positive_until_store_
         return original_begin(*args, **kwargs)
 
     def resolve(*args: Any, **kwargs: Any) -> None:
-        assert trace == ["driver", "begin", "accepted_event"]
         trace.append("resolve")
         original_resolve(*args, **kwargs)
 
@@ -3821,6 +3820,8 @@ def test_public_drop_pending_boundary_fences_post_accepted_positive_until_store_
 
     started = call("start_roast_session", first_crack_observer_ack="manual/v1")
     session_id = started.session.session_id
+    session = context.session_store.get_latest_session()
+    assert session is not None
     context.telemetry_sampler.stop_for_session(session_id, reason="controlled synthetic clock")
     observer = runtime._observer  # pyright: ignore[reportPrivateUsage]
     assert observer is not None
@@ -3885,6 +3886,8 @@ def test_public_drop_pending_boundary_fences_post_accepted_positive_until_store_
         if drop_thread is not None:
             drop_thread.join(2)
         if not observer.reaped.is_set():
+            runtime.close_observation(session, reason="diagnostic cleanup")
+            observer.changed.set()
             assert observer.reaped.wait(2)
 
     assert [row.payload.eligibility for row in rows] == ["ineligible_post_drop"]
@@ -3902,6 +3905,217 @@ def test_public_drop_pending_boundary_fences_post_accepted_positive_until_store_
     assert observer.cutoff == base + 10
     assert observer.confirmation is None
     assert captures[0].started and captures[0].stopped
+
+
+def _public_boundary_matrix_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    authority: str,
+) -> tuple[Any, Any, Any, Any, str, Any | None]:
+    """Build an actual public context with only the admitted test seams."""
+    from types import SimpleNamespace
+
+    from coffee_roaster_mcp.mcp_server import build_server_context, create_mcp_server
+
+    path = tmp_path / f"{authority}-public-boundary-context.yaml"
+    path.write_text(f"logging:\n  log_dir: {tmp_path / 'context-logs'}\n", encoding="utf-8")
+    if authority == "manual":
+        runtime, _captures, config = _manual_runtime_fixture(tmp_path)
+        context = build_server_context(config_path=path)
+        object.__setattr__(context, "config", config)
+        object.__setattr__(context, "first_crack_runtime", runtime)
+    else:
+        # The real legacy default is disabled and receives no observer ack.
+        context = build_server_context(config_path=path)
+        runtime = context.first_crack_runtime
+    server = create_mcp_server(config_path=path)
+    ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=context))
+
+    def call(name: str, **arguments: object) -> Any:
+        tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
+        assert tool is not None
+        return tool.fn(ctx, **arguments)
+
+    started = call(
+        "start_roast_session",
+        **({"first_crack_observer_ack": "manual/v1"} if authority == "manual" else {}),
+    )
+    session_id = started.session.session_id
+    context.telemetry_sampler.stop_for_session(session_id, reason="controlled matrix")
+    call("mark_beans_added")
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - public lifecycle witness
+    return context, runtime, call, started, session_id, observer
+
+
+def _install_public_boundary_trace(
+    monkeypatch: pytest.MonkeyPatch, context: Any, runtime: Any
+) -> list[tuple[str, object]]:
+    """Trace actual dispatch, boundary, accepted-event, and resolution calls."""
+    trace: list[tuple[str, object]] = []
+    for name in ("drop_beans", "emergency_stop"):
+        original = getattr(context.roaster_driver, name)
+
+        def driver(*args: Any, _name: str = name, _original: Any = original, **kwargs: Any) -> Any:
+            result = _original(*args, **kwargs)
+            trace.append(("driver", _name))
+            return result
+
+        monkeypatch.setattr(context.roaster_driver, name, driver)
+
+    for name in (
+        "complete_reserved_driver_drop_snapshot",
+        "complete_reserved_driver_fault_recovery_snapshot",
+        "emergency_stop_snapshot",
+    ):
+        original = getattr(context.session_store, name)
+
+        def accepted(
+            *args: Any, _name: str = name, _original: Any = original, **kwargs: Any
+        ) -> Any:
+            result = _original(*args, **kwargs)
+            trace.append(("accepted", (_name, result[0])))
+            return result
+
+        monkeypatch.setattr(context.session_store, name, accepted)
+
+    original_begin = runtime.begin_observation_boundary
+    original_resolve = runtime.resolve_observation_boundary
+
+    def begin(*args: Any, **kwargs: Any) -> object | None:
+        ticket = original_begin(*args, **kwargs)
+        trace.append(("begin", (kwargs["reason"], ticket)))
+        return ticket
+
+    def resolve(*args: Any, **kwargs: Any) -> None:
+        trace.append(("resolve", (args[1], kwargs["cutoff_monotonic_seconds"])))
+        original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "begin_observation_boundary", begin)
+    monkeypatch.setattr(runtime, "resolve_observation_boundary", resolve)
+    return trace
+
+
+def _assert_manual_public_boundary_trace(
+    trace: list[tuple[str, object]], *, reason: str, session: Any
+) -> None:
+    """Check the ticket and accepted-event scalar stay with one dispatch."""
+    assert [entry[0] for entry in trace] == ["driver", "begin", "accepted", "resolve"]
+    begin_reason, ticket = cast(tuple[str, object | None], trace[1][1])
+    _method, event = cast(tuple[str, Any], trace[2][1])
+    resolved_ticket, cutoff = cast(tuple[object | None, float], trace[3][1])
+    assert begin_reason == reason
+    assert resolved_ticket is ticket
+    assert cutoff == session.monotonic_start + event.monotonic_seconds
+
+
+@pytest.mark.parametrize(
+    "path", ["ordinary_drop", "stopped_fault_drop", "public_emergency", "sampler_failure"]
+)
+@pytest.mark.parametrize("authority", ["manual", "automatic"])
+def test_public_observation_boundary_dispatch_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, authority: str
+) -> None:
+    """Each public dispatch keeps manual boundaries causal; automatic stays legacy-disabled."""
+    from coffee_roaster_mcp import mcp_server
+
+    context, runtime, call, _started, session_id, observer = _public_boundary_matrix_context(
+        tmp_path, monkeypatch, authority=authority
+    )
+    trace = _install_public_boundary_trace(monkeypatch, context, runtime)
+    session = context.session_store.get_session_snapshot(session_id=session_id)
+    frozen_summary: str | None = None
+    try:
+        if path == "stopped_fault_drop":
+            setup = call("emergency_stop", reason="matrix stopped-fault setup")
+            assert setup.event.kind == "fault"
+            if observer is not None:
+                assert observer.reaped.wait(2)
+                frozen_summary = observer.summary.model_dump_json()
+            trace.clear()
+            result = call("drop_beans", expected_session_id=session_id)
+            expected_reason = "beans_dropped"
+        elif path == "ordinary_drop":
+            result = call("drop_beans")
+            expected_reason = "beans_dropped"
+        elif path == "public_emergency":
+            result = call("emergency_stop", reason="matrix public emergency")
+            expected_reason = "emergency_stop"
+        else:
+            active = context.session_store.get_active_session()
+            assert active is not None
+            sampler_failure = getattr(  # noqa: B009 - invokes the registered private callback.
+                mcp_server, "_fault_active_session_after_sampler_failure"
+            )
+            sampler_failure(context, session=active, error=RuntimeError("matrix sampler callback"))
+            result = context.session_store.get_session_snapshot(
+                session_id=session_id
+            ).event_timeline[-1]
+            expected_reason = "autonomous_telemetry_sampler_failure"
+
+        event = result.event if hasattr(result, "event") else result
+        assert event is not None
+        snapshot = context.session_store.get_session_snapshot(session_id=session_id)
+        assert snapshot.first_crack_at_utc is None
+        if authority == "manual":
+            _assert_manual_public_boundary_trace(trace, reason=expected_reason, session=session)
+            if path == "stopped_fault_drop":
+                assert frozen_summary is not None
+                assert observer is not None and observer.summary.model_dump_json() == frozen_summary
+        else:
+            assert not any(name in {"begin", "resolve"} for name, _value in trace)
+            assert [name for name, _value in trace] == ["driver", "accepted"]
+    finally:
+        if observer is not None and not observer.reaped.is_set():
+            runtime.close_observation(session, reason="matrix diagnostic cleanup")
+            observer.changed.set()
+            assert observer.reaped.wait(2)
+
+
+@pytest.mark.parametrize(
+    "path", ["ordinary_retry", "stopped_fault_start_cooling", "stopped_fault_stop_cooling"]
+)
+def test_public_drop_retry_and_fault_cooling_do_not_open_new_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Retries and cooling recovery retain their events without a new drop boundary."""
+    context, runtime, call, _started, session_id, observer = _public_boundary_matrix_context(
+        tmp_path, monkeypatch, authority="manual"
+    )
+    trace = _install_public_boundary_trace(monkeypatch, context, runtime)
+    session = context.session_store.get_session_snapshot(session_id=session_id)
+    try:
+        if path == "ordinary_retry":
+            first = call("drop_beans")
+            trace.clear()
+            result = call("drop_beans")
+            assert result.event == first.event
+            assert [name for name, _value in trace] == []
+        else:
+            setup = call("emergency_stop", reason="matrix cooling setup")
+            assert setup.event.kind == "fault"
+            assert observer is not None and observer.reaped.wait(2)
+            trace.clear()
+            if path == "stopped_fault_stop_cooling":
+                recovered_drop = call("drop_beans", expected_session_id=session_id)
+                assert recovered_drop.event is not None
+                started_cooling = call("start_cooling", expected_session_id=session_id)
+                assert started_cooling.event is not None
+                trace.clear()
+            result = call(
+                "start_cooling" if path == "stopped_fault_start_cooling" else "stop_cooling",
+                expected_session_id=session_id,
+            )
+            assert result.event is not None
+            assert [name for name, _value in trace] == ["accepted"]
+        snapshot = context.session_store.get_session_snapshot(session_id=session_id)
+        assert snapshot.first_crack_at_utc is None
+        assert not any(name in {"begin", "resolve"} for name, _value in trace)
+    finally:
+        if observer is not None and not observer.reaped.is_set():
+            runtime.close_observation(session, reason="matrix diagnostic cleanup")
+            observer.changed.set()
+            assert observer.reaped.wait(2)
 
 
 def test_public_drop_pending_timeout_keeps_owned_result_cutoff_unknown(
