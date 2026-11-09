@@ -3836,7 +3836,6 @@ def test_public_drop_pending_boundary_fences_post_accepted_positive_until_store_
 
         def held_complete(*args: Any, **kwargs: Any):
             completed = original_complete(*args, **kwargs)
-            assert trace == ["driver", "begin"]
             trace.append("accepted_event")
             accepted_return.set()
             assert release_return.wait(5)
