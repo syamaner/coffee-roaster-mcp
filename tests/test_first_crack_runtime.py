@@ -4344,6 +4344,11 @@ def test_manual_boundary_raised_dispatch_has_no_ticket(
     )
     trace = _install_public_boundary_trace(monkeypatch, context, runtime)
     session = context.session_store.get_session_snapshot(session_id=session_id)
+    capture = (
+        runtime._pipeline  # pyright: ignore[reportPrivateUsage] - existing fixture cleanup witness
+        if path == "public_emergency"
+        else None
+    )
     try:
         if path == "stopped_fault_drop":
             assert call("emergency_stop", reason="raised dispatch setup").event.kind == "fault"
@@ -4391,6 +4396,14 @@ def test_manual_boundary_raised_dispatch_has_no_ticket(
             assert snapshot.beans_dropped_at_utc is None
         if path == "stopped_fault_drop":
             assert snapshot.phase == "fault"
+        if path == "public_emergency":
+            assert observer is not None and observer.reaped.wait(2)
+            assert observer.summary is not None
+            assert capture is not None
+            assert observer.summary.drop_cutoff.value is None
+            assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
+            assert observer.summary.coverage_complete is False
+            assert capture.stopped and capture.shutdown_confirmed
     finally:
         if observer is not None and not observer.reaped.is_set():
             runtime.close_observation(session, reason="raised dispatch diagnostic cleanup")
