@@ -11,6 +11,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Literal, Protocol
 
+from pydantic import ValidationError
+
 from coffee_roaster_mcp.artifacts import ArtifactResolutionError
 from coffee_roaster_mcp.audio import (
     AdditionalRecordingDevice,
@@ -25,13 +27,31 @@ from coffee_roaster_mcp.audio import (
     audio_capture_settings_from_config,
     build_audio_capture_pipeline,
 )
-from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig
+from coffee_roaster_mcp.config import (
+    AppConfig,
+    AudioConfig,
+    ConfigError,
+    FirstCrackConfig,
+    validate_first_crack_authority,
+)
 from coffee_roaster_mcp.detector import (
     FirstCrackDetectorAdapter,
     FirstCrackDetectorError,
     FirstCrackWindowObservation,
     build_released_onnx_first_crack_detector_adapter,
     integrate_first_crack_window_with_session,
+)
+from coffee_roaster_mcp.first_crack_observation import ClockMapping, ObservationSnapshot, absent
+from coffee_roaster_mcp.first_crack_observer import (
+    CaptureCleanup,
+    FirstCrackObserver,
+    JsonlObservationSink,
+    ObservationModel,
+    ObservationSink,
+    configured_identity,
+    coordinator,
+    load_observation_model,
+    observation_settings,
 )
 from coffee_roaster_mcp.session import RoastSession, RoastSessionStore, SessionLifecycleError
 
@@ -139,6 +159,17 @@ class FirstCrackRuntimeSnapshot:
     last_inference_duration_ms: float = 0.0
     max_inference_duration_ms: float = 0.0
     inference_overrun_count: int = 0
+    observation: ObservationSnapshot | None = None
+
+
+@dataclass(frozen=True)
+class _ObservationHistoryEntry:
+    """A session-owned projection; pending owners never gain store access."""
+
+    generation: int
+    snapshot: ObservationSnapshot
+    observer: FirstCrackObserver | None = None
+    cleanup: CaptureCleanup | None = None
 
 
 class FirstCrackSessionRuntime:
@@ -152,6 +183,9 @@ class FirstCrackSessionRuntime:
         detector_adapter_factory: FirstCrackDetectorAdapterFactory | None = None,
         stop_timeout_seconds: float = 1.0,
         monotonic_now: Callable[[], float] | None = None,
+        observation_sink_factory: Callable[[Path], ObservationSink] | None = None,
+        observation_model_loader: Callable[[FirstCrackConfig], ObservationModel] | None = None,
+        session_is_retained: Callable[[str], bool] | None = None,
     ) -> None:
         """Initialize a session-owned first-crack runtime.
 
@@ -163,8 +197,22 @@ class FirstCrackSessionRuntime:
             monotonic_now: Optional monotonic clock supplier for tests. Used
                 to decay the rolling overflow fields on the post-stop
                 snapshot (coffee-roaster-mcp#193 review finding).
+            session_is_retained: Optional read-only consumer membership capability.
+                Called only at admission/history lookup, outside feature locks;
+                omitted means current-session-only diagnostic retention.
         """
         self._config = config
+        self._observer: FirstCrackObserver | None = None
+        self._refused_observation: ObservationSnapshot | None = None
+        self._capture_cleanup: CaptureCleanup | None = None
+        self._capture_cleanup_session_id: str | None = None
+        self._capture_cleanup_generation: int | None = None
+        self._completed_observation: ObservationSnapshot | None = None
+        self._session_is_retained = session_is_retained
+        self._observation_history: dict[str, _ObservationHistoryEntry] = {}
+        self._observation_model_loader = observation_model_loader or load_observation_model
+        self._observation_generation = 0
+        self._observation_sink_factory = observation_sink_factory or JsonlObservationSink
         self._audio_pipeline_factory = audio_pipeline_factory or self._build_default_audio_pipeline
         self._detector_adapter_factory = (
             detector_adapter_factory or _build_released_detector_adapter
@@ -174,6 +222,8 @@ class FirstCrackSessionRuntime:
         self._lock = RLock()
         self._active_session_id: str | None = None
         self._pipeline: FirstCrackAudioPipeline | None = None
+        self._pipeline_session_id: str | None = None
+        self._recording_session_id: str | None = None
         self._capture_started_for_session = False
         self._capture_start_failed_for_session = False
         self._capture_teardown_started = False
@@ -226,6 +276,13 @@ class FirstCrackSessionRuntime:
         self._recovered_first_crack_holder: list[float | None] = []
         self._active_recorder: RoastRecorder | None = None
         self._recording_plan: RecordingArtifactPlan | None = None
+        if config.first_crack.event_authority == "manual":
+            try:
+                validate_first_crack_authority(config)
+            except ConfigError:
+                pass
+            else:
+                coordinator()
 
     def set_recording_metadata(self, *, origin: str, roast_num: int) -> RecordingMetadata:
         """Store annotation-pipeline metadata for the next roast's recording.
@@ -280,6 +337,14 @@ class FirstCrackSessionRuntime:
 
     def start_for_session(self, session: RoastSession) -> FirstCrackRuntimeSnapshot:
         """Start or prepare first-crack detection for a roast session."""
+        if self._config.first_crack.event_authority not in {"automatic", "manual"}:
+            with self._lock:
+                self._active_session_id = session.id
+                self._status = "unavailable"
+                self._reason = "first_crack_authority_not_admitted"
+                return self.snapshot()
+        if self._config.first_crack.event_authority == "manual":
+            return self._start_observer(session)
         with self._lock:
             self._stop_locked(reason="new roast session")
             self._active_session_id = session.id
@@ -357,6 +422,303 @@ class FirstCrackSessionRuntime:
             self._pipeline = pipeline
             return self.snapshot()
 
+    def _start_observer(self, session: RoastSession) -> FirstCrackRuntimeSnapshot:
+        # No model load or inference occurs under this runtime lock.
+        retained = self._prune_observation_history(session.id)
+        with self._lock:
+            self._remember_observation_locked(retained)
+            if self._observer is not None and self._observer.session_id != session.id:
+                self._observer.invalidate()
+            self._active_session_id = session.id
+            # Projection state belongs to this newly selected session, even
+            # when an older capture/recorder must remain owned until reaped.
+            self._last_capture_snapshot = None
+            self._last_capture_snapshot_as_of_monotonic_seconds = None
+            self._processed_window_count = 0
+            self._last_inference_duration_ms = 0.0
+            self._max_inference_duration_ms = 0.0
+            self._inference_overrun_count = 0
+            self._inference_stopped = False
+            self._capture_started_for_session = False
+            self._capture_start_failed_for_session = False
+            self._capture_teardown_started = False
+            self._recorder_built_for_session = False
+            self._completed_observation = None
+            self._refused_observation = None
+            try:
+                # Preserve the closed refusal projection whenever the actual
+                # settings are representable; never invent valid defaults.
+                self._refused_observation = ObservationSnapshot(
+                    observer_state="not_admitted",
+                    identity=configured_identity(self._config.first_crack),
+                    settings=observation_settings(self._config),
+                    first_confirmation=absent(),
+                    frozen_summary=absent(),
+                    durability="pending",
+                    worker_reaped=False,
+                )
+                validate_first_crack_authority(self._config)
+                ClockMapping(
+                    session_origin=session.monotonic_start, session_utc=session.created_at_utc
+                )
+            except (ConfigError, ValidationError, TypeError, ValueError):
+                self._status = "unavailable"
+                self._reason = "manual_authority_not_admitted"
+                return self.snapshot()
+            token = object()
+            if not coordinator().reserve(token):
+                self._status = "unavailable"
+                self._reason = "previous_observer_not_reaped"
+                return self.snapshot()
+            if self._pipeline is not None and not self._pipeline.shutdown_confirmed:
+                coordinator().release(token)
+                self._status = "unavailable"
+                self._reason = "previous_capture_not_released"
+                return self.snapshot()
+            self._active_session_id = session.id
+            self._observation_generation += 1
+            self._recovered_first_crack_holder = []
+            self._active_recorder = None
+            self._recording_plan = None
+            self._recording_session_id = None
+            self._capture_start_failed_for_session = False
+            pipeline: FirstCrackAudioPipeline | None = None
+            recorder: RoastRecorder | None = None
+            observer: FirstCrackObserver | None = None
+            self._capture_cleanup = None
+            self._capture_cleanup_session_id = None
+            self._capture_cleanup_generation = None
+            try:
+                recorder = build_session_recorder(
+                    self._config,
+                    session,
+                    metadata=self._recording_metadata,
+                    recovered_first_crack_holder=self._recovered_first_crack_holder,
+                )
+                self._active_recorder = recorder
+                self._recording_session_id = session.id
+                self._recording_plan = plan_session_recording_artifacts(
+                    self._config, session, self._recording_metadata
+                )
+                self._pending_recorder = recorder
+                self._recorder_built_for_session = recorder is not None
+                pipeline = self._audio_pipeline_factory(self._config.audio)
+                self._pipeline = pipeline
+                self._pipeline_session_id = session.id
+                self._last_capture_snapshot = pipeline.start()
+                self._capture_started_for_session = True
+                log_dir = (
+                    session.log_writer.log_dir
+                    if session.log_writer is not None
+                    else self._config.logging.log_dir / "roasts" / session.id
+                )
+                observer = FirstCrackObserver(
+                    config=self._config,
+                    session_id=session.id,
+                    generation=self._observation_generation,
+                    session_origin=session.monotonic_start,
+                    session_utc=session.created_at_utc,
+                    recording_origin=recorder.started_monotonic_seconds
+                    if recorder is not None
+                    else None,
+                    pipeline=pipeline,
+                    loader=self._observation_model_loader,
+                    sink_factory=self._observation_sink_factory,
+                    log_dir=log_dir,
+                    monotonic_now=self._monotonic_now,
+                    stop_timeout_seconds=self._stop_timeout_seconds,
+                    recording_origin_reader=(lambda: recorder.started_monotonic_seconds)
+                    if recorder is not None
+                    else None,
+                )
+                self._observer = observer
+                self._status = "pending"
+                self._reason = (
+                    "Human first crack is authoritative; model observations are diagnostic only."
+                )
+                if not observer.start(token):
+                    raise RuntimeError("Observation worker could not acquire its reservation.")
+            except Exception:  # noqa: BLE001 - no fall back to automatic authority.
+                self._status = "unavailable"
+                self._reason = "manual_observation_capture_unavailable"
+                self._capture_start_failed_for_session = True
+                if observer is not None and observer.worker_running:
+                    observer.close(cutoff=self._monotonic_now(), reason="capture_setup_failed")
+                elif pipeline is not None or recorder is not None:
+                    cleanup = CaptureCleanup(pipeline, recorder, self._stop_timeout_seconds)
+                    self._capture_cleanup = cleanup
+                    self._capture_cleanup_session_id = session.id
+                    self._capture_cleanup_generation = self._observation_generation
+                    try:
+                        cleanup.start(token, observer)
+                    except Exception:  # noqa: BLE001 - unresolved slot remains owned.
+                        self._reason = "capture_cleanup_unavailable"
+                else:
+                    coordinator().release(token)
+            finally:
+                self._pending_recorder = None
+            return self.snapshot()
+
+    def _prune_observation_history(self, requested_id: str) -> set[str]:
+        """Ask the owning consumer about lifetime outside every feature lock."""
+        predicate = self._session_is_retained
+        with self._lock:
+            entries = tuple(self._observation_history.items())
+            candidates = {sid for sid, _entry in entries}
+            if self._active_session_id is not None:
+                candidates.add(self._active_session_id)
+        candidates.add(requested_id)
+        retained: set[str] = (
+            set() if predicate is None else {sid for sid in candidates if predicate(sid)}
+        )
+        compacted: list[tuple[str, _ObservationHistoryEntry, ObservationSnapshot]] = []
+        for sid, entry in entries:
+            owner = entry.observer or entry.cleanup
+            if sid in retained and owner is not None and owner.reaped.is_set():
+                snapshot = self._history_entry_snapshot(sid, entry)
+                if snapshot is not None and snapshot.worker_reaped:
+                    compacted.append((sid, entry, snapshot))
+        with self._lock:
+            for sid in candidates - retained:
+                self._observation_history.pop(sid, None)
+            for sid, entry, snapshot in compacted:
+                if self._observation_history.get(sid) is entry:
+                    self._observation_history[sid] = _ObservationHistoryEntry(
+                        generation=entry.generation, snapshot=snapshot
+                    )
+        return retained
+
+    @staticmethod
+    def _history_entry_snapshot(
+        session_id: str, entry: _ObservationHistoryEntry
+    ) -> ObservationSnapshot | None:
+        if entry.observer is not None:
+            if (
+                entry.observer.session_id != session_id
+                or entry.observer.generation != entry.generation
+            ):
+                return None
+            return entry.observer.snapshot()
+        if entry.cleanup is not None:
+            reaped = entry.cleanup.reaped.is_set()
+            return entry.snapshot.model_copy(
+                update=dict(
+                    observer_state="unavailable" if reaped else "incomplete",
+                    worker_reaped=reaped,
+                    durability="failed",
+                )
+            )
+        return entry.snapshot
+
+    def _remember_observation_locked(self, retained: set[str]) -> None:
+        session_id = self._active_session_id
+        if session_id is None or session_id not in retained:
+            return
+        snapshot = self._observation_snapshot()
+        if snapshot is None:
+            return
+        observer = self._observer
+        if observer is not None and observer.session_id != session_id:
+            observer = None
+        cleanup = (
+            self._capture_cleanup
+            if self._capture_cleanup_session_id == session_id
+            and self._capture_cleanup_generation == self._observation_generation
+            else None
+        )
+        self._observation_history[session_id] = _ObservationHistoryEntry(
+            generation=self._observation_generation,
+            snapshot=snapshot,
+            observer=observer if not snapshot.worker_reaped and cleanup is None else None,
+            cleanup=cleanup if not snapshot.worker_reaped else None,
+        )
+
+    def observation_for_session(self, session_id: str) -> ObservationSnapshot | None:
+        """Read one retained diagnostic generation without capture/model/file I/O.
+
+        The injected consumer membership capability is called only here and at
+        admission, outside feature locks. Without it, only the current session
+        is available; there is no unbounded historical fallback.
+
+        Args:
+            session_id: The exact canonical session requested by the consumer.
+
+        Returns:
+            Its own typed observation while retained, otherwise None.
+        """
+        if self._config.first_crack.event_authority != "manual":
+            return None
+        retained = self._prune_observation_history(session_id)
+        with self._lock:
+            if self._session_is_retained is not None and session_id not in retained:
+                return None
+            if session_id == self._active_session_id:
+                return self._observation_snapshot()
+            entry = self._observation_history.get(session_id)
+        if entry is None:
+            return None
+        snapshot = self._history_entry_snapshot(session_id, entry)
+        if snapshot is None:
+            return None
+        if snapshot.worker_reaped and (entry.observer is not None or entry.cleanup is not None):
+            with self._lock:
+                if self._observation_history.get(session_id) is entry:
+                    self._observation_history[session_id] = _ObservationHistoryEntry(
+                        generation=entry.generation, snapshot=snapshot
+                    )
+        return snapshot
+
+    def _observation_snapshot(self) -> ObservationSnapshot | None:
+        cleanup = self._capture_cleanup
+        if (
+            cleanup is not None
+            and self._refused_observation is not None
+            and self._capture_cleanup_session_id == self._active_session_id
+            and self._capture_cleanup_generation == self._observation_generation
+        ):
+            return self._refused_observation.model_copy(
+                update=dict(
+                    observer_state="unavailable" if cleanup.reaped.is_set() else "incomplete",
+                    worker_reaped=cleanup.reaped.is_set(),
+                    durability="failed",
+                )
+            )
+        if self._observer is not None and self._observer.session_id == self._active_session_id:
+            return self._observer.snapshot()
+        return self._completed_observation or self._refused_observation
+
+    def notify_human_mark(self, session: RoastSession) -> None:
+        """Publish accepted canonical boundaries without waiting for the model."""
+        observer = self._observer
+        if observer is not None and observer.session_id == session.id:
+            observer.update_boundaries(
+                charge_at=None
+                if session.beans_added_monotonic_seconds is None
+                else session.monotonic_start + session.beans_added_monotonic_seconds,
+                human_at=None
+                if session.first_crack_monotonic_seconds is None
+                else session.monotonic_start + session.first_crack_monotonic_seconds,
+            )
+
+    def close_observation(
+        self,
+        session: RoastSession,
+        *,
+        reason: str,
+        cutoff_monotonic_seconds: float | None = None,
+    ) -> None:
+        """Called only after driver dispatch, with the accepted drop cutoff."""
+        observer = self._observer
+        if observer is not None and observer.session_id == session.id:
+            cutoff = cutoff_monotonic_seconds
+            if cutoff is None:
+                cutoff = (
+                    self._monotonic_now()
+                    if session.beans_dropped_monotonic_seconds is None
+                    else session.monotonic_start + session.beans_dropped_monotonic_seconds
+                )
+            observer.close(cutoff=cutoff, reason=reason.replace(" ", "_"))
+
     def process_available_windows(
         self,
         *,
@@ -364,6 +726,9 @@ class FirstCrackSessionRuntime:
         session: RoastSession,
     ) -> FirstCrackRuntimeSnapshot:
         """Process queued detector windows for the owning active roast session."""
+        if self._config.first_crack.event_authority == "manual":
+            self.notify_human_mark(session)
+            return self.snapshot()
         with self._lock:
             if not self._can_process_locked(session):
                 return self.snapshot()
@@ -474,6 +839,9 @@ class FirstCrackSessionRuntime:
         Returns:
             The resulting runtime snapshot.
         """
+        if self._config.first_crack.event_authority == "manual":
+            self.close_observation(session, reason="beans_dropped")
+            return self.snapshot()
         with self._lock:
             if not self._can_process_after_drop_locked(session):
                 return self.snapshot()
@@ -600,6 +968,11 @@ class FirstCrackSessionRuntime:
         reason: str,
     ) -> FirstCrackRuntimeSnapshot:
         """Stop first-crack detection if it belongs to the supplied session."""
+        if self._config.first_crack.event_authority == "manual":
+            observer = self._observer
+            if observer is not None and observer.session_id == session_id:
+                observer.close(cutoff=self._monotonic_now(), reason=reason.replace(" ", "_"))
+            return self.snapshot()
         with self._lock:
             if self._active_session_id != session_id:
                 return self.snapshot()
@@ -612,6 +985,36 @@ class FirstCrackSessionRuntime:
         Literal["not_active", "stopped", "capture_still_running", "stop_failed"], str | None, bool
     ]:
         """Stop capture without inference and retain it for a later retry."""
+        if self._config.first_crack.event_authority == "manual":
+            if (
+                self._capture_cleanup is not None
+                and self._active_session_id == session_id
+                and self._capture_cleanup_session_id == session_id
+                and self._capture_cleanup_generation == self._observation_generation
+            ):
+                if self._capture_cleanup.reaped.is_set():
+                    return "stopped", None, False
+                return "capture_still_running", "Setup failure cleanup is pending.", True
+            observer = self._observer
+            if observer is None or observer.session_id != session_id:
+                return "not_active", None, False
+            observer.close(cutoff=self._monotonic_now(), reason="finalisation")
+            if observer.reaped.is_set() and observer.pipeline.shutdown_confirmed:
+                with self._lock:
+                    self._completed_observation = observer.snapshot()
+                    self._observer = None
+                    self._pipeline = None
+                    self._pipeline_session_id = None
+                    self._adapter = None
+                    self._pending_recorder = None
+                    self._recorder_built_for_session = False
+                    self._capture_teardown_started = False
+                return "stopped", None, False
+            return (
+                "capture_still_running",
+                "observer_still_running: observer or capture teardown is pending.",
+                True,
+            )
         with self._lock:
             if self._active_session_id != session_id:
                 return "not_active", None, False
@@ -646,7 +1049,10 @@ class FirstCrackSessionRuntime:
     ) -> tuple[RoastRecorder | None, RecordingArtifactPlan | None]:
         """Return recorder and pure artifact plan for the owning session."""
         with self._lock:
-            if self._active_session_id != session_id:
+            if self._active_session_id != session_id or (
+                self._config.first_crack.event_authority == "manual"
+                and self._recording_session_id != session_id
+            ):
                 return None, None
             return self._active_recorder, self._recording_plan
 
@@ -667,6 +1073,8 @@ class FirstCrackSessionRuntime:
         CI runner produces). Uses `discard_pending_audio()`, which clears
         every stage of the pipeline, not just `drain_windows()`'s queue.
         """
+        if self._config.first_crack.event_authority == "manual":
+            return self.snapshot()
         with self._lock:
             if self._active_session_id != session_id:
                 return self.snapshot()
@@ -680,6 +1088,19 @@ class FirstCrackSessionRuntime:
 
     def shutdown(self) -> FirstCrackRuntimeSnapshot:
         """Stop any active detector runtime for process shutdown."""
+        if self._config.first_crack.event_authority == "manual":
+            if self._capture_cleanup is not None:
+                self._capture_cleanup.finished.wait(timeout=self._stop_timeout_seconds)
+                return self.snapshot()
+            observer = self._observer
+            if observer is not None:
+                observer.shutdown_capture(timeout=self._stop_timeout_seconds)
+                if observer.pipeline.shutdown_confirmed:
+                    with self._lock:
+                        self._pipeline = None
+                        self._pending_recorder = None
+                        self._recorder_built_for_session = False
+            return self.snapshot()
         with self._lock:
             self._stop_locked(reason="process shutdown")
             return self.snapshot()
@@ -687,8 +1108,19 @@ class FirstCrackSessionRuntime:
     def snapshot(self) -> FirstCrackRuntimeSnapshot:
         """Return an MCP-visible runtime snapshot."""
         with self._lock:
-            capture_snapshot = self._pipeline.snapshot() if self._pipeline is not None else None
+            pipeline = self._pipeline
+            if (
+                self._config.first_crack.event_authority == "manual"
+                and self._pipeline_session_id != self._active_session_id
+            ):
+                pipeline = None  # Keep the older resource owned, never relabel it.
+            capture_snapshot = pipeline.snapshot() if pipeline is not None else None
             if capture_snapshot is not None:
+                if (
+                    self._observer is not None
+                    and self._observer.session_id == self._active_session_id
+                ):
+                    self._observer.note_capture(capture_snapshot)
                 self._last_capture_snapshot = capture_snapshot
                 # coffee-roaster-mcp#193 review finding, round 2: stamp EVERY
                 # live poll, not just the final stop. A live-polled aggregate
@@ -748,7 +1180,11 @@ class FirstCrackSessionRuntime:
             return FirstCrackRuntimeSnapshot(
                 status=status,
                 active_session_id=self._active_session_id,
-                active=self._pipeline is not None,
+                active=pipeline is not None
+                and not (
+                    self._config.first_crack.event_authority == "manual"
+                    and pipeline.shutdown_confirmed
+                ),
                 reason=reason,
                 audio_running=audio_running,
                 queued_window_count=0
@@ -778,6 +1214,7 @@ class FirstCrackSessionRuntime:
                 last_inference_duration_ms=self._last_inference_duration_ms,
                 max_inference_duration_ms=self._max_inference_duration_ms,
                 inference_overrun_count=self._inference_overrun_count,
+                observation=self._observation_snapshot(),
             )
 
     def _record_inference_duration_locked(self, started_at: float) -> None:
@@ -887,12 +1324,14 @@ def build_first_crack_session_runtime(
     *,
     audio_pipeline_factory: FirstCrackAudioPipelineFactory | None = None,
     detector_adapter_factory: FirstCrackDetectorAdapterFactory | None = None,
+    session_is_retained: Callable[[str], bool] | None = None,
 ) -> FirstCrackSessionRuntime:
     """Build the configured session-owned first-crack runtime."""
     return FirstCrackSessionRuntime(
         config=config,
         audio_pipeline_factory=audio_pipeline_factory,
         detector_adapter_factory=detector_adapter_factory,
+        session_is_retained=session_is_retained,
     )
 
 

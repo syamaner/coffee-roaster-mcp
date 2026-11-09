@@ -53,6 +53,7 @@ _EXPECTED_ROAST_STATE_KEYS = {
     "first_crack_at_utc",
     "first_crack_monotonic_seconds",
     "ambient_status",
+    "first_crack_observation",
     "first_crack_status",
     "heat_level_percent",
     "log_dir",
@@ -262,6 +263,7 @@ async def _assert_stdio_cold_session_roast_fan_observation(tmp_path: Path) -> No
         assert observation == {"outcome": "observed", "roast_fan_level_percent": 0}
         assert type(observation["roast_fan_level_percent"]) is int
         assert set(state) == _EXPECTED_ROAST_STATE_KEYS
+        assert state["first_crack_observation"] is None
         projection = state["cold_temperature_projection"]
         assert set(projection) == _EXPECTED_COLD_TEMPERATURE_PROJECTION_KEYS
         # The packaged default mock driver is not a supported projection source.
@@ -397,7 +399,12 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
                     "enum": ["roast", "cold_characterisation"],
                     "title": "Purpose",
                     "type": "string",
-                }
+                },
+                "first_crack_observer_ack": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": None,
+                    "title": "First Crack Observer Ack",
+                },
             },
             "title": "start_roast_sessionArguments",
             "type": "object",
@@ -415,6 +422,8 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
         assert runtime_config.structuredContent is not None
         assert runtime_config.structuredContent["roaster_driver"] == "mock"
         assert runtime_config.structuredContent["first_crack_mode"] == "disabled"
+        assert runtime_config.structuredContent["first_crack_event_authority"] == "automatic"
+        assert runtime_config.structuredContent["first_crack_observer_protocol"] is None
 
 
 def test_stdio_server_supports_basic_mock_roast_tool_flow(tmp_path: Path) -> None:
@@ -497,6 +506,8 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         )
         assert runtime_config.structuredContent["roaster_driver"] == "mock"
         assert runtime_config.structuredContent["first_crack_mode"] == "disabled"
+        assert runtime_config.structuredContent["first_crack_event_authority"] == "automatic"
+        assert runtime_config.structuredContent["first_crack_observer_protocol"] is None
         assert runtime_config.structuredContent["auto_t0_detection_enabled"] is False
 
         start_result = cast(
@@ -578,6 +589,7 @@ async def _assert_basic_mock_roast_flow(tmp_path: Path) -> None:
         state_content = state_result.structuredContent
         assert state_content is not None
         assert set(state_content) == _EXPECTED_ROAST_STATE_KEYS
+        assert state_content["first_crack_observation"] is None
         assert state_content["session_id"] == session_id
         assert state_content["active"] is False
         assert state_content["phase"] == "complete"

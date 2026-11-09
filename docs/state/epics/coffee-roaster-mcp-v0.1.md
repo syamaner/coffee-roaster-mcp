@@ -2546,3 +2546,53 @@ lifecycle under root `AGENTS.md`.
   - Ran `./.venv/bin/python -m pyright`: 0 errors.
   - Ran `./.venv/bin/coffee-roaster-mcp --help`: passed.
   - Ran `./.venv/bin/coffee-roaster-mcp --version`: `coffee-roaster-mcp 0.1.2`.
+
+### #237 — human-authoritative FC / diagnostic model observation
+
+One atomic mock-only software delivery preserves recording across the human mark
+and records independent model identity, onset, decision availability and coverage.
+A bounded observation worker and I/O-free deadline supervisor isolate loading,
+inference and diagnostic persistence from canonical mark/control dispatch. The
+new protocol rejects real/unknown drivers and missing/mismatched acknowledgement;
+legacy automatic behaviour remains the default. No endpoint threshold, priority,
+pre-FC protection or Agent production change belongs to this story. Mock tests
+and software reviews do not qualify hardware or resolve missing-mark protection.
+
+Recording origin is read and latched from the actual recorder, including delayed
+capture start; earlier unknown timestamps are preserved. Capture is flushed by
+its owner before declaring the final eligible drain complete. Partial setup and
+blocked model work retain one resource owner; lifespan-only shutdown assurance
+can close capture without waiting for the model. These software boundaries and
+the explicit Pydantic dependency floor do not change live-admission authority.
+
+
+### #237 downstream admission boundary
+
+`first_crack.event_authority` and `COFFEE_FIRST_CRACK_EVENT_AUTHORITY` are
+reserved for a consumer that explicitly acknowledges the mock-only `manual/v1`
+protocol. The existing Agent configuration merge preserves unmanaged YAML
+values, and ambient environment forwarding can also pass these settings
+through. Agent integration must explicitly pin, strip or admit them under a
+separate consumer contract. Rejection without the protocol acknowledgement is
+intentional fail-closed behaviour; this slice supplies no Agent mitigation or
+real-roaster enablement.
+
+
+The observer's frozen summary is an immutable accepted prefix. Its discard
+counters describe accepted pre-freeze accounting: invalidation and closing
+cutoff enforcement freeze under the acceptance lock before rejecting a returned
+old result, so those before-freeze counters remain legitimately zero. Later
+result rejections increment a separate process diagnostic metric; they never
+rewrite a frozen summary. `undecided_eligible_windows` counts only owned, known
+eligible work. Unknown capture backlog keeps coverage incomplete without an
+invented eligible count. Capture loss learned after freeze likewise cannot
+rewrite the prefix or turn incomplete coverage into a clean negative. The
+`observer_still_running` detail uses the existing finalisation reason surface;
+legacy tuple/status vocabulary stays unchanged. File flush/fsync is promised;
+parent-directory crash persistence is not claimed.
+
+
+Historical in-process observation snapshots follow the actual session store's
+retention and never restore control across a restart. The manual protocol
+requires recording-capable capture: detector-paced WAV replay is refused;
+automatic paced replay and recording-capable realtime behaviour stay unchanged.

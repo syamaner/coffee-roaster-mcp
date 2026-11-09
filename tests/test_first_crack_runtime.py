@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
@@ -26,7 +26,10 @@ from coffee_roaster_mcp.detector import (
     FirstCrackDetectorOutput,
     build_first_crack_detector_adapter,
 )
-from coffee_roaster_mcp.first_crack_runtime import FirstCrackSessionRuntime
+from coffee_roaster_mcp.first_crack_runtime import (
+    FirstCrackRuntimeSnapshot,
+    FirstCrackSessionRuntime,
+)
 from coffee_roaster_mcp.session import RoastSessionStore, SessionLifecycleError
 
 
@@ -2526,3 +2529,1388 @@ def test_finalisation_fence_session_error_preserves_live_capture_handles(
     assert unfenced.status == "faulted"
     assert unfenced.reason == "First-crack detection failed: Session finalisation is in progress."
     assert runtime.finalise_for_session(session.id)[0] == "stopped"
+
+
+def test_manual_authority_direct_runtime_refuses_before_capture(tmp_path: Path) -> None:
+    calls: list[str] = []
+    config = AppConfig(first_crack=FirstCrackConfig(mode="audio", event_authority="manual"))
+
+    def forbidden_loader(_: FirstCrackConfig):
+        raise RuntimeError("Model loading must not occur in this refusal witness.")
+
+    runtime = FirstCrackSessionRuntime(
+        config=config,
+        observation_model_loader=forbidden_loader,
+        audio_pipeline_factory=lambda _: calls.append("capture") or FakeAudioPipeline(),
+    )
+    store = RoastSessionStore(default_log_dir=tmp_path)
+    snapshot = runtime.start_for_session(store.start_session())
+    assert snapshot.status == "unavailable"
+    assert snapshot.reason == "manual_authority_not_admitted"
+    assert snapshot.observation is not None
+    assert snapshot.observation.observer_state == "not_admitted"
+    assert not calls
+
+
+def test_manual_mark_preserves_synthetic_recording_and_canonical_milestone(tmp_path: Path) -> None:
+    import wave
+
+    from coffee_roaster_mcp.config import LoggingConfig
+    from coffee_roaster_mcp.first_crack_observer import load_observation_model
+
+    config = AppConfig(
+        first_crack=FirstCrackConfig(mode="audio", event_authority="manual"),
+        recording=RecordingConfig(
+            enabled=True, autocapture=True, export_location=tmp_path / "recordings"
+        ),
+        logging=LoggingConfig(log_dir=tmp_path / "logs"),
+    )
+
+    class RecordingPipeline(FakeAudioPipeline):
+        recorder: RoastRecorder | None = None
+
+        def start(self) -> AudioCaptureSnapshot:
+            assert self.recorder is not None
+            self.recorder.begin()
+            self.recorder.write_samples((0.0,) * 160)
+            return super().start()
+
+        def stop(self, *, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
+            assert self.recorder is not None
+            if not self.stopped:
+                self.recorder.write_samples((0.0,) * 160)
+                self.recorder.close()
+            return super().stop(timeout_seconds=timeout_seconds)
+
+    pipeline = RecordingPipeline()
+    model = tmp_path / "synthetic.onnx"
+    model.write_bytes(b"synthetic")
+    prep = tmp_path / "synthetic.json"
+    prep.write_text("{}", encoding="utf-8")
+    artifacts = ResolvedDetectorArtifacts(
+        ResolvedArtifact("test", None, "model.onnx", model),
+        ResolvedArtifact("test", None, "preprocessor.json", prep),
+    )
+
+    def capture_factory(_: AudioConfig) -> RecordingPipeline:
+        pipeline.recorder = runtime._pending_recorder  # pyright: ignore[reportPrivateUsage] - synthetic boundary witness
+        return pipeline
+
+    runtime = FirstCrackSessionRuntime(
+        config=config,
+        audio_pipeline_factory=capture_factory,
+        observation_model_loader=lambda fc: load_observation_model(
+            fc,
+            resolver=lambda _: artifacts,
+            backend_factory=lambda _config, _artifacts: MockDetectorBackend(()),
+        ),
+    )
+    store = RoastSessionStore(default_log_dir=tmp_path / "logs")
+    session = store.start_session()
+    runtime.start_for_session(session)
+    store.record_event(session, "beans_added")
+    runtime.process_available_windows(session_store=store, session=session)
+    event = store.record_event(session, "first_crack_detected")
+    runtime.notify_human_mark(session)
+    assert not pipeline.stopped
+    assert runtime._recovered_first_crack_holder == []  # pyright: ignore[reportPrivateUsage] - synthetic boundary witness
+    assert session.first_crack_monotonic_seconds == event.monotonic_seconds
+    store.record_event(session, "beans_dropped")
+    runtime.close_observation(session, reason="beans_dropped")
+    assert runtime._observer is not None and runtime._observer.reaped.wait(2)  # pyright: ignore[reportPrivateUsage] - synthetic boundary witness
+    _, plan = runtime.recording_for_session(session.id)
+    assert plan is not None
+    with wave.open(str(plan.primary_wav), "rb") as stream:
+        assert stream.getnframes() == 320
+    assert plan.recording_sidecar.is_file()
+    assert session.first_crack_monotonic_seconds == event.monotonic_seconds
+
+
+def _manual_runtime_fixture(
+    tmp_path: Path,
+    *,
+    stop_barrier: tuple[Event, Event] | None = None,
+    fail_capture_start: bool = False,
+    session_is_retained: Callable[[str], bool] | None = None,
+):
+    from coffee_roaster_mcp.config import LoggingConfig
+    from coffee_roaster_mcp.first_crack_observer import load_observation_model
+
+    model = tmp_path / "synthetic-model"
+    model.write_bytes(b"synthetic")
+    prep = tmp_path / "synthetic-prep"
+    prep.write_text("{}", encoding="utf-8")
+    artifacts = ResolvedDetectorArtifacts(
+        ResolvedArtifact("test", None, "model.onnx", model),
+        ResolvedArtifact("test", None, "preprocessor.json", prep),
+    )
+    config = AppConfig(
+        first_crack=FirstCrackConfig(mode="audio", event_authority="manual"),
+        recording=RecordingConfig(
+            enabled=True, autocapture=True, export_location=tmp_path / "recordings"
+        ),
+        logging=LoggingConfig(log_dir=tmp_path / "logs"),
+    )
+    captures: list[FakeAudioPipeline] = []
+
+    class RecordingCapture(FakeAudioPipeline):
+        recorder: RoastRecorder | None = None
+
+        def start(self) -> AudioCaptureSnapshot:
+            assert self.recorder is not None
+            self.recorder.begin()
+            self.recorder.write_samples((0.0,) * 160)
+            result = super().start()
+            if fail_capture_start:
+                raise AudioCaptureError("synthetic partial start failure")
+            return result
+
+        def stop(self, *, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
+            if stop_barrier is not None:
+                stop_barrier[0].set()
+                assert stop_barrier[1].wait(5)
+            if self.recorder is not None and not self.stopped:
+                self.recorder.write_samples((0.0,) * 160)
+                self.recorder.close()
+            return super().stop(timeout_seconds=timeout_seconds)
+
+    def capture_factory(_: AudioConfig) -> RecordingCapture:
+        pipeline = RecordingCapture()
+        pipeline.recorder = runtime._pending_recorder  # pyright: ignore[reportPrivateUsage] - synthetic lifecycle witness
+        captures.append(pipeline)
+        return pipeline
+
+    runtime = FirstCrackSessionRuntime(
+        config=config,
+        audio_pipeline_factory=capture_factory,
+        session_is_retained=session_is_retained,
+        observation_model_loader=lambda fc: load_observation_model(
+            fc,
+            resolver=lambda _: artifacts,
+            backend_factory=lambda _config, _artifacts: MockDetectorBackend(()),
+        ),
+    )
+    return runtime, captures, config
+
+
+@pytest.mark.parametrize(
+    "failure", ["constructor", "observer_start", "observer_refused", "capture_start"]
+)
+def test_partial_setup_keeps_single_slot_until_off_request_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import threading
+
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+
+    entered = Event()
+    release = Event()
+    runtime, captures, config = _manual_runtime_fixture(
+        tmp_path, stop_barrier=(entered, release), fail_capture_start=failure == "capture_start"
+    )
+    if failure == "constructor":
+
+        def fail_constructor(**_: object):
+            raise RuntimeError("synthetic constructor failure")
+
+        monkeypatch.setattr(runtime_module, "FirstCrackObserver", fail_constructor)
+    elif failure == "observer_start":
+
+        def fail_start(self: object, reservation: object | None = None) -> bool:
+            raise RuntimeError("synthetic start failure")
+
+        monkeypatch.setattr(runtime_module.FirstCrackObserver, "start", fail_start)
+    if failure == "observer_refused":
+
+        def refused_start(self: object, reservation: object | None = None) -> bool:
+            return False
+
+        monkeypatch.setattr(runtime_module.FirstCrackObserver, "start", refused_start)
+    store = RoastSessionStore(default_log_dir=tmp_path / "logs")
+    snapshot = runtime.start_for_session(store.start_session())
+    assert snapshot.status == "unavailable" and entered.wait(2)
+    cleanup = runtime._capture_cleanup  # pyright: ignore[reportPrivateUsage] - synthetic lifecycle witness
+    assert cleanup is not None and not cleanup.reaped.is_set()
+    assert snapshot.observation is not None and not snapshot.observation.worker_reaped
+    assert len(captures) == 1 and not captures[0].stopped
+    assert (
+        sum(
+            t.name in {"fc-observation-worker", "fc-observation-cleanup"}
+            for t in threading.enumerate()
+        )
+        <= 1
+    )
+    calls: list[str] = []
+    next_runtime = FirstCrackSessionRuntime(
+        config=config,
+        audio_pipeline_factory=lambda _: calls.append("capture") or FakeAudioPipeline(),
+    )
+    other_store = RoastSessionStore(default_log_dir=tmp_path / "other")
+    denied = next_runtime.start_for_session(other_store.start_session())
+    assert denied.reason == "previous_observer_not_reaped" and not calls
+    release.set()
+    assert cleanup.reaped.wait(2)
+    assert captures[0].stopped and not runtime.snapshot().active
+
+
+def test_public_runtime_supersession_cannot_publish_old_result(tmp_path: Path) -> None:
+    runtime, _captures, _config = _manual_runtime_fixture(tmp_path)
+    entered = Event()
+    release = Event()
+    original = runtime._observation_model_loader  # pyright: ignore[reportPrivateUsage] - synthetic lifecycle witness
+
+    def blocked(fc: FirstCrackConfig):
+        entered.set()
+        assert release.wait(5)
+        return original(fc)
+
+    runtime._observation_model_loader = blocked  # pyright: ignore[reportPrivateUsage] - synthetic lifecycle witness
+    first_store = RoastSessionStore(default_log_dir=tmp_path / "first")
+    first = first_store.start_session()
+    runtime.start_for_session(first)
+    assert entered.wait(2)
+    old = runtime._observer  # pyright: ignore[reportPrivateUsage] - synthetic lifecycle witness
+    assert old is not None
+    next_store = RoastSessionStore(default_log_dir=tmp_path / "next")
+    second = next_store.start_session()
+    denied = runtime.start_for_session(second)
+    assert denied.active_session_id == second.id and denied.status == "unavailable"
+    assert denied.observation is not None and denied.observation.first_confirmation.value is None
+    release.set()
+    assert old.reaped.wait(2)
+    after = runtime.snapshot()
+    assert after.active_session_id == second.id
+    assert after.observation is not None and after.observation.first_confirmation.value is None
+    assert first.first_crack_at_utc is None and second.first_crack_at_utc is None
+
+
+def test_successful_manual_finalise_accepts_next_recording_metadata(tmp_path: Path) -> None:
+    runtime, _captures, _ = _manual_runtime_fixture(tmp_path)
+    store = RoastSessionStore(default_log_dir=tmp_path / "logs")
+    runtime.set_recording_metadata(origin="first", roast_num=1)
+    first = store.start_session()
+    runtime.start_for_session(first)
+    runtime.close_observation(first, reason="beans_dropped")
+    assert runtime._observer is not None and runtime._observer.reaped.wait(2)  # pyright: ignore[reportPrivateUsage] - synthetic lifecycle witness
+    assert runtime.finalise_for_session(first.id) == ("stopped", None, False)
+    assert not runtime.snapshot().active and not runtime._recorder_built_for_session  # pyright: ignore[reportPrivateUsage] - synthetic lifecycle witness
+    assert runtime.snapshot().observation is not None
+    runtime.set_recording_metadata(origin="second", roast_num=2)
+    second_store = RoastSessionStore(default_log_dir=tmp_path / "second")
+    second = second_store.start_session()
+    runtime.start_for_session(second)
+    _, plan = runtime.recording_for_session(second.id)
+    assert plan is not None and "second-roast2" in plan.primary_wav.name
+    runtime.close_observation(second, reason="beans_dropped")
+    assert runtime._observer is not None and runtime._observer.reaped.wait(2)  # pyright: ignore[reportPrivateUsage] - synthetic lifecycle witness
+    assert runtime.finalise_for_session(second.id) == ("stopped", None, False)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("confidence_threshold", float("nan")),
+        ("min_positive_windows", 0),
+        ("confirmation_window_seconds", float("inf")),
+        ("hop_seconds", 0.0),
+    ],
+)
+def test_invalid_direct_manual_settings_refuse_before_capture(
+    tmp_path: Path, field: str, value: float
+) -> None:
+    from dataclasses import replace
+
+    _runtime, captures, config = _manual_runtime_fixture(tmp_path)
+    bad = (
+        replace(config, audio=replace(config.audio, hop_seconds=value))
+        if field == "hop_seconds"
+        else replace(config, first_crack=replace(config.first_crack, **{field: value}))
+    )
+    calls: list[str] = []
+    refused = FirstCrackSessionRuntime(
+        config=bad, audio_pipeline_factory=lambda _: calls.append("capture") or FakeAudioPipeline()
+    )
+    store = RoastSessionStore(default_log_dir=tmp_path / "logs")
+    snapshot = refused.start_for_session(store.start_session())
+    assert snapshot.status == "unavailable" and snapshot.observation is None
+    assert snapshot.reason == "manual_authority_not_admitted"
+    assert not calls and not captures
+
+
+def test_injected_missing_recorder_is_never_started_not_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+
+    _unused, _, config = _manual_runtime_fixture(tmp_path)
+
+    def no_recorder(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(runtime_module, "build_session_recorder", no_recorder)
+    runtime = FirstCrackSessionRuntime(
+        config=config,
+        audio_pipeline_factory=lambda _: FakeAudioPipeline(),
+        observation_model_loader=_unused._observation_model_loader,  # pyright: ignore[reportPrivateUsage] - synthetic only
+    )
+    store = RoastSessionStore(default_log_dir=tmp_path / "missing-recorder")
+    session = store.start_session()
+    runtime.start_for_session(session)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - injected recorder boundary
+    assert observer is not None
+    try:
+        clock = observer.clock.at(session.monotonic_start)
+        assert clock.recording_relative_seconds.value is None
+        assert clock.recording_relative_seconds.null_reason == "recorder_never_started"
+        assert not observer.clock.recording_pending
+    finally:
+        runtime.close_observation(session, reason="beans_dropped")
+        assert observer.reaped.wait(2)
+
+
+def test_unreaped_manual_finalisation_reports_existing_detail_token(tmp_path: Path) -> None:
+    runtime, _, _ = _manual_runtime_fixture(tmp_path)
+    entered, release = Event(), Event()
+    original = runtime._observation_model_loader  # pyright: ignore[reportPrivateUsage]
+
+    def blocked(fc: FirstCrackConfig):
+        entered.set()
+        assert release.wait(5)
+        return original(fc)
+
+    runtime._observation_model_loader = blocked  # pyright: ignore[reportPrivateUsage]
+    store = RoastSessionStore(default_log_dir=tmp_path / "pending-finalise")
+    session = store.start_session()
+    runtime.start_for_session(session)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert observer is not None
+    try:
+        assert entered.wait(2)
+        status, detail, pending = runtime.finalise_for_session(session.id)
+        assert status == "capture_still_running" and pending
+        assert detail is not None and "observer_still_running" in detail
+    finally:
+        release.set()
+        assert observer.reaped.wait(2)
+
+
+def test_supervisor_is_manual_only_singleton_and_survives_failure_callback(tmp_path: Path) -> None:
+    """Isolated process: no immortal test supervisor leaks into this pytest process."""
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    script = """
+import threading
+from coffee_roaster_mcp.config import AppConfig, FirstCrackConfig, RecordingConfig
+from coffee_roaster_mcp.first_crack_runtime import (
+    FirstCrackRuntimeSnapshot,
+    FirstCrackSessionRuntime,
+)
+from coffee_roaster_mcp.first_crack_observer import coordinator
+from coffee_roaster_mcp.session import RoastSessionStore
+
+def supervisors():
+    return [t for t in threading.enumerate() if t.name == 'fc-observation-supervisor']
+auto = FirstCrackSessionRuntime(config=AppConfig())
+auto.start_for_session(RoastSessionStore().start_session())
+assert supervisors() == []
+config = AppConfig(
+    first_crack=FirstCrackConfig(mode='audio', event_authority='manual'),
+    recording=RecordingConfig(enabled=True, autocapture=True))
+first = FirstCrackSessionRuntime(config=config)
+second = FirstCrackSessionRuntime(config=config)
+assert len(supervisors()) == 1
+failed = threading.Event()
+class BrokenOwner:
+    reaped = threading.Event()
+    def check_deadline(self):
+        raise ValueError('synthetic deadline error')
+    def supervision_failed(self):
+        failed.set()
+        raise ValueError('synthetic reporting error')
+broken = BrokenOwner()
+shared = coordinator()
+assert shared.claim(broken)
+shared.wake.set()
+assert failed.wait(2)
+broken.reaped.set()
+reached = threading.Event()
+class ValidOwner:
+    reaped = threading.Event()
+    def check_deadline(self):
+        reached.set()
+    def supervision_failed(self):
+        raise AssertionError('valid owner must not fail')
+valid = ValidOwner()
+assert shared.claim(valid)
+shared.wake.set()
+assert reached.wait(2), 'failure callback killed sole deadline supervisor'
+valid.reaped.set()
+assert len(supervisors()) == 1 and supervisors()[0].is_alive()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env={"PYTHONPATH": str(root / "src")},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_unknown_direct_authority_refuses_every_legacy_side_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+    from coffee_roaster_mcp.config import FirstCrackEventAuthority
+
+    calls: list[str] = []
+
+    def forbidden(*_args: object, **_kwargs: object):
+        calls.append("effect")
+        raise AssertionError("unknown authority reached a legacy effect")
+
+    monkeypatch.setattr(runtime_module, "build_session_recorder", forbidden)
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(
+            first_crack=FirstCrackConfig(
+                mode="audio", event_authority=cast(FirstCrackEventAuthority, "unknown")
+            ),
+            recording=RecordingConfig(enabled=True, autocapture=True),
+        ),
+        audio_pipeline_factory=forbidden,
+        detector_adapter_factory=forbidden,
+        observation_model_loader=forbidden,
+    )
+    store = RoastSessionStore(default_log_dir=tmp_path / "unknown")
+    snapshot = runtime.start_for_session(store.start_session())
+    assert snapshot.status == "unavailable"
+    assert snapshot.reason == "first_crack_authority_not_admitted"
+    assert not snapshot.audio_running and snapshot.observation is None
+    assert not calls
+
+
+def test_invalid_direct_driver_preserves_representable_refusal(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    from coffee_roaster_mcp.config import RoasterConfig
+
+    _unused, _, config = _manual_runtime_fixture(tmp_path)
+    config = replace(config, roaster=RoasterConfig(driver="hottop_kn8828b_2k_plus"))
+    calls: list[str] = []
+    runtime = FirstCrackSessionRuntime(
+        config=config,
+        audio_pipeline_factory=lambda _: calls.append("capture") or FakeAudioPipeline(),
+    )
+    store = RoastSessionStore(default_log_dir=tmp_path / "invalid-driver")
+    snapshot = runtime.start_for_session(store.start_session())
+    assert snapshot.status == "unavailable" and snapshot.reason == "manual_authority_not_admitted"
+    assert snapshot.observation is not None
+    assert snapshot.observation.observer_state == "not_admitted"
+    assert (
+        snapshot.observation.settings.confidence_threshold
+        == config.first_crack.confidence_threshold
+    )
+    assert not calls
+
+
+def test_late_release_keeps_tools_sampler_and_finalise_live_then_admits_successor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+    from types import SimpleNamespace
+
+    from coffee_roaster_mcp.mcp_server import build_server_context, create_mcp_server
+
+    runtime, captures, config = _manual_runtime_fixture(tmp_path)
+    config_file = tmp_path / "context.yaml"
+    config_file.write_text(
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"logging:\n  log_dir: {tmp_path / 'context-logs'}\n",
+        encoding="utf-8",
+    )
+    context = build_server_context(config_path=config_file)
+    object.__setattr__(context, "first_crack_runtime", runtime)
+    server = create_mcp_server(config_path=config_file)
+    ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=context))
+
+    def call(name: str):
+        tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
+        assert tool is not None
+        return tool.fn(ctx)
+
+    session = context.session_store.start_session()
+    runtime.start_for_session(session)
+    pipeline = captures[0]
+    released, persisted, after_persist = Event(), Event(), Event()
+    stop_calls: list[str] = []
+    original_stop = pipeline.stop
+
+    def stop(*, timeout_seconds: float = 1.0):
+        stop_calls.append("stop")
+        return original_stop(timeout_seconds=timeout_seconds)
+
+    def capture_released(self: FakeAudioPipeline) -> bool:
+        if self is pipeline:
+            if persisted.is_set():
+                after_persist.set()
+            return released.is_set()
+        return self.stopped
+
+    monkeypatch.setattr(pipeline, "stop", stop)
+    monkeypatch.setattr(type(pipeline), "shutdown_confirmed", property(capture_released))
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert observer is not None
+    call("mark_beans_added")
+    runtime.close_observation(session, reason="beans_dropped")
+    try:
+        # Public state polling and the sampler capability must remain available
+        # while that same observation worker is waiting for resource release.
+        def no_join(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("request joined observation worker")
+
+        assert observer._thread is not None  # pyright: ignore[reportPrivateUsage]
+        monkeypatch.setattr(observer._thread, "join", no_join)  # pyright: ignore[reportPrivateUsage]
+        deadline = time.monotonic() + 2
+        while observer.snapshot().durability != "persisted":
+            assert time.monotonic() < deadline
+            observer.changed.wait(0.001)
+        persisted.set()
+        observer.changed.set()
+        assert after_persist.wait(2)
+        assert observer.worker_running and not observer.reaped.is_set()
+        assert observer.summary is not None
+        frozen = observer.summary.model_dump_json()
+        state = call("get_roast_state")
+        assert state.session_id == session.id
+        runtime.process_available_windows(session_store=context.session_store, session=session)
+        call("mark_first_crack")
+        assert session.first_crack_at_utc is not None
+        call("drop_beans")
+        call("stop_cooling")
+        assert runtime.finalise_for_session(session.id)[0] == "capture_still_running"
+        assert stop_calls == ["stop"]
+    finally:
+        released.set()
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+    assert runtime.finalise_for_session(session.id) == ("stopped", None, False)
+    assert observer.summary.model_dump_json() == frozen
+    assert stop_calls == ["stop"]
+    # A different runtime proves the process-wide slot was released, not merely
+    # a local finalisation flag. All capture/model work remains synthetic.
+    successor = FirstCrackSessionRuntime(
+        config=config,
+        audio_pipeline_factory=lambda _: FakeAudioPipeline(),
+        observation_model_loader=runtime._observation_model_loader,  # pyright: ignore[reportPrivateUsage]
+    )
+    other = RoastSessionStore(default_log_dir=tmp_path / "successor").start_session()
+    admitted = successor.start_for_session(other)
+    next_observer = successor._observer  # pyright: ignore[reportPrivateUsage]
+    assert next_observer is not None and admitted.status == "pending"
+    successor.close_observation(other, reason="beans_dropped")
+    assert next_observer.reaped.wait(2)
+
+
+def _retains_session(store: RoastSessionStore, session_id: str) -> bool:
+    try:
+        store.get_session_snapshot(session_id=session_id)
+    except SessionLifecycleError:
+        return False
+    return True
+
+
+def _complete_manual_observation(runtime: FirstCrackSessionRuntime, store: RoastSessionStore):
+    session = store.start_session()
+    runtime.start_for_session(session)
+    store.record_event(session, "beans_added")
+    store.record_event(session, "first_crack_detected")
+    runtime.notify_human_mark(session)
+    store.record_event(session, "beans_dropped")
+    runtime.close_observation(session, reason="beans_dropped")
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - scoped synthetic lifecycle
+    assert observer is not None and observer.reaped.wait(2)
+    assert runtime.finalise_for_session(session.id) == ("stopped", None, False)
+    store.stop_session()
+    return session
+
+
+@pytest.mark.parametrize("limit", [1, 3, 12])
+def test_observation_history_follows_actual_store_retention(tmp_path: Path, limit: int) -> None:
+    import threading
+
+    store = RoastSessionStore(default_log_dir=tmp_path / "retained", session_history_limit=limit)
+    runtime: FirstCrackSessionRuntime
+    threads: list[str] = []
+
+    def retained(session_id: str) -> bool:
+        assert not runtime._lock._is_owned()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue, reportUnknownMemberType]
+        threads.append(threading.current_thread().name)
+        return _retains_session(store, session_id)
+
+    runtime, _, _ = _manual_runtime_fixture(tmp_path, session_is_retained=retained)
+    sessions = [_complete_manual_observation(runtime, store) for _ in range(limit + 2)]
+    retained_ids = {session.id for session in sessions[-limit:]}
+    for session in sessions:
+        observation = runtime.observation_for_session(session.id)
+        if session.id not in retained_ids:
+            assert observation is None
+        else:
+            assert observation is not None and observation.worker_reaped
+            summary = observation.frozen_summary.value
+            assert summary is not None and summary.human_mark.value is not None
+            assert (
+                summary.human_mark.value.session_relative_seconds.value
+                == session.first_crack_monotonic_seconds
+            )
+    history = runtime._observation_history  # pyright: ignore[reportPrivateUsage]
+    assert set(history) <= retained_ids and len(history) <= limit
+    assert all(entry.observer is None and entry.cleanup is None for entry in history.values())
+    assert threads and set(threads) == {threading.current_thread().name}
+
+
+def test_observation_history_without_membership_is_current_only(tmp_path: Path) -> None:
+    runtime, _, _ = _manual_runtime_fixture(tmp_path)
+    store = RoastSessionStore(default_log_dir=tmp_path / "current-only")
+    first = _complete_manual_observation(runtime, store)
+    second = _complete_manual_observation(runtime, store)
+    assert runtime.observation_for_session(first.id) is None
+    assert runtime.observation_for_session(second.id) is not None
+    assert not runtime._observation_history  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("limit", [1, 3])
+def test_pending_history_is_own_generation_and_prunes_evicted_owner(
+    tmp_path: Path, limit: int
+) -> None:
+    store = RoastSessionStore(
+        default_log_dir=tmp_path / "pending-history", session_history_limit=limit
+    )
+    runtime, _, _ = _manual_runtime_fixture(
+        tmp_path, session_is_retained=lambda sid: _retains_session(store, sid)
+    )
+    entered, release = Event(), Event()
+    original = runtime._observation_model_loader  # pyright: ignore[reportPrivateUsage]
+
+    def blocked(fc: FirstCrackConfig):
+        entered.set()
+        assert release.wait(5)
+        return original(fc)
+
+    runtime._observation_model_loader = blocked  # pyright: ignore[reportPrivateUsage]
+    first = store.start_session()
+    runtime.start_for_session(first)
+    owner = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None
+    try:
+        assert entered.wait(2)
+        store.stop_session()
+        second = store.start_session()
+        refused = runtime.start_for_session(second)
+        assert refused.reason == "previous_observer_not_reaped"
+        before = runtime.observation_for_session(second.id)
+        assert before is not None and before.observer_state == "not_admitted"
+        previous = runtime.observation_for_session(first.id)
+        if limit == 1:
+            assert previous is None
+            assert first.id not in runtime._observation_history  # pyright: ignore[reportPrivateUsage]
+        else:
+            assert previous is not None and previous.durability == "pending"
+            assert previous.frozen_summary.value is not None
+        assert not owner.reaped.is_set()
+    finally:
+        release.set()
+        assert owner.reaped.wait(2)
+    after = runtime.observation_for_session(first.id)
+    if limit > 1:
+        assert after is not None and after.worker_reaped and after.durability == "persisted"
+        entry = runtime._observation_history[first.id]  # pyright: ignore[reportPrivateUsage]
+        assert entry.observer is None
+    else:
+        assert after is None
+    assert runtime.observation_for_session(second.id) == before
+    assert runtime.snapshot().active_session_id == second.id
+    assert first.first_crack_at_utc is None and second.first_crack_at_utc is None
+
+
+def test_blocked_history_membership_never_participates_in_sampler_or_dispatch(
+    tmp_path: Path,
+) -> None:
+    import threading
+
+    store = RoastSessionStore(default_log_dir=tmp_path / "history-callback")
+    entered, release = Event(), Event()
+    forbid_main = [False]
+    runtime: FirstCrackSessionRuntime
+
+    def retained(session_id: str) -> bool:
+        assert not runtime._lock._is_owned()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue, reportUnknownMemberType]
+        assert threading.current_thread().name not in {
+            "fc-observation-worker",
+            "fc-observation-supervisor",
+        }
+        if threading.current_thread().name == "history-reader":
+            entered.set()
+            assert release.wait(5)
+        else:
+            assert not forbid_main[0], "retention callback reached a canonical/sampler path"
+        return _retains_session(store, session_id)
+
+    runtime, _, _ = _manual_runtime_fixture(tmp_path, session_is_retained=retained)
+    first = _complete_manual_observation(runtime, store)
+    second = store.start_session()
+    runtime.start_for_session(second)
+    owner = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None
+    reader = threading.Thread(
+        target=lambda: runtime.observation_for_session(first.id), name="history-reader"
+    )
+    reader.start()
+    try:
+        assert entered.wait(2)
+        forbid_main[0] = True
+        store.record_event(second, "beans_added")
+        runtime.process_available_windows(session_store=store, session=second)
+        store.record_event(second, "first_crack_detected")
+        runtime.notify_human_mark(second)
+        store.record_event(second, "beans_dropped")
+        runtime.close_observation(second, reason="beans_dropped")
+        runtime.stop_for_session(second.id, reason="synthetic stop")
+        runtime.snapshot()
+        assert owner.reaped.wait(2)
+    finally:
+        forbid_main[0] = False
+        release.set()
+        reader.join(2)
+        assert not reader.is_alive()
+
+
+def test_manual_paced_wav_refuses_before_recorder_model_capture_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+
+    _, _, config = _manual_runtime_fixture(tmp_path)
+    config = replace(
+        config,
+        audio=replace(
+            config.audio,
+            source="wav",
+            replay_mode="detector_paced",
+            wav_path=tmp_path / "never-opened.wav",
+        ),
+    )
+    effects: list[str] = []
+
+    def forbidden(*_args: object, **_kwargs: object):
+        effects.append("effect")
+        raise AssertionError("recording-incompatible replay reached an effect")
+
+    monkeypatch.setattr(runtime_module, "build_session_recorder", forbidden)
+    runtime = FirstCrackSessionRuntime(
+        config=config,
+        audio_pipeline_factory=forbidden,
+        detector_adapter_factory=forbidden,
+        observation_model_loader=forbidden,
+    )
+    store = RoastSessionStore(default_log_dir=tmp_path / "paced-refusal")
+    for _ in range(2):
+        session = store.start_session()
+        snapshot = runtime.start_for_session(session)
+        assert (
+            snapshot.status == "unavailable" and snapshot.reason == "manual_authority_not_admitted"
+        )
+        assert (
+            snapshot.observation is not None
+            and snapshot.observation.observer_state == "not_admitted"
+        )
+        assert not effects
+        assert config.audio.replay_mode == "detector_paced"
+        assert config.recording.enabled and config.recording.autocapture
+        store.stop_session()
+
+
+@pytest.mark.parametrize("limit", [1, 3])
+def test_cleanup_history_scope_and_shutdown_owner_survive_successor_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: int
+) -> None:
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+
+    store = RoastSessionStore(
+        default_log_dir=tmp_path / "cleanup-history", session_history_limit=limit
+    )
+    runtime, captures, _ = _manual_runtime_fixture(
+        tmp_path, session_is_retained=lambda sid: _retains_session(store, sid)
+    )
+    entered, release = Event(), Event()
+    stops: list[str] = []
+    closes: list[str] = []
+    original_factory = runtime._audio_pipeline_factory  # pyright: ignore[reportPrivateUsage]
+
+    def pipeline_factory(audio: AudioConfig):
+        pipeline = original_factory(audio)
+        recorder = cast(RoastRecorder | None, cast(Any, captures[-1]).recorder)
+        assert recorder is not None
+        original_close = recorder.close
+
+        def stop(*, timeout_seconds: float = 1.0):
+            stops.append("stop")
+            entered.set()
+            assert release.wait(5)
+            captures[-1].stopped = True
+            return pipeline.snapshot()
+
+        def close() -> None:
+            closes.append("close")
+            original_close()
+
+        monkeypatch.setattr(pipeline, "stop", stop)
+        monkeypatch.setattr(recorder, "close", close)
+        return pipeline
+
+    def refused_start(self: object, reservation: object | None = None) -> bool:
+        return False
+
+    monkeypatch.setattr(runtime, "_audio_pipeline_factory", pipeline_factory)
+    monkeypatch.setattr(runtime_module.FirstCrackObserver, "start", refused_start)
+    first = store.start_session()
+    runtime.start_for_session(first)
+    cleanup = runtime._capture_cleanup  # pyright: ignore[reportPrivateUsage]
+    disowned = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert cleanup is not None and disowned is not None
+
+    def forbidden_shutdown(*, timeout: float) -> None:
+        raise AssertionError("disowned observer tried a second capture stop")
+
+    monkeypatch.setattr(disowned, "shutdown_capture", forbidden_shutdown)
+    try:
+        assert entered.wait(2)
+        store.stop_session()
+        second = store.start_session()
+        denied = runtime.start_for_session(second)
+        before = runtime.observation_for_session(second.id)
+        assert denied.reason == "previous_observer_not_reaped"
+        assert before is not None and before.observer_state == "not_admitted"
+        assert runtime.finalise_for_session(second.id) == ("not_active", None, False)
+        runtime._stop_timeout_seconds = 0  # pyright: ignore[reportPrivateUsage] - injected wait budget
+        runtime.shutdown()
+        assert stops == ["stop"] and closes == []
+        assert not cleanup.finished.is_set() and not cleanup.reaped.is_set()
+        if limit == 1:
+            assert runtime.observation_for_session(first.id) is None
+        else:
+            previous = runtime.observation_for_session(first.id)
+            assert previous is not None and previous.observer_state == "incomplete"
+    finally:
+        release.set()
+        assert cleanup.reaped.wait(2)
+    assert stops == ["stop"] and closes == ["close"]
+    assert runtime.observation_for_session(second.id) == before
+    if limit > 1:
+        previous = runtime.observation_for_session(first.id)
+        assert previous is not None and previous.worker_reaped
+        assert previous.observer_state == "unavailable" and previous.durability == "failed"
+        assert runtime._observation_history[first.id].cleanup is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_history_lookup_is_memory_only_and_does_not_restore_across_runtime_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RoastSessionStore(default_log_dir=tmp_path / "memory-only")
+
+    def retained(session_id: str) -> bool:
+        return _retains_session(store, session_id)
+
+    runtime, _, config = _manual_runtime_fixture(tmp_path, session_is_retained=retained)
+    first = _complete_manual_observation(runtime, store)
+    _complete_manual_observation(runtime, store)
+    expected = runtime.observation_for_session(first.id)
+    effects: list[str] = []
+
+    def forbidden(*_args: object, **_kwargs: object):
+        effects.append("I/O or model")
+        raise AssertionError("historical lookup tried to read files or run a model")
+
+    fresh = FirstCrackSessionRuntime(
+        config=config,
+        session_is_retained=retained,
+        audio_pipeline_factory=forbidden,
+        detector_adapter_factory=forbidden,
+        observation_model_loader=forbidden,
+        observation_sink_factory=forbidden,
+    )
+    monkeypatch.setattr(runtime, "_observation_model_loader", forbidden)
+    monkeypatch.setattr(runtime, "_observation_sink_factory", forbidden)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", forbidden)
+        historical = runtime.observation_for_session(first.id)
+        absent = fresh.observation_for_session(first.id)
+    assert historical == expected and expected is not None
+    assert absent is None and not effects
+
+
+@pytest.mark.parametrize("owner_kind", ["observer", "cleanup"])
+def test_new_admission_compacts_all_retained_terminal_handles_without_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner_kind: str
+) -> None:
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+
+    store = RoastSessionStore(
+        default_log_dir=tmp_path / "terminal-history", session_history_limit=3
+    )
+    entered, release = Event(), Event()
+    runtime, _, _ = _manual_runtime_fixture(
+        tmp_path,
+        stop_barrier=(entered, release) if owner_kind == "cleanup" else None,
+        session_is_retained=lambda sid: _retains_session(store, sid),
+    )
+    original_loader = runtime._observation_model_loader  # pyright: ignore[reportPrivateUsage]
+    original_start = runtime_module.FirstCrackObserver.start
+
+    def blocked(fc: FirstCrackConfig):
+        entered.set()
+        assert release.wait(5)
+        return original_loader(fc)
+
+    def refused_start(self: object, reservation: object | None = None) -> bool:
+        return False
+
+    if owner_kind == "observer":
+        monkeypatch.setattr(runtime, "_observation_model_loader", blocked)
+    else:
+        monkeypatch.setattr(runtime_module.FirstCrackObserver, "start", refused_start)
+    first = store.start_session()
+    runtime.start_for_session(first)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    cleanup = runtime._capture_cleanup  # pyright: ignore[reportPrivateUsage]
+    owner = observer if owner_kind == "observer" else cleanup
+    assert owner is not None
+    try:
+        assert entered.wait(2)
+        store.stop_session()
+        second = store.start_session()
+        assert runtime.start_for_session(second).reason == "previous_observer_not_reaped"
+        # Do not call observation_for_session(A): the next admission must
+        # compact every retained terminal handle without a historical read.
+        entry = runtime._observation_history[first.id]  # pyright: ignore[reportPrivateUsage]
+        assert entry.observer is owner if owner_kind == "observer" else entry.cleanup is owner
+    finally:
+        release.set()
+        assert owner.reaped.wait(2)
+    if owner_kind == "observer":
+        assert observer is not None
+        expected = observer.snapshot()
+    else:
+        expected = entry.snapshot.model_copy(
+            update=dict(observer_state="unavailable", worker_reaped=True, durability="failed")
+        )
+    monkeypatch.setattr(runtime, "_observation_model_loader", original_loader)
+    monkeypatch.setattr(runtime_module.FirstCrackObserver, "start", original_start)
+    store.stop_session()
+    third = store.start_session()
+    runtime.start_for_session(third)
+    next_owner = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert next_owner is not None
+    try:
+        compacted = runtime._observation_history[first.id]  # pyright: ignore[reportPrivateUsage]
+        assert compacted.observer is None and compacted.cleanup is None
+        assert compacted.snapshot == expected
+        assert runtime.snapshot().active_session_id == third.id
+    finally:
+        runtime.close_observation(third, reason="beans_dropped")
+        assert next_owner.reaped.wait(2)
+
+
+def test_public_manual_emergency_cutoff_uses_this_accepted_event_not_cleanup_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _accepted_emergency_clock_witness(tmp_path, monkeypatch, trigger="public")
+
+
+def test_sampler_failure_cutoff_uses_this_accepted_event_not_cleanup_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _accepted_emergency_clock_witness(tmp_path, monkeypatch, trigger="sampler")
+
+
+def _accepted_emergency_clock_witness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, trigger: str
+) -> None:
+    import time
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from coffee_roaster_mcp.first_crack_observation import Record, WindowRecord
+    from coffee_roaster_mcp.first_crack_observer import JsonlObservationSink
+    from coffee_roaster_mcp.mcp_server import (
+        _fault_active_session_after_sampler_failure,  # pyright: ignore[reportPrivateUsage]
+        build_server_context,
+        create_mcp_server,
+    )
+    from coffee_roaster_mcp.session import RoastSession
+
+    runtime, captures, config = _manual_runtime_fixture(tmp_path)
+    base = time.monotonic()
+    clock = [base]
+    utc_origin = datetime(2026, 11, 8, tzinfo=UTC)
+    store = RoastSessionStore(
+        default_log_dir=tmp_path / "event-clock",
+        monotonic_now=lambda: clock[0],
+        utc_now=lambda: utc_origin + timedelta(seconds=clock[0] - base),
+    )
+    runtime._monotonic_now = lambda: clock[0]  # pyright: ignore[reportPrivateUsage]
+    entered, release = Event(), Event()
+    original_loader = runtime._observation_model_loader  # pyright: ignore[reportPrivateUsage]
+    rows: list[WindowRecord] = []
+
+    class EvidenceSink(JsonlObservationSink):
+        def append(self, record: Record) -> None:
+            super().append(record)
+            if isinstance(record, WindowRecord):
+                rows.append(record)
+
+    def loader(fc: FirstCrackConfig):
+        entered.set()
+        assert release.wait(5)
+        loaded = original_loader(fc)
+
+        def negative(window: AudioWindow) -> FirstCrackDetectorOutput:
+            return FirstCrackDetectorOutput(confirmed=False, confidence=0.2)
+
+        loaded.adapter.backend.detect = negative
+        return loaded
+
+    monkeypatch.setattr(runtime, "_observation_model_loader", loader)
+    monkeypatch.setattr(runtime, "_observation_sink_factory", EvidenceSink)
+    path = tmp_path / "context.yaml"
+    path.write_text(f"logging:\n  log_dir: {tmp_path / 'context-logs'}\n", encoding="utf-8")
+    context = build_server_context(config_path=path)
+    object.__setattr__(context, "config", config)
+    object.__setattr__(context, "session_store", store)
+    object.__setattr__(context, "first_crack_runtime", runtime)
+    server = create_mcp_server(config_path=path)
+    ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=context))
+
+    def call(name: str, **arguments: object):
+        tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
+        assert tool is not None
+        return tool.fn(ctx, **arguments)
+
+    def emergency_event(*, repeated: bool = False):
+        if trigger == "public":
+            return call(
+                "emergency_stop",
+                reason="synthetic clock witness",
+                **({"expected_session_id": session_id} if repeated else {}),
+            ).event
+        active = store.get_latest_session()
+        assert active is not None
+        _fault_active_session_after_sampler_failure(
+            context, session=active, error=RuntimeError("synthetic sampler witness")
+        )
+        return store.get_session_snapshot(session_id=active.id).event_timeline[-1]
+
+    started = call("start_roast_session", first_crack_observer_ack="manual/v1")
+    session_id = started.session.session_id
+    context.telemetry_sampler.stop_for_session(session_id, reason="controlled synthetic clock")
+    owner = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None
+    trace: list[str] = []
+    cutoffs: list[float | None] = []
+    original_emergency = context.roaster_driver.emergency_stop
+    original_event = store.emergency_stop_snapshot
+    original_close = runtime.close_observation
+
+    def emergency(*, reason: str):
+        result = original_emergency(reason=reason)
+        trace.append("driver")
+        return result
+
+    def accepted(*args: Any, **kwargs: Any):
+        result = original_event(*args, **kwargs)
+        trace.append("accepted_event")
+        clock[0] += 10  # Delay only after the real accepted event exists.
+        return result
+
+    def close(
+        session: RoastSession, *, reason: str, cutoff_monotonic_seconds: float | None = None
+    ) -> None:
+        assert trace[-1] == "accepted_event"
+        assert reason == (
+            "emergency_stop" if trigger == "public" else "autonomous_telemetry_sampler_failure"
+        )
+        cutoffs.append(cutoff_monotonic_seconds)
+        trace.append("close")
+        return original_close(
+            session, reason=reason, cutoff_monotonic_seconds=cutoff_monotonic_seconds
+        )
+
+    monkeypatch.setattr(context.roaster_driver, "emergency_stop", emergency)
+    monkeypatch.setattr(store, "emergency_stop_snapshot", accepted)
+    monkeypatch.setattr(runtime, "close_observation", close)
+    try:
+        assert entered.wait(2)
+        clock[0] = base + 1
+        call("mark_beans_added")
+        captures[0].add_window(
+            _audio_window(sequence_number=1, started_at_monotonic_seconds=base + 8)
+        )
+        captures[0].add_window(
+            _audio_window(sequence_number=2, started_at_monotonic_seconds=base + 9)
+        )
+        captures[0].add_window(
+            _audio_window(sequence_number=3, started_at_monotonic_seconds=base + 10)
+        )
+        clock[0] = base + 10
+        first = emergency_event()
+        assert first.monotonic_seconds == 10
+        assert clock[0] == base + 20
+        assert cutoffs == [base + 10]
+        assert owner.cutoff == base + 10
+    finally:
+        release.set()
+        assert owner.reaped.wait(2)
+    assert [row.payload.eligibility for row in rows] == [
+        "eligible",
+        "ineligible_post_drop",
+        "ineligible_post_drop",
+    ]
+    assert owner.confirmation is None
+    before = store.get_session_snapshot(session_id=session_id)
+    assert before.first_crack_at_utc is None
+    assert [event.kind for event in before.event_timeline] == ["beans_added", "fault"]
+    clock[0] = base + 30
+    second = emergency_event(repeated=True)
+    assert second.monotonic_seconds == 30
+    assert cutoffs == [base + 10, base + 30]
+    # Repeated command supplies its own accepted event; the first frozen
+    # observation cutoff and original canonical fault time remain immutable.
+    assert owner.cutoff == base + 10
+    after = store.get_session_snapshot(session_id=session_id)
+    assert after.faulted_monotonic_seconds == 10
+    assert [event.kind for event in after.event_timeline] == ["beans_added", "fault", "fault"]
+    assert trace == ["driver", "accepted_event", "close"] * 2
+
+
+def _assert_empty_successor_capture(snapshot: FirstCrackRuntimeSnapshot) -> None:
+    assert not snapshot.active and not snapshot.audio_running
+    assert (
+        snapshot.queued_window_count
+        == snapshot.emitted_window_count
+        == snapshot.dropped_window_count
+        == 0
+    )
+    assert snapshot.processed_window_count == snapshot.inference_overrun_count == 0
+    assert snapshot.last_inference_duration_ms == snapshot.max_inference_duration_ms == 0
+    assert snapshot.overflow_count_last_minute == snapshot.total_overflow_count == 0
+    assert snapshot.estimated_lost_audio_ms_last_minute == 0
+    assert snapshot.max_consecutive_overflow_count == 0
+    assert snapshot.mic_peak_dbfs is None and snapshot.mic_rms_dbfs is None
+    assert snapshot.status == "unavailable"
+    assert (
+        snapshot.observation is not None and snapshot.observation.first_confirmation.value is None
+    )
+
+
+def _seed_previous_capture_metrics(
+    runtime: FirstCrackSessionRuntime, pipeline: FakeAudioPipeline, monkeypatch: pytest.MonkeyPatch
+):
+    from dataclasses import replace
+
+    polls: list[str] = []
+    original = pipeline.snapshot
+
+    def snapshot() -> AudioCaptureSnapshot:
+        polls.append("A")
+        return replace(
+            original(),
+            queued_window_count=3,
+            emitted_window_count=13,
+            dropped_window_count=4,
+            latest_error="previous_A_capture_error",
+            peak_dbfs=-3,
+            rms_dbfs=-8,
+            overflow_count_last_minute=2,
+            estimated_lost_audio_ms_last_minute=150,
+            total_overflow_count=9,
+            max_consecutive_overflow_count=2,
+        )
+
+    monkeypatch.setattr(pipeline, "snapshot", snapshot)
+    runtime._processed_window_count = 7  # pyright: ignore[reportPrivateUsage]
+    runtime._last_inference_duration_ms = 81  # pyright: ignore[reportPrivateUsage]
+    runtime._max_inference_duration_ms = 125  # pyright: ignore[reportPrivateUsage]
+    runtime._inference_overrun_count = 3  # pyright: ignore[reportPrivateUsage]
+    seeded = runtime.snapshot()
+    assert seeded.emitted_window_count == 13 and seeded.processed_window_count == 7
+    return polls
+
+
+def test_refused_successor_does_not_poll_or_relabel_owned_previous_capture_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RoastSessionStore(default_log_dir=tmp_path / "projection-history")
+    runtime, captures, _ = _manual_runtime_fixture(
+        tmp_path, session_is_retained=lambda sid: _retains_session(store, sid)
+    )
+    entered, release = Event(), Event()
+    original = runtime._observation_model_loader  # pyright: ignore[reportPrivateUsage]
+
+    def blocked(fc: FirstCrackConfig):
+        entered.set()
+        assert release.wait(5)
+        return original(fc)
+
+    monkeypatch.setattr(runtime, "_observation_model_loader", blocked)
+    first = store.start_session()
+    runtime.start_for_session(first)
+    owner = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None
+    pipeline = captures[0]
+    recorder_a, plan_a = runtime.recording_for_session(first.id)
+    assert recorder_a is not None and plan_a is not None
+    try:
+        assert entered.wait(2)
+        polls = _seed_previous_capture_metrics(runtime, pipeline, monkeypatch)
+        before = len(polls)
+        store.stop_session()
+        second = store.start_session()
+        snapshot = runtime.start_for_session(second)
+        _assert_empty_successor_capture(snapshot)
+        assert runtime.snapshot().active_session_id == second.id
+        assert len(polls) == before
+        assert runtime.recording_for_session(second.id) == (None, None)
+        assert runtime._pipeline is pipeline  # pyright: ignore[reportPrivateUsage] - ownership must remain real
+        assert runtime._active_recorder is recorder_a  # pyright: ignore[reportPrivateUsage]
+        assert not owner.reaped.is_set() and not pipeline.shutdown_confirmed
+        prior = runtime.observation_for_session(first.id)
+        assert prior is not None and not prior.worker_reaped
+        assert len(captures) == 1 and not pipeline.stop_reasons
+    finally:
+        release.set()
+        assert owner.reaped.wait(2)
+    assert len(pipeline.stop_reasons) == 1
+    store.stop_session()
+    third = store.start_session()
+    runtime.start_for_session(third)
+    next_owner = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert next_owner is not None
+    try:
+        assert runtime.snapshot().active and runtime.snapshot().active_session_id == third.id
+        recorder_c, plan_c = runtime.recording_for_session(third.id)
+        assert recorder_c is not recorder_a and plan_c != plan_a
+    finally:
+        runtime.close_observation(third, reason="beans_dropped")
+        assert next_owner.reaped.wait(2)
+
+
+@pytest.mark.parametrize("stage", ["recorder", "factory", "partial_capture"])
+def test_successor_setup_failure_exposes_only_its_allocated_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from dataclasses import replace
+
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+
+    store = RoastSessionStore(default_log_dir=tmp_path / "setup-projections")
+    runtime, captures, _ = _manual_runtime_fixture(tmp_path)
+    first = store.start_session()
+    runtime.start_for_session(first)
+    first_owner = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert first_owner is not None
+    pipeline_a = captures[0]
+    recorder_a, plan_a = runtime.recording_for_session(first.id)
+    polls = _seed_previous_capture_metrics(runtime, pipeline_a, monkeypatch)
+    runtime.close_observation(first, reason="beans_dropped")
+    assert first_owner.reaped.wait(2)
+    runtime.snapshot()  # Cache A's terminal nonzero metrics; do not finalise/drop handles.
+    before = len(polls)
+    store.stop_session()
+    second = store.start_session()
+    entered, release = Event(), Event()
+    original_factory = runtime._audio_pipeline_factory  # pyright: ignore[reportPrivateUsage]
+
+    def fail_recorder(*_args: object, **_kwargs: object):
+        raise RuntimeError("synthetic recorder construction failure")
+
+    def factory(audio: AudioConfig):
+        if stage == "factory":
+            raise RuntimeError("synthetic capture construction failure")
+        pipeline = original_factory(audio)
+        start = pipeline.start
+        snapshot = pipeline.snapshot
+        stop = pipeline.stop
+
+        def own_snapshot() -> AudioCaptureSnapshot:
+            return replace(
+                snapshot(),
+                emitted_window_count=2,
+                dropped_window_count=1,
+                total_overflow_count=1,
+                peak_dbfs=-12,
+                rms_dbfs=-15,
+            )
+
+        def partial_start():
+            start()
+            raise RuntimeError("synthetic partially started B capture")
+
+        def blocked_stop(*, timeout_seconds: float = 1.0):
+            entered.set()
+            assert release.wait(5)
+            return stop(timeout_seconds=timeout_seconds)
+
+        monkeypatch.setattr(pipeline, "snapshot", own_snapshot)
+        monkeypatch.setattr(pipeline, "start", partial_start)
+        monkeypatch.setattr(pipeline, "stop", blocked_stop)
+        return pipeline
+
+    with monkeypatch.context() as patch:
+        if stage == "recorder":
+            patch.setattr(runtime_module, "build_session_recorder", fail_recorder)
+        else:
+            patch.setattr(runtime, "_audio_pipeline_factory", factory)
+        try:
+            failed = runtime.start_for_session(second)
+            assert failed.status == "unavailable" and len(polls) == before
+            recorder_b, plan_b = runtime.recording_for_session(second.id)
+            if stage == "recorder":
+                _assert_empty_successor_capture(failed)
+                assert (recorder_b, plan_b) == (None, None)
+            else:
+                assert recorder_b is not None and recorder_b is not recorder_a and plan_b != plan_a
+                cleanup = runtime._capture_cleanup  # pyright: ignore[reportPrivateUsage]
+                assert cleanup is not None
+                if stage == "factory":
+                    assert cleanup.reaped.wait(2)
+                    _assert_empty_successor_capture(runtime.snapshot())
+                else:
+                    assert entered.wait(2)
+                    assert failed.active and failed.audio_running
+                    assert failed.emitted_window_count == 2 and failed.dropped_window_count == 1
+                    assert failed.total_overflow_count == 1 and failed.mic_peak_dbfs == -12
+                    assert not cleanup.reaped.is_set()
+        finally:
+            release.set()
+            cleanup = runtime._capture_cleanup  # pyright: ignore[reportPrivateUsage]
+            if cleanup is not None and runtime._capture_cleanup_session_id == second.id:  # pyright: ignore[reportPrivateUsage]
+                assert cleanup.reaped.wait(2)
+    store.stop_session()
+    third = store.start_session()
+    runtime.start_for_session(third)
+    third_owner = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert third_owner is not None
+    try:
+        assert runtime.snapshot().active_session_id == third.id and runtime.snapshot().active
+        assert runtime.recording_for_session(third.id)[0] is not recorder_a
+    finally:
+        runtime.close_observation(third, reason="beans_dropped")
+        assert third_owner.reaped.wait(2)
