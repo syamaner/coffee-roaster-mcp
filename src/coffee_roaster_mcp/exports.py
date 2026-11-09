@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from coffee_roaster_mcp.first_crack_observation import ObservationSnapshot
 from coffee_roaster_mcp.session import (
     EventPayloadValue,
     RoastEvent,
@@ -72,6 +73,7 @@ def export_roast_snapshot(
     roaster_driver: str = "mock",
     ror_window_seconds: float = 60.0,
     ror_min_sample_seconds: float = 10.0,
+    first_crack_observation: ObservationSnapshot | None = None,
 ) -> RoastLogExport:
     """Write a deterministic snapshot export for one roast session.
 
@@ -115,6 +117,7 @@ def export_roast_snapshot(
         summary_path,
         session=session,
         roaster_driver=roaster_driver,
+        first_crack_observation=first_crack_observation,
         ror_window_seconds=ror_window_seconds,
         ror_min_sample_seconds=ror_min_sample_seconds,
     )
@@ -165,6 +168,7 @@ def _write_summary_json(
     *,
     session: RoastSession,
     roaster_driver: str,
+    first_crack_observation: ObservationSnapshot | None = None,
     ror_window_seconds: float = 60.0,
     ror_min_sample_seconds: float = 10.0,
 ) -> None:
@@ -210,6 +214,9 @@ def _write_summary_json(
             "env_ror_c_per_min": metrics.env_ror_c_per_min,
         },
     }
+    payload["first_crack_observation"] = (
+        None if first_crack_observation is None else first_crack_observation.model_dump(mode="json")
+    )
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 

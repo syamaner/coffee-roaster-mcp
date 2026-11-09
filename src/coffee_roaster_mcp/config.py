@@ -14,6 +14,7 @@ DEFAULT_CONFIG_FILENAME = "coffee-roaster-mcp.yaml"
 TransportType = Literal["stdio"]
 TemperatureUnit = Literal["celsius", "fahrenheit", "auto"]
 FirstCrackMode = Literal["disabled", "audio", "manual"]
+FirstCrackEventAuthority = Literal["automatic", "manual"]
 ModelPrecision = Literal["int8", "fp32"]
 AudioSource = Literal["microphone", "wav"]
 AudioReplayMode = Literal["realtime", "detector_paced"]
@@ -59,6 +60,8 @@ class FirstCrackConfig:
     """
 
     mode: FirstCrackMode = "disabled"
+    event_authority: FirstCrackEventAuthority = "automatic"
+    observation_closing_timeout_seconds: float = 5.0
     repo_id: str = "syamaner/coffee-first-crack-detection"
     revision: str | None = None
     precision: ModelPrecision = "int8"
@@ -232,7 +235,9 @@ def load_config(
 
     source_path = config_path if config_path_exists else None
     config = _config_from_mapping(raw_config, source_path=source_path)
-    return _apply_env_overrides(config, env)
+    config = _apply_env_overrides(config, env)
+    validate_first_crack_authority(config)
+    return config
 
 
 def _resolve_config_path(path: str | Path | None, environ: Mapping[str, str]) -> Path:
@@ -323,6 +328,15 @@ def _first_crack_from_mapping(raw: Mapping[str, Any]) -> FirstCrackConfig:
         mode=_first_crack_mode(
             _string(raw, "mode", "disabled", label="first_crack.mode"),
             label="first_crack.mode",
+        ),
+        event_authority=_first_crack_event_authority(
+            _string(raw, "event_authority", "automatic", label="first_crack.event_authority")
+        ),
+        observation_closing_timeout_seconds=_float(
+            raw,
+            "observation_closing_timeout_seconds",
+            5.0,
+            label="first_crack.observation_closing_timeout_seconds",
         ),
         repo_id=_string(
             raw,
@@ -482,6 +496,13 @@ def _session_from_mapping(raw: Mapping[str, Any]) -> SessionConfig:
 def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppConfig:
     roaster = config.roaster
     first_crack = config.first_crack
+    if "COFFEE_FIRST_CRACK_EVENT_AUTHORITY" in environ:
+        first_crack = replace(
+            first_crack,
+            event_authority=_first_crack_event_authority(
+                environ["COFFEE_FIRST_CRACK_EVENT_AUTHORITY"]
+            ),
+        )
     audio = config.audio
     ambient = config.ambient
     logging = config.logging
@@ -964,6 +985,60 @@ def _temperature_unit(value: str, label: str = "temperature_unit") -> Temperatur
     if normalized not in {"celsius", "fahrenheit", "auto"}:
         raise ConfigError(f"{label} must be one of: celsius, fahrenheit, auto.")
     return cast(TemperatureUnit, normalized)
+
+
+def _first_crack_event_authority(value: str) -> FirstCrackEventAuthority:
+    normalized = value.strip().lower()
+    if normalized not in {"automatic", "manual"}:
+        raise ConfigError("first_crack.event_authority must be one of: automatic, manual.")
+    return cast(FirstCrackEventAuthority, normalized)
+
+
+def validate_first_crack_authority(config: AppConfig) -> None:
+    """Validate the closed mock-only human/shadow protocol before side effects."""
+    fc = config.first_crack
+    if fc.event_authority not in {"automatic", "manual"}:
+        raise ConfigError("first_crack.event_authority must be one of: automatic, manual.")
+    timeout = fc.observation_closing_timeout_seconds
+    if type(timeout) not in {float, int} or not math.isfinite(timeout) or timeout < 0:
+        raise ConfigError(
+            "first_crack.observation_closing_timeout_seconds must be finite and >= 0."
+        )
+    if fc.event_authority == "manual" and not (
+        config.roaster.driver == "mock"
+        and fc.mode == "audio"
+        and fc.allow_manual_override is True
+        and config.recording.enabled is True
+        and config.recording.autocapture is True
+    ):
+        raise ConfigError(
+            "Manual first-crack authority requires mock driver, audio mode, manual override "
+            "and explicitly enabled recording/autocapture."
+        )
+    if fc.event_authority == "manual":
+        if config.audio.source == "wav" and config.audio.replay_mode == "detector_paced":
+            raise ConfigError(
+                "Manual first-crack authority requires recording-capable capture; "
+                "detector-paced WAV replay never records."
+            )
+        # Legacy source-checkout evaluators do not require the manual schema.
+        from pydantic import ValidationError
+
+        from coffee_roaster_mcp.first_crack_observation import Settings
+
+        try:
+            Settings(
+                confidence_threshold=fc.confidence_threshold,
+                min_positive_windows=fc.min_positive_windows,
+                confirmation_window_seconds=fc.confirmation_window_seconds,
+                window_seconds=config.audio.window_seconds,
+                effective_hop_seconds=config.audio.hop_seconds
+                if config.audio.hop_seconds is not None
+                else config.audio.window_seconds * (1 - config.audio.overlap),
+                sample_rate=config.audio.sample_rate,
+            )
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise ConfigError("Manual observation settings must be finite and valid.") from exc
 
 
 def _first_crack_mode(value: str, label: str = "first_crack.mode") -> FirstCrackMode:

@@ -509,3 +509,43 @@ The first implementation milestone is now complete. The mock vertical slice can 
 Epic 2 and Epic 3 are complete. Coverage output is visible in GitHub Actions through a concise Markdown job summary and an `html-coverage-report` artifact.
 
 For Epic 2 implementation, the old `coffee-roasting` repository is a behavioral reference only. Reuse proven roast-session and stdio MCP patterns, but do not recreate the old two-server, Auth0, SSE, or `n8n` architecture.
+
+### Human-authoritative FC / model-shadow prototype (#237)
+
+The new `first_crack.event_authority: manual` opt-in is mock-only and requires
+`mode: audio`, manual override, and explicitly enabled recording/autocapture.
+A caller must verify current-child authority/protocol/driver readback and send
+`first_crack_observer_ack: manual/v1` when starting. Existing automatic authority
+remains the default. Model observations use a separate versioned diagnostic JSONL
+file; only the human mark creates operational FC/development. Pending/failed
+persistence and incomplete coverage are distinct from a clean model miss.
+
+This software prototype does not admit integrated Agent or real-roaster use.
+Missing/late-human-mark protection, consumer admission, candidate qualification,
+release, Pi installation and physical/live authority remain separate and blocked.
+
+The prerelease diagnostic schema distinguishes intentionally ineligible audio
+with `window_status: not_inferred`: probability and decision time are explicitly
+not applicable, and no backend call is claimed. On that tag, availability class
+compares diagnostic row acceptance with the cutoff. Summary ordering compares
+model decision availability with the accepted human mark, including exact ties;
+it does not compare the retrospective acoustic onset. Eligible pre-drop coverage,
+recording loss and durable persistence remain separate measures.
+
+
+### #237 downstream admission boundary
+
+`first_crack.event_authority` and `COFFEE_FIRST_CRACK_EVENT_AUTHORITY` are
+reserved for a consumer that explicitly acknowledges the mock-only `manual/v1`
+protocol. The existing Agent configuration merge preserves unmanaged YAML
+values, and ambient environment forwarding can also pass these settings
+through. Agent integration must explicitly pin, strip or admit them under a
+separate consumer contract. Rejection without the protocol acknowledgement is
+intentional fail-closed behaviour; this slice supplies no Agent mitigation or
+real-roaster enablement.
+
+
+Historical in-process observation snapshots follow the actual session store's
+retention and never restore control across a restart. The manual protocol
+requires recording-capable capture: detector-paced WAV replay is refused;
+automatic paced replay and recording-capable realtime behaviour stay unchanged.

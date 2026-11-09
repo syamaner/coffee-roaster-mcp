@@ -34,6 +34,7 @@ from coffee_roaster_mcp.config import (
     ConfigError,
     FirstCrackMode,
     load_config,
+    validate_first_crack_authority,
 )
 from coffee_roaster_mcp.drivers import (
     DriverLifecycleEvidence,
@@ -43,6 +44,7 @@ from coffee_roaster_mcp.drivers import (
     create_roaster_driver,
 )
 from coffee_roaster_mcp.exports import export_roast_snapshot
+from coffee_roaster_mcp.first_crack_observation import ObservationSnapshot
 from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackRuntimeSnapshot,
     FirstCrackSessionRuntime,
@@ -280,6 +282,8 @@ class RuntimeConfigSnapshot:
     sample_interval_seconds: float
     auto_t0_detection_enabled: bool
     auto_t0_drop_threshold_c: float
+    first_crack_event_authority: str = "automatic"
+    first_crack_observer_protocol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -504,6 +508,7 @@ class RoastSessionState:
     session_purpose: SessionPurpose = "roast"
     cold_characterisation_observation: ColdCharacterisationObservation | None = None
     cold_temperature_projection: ColdTemperatureProjection | None = None
+    first_crack_observation: ObservationSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -762,6 +767,7 @@ def build_server_context(
         The initialized server context used by the MCP lifespan.
     """
     config = load_config(path=config_path)
+    validate_first_crack_authority(config)
     try:
         roaster_driver = create_roaster_driver(
             config.roaster.driver,
@@ -783,15 +789,26 @@ def build_server_context(
         interval_seconds=config.logging.sample_interval_seconds,
         sample_callback=sample_active_session,
     )
+    session_store = RoastSessionStore(
+        default_log_dir=config.logging.log_dir / "roasts",
+        telemetry_log_interval_seconds=config.logging.sample_interval_seconds,
+    )
+
+    def session_is_retained(session_id: str) -> bool:
+        try:
+            session_store.get_session_snapshot(session_id=session_id)
+        except SessionLifecycleError:
+            return False
+        return True
+
     server_context = ServerContext(
         config=config,
         transport=transport,
-        session_store=RoastSessionStore(
-            default_log_dir=config.logging.log_dir / "roasts",
-            telemetry_log_interval_seconds=config.logging.sample_interval_seconds,
-        ),
+        session_store=session_store,
         roaster_driver=roaster_driver,
-        first_crack_runtime=build_first_crack_session_runtime(config),
+        first_crack_runtime=build_first_crack_session_runtime(
+            config, session_is_retained=session_is_retained
+        ),
         ambient_runtime=build_ambient_session_runtime(config),
         telemetry_sampler=telemetry_sampler,
         started_at_utc=datetime.now(UTC),
@@ -887,6 +904,10 @@ def create_mcp_server(
             temperature_unit=config.roaster.temperature_unit,
             command_interval_seconds=config.roaster.command_interval_seconds,
             first_crack_mode=config.first_crack.mode,
+            first_crack_event_authority=config.first_crack.event_authority,
+            first_crack_observer_protocol="manual/v1"
+            if config.first_crack.event_authority == "manual"
+            else None,
             model_repo_id=config.first_crack.repo_id,
             model_precision=config.first_crack.precision,
             allow_manual_override=config.first_crack.allow_manual_override,
@@ -900,9 +921,18 @@ def create_mcp_server(
     def start_roast_session(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
         purpose: SessionPurpose = "roast",
+        first_crack_observer_ack: str | None = None,
     ) -> StartRoastSessionResult:
         """Start one new authoritative roast session and prepare the driver."""
         server_context = ctx.request_context.lifespan_context
+        validate_first_crack_authority(server_context.config)
+        manual = server_context.config.first_crack.event_authority == "manual"
+        if (manual and first_crack_observer_ack != "manual/v1") or (
+            not manual and first_crack_observer_ack is not None
+        ):
+            raise ValueError(
+                "Requested first-crack observer protocol does not match configured authority."
+            )
         with server_context.lifecycle_barrier:
             reservation = server_context.session_store.reserve_session_start()
         try:
@@ -922,6 +952,9 @@ def create_mcp_server(
                 session,
                 config=server_context.config,
                 first_crack_runtime=server_context.first_crack_runtime.snapshot(),
+                first_crack_observation=server_context.first_crack_runtime.observation_for_session(
+                    session.id
+                ),
                 ambient_runtime=server_context.ambient_runtime.snapshot(),
             )
         )
@@ -994,6 +1027,9 @@ def create_mcp_server(
             config=server_context.config,
             device_state=device_state,
             first_crack_runtime=server_context.first_crack_runtime.snapshot(),
+            first_crack_observation=server_context.first_crack_runtime.observation_for_session(
+                session.id
+            ),
             ambient_runtime=server_context.ambient_runtime.snapshot(),
             cold_characterisation_observation=cold_characterisation_observation,
             cold_temperature_projection=cold_temperature_projection,
@@ -1063,10 +1099,14 @@ def create_mcp_server(
         if not server_context.config.first_crack.allow_manual_override:
             raise ValueError("Manual first-crack override is disabled by configuration.")
         result = _record_session_event(ctx, "first_crack_detected")
-        server_context.first_crack_runtime.stop_for_session(
-            result.session_id,
-            reason="manual first-crack override",
-        )
+        if server_context.config.first_crack.event_authority == "manual":
+            server_context.first_crack_runtime.notify_human_mark(
+                _resolve_session(server_context, session_id=result.session_id)
+            )
+        else:
+            server_context.first_crack_runtime.stop_for_session(
+                result.session_id, reason="manual first-crack override"
+            )
         return result
 
     @mcp.tool()
@@ -1106,14 +1146,11 @@ def create_mcp_server(
         # first_crack_detected to the session event log — see
         # process_pending_windows_after_drop's docstring for why that stays
         # untouched by design.
-        server_context.first_crack_runtime.process_pending_windows_after_drop(
-            session_store=server_context.session_store,
-            session=session,
-        )
-        server_context.first_crack_runtime.stop_for_session(
-            snapshot.id,
-            reason="beans dropped",
-        )
+        if server_context.config.first_crack.event_authority != "manual":
+            server_context.first_crack_runtime.process_pending_windows_after_drop(
+                session_store=server_context.session_store, session=session
+            )
+            server_context.first_crack_runtime.stop_for_session(snapshot.id, reason="beans dropped")
         if not snapshot.active:
             server_context.telemetry_sampler.stop_for_session(snapshot.id, reason="beans dropped")
             server_context.ambient_runtime.stop_for_session(snapshot.id, reason="beans dropped")
@@ -1206,11 +1243,13 @@ def create_mcp_server(
         """Write a snapshot export for one roast session."""
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
+        observation = server_context.first_crack_runtime.observation_for_session(session.id)
         export = export_roast_snapshot(
             session,
             roaster_driver=server_context.config.roaster.driver,
             ror_window_seconds=server_context.config.session.ror_window_seconds,
             ror_min_sample_seconds=server_context.config.session.ror_min_sample_seconds,
+            first_crack_observation=observation,
         )
         return ExportRoastLogResult(
             session_id=export.session_id,
@@ -1233,6 +1272,7 @@ def create_mcp_server(
         session: RoastSession | None = None
         has_verified_containment = False
         primary_error: BaseException | None = None
+        observation_ticket: object | None = None
         try:
             with server_context.lifecycle_barrier:
                 if expected_session_id is None:
@@ -1246,6 +1286,12 @@ def create_mcp_server(
                     server_context.session_store.cancel_session_start_for_emergency_stop()
                 server_context.session_store.cancel_nonfinalisation_driver_command(session)
                 safety_payload = run_driver_emergency_stop(server_context, reason=reason)
+                if server_context.config.first_crack.event_authority == "manual":
+                    observation_ticket = (
+                        server_context.first_crack_runtime.begin_observation_boundary(
+                            session, reason="emergency_stop"
+                        )
+                    )
                 has_verified_containment = has_verified_emergency_containment(
                     safety_payload=safety_payload
                 )
@@ -1265,6 +1311,13 @@ def create_mcp_server(
                         safety_payload=safety_payload,
                         allow_stopped_latest=True,
                     )
+                    if server_context.config.first_crack.event_authority == "manual":
+                        server_context.first_crack_runtime.resolve_observation_boundary(
+                            session,
+                            observation_ticket,
+                            cutoff_monotonic_seconds=session.monotonic_start
+                            + event.monotonic_seconds,
+                        )
                 except Exception as exc:
                     if expected_session_id is not None:
                         with suppress(Exception):  # Preserve the persistence failure.
@@ -1292,9 +1345,15 @@ def create_mcp_server(
             if session is not None:
                 cleanup_error: Exception | None = None
                 for stop_runtime in (
-                    lambda: server_context.first_crack_runtime.stop_for_session(
-                        session.id,
-                        reason="emergency stop",
+                    lambda: (
+                        server_context.first_crack_runtime.freeze_observation_boundary(
+                            session, observation_ticket, reason="emergency_stop"
+                        )
+                        if server_context.config.first_crack.event_authority == "manual"
+                        and observation_ticket is not None
+                        else server_context.first_crack_runtime.stop_for_session(
+                            session.id, reason="emergency stop"
+                        )
                     ),
                     lambda: server_context.telemetry_sampler.stop_for_session(
                         session.id,
@@ -1597,18 +1656,34 @@ def _run_reserved_driver_drop(
         return drop_reservation.existing_event, drop_reservation.snapshot
 
     reservation = drop_reservation.reservation
+    observation_ticket: object | None = None
     try:
         driver_state = server_context.roaster_driver.drop_beans()
+        if server_context.config.first_crack.event_authority == "manual":
+            observation_ticket = server_context.first_crack_runtime.begin_observation_boundary(
+                session, reason="beans_dropped"
+            )
         try:
-            return server_context.session_store.complete_reserved_driver_drop_snapshot(
+            event, snapshot = server_context.session_store.complete_reserved_driver_drop_snapshot(
                 session,
                 reservation=reservation,
                 heat_level_percent=driver_state.heat_level_percent,
                 fan_level_percent=driver_state.fan_level_percent,
                 cooling_on=driver_state.cooling_on,
             )
+            if server_context.config.first_crack.event_authority == "manual":
+                server_context.first_crack_runtime.resolve_observation_boundary(
+                    session,
+                    observation_ticket,
+                    cutoff_monotonic_seconds=session.monotonic_start + event.monotonic_seconds,
+                )
+            return event, snapshot
         except SessionLifecycleError:
             _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
+            if server_context.config.first_crack.event_authority == "manual":
+                server_context.first_crack_runtime.freeze_observation_boundary(
+                    session, observation_ticket, reason="drop_recording_failed"
+                )
             raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
@@ -1686,6 +1761,7 @@ def _run_reserved_driver_fault_recovery(
     """
     command: Literal["drop", "start_cooling", "stop_cooling"] = "stop_cooling"
     driver_state: RoasterState | None = None
+    observation_ticket: object | None = None
     try:
         if reservation.kind == "drop":
             command = "drop"
@@ -1698,14 +1774,27 @@ def _run_reserved_driver_fault_recovery(
             driver_state = server_context.roaster_driver.stop_cooling()
         else:
             raise SessionLifecycleError("Unsupported stopped-fault recovery command.")
-        return server_context.session_store.complete_reserved_driver_fault_recovery_snapshot(
-            session,
-            reservation=reservation,
-            heat_level_percent=driver_state.heat_level_percent,
-            fan_level_percent=driver_state.fan_level_percent,
-            cooling_on=driver_state.cooling_on,
-            connected=driver_state.connected,
+        if command == "drop" and server_context.config.first_crack.event_authority == "manual":
+            observation_ticket = server_context.first_crack_runtime.begin_observation_boundary(
+                session, reason="beans_dropped"
+            )
+        event, snapshot = (
+            server_context.session_store.complete_reserved_driver_fault_recovery_snapshot(
+                session,
+                reservation=reservation,
+                heat_level_percent=driver_state.heat_level_percent,
+                fan_level_percent=driver_state.fan_level_percent,
+                cooling_on=driver_state.cooling_on,
+                connected=driver_state.connected,
+            )
         )
+        if command == "drop" and server_context.config.first_crack.event_authority == "manual":
+            server_context.first_crack_runtime.resolve_observation_boundary(
+                session,
+                observation_ticket,
+                cutoff_monotonic_seconds=session.monotonic_start + event.monotonic_seconds,
+            )
+        return event, snapshot
     except Exception:
         if command == "drop":
             server_context.session_store.retain_fault_drop_ambiguity_if_unrecorded(session)
@@ -1720,6 +1809,10 @@ def _run_reserved_driver_fault_recovery(
             or (command in {"drop", "start_cooling"} and driver_state.fan_level_percent != 100)
         ):
             server_context.session_store.retain_fault_recovery_admission_block(session)
+        if command == "drop" and server_context.config.first_crack.event_authority == "manual":
+            server_context.first_crack_runtime.freeze_observation_boundary(
+                session, observation_ticket, reason="fault_recovery_incomplete"
+            )
         raise
 
 
@@ -2091,6 +2184,7 @@ def _fault_active_session_after_sampler_failure(
 ) -> None:
     """Fail closed when autonomous sampling cannot safely continue."""
     reason = f"autonomous telemetry sampler failed: {type(error).__name__}: {error}"
+    observation_ticket: object | None = None
     try:
         with server_context.lifecycle_barrier:
             latest_session = server_context.session_store.get_latest_session()
@@ -2109,18 +2203,33 @@ def _fault_active_session_after_sampler_failure(
             ):
                 return
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
-            _, snapshot = server_context.session_store.emergency_stop_snapshot(
+            if server_context.config.first_crack.event_authority == "manual":
+                observation_ticket = server_context.first_crack_runtime.begin_observation_boundary(
+                    session, reason="autonomous_telemetry_sampler_failure"
+                )
+            event, snapshot = server_context.session_store.emergency_stop_snapshot(
                 session,
                 reason=reason,
                 safety_payload=safety_payload,
                 allow_stopped_latest=True,
             )
     except SessionLifecycleError:
+        if server_context.config.first_crack.event_authority == "manual":
+            server_context.first_crack_runtime.freeze_observation_boundary(
+                session, observation_ticket, reason="sampler_fault_recording_failed"
+            )
         return
-    server_context.first_crack_runtime.stop_for_session(
-        snapshot.id,
-        reason="autonomous telemetry sampler failure",
-    )
+    if server_context.config.first_crack.event_authority == "manual":
+        server_context.first_crack_runtime.resolve_observation_boundary(
+            session,
+            observation_ticket,
+            cutoff_monotonic_seconds=session.monotonic_start + event.monotonic_seconds,
+        )
+    else:
+        server_context.first_crack_runtime.stop_for_session(
+            snapshot.id,
+            reason="autonomous telemetry sampler failure",
+        )
     server_context.ambient_runtime.stop_for_session(
         snapshot.id,
         reason="autonomous telemetry sampler failure",
@@ -2699,6 +2808,7 @@ def _serialize_session_state(
     config: AppConfig,
     device_state: RoasterDeviceState | None = None,
     first_crack_runtime: FirstCrackRuntimeSnapshot | None = None,
+    first_crack_observation: ObservationSnapshot | None = None,
     ambient_runtime: AmbientRuntimeSnapshot | None = None,
     cold_characterisation_observation: ColdCharacterisationObservation | None = None,
     cold_temperature_projection: ColdTemperatureProjection | None = None,
@@ -2756,6 +2866,7 @@ def _serialize_session_state(
         session_purpose=session.purpose,
         cold_characterisation_observation=cold_characterisation_observation,
         cold_temperature_projection=cold_temperature_projection,
+        first_crack_observation=first_crack_observation,
     )
 
 

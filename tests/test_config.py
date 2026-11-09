@@ -606,3 +606,146 @@ def test_recording_devices_invalid_entries_fail(tmp_path: Path) -> None:
     config_path.write_text("recording:\n  devices: USB PnP\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="recording.devices"):
         load_config(config_path, environ={})
+
+
+@pytest.mark.parametrize("authority", ["manual", "unknown"])
+def test_first_crack_authority_initial_build_refuses_opt_in(tmp_path: Path, authority: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(f"first_crack:\n  event_authority: {authority}\n", encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(path, environ={})
+
+
+def test_first_crack_authority_env_initial_build_refuses_opt_in(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("{}", encoding="utf-8")
+    with pytest.raises(ConfigError, match="requires mock driver"):
+        load_config(path, environ={"COFFEE_FIRST_CRACK_EVENT_AUTHORITY": "manual"})
+
+
+def test_manual_authority_requires_complete_mock_protocol_config(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n",
+        encoding="utf-8",
+    )
+    config = load_config(path, environ={})
+    assert config.first_crack.event_authority == "manual"
+    assert config.first_crack.observation_closing_timeout_seconds == 5.0
+    for override in ["hottop_kn8828b_2k_plus", "unknown", "MOCK"]:
+        with pytest.raises(ConfigError, match="requires mock driver"):
+            load_config(path, environ={"COFFEE_ROASTER_DRIVER": override})
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        "first_crack:\n  mode: manual\n  event_authority: manual\n",
+        "first_crack:\n  mode: audio\n  event_authority: manual\n  allow_manual_override: false\n",
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: false\n",
+    ],
+)
+def test_incomplete_manual_authority_config_fails_closed(tmp_path: Path, section: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(section, encoding="utf-8")
+    with pytest.raises(ConfigError, match="requires mock driver"):
+        load_config(path, environ={})
+
+
+@pytest.mark.parametrize("timeout", ["-1", ".nan", ".inf"])
+def test_observer_timeout_is_finite_nonnegative(tmp_path: Path, timeout: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"first_crack:\n  observation_closing_timeout_seconds: {timeout}\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError):
+        load_config(path, environ={})
+
+
+def test_automatic_source_checkout_imports_without_manual_schema(tmp_path: Path) -> None:
+    """FC's source-selected replay imports need no new manual-only dependency."""
+    import subprocess
+    import sys
+
+    source = Path(__file__).resolve().parents[1] / "src"
+    script = """
+import importlib
+import importlib.abc
+import sys
+from pathlib import Path
+class RejectManualSchema(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if (fullname == 'pydantic' or fullname.startswith('pydantic.')
+                or fullname == 'coffee_roaster_mcp.first_crack_observation'):
+            raise AssertionError('automatic replay imported manual schema: ' + fullname)
+sys.meta_path.insert(0, RejectManualSchema())
+for name in ('artifacts', 'audio', 'config', 'detector'):
+    module = importlib.import_module('coffee_roaster_mcp.' + name)
+    assert Path(module.__file__).is_relative_to(Path(sys.argv[1]))
+from coffee_roaster_mcp.config import load_config, validate_first_crack_authority
+config = load_config(environ={})
+validate_first_crack_authority(config)
+assert config.first_crack.event_authority == 'automatic'
+assert 'pydantic' not in sys.modules
+assert 'coffee_roaster_mcp.first_crack_observation' not in sys.modules
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(source)],
+        cwd=tmp_path,
+        env={"PYTHONPATH": str(source)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    "authority,source,replay,admitted",
+    [
+        ("manual", "wav", "detector_paced", False),
+        ("manual", "wav", "realtime", True),
+        ("manual", "microphone", "detector_paced", True),
+        ("automatic", "wav", "detector_paced", True),
+    ],
+)
+def test_recording_capable_manual_capture_admission_is_exact(
+    tmp_path: Path, authority: str, source: str, replay: str, admitted: bool
+) -> None:
+    path = tmp_path / "capture.yaml"
+    path.write_text(
+        f"first_crack:\n  mode: audio\n  event_authority: {authority}\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"audio:\n  source: {source}\n  replay_mode: {replay}\n  wav_path: never-opened.wav\n",
+        encoding="utf-8",
+    )
+    if not admitted:
+        with pytest.raises(ConfigError, match="detector-paced WAV replay never records"):
+            load_config(path, environ={})
+    else:
+        config = load_config(path, environ={})
+        assert config.audio.source == source and config.audio.replay_mode == replay
+        assert config.first_crack.event_authority == authority
+        assert config.recording.enabled and config.recording.autocapture
+
+
+def test_manual_paced_wav_env_merge_refuses_incomplete_recording_protocol(tmp_path: Path) -> None:
+    path = tmp_path / "env.yaml"
+    path.write_text(
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="recording-capable capture"):
+        load_config(
+            path,
+            environ={
+                "COFFEE_AUDIO_SOURCE": "wav",
+                "COFFEE_AUDIO_REPLAY_MODE": "detector_paced",
+                "COFFEE_AUDIO_WAV_PATH": str(tmp_path / "never-opened.wav"),
+            },
+        )

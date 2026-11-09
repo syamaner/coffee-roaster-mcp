@@ -4140,9 +4140,11 @@ def test_initial_emergency_stop_driver_error_blocks_fault_recovery_commands(
     assert driver.actions == ["connect"]
 
 
+@pytest.mark.parametrize("authority", ["automatic", "manual"])
 def test_active_emergency_stop_recording_failure_retains_in_memory_fault_block(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    authority: str,
 ) -> None:
     """Driver and logging failures still close active hardware control admission."""
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
@@ -4154,6 +4156,17 @@ def test_active_emergency_stop_recording_failure_retains_in_memory_fault_block(
     ctx = _ctx(server_context)
     started = _call_tool(server, "start_roast_session", ctx, purpose="cold_characterisation")
     session_id = started.session.session_id
+    original_config = server_context.config
+    object.__setattr__(
+        server_context,
+        "config",
+        dataclasses.replace(
+            server_context.config,
+            first_crack=dataclasses.replace(
+                server_context.config.first_crack, event_authority=authority
+            ),
+        ),
+    )
     session, rejection, generation = server_context.session_store.begin_finalisation(session_id)
     assert session is not None and rejection is None and generation is not None
 
@@ -4212,6 +4225,7 @@ def test_active_emergency_stop_recording_failure_retains_in_memory_fault_block(
 
     with pytest.raises(SessionLifecycleError, match="fault recording failed") as failure:
         _call_tool(server, "emergency_stop", ctx)
+    object.__setattr__(server_context, "config", original_config)
 
     assert isinstance(failure.value.__cause__, OSError)
     assert cleanup_calls == [
@@ -5011,6 +5025,10 @@ class FakeFirstCrackRuntime:
         self.processed_after_drop_sessions.append(True)
         return self.snapshot()
 
+    def observation_for_session(self, session_id: str) -> None:
+        """Automatic-path double has no manual observations to retain."""
+        return None
+
     def stop_for_session(self, session_id: str, *, reason: str) -> FirstCrackRuntimeSnapshot:
         self.stopped_sessions.append(session_id)
         self.reason = reason
@@ -5772,3 +5790,761 @@ def test_cold_temperature_projection_schema_is_additive_and_closed() -> None:
         "malformed",
     ]
     assert "cold_temperature_projection" not in cast(list[str], schema.get("required", []))
+
+
+@pytest.mark.parametrize("stage", ["loader", "backend", "sink", "none"])
+def test_manual_shadow_real_stdio_dispatch_survives_blocked_observer(
+    tmp_path: Path, stage: str
+) -> None:
+    asyncio.run(_manual_shadow_blocked_stdio(tmp_path, stage))
+
+
+async def _manual_shadow_blocked_stdio(tmp_path: Path, stage: str) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "  observation_closing_timeout_seconds: 0.2\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            stage,
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        readback = await asyncio.wait_for(client.call_tool("get_runtime_config", {}), 5)
+        assert readback.structuredContent is not None
+        authority = readback.structuredContent
+        assert authority["first_crack_event_authority"] == "manual"
+        assert authority["first_crack_observer_protocol"] == "manual/v1"
+        assert authority["roaster_driver"] == "mock"
+        # Missing ack must leave no session, not just disable observations.
+        rejected = await asyncio.wait_for(client.call_tool("start_roast_session", {}), 5)
+        assert rejected.isError
+        info = await asyncio.wait_for(client.call_tool("get_server_info", {}), 5)
+        assert (
+            info.structuredContent is not None
+            and info.structuredContent["session_presence"] == "none"
+        )
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert not started.isError
+        await asyncio.wait_for(client.call_tool("mark_beans_added", {}), 5)
+        (tmp_path / "charge-ready").write_text("ready", encoding="utf-8")
+
+        async def wait_for_actual_blocker() -> dict[str, Any]:
+            while True:
+                state = await client.call_tool("get_roast_state", {})
+                assert state.structuredContent is not None
+                observation = state.structuredContent["first_crack_observation"]
+                if (tmp_path / f"{stage}-entered").exists() or (
+                    stage == "none" and observation["first_confirmation"]["value"] is not None
+                ):
+                    return state.structuredContent
+                await asyncio.sleep(0)
+
+        state = await asyncio.wait_for(wait_for_actual_blocker(), 5)
+        assert state["first_crack_at_utc"] is None
+        assert state["first_crack_status"]["status"] == "pending"
+        assert state["first_crack_status"]["detected_at_utc"] is None
+        assert state["first_crack_status"]["detected_monotonic_seconds"] is None
+        if stage == "loader":
+            assert state["first_crack_observation"]["identity"]["status"] == "pending"
+        marked = await asyncio.wait_for(client.call_tool("mark_first_crack", {}), 5)
+        assert not marked.isError
+        assert marked.structuredContent is not None
+        canonical_event = marked.structuredContent["event"]
+        duplicate = await asyncio.wait_for(client.call_tool("mark_first_crack", {}), 5)
+        assert duplicate.structuredContent == marked.structuredContent
+        after = await asyncio.wait_for(client.call_tool("get_roast_state", {}), 5)
+        assert after.structuredContent is not None
+        assert after.structuredContent["phase"] == "development"
+        assert after.structuredContent["first_crack_at_utc"] == canonical_event["recorded_at_utc"]
+        assert (
+            after.structuredContent["first_crack_monotonic_seconds"]
+            == canonical_event["monotonic_seconds"]
+        )
+        if stage == "none":
+            assert after.structuredContent["first_crack_observation"]["observer_state"] in {
+                "observing",
+                "confirmed",
+            }
+            assert not (tmp_path / "capture-stopped").exists()
+        dropped = await asyncio.wait_for(client.call_tool("drop_beans", {}), 5)
+        assert not dropped.isError
+        emergency = await asyncio.wait_for(
+            client.call_tool("emergency_stop", {"reason": "synthetic protocol test"}), 5
+        )
+        assert not emergency.isError
+        observed = await asyncio.wait_for(client.call_tool("get_roast_state", {}), 5)
+        assert observed.structuredContent is not None
+        assert (
+            observed.structuredContent["first_crack_at_utc"]
+            == after.structuredContent["first_crack_at_utc"]
+        )
+        (tmp_path / "release").write_text("release", encoding="utf-8")
+
+        async def wait_for_reap() -> dict[str, Any]:
+            while True:
+                final = await client.call_tool("get_roast_state", {})
+                assert final.structuredContent is not None
+                if final.structuredContent["first_crack_observation"]["worker_reaped"]:
+                    return final.structuredContent
+                await asyncio.sleep(0)
+
+        final_state = await asyncio.wait_for(wait_for_reap(), 5)
+        summary = final_state["first_crack_observation"]["frozen_summary"]["value"]
+        assert summary is not None
+        human = summary["human_mark"]["value"]
+        assert human is not None
+        accepted_seconds = canonical_event["monotonic_seconds"]
+        assert human["session_relative_seconds"]["value"] == pytest.approx(
+            accepted_seconds, abs=1e-6
+        )
+        model_decision = summary["decision_available_at"]["value"]
+        if model_decision is None:
+            expected_order = "model_absent"
+        else:
+            delta = model_decision["session_relative_seconds"]["value"] - accepted_seconds
+            expected_order = (
+                "same_instant"
+                if delta == 0
+                else "model_before_human"
+                if delta < 0
+                else "human_before_model"
+            )
+        assert summary["order"] == expected_order
+
+
+def test_manual_authority_composition_refuses_before_driver_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = AppConfig(first_crack=FirstCrackConfig(mode="audio", event_authority="manual"))
+    calls: list[str] = []
+
+    def fake_load(**_: object) -> AppConfig:
+        return config
+
+    def fake_driver(*_args: object, **_kwargs: object) -> None:
+        calls.append("driver")
+
+    monkeypatch.setattr(mcp_server, "load_config", fake_load)
+    monkeypatch.setattr(mcp_server, "create_roaster_driver", fake_driver)
+    from coffee_roaster_mcp.config import ConfigError
+
+    with pytest.raises(ConfigError, match="requires mock driver"):
+        build_server_context(config_path=tmp_path / "not-read.yaml")
+    assert not calls
+
+
+def test_lifespan_shutdown_finalises_synthetic_recording_with_loader_hung(tmp_path: Path) -> None:
+    asyncio.run(_manual_shutdown_recording(tmp_path))
+
+
+async def _manual_shutdown_recording(tmp_path: Path) -> None:
+    import wave
+
+    root = Path(__file__).resolve().parents[1]
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "loader",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert not started.isError
+
+        async def wait_for_loader() -> None:
+            while True:
+                state = await client.call_tool("get_roast_state", {})
+                assert state.structuredContent is not None
+                if (tmp_path / "loader-entered").exists():
+                    return
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_loader(), 5)
+        assert not (tmp_path / "release").exists()
+    # EOF/lifespan cleanup must close capture without waiting for the model.
+    assert (tmp_path / "capture-stopped").exists()
+    wavs = list((tmp_path / "recordings").rglob("*.wav"))
+    assert len(wavs) == 1
+    with wave.open(str(wavs[0]), "rb") as stream:
+        assert stream.getnframes() == 320
+    assert list((tmp_path / "recordings").rglob("roast.recording.json"))
+
+
+def test_export_uses_one_atomic_runtime_observation_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from coffee_roaster_mcp.first_crack_observation import ObservationSnapshot, absent
+    from coffee_roaster_mcp.first_crack_observer import configured_identity, observation_settings
+
+    context = _cold_finalisation_context(tmp_path)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    started = _call_tool(server, "start_roast_session", ctx)
+    session_id = started.session.session_id
+    config = AppConfig()
+
+    def observation(repo_id: str) -> ObservationSnapshot:
+        return ObservationSnapshot(
+            observer_state="observing",
+            identity=configured_identity(FirstCrackConfig(repo_id=repo_id)),
+            settings=observation_settings(config),
+            first_confirmation=absent("no_confirmation"),
+            frozen_summary=absent(),
+            durability="pending",
+            worker_reaped=False,
+        )
+
+    calls: list[int] = []
+
+    def snapshot(requested_id: str) -> ObservationSnapshot:
+        assert requested_id == session_id
+        calls.append(1)
+        return observation("first" if len(calls) == 1 else "other")
+
+    monkeypatch.setattr(context.first_crack_runtime, "observation_for_session", snapshot)
+    result = _call_tool(server, "export_roast_log", ctx, session_id=session_id)
+    assert len(calls) == 1
+    payload = json.loads(Path(result.summary_path).read_text(encoding="utf-8"))
+    assert payload["first_crack_observation"]["identity"]["repo_id"] == "first"
+    context.telemetry_sampler.stop_for_session(session_id, reason="test_cleanup")
+
+
+@pytest.mark.parametrize("authority", ["automatic", "manual"])
+def test_guarded_drop_closes_only_manual_observation_after_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, authority: str
+) -> None:
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+    context = ctx.request_context.lifespan_context
+    config = context.config
+    object.__setattr__(
+        context,
+        "config",
+        dataclasses.replace(
+            config, first_crack=dataclasses.replace(config.first_crack, event_authority=authority)
+        ),
+    )
+    resolved: list[tuple[str, float]] = []
+
+    def resolve(
+        session: RoastSession, ticket: object | None, *, cutoff_monotonic_seconds: float
+    ) -> None:
+        # Recovery preserves terminal canonical fields; its accepted event is
+        # the diagnostic timing input, after real fake-driver dispatch.
+        assert driver.actions[-1] == "drop_beans"
+        event = next(event for event in session.event_timeline if event.kind == "beans_dropped")
+        assert cutoff_monotonic_seconds == session.monotonic_start + event.monotonic_seconds
+        resolved.append((session.id, cutoff_monotonic_seconds))
+
+    monkeypatch.setattr(context.first_crack_runtime, "resolve_observation_boundary", resolve)
+    result = _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    assert result.event.kind == "beans_dropped"
+    if authority == "manual":
+        session = context.session_store.get_latest_session()
+        assert session is not None
+        assert resolved == [(session_id, session.monotonic_start + result.event.monotonic_seconds)]
+    else:
+        assert resolved == []
+
+
+def test_manual_shadow_stdio_successor_refuses_unreaped_prior_observer(tmp_path: Path) -> None:
+    asyncio.run(_manual_shadow_stdio_successor(tmp_path))
+
+
+def test_public_refused_successor_projection_and_export_excludes_previous_capture(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_manual_shadow_stdio_successor(tmp_path, seed_projection=True))
+
+
+async def _manual_shadow_stdio_successor(tmp_path: Path, *, seed_projection: bool = False) -> None:
+    root = Path(__file__).resolve().parents[1]
+    if seed_projection:
+        (tmp_path / "projection-counters").write_text("synthetic counters", encoding="utf-8")
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "  observation_closing_timeout_seconds: 10\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "loader",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+
+        async def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            result = await asyncio.wait_for(client.call_tool(name, arguments), 5)
+            assert not result.isError, result
+            assert result.structuredContent is not None
+            return result.structuredContent
+
+        async def until_exists(name: str) -> None:
+            while not (tmp_path / name).exists():
+                await asyncio.sleep(0)
+
+        ack = {"first_crack_observer_ack": "manual/v1"}
+        first = await call("start_roast_session", ack)
+        await asyncio.wait_for(until_exists("loader-entered"), 5)
+        try:
+            await call("mark_beans_added", {})
+            await call("drop_beans", {})
+            await call("stop_cooling", {})
+            completed = await call("get_roast_state", {})
+            assert not completed["active"]
+            assert not completed["first_crack_observation"]["worker_reaped"]
+            if seed_projection:
+                previous_capture = completed["first_crack_status"]
+                assert previous_capture["audio_running"]
+                assert previous_capture["emitted_window_count"] == 13
+                assert previous_capture["dropped_window_count"] == 4
+                assert previous_capture["total_overflow_count"] == 9
+                assert previous_capture["mic_peak_dbfs"] == -3
+            # Canonical completion is essential: otherwise active-session
+            # rejection would mask the process-wide observer ownership gate.
+            second = await call("start_roast_session", ack)
+            assert first["session"]["session_id"] != second["session"]["session_id"]
+            refused = await call("get_roast_state", {})
+            assert refused["active"]
+            assert refused["first_crack_status"]["status"] == "unavailable"
+            assert refused["first_crack_status"]["reason"] == "previous_observer_not_reaped"
+            observation = refused["first_crack_observation"]
+            assert observation["observer_state"] == "not_admitted"
+            assert observation["durability"] == "pending"
+            assert not observation["worker_reaped"]
+            assert observation["first_confirmation"]["value"] is None
+            assert observation["frozen_summary"]["value"] is None
+            if seed_projection:
+                capture = refused["first_crack_status"]
+                assert not capture["audio_running"]
+                assert capture["queued_window_count"] == capture["emitted_window_count"] == 0
+                assert capture["dropped_window_count"] == capture["total_overflow_count"] == 0
+                assert capture["mic_peak_dbfs"] is None and capture["mic_rms_dbfs"] is None
+                exported = await call(
+                    "export_roast_log", {"session_id": second["session"]["session_id"]}
+                )
+                summary = json.loads(Path(exported["summary_path"]).read_text())
+                assert summary["first_crack_observation"] == observation
+                assert summary["first_crack_detection"]["window_count"] == 0
+            assert (tmp_path / "capture-starts").read_text().splitlines() == ["start"]
+            assert (tmp_path / "loader-starts").read_text().splitlines() == ["load"]
+        finally:
+            (tmp_path / "release").write_text("release", encoding="utf-8")
+        await asyncio.wait_for(until_exists("summary-persisted"), 5)
+        after = await call("get_roast_state", {})
+        assert after["session_id"] == second["session"]["session_id"]
+        assert after["first_crack_at_utc"] is None
+        assert after["first_crack_observation"] == observation
+        assert (tmp_path / "capture-starts").read_text().splitlines() == ["start"]
+        assert (tmp_path / "loader-starts").read_text().splitlines() == ["load"]
+
+
+def test_retained_roast_observation_survives_successor_state_and_reexport(tmp_path: Path) -> None:
+    asyncio.run(_historical_observation_stdio(tmp_path))
+
+
+def test_manual_shadow_real_stdio_normal_drop_export_retains_recording_sibling(
+    tmp_path: Path,
+) -> None:
+    """The real synthetic stdio child retains recording and shadow sidecars after normal drop."""
+    asyncio.run(_manual_shadow_stdio_normal_drop_export(tmp_path))
+
+
+async def _manual_shadow_stdio_normal_drop_export(tmp_path: Path) -> None:
+    import wave
+
+    root = Path(__file__).resolve().parents[1]
+    config = tmp_path / "normal-recording.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "none",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+
+        async def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            result = await asyncio.wait_for(client.call_tool(name, arguments), 5)
+            assert not result.isError, result
+            assert result.structuredContent is not None
+            return result.structuredContent
+
+        started = await call("start_roast_session", {"first_crack_observer_ack": "manual/v1"})
+        session_id = started["session"]["session_id"]
+        await call("mark_beans_added", {})
+        (tmp_path / "charge-ready").write_text("ready", encoding="utf-8")
+
+        async def confirmed() -> dict[str, Any]:
+            while True:
+                state = await call("get_roast_state", {"session_id": session_id})
+                if state["first_crack_observation"]["first_confirmation"]["value"] is not None:
+                    return state
+                await asyncio.sleep(0)
+
+        before_mark = await asyncio.wait_for(confirmed(), 5)
+        marked = await call("mark_first_crack", {})
+        canonical = marked["event"]
+        after_mark = await call("get_roast_state", {"session_id": session_id})
+        assert after_mark["first_crack_at_utc"] == canonical["recorded_at_utc"]
+        assert (
+            after_mark["first_crack_observation"]["first_confirmation"]
+            == before_mark["first_crack_observation"]["first_confirmation"]
+        )
+        assert not (tmp_path / "capture-stopped").exists()
+        await call("drop_beans", {})
+        await call("stop_cooling", {})
+
+        async def reaped() -> dict[str, Any]:
+            while True:
+                state = await call("get_roast_state", {"session_id": session_id})
+                if state["first_crack_observation"]["worker_reaped"]:
+                    return state
+                await asyncio.sleep(0)
+
+        final = await asyncio.wait_for(reaped(), 5)
+        exported = await call("export_roast_log", {"session_id": session_id})
+    wavs = list((tmp_path / "recordings").rglob("*.wav"))
+    assert len(wavs) == 1 and (tmp_path / "capture-starts").read_text().splitlines() == ["start"]
+    with wave.open(str(wavs[0]), "rb") as stream:
+        assert stream.getnframes() == 480
+    recording = next((tmp_path / "recordings").rglob("roast.recording.json"))
+    shadow = Path(final["log_dir"]) / "first_crack_observation.jsonl"
+    summary = json.loads(Path(exported["summary_path"]).read_text())
+    assert recording.is_file() and shadow.is_file()
+    assert session_id in shadow.read_text(encoding="utf-8")
+    assert summary["first_crack_observation"] == final["first_crack_observation"]
+    assert summary["session_id"] == session_id
+
+
+async def _historical_observation_stdio(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = tmp_path / "history.yaml"
+    config.write_text(
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "none",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+
+        async def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            result = await asyncio.wait_for(client.call_tool(name, arguments), 5)
+            assert not result.isError, result
+            assert result.structuredContent is not None
+            return result.structuredContent
+
+        ack = {"first_crack_observer_ack": "manual/v1"}
+        first = await call("start_roast_session", ack)
+        first_id = first["session"]["session_id"]
+        await call("mark_beans_added", {})
+        (tmp_path / "charge-ready").write_text("ready", encoding="utf-8")
+
+        async def confirmation() -> None:
+            while True:
+                state = await call("get_roast_state", {"session_id": first_id})
+                if state["first_crack_observation"]["first_confirmation"]["value"] is not None:
+                    return
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(confirmation(), 5)
+        await call("mark_first_crack", {})
+        await call("drop_beans", {})
+        await call("stop_cooling", {})
+
+        async def reaped() -> dict[str, Any]:
+            while True:
+                state = await call("get_roast_state", {"session_id": first_id})
+                if state["first_crack_observation"]["worker_reaped"]:
+                    return state
+                await asyncio.sleep(0)
+
+        before = await asyncio.wait_for(reaped(), 5)
+        first_observation = before["first_crack_observation"]
+        assert first_observation["durability"] == "persisted"
+        assert (
+            first_id in first_observation["first_confirmation"]["value"]["first_confirmation_key"]
+        )
+        exported = await call("export_roast_log", {"session_id": first_id})
+        summary_path = Path(exported["summary_path"])
+        summary_before = json.loads(summary_path.read_text())
+        original_log = (Path(before["log_dir"]) / "roast.jsonl").read_bytes()
+        second = await call("start_roast_session", ack)
+        second_id = second["session"]["session_id"]
+        assert second_id != first_id
+        historical = await call("get_roast_state", {"session_id": first_id})
+        current = await call("get_roast_state", {"session_id": second_id})
+        assert historical["first_crack_observation"] == first_observation
+        assert historical["first_crack_at_utc"] == before["first_crack_at_utc"]
+        assert current["session_id"] == second_id and current["active"]
+        assert current["first_crack_at_utc"] is None
+        assert current["first_crack_observation"]["first_confirmation"]["value"] is None
+        await call("export_roast_log", {"session_id": first_id})
+        assert json.loads(summary_path.read_text()) == summary_before
+        assert (Path(before["log_dir"]) / "roast.jsonl").read_bytes() == original_log
+
+
+def test_manual_paced_wav_context_refuses_before_any_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from coffee_roaster_mcp.config import AudioConfig, ConfigError, RecordingConfig
+
+    config = AppConfig(
+        first_crack=FirstCrackConfig(mode="audio", event_authority="manual"),
+        recording=RecordingConfig(enabled=True, autocapture=True),
+        audio=AudioConfig(
+            source="wav", replay_mode="detector_paced", wav_path=tmp_path / "never-opened.wav"
+        ),
+    )
+    effects: list[str] = []
+
+    def load(**_kwargs: object) -> AppConfig:
+        return config
+
+    def forbidden(*_args: object, **_kwargs: object):
+        effects.append("factory")
+        raise AssertionError("incompatible recording protocol reached a factory")
+
+    monkeypatch.setattr(mcp_server, "load_config", load)
+    monkeypatch.setattr(mcp_server, "create_roaster_driver", forbidden)
+    monkeypatch.setattr(mcp_server, "RoastSessionStore", forbidden)
+    monkeypatch.setattr(mcp_server, "build_first_crack_session_runtime", forbidden)
+    for _ in range(2):
+        with pytest.raises(ConfigError, match="recording-capable capture"):
+            build_server_context(config_path=tmp_path / "not-read.yaml")
+    assert not effects
+
+
+def test_manual_paced_wav_public_start_revalidates_before_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from coffee_roaster_mcp.config import AudioConfig, ConfigError, RecordingConfig
+
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(
+        context,
+        "config",
+        AppConfig(
+            first_crack=FirstCrackConfig(mode="audio", event_authority="manual"),
+            recording=RecordingConfig(enabled=True, autocapture=True),
+            audio=AudioConfig(
+                source="wav", replay_mode="detector_paced", wav_path=tmp_path / "never-opened.wav"
+            ),
+        ),
+    )
+    effects: list[str] = []
+
+    def forbidden():
+        effects.append("reservation")
+        raise AssertionError("inadmissible manual replay reserved a session")
+
+    monkeypatch.setattr(context.session_store, "reserve_session_start", forbidden)
+    with pytest.raises(ConfigError, match="recording-capable capture"):
+        _call_tool(
+            create_mcp_server(),
+            "start_roast_session",
+            _ctx(context),
+            first_crack_observer_ack="manual/v1",
+        )
+    assert not effects
+    assert context.session_store.get_active_session() is None
+
+
+def test_stdio_test_bootstrap_refuses_missing_runtime_builder_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import runpy
+
+    helper = Path(__file__).parent / "support" / "observation_mcp_child.py"
+    bootstrap = runpy.run_path(str(helper))["serve"]
+    effects: list[str] = []
+
+    def forbidden(*_args: object, **_kwargs: object):
+        effects.append("server composition")
+        raise AssertionError("bootstrap drift reached production composition")
+
+    monkeypatch.delattr(mcp_server, "build_first_crack_session_runtime")
+    monkeypatch.setattr(mcp_server, "create_mcp_server", forbidden)
+    with pytest.raises(AssertionError, match="runtime builder seam is missing"):
+        bootstrap(tmp_path / "not-read.yaml", tmp_path, "none")
+    assert not effects
+
+
+@pytest.mark.parametrize("trigger", ["public", "sampler"])
+def test_automatic_emergency_dispatch_preserves_stop_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trigger: str
+) -> None:
+    """Tracked CI counterpart of the previously approved supplemental witness."""
+    context = _cold_finalisation_context(tmp_path)
+    assert context.config.first_crack.event_authority == "automatic"
+    assert context.config.roaster.driver == "mock"
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    start = _call_tool(server, "start_roast_session", ctx)
+    session_id = start.session.session_id
+    context.telemetry_sampler.stop_for_session(session_id, reason="controlled routing witness")
+    trace: list[str] = []
+    stops: list[tuple[str, str]] = []
+    forbidden_closes: list[str] = []
+    driver_stop = context.roaster_driver.emergency_stop
+    accepted_event = context.session_store.emergency_stop_snapshot
+    runtime_stop = context.first_crack_runtime.stop_for_session
+
+    def driver(*, reason: str):
+        result = driver_stop(reason=reason)
+        trace.append("driver")
+        return result
+
+    def accepted(*args: Any, **kwargs: Any):
+        result = accepted_event(*args, **kwargs)
+        trace.append("accepted_event")
+        return result
+
+    def stop(requested_id: str, *, reason: str):
+        trace.append("stop_for_session")
+        stops.append((requested_id, reason))
+        return runtime_stop(requested_id, reason=reason)
+
+    def close(
+        session: RoastSession, *, reason: str, cutoff_monotonic_seconds: float | None = None
+    ) -> None:
+        trace.append("forbidden_manual_close")
+        forbidden_closes.append(session.id)
+
+    monkeypatch.setattr(context.roaster_driver, "emergency_stop", driver)
+    monkeypatch.setattr(context.session_store, "emergency_stop_snapshot", accepted)
+    monkeypatch.setattr(context.first_crack_runtime, "stop_for_session", stop)
+    monkeypatch.setattr(context.first_crack_runtime, "close_observation", close)
+    if trigger == "public":
+        result = _call_tool(server, "emergency_stop", ctx, reason="synthetic automatic boundary")
+        assert result.event.kind == "fault" and result.session_id == session_id
+        expected_reason = "emergency stop"
+    else:
+        session = context.session_store.get_active_session()
+        assert session is not None
+        _fault_active_session_after_sampler_failure(
+            context, session=session, error=RuntimeError("synthetic sampler")
+        )
+        assert (
+            context.session_store.get_session_snapshot(session_id=session_id)
+            .event_timeline[-1]
+            .kind
+            == "fault"
+        )
+        expected_reason = "autonomous telemetry sampler failure"
+    assert not forbidden_closes, "automatic authority entered forbidden manual closure"
+    assert stops == [(session_id, expected_reason)]
+    assert trace == ["driver", "accepted_event", "stop_for_session"]
+
+
+@pytest.mark.parametrize("authority", ["automatic", "manual"])
+def test_sampler_failed_event_keeps_original_early_return_cleanup_behaviour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, authority: str
+) -> None:
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(
+        context,
+        "config",
+        dataclasses.replace(
+            context.config,
+            first_crack=dataclasses.replace(context.config.first_crack, event_authority=authority),
+        ),
+    )
+    session = context.session_store.start_session()
+    context.roaster_driver.connect()
+    trace: list[str] = []
+    driver_stop = context.roaster_driver.emergency_stop
+
+    def driver(*, reason: str):
+        result = driver_stop(reason=reason)
+        trace.append("driver")
+        return result
+
+    def fail_event(*_args: object, **_kwargs: object):
+        trace.append("failed_event")
+        raise SessionLifecycleError("synthetic stale event")
+
+    def forbidden(*_args: object, **_kwargs: object):
+        trace.append("unexpected_cleanup")
+        raise AssertionError("failed event path crossed original early return")
+
+    monkeypatch.setattr(context.roaster_driver, "emergency_stop", driver)
+    monkeypatch.setattr(context.session_store, "emergency_stop_snapshot", fail_event)
+    monkeypatch.setattr(context.first_crack_runtime, "stop_for_session", forbidden)
+    monkeypatch.setattr(context.first_crack_runtime, "close_observation", forbidden)
+    monkeypatch.setattr(context.ambient_runtime, "stop_for_session", forbidden)
+    _fault_active_session_after_sampler_failure(
+        context, session=session, error=RuntimeError("synthetic sampler")
+    )
+    assert trace == ["driver", "failed_event"]
+    assert context.session_store.get_session_snapshot(session_id=session.id).active

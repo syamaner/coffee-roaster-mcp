@@ -120,6 +120,7 @@ EXPECTED_SUMMARY_KEYS = {
     "roaster_driver",
     "first_crack_model",
     "first_crack_detection",
+    "first_crack_observation",
     "metrics",
 }
 EXPECTED_FIRST_CRACK_DETECTION_KEYS = {
@@ -966,3 +967,36 @@ def test_snapshot_export_rejects_existing_jsonl_directory(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match="JSONL export path exists but is not a file"):
         export_roast_snapshot(session)
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_summary_observation_sibling_is_null_or_exact_closed_snapshot(
+    tmp_path: Path, manual: bool
+) -> None:
+    from coffee_roaster_mcp.config import AppConfig
+    from coffee_roaster_mcp.first_crack_observation import ObservationSnapshot, absent
+    from coffee_roaster_mcp.first_crack_observer import configured_identity, observation_settings
+
+    store = RoastSessionStore(default_log_dir=tmp_path / "roasts")
+    session = store.start_session()
+    config = AppConfig()
+    observation = (
+        ObservationSnapshot(
+            observer_state="not_admitted",
+            identity=configured_identity(config.first_crack),
+            settings=observation_settings(config),
+            first_confirmation=absent(),
+            frozen_summary=absent(),
+            durability="pending",
+            worker_reaped=False,
+        )
+        if manual
+        else None
+    )
+    export = export_roast_snapshot(session, first_crack_observation=observation)
+    summary = json.loads(export.summary_path.read_text(encoding="utf-8"))
+    assert "first_crack_observation" in summary
+    assert summary["first_crack_observation"] == (
+        None if observation is None else observation.model_dump(mode="json")
+    )
+    assert summary["first_crack_detection"]["window_count"] == 0
