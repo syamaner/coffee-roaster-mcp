@@ -549,7 +549,7 @@ class FirstCrackObserver:
                 self.changed.set()
                 coordinator().wake.set()
                 return
-            if cutoff is None:
+            if cutoff is None and self.cutoff is None:
                 # A lifecycle transition proves that no more observation work
                 # may be accepted.  It does not prove that beans were dropped
                 # (or that a fault/e-stop event was accepted), so do not turn

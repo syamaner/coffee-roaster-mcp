@@ -2767,6 +2767,174 @@ def test_manual_runtime_lifecycle_close_has_no_synthetic_cutoff(
     assert captures[0].stopped
 
 
+@pytest.mark.parametrize("lifecycle", ["stop", "finalise"])
+def test_manual_runtime_lifecycle_close_preserves_resolved_cutoff_deadline(
+    tmp_path: Path, lifecycle: str
+) -> None:
+    """Ordinary lifecycle close keeps an accepted boundary's original budget."""
+    clock = ClockHarness()
+    runtime, captures, _ = _manual_runtime_fixture(tmp_path)
+    runtime._monotonic_now = clock.monotonic_now  # pyright: ignore[reportPrivateUsage] - injected clock witness
+    store = RoastSessionStore(
+        default_log_dir=tmp_path / "accepted-lifecycle",
+        monotonic_now=clock.monotonic_now,
+        utc_now=clock.utc_now,
+    )
+    entered, release = Event(), Event()
+    original_loader = runtime._observation_model_loader  # pyright: ignore[reportPrivateUsage]
+
+    def loader(config: FirstCrackConfig):
+        loaded = original_loader(config)
+
+        def blocked_positive(window: AudioWindow) -> FirstCrackDetectorOutput:
+            del window
+            entered.set()
+            assert release.wait(2)
+            return FirstCrackDetectorOutput(confirmed=True, confidence=0.95)
+
+        loaded.adapter.backend.detect = blocked_positive
+        return loaded
+
+    runtime._observation_model_loader = loader  # pyright: ignore[reportPrivateUsage] - injected backend witness
+    session = store.start_session()
+    runtime.start_for_session(session)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - public lifecycle witness
+    assert observer is not None and len(captures) == 1
+    try:
+        store.record_event(session, "beans_added")
+        runtime.notify_human_mark(session)
+        captures[0].add_window(
+            _audio_window(sequence_number=1, started_at_monotonic_seconds=clock.monotonic_value + 1)
+        )
+        clock.monotonic_value += 3
+        assert entered.wait(2)
+
+        ticket = runtime.begin_observation_boundary(session, reason="beans_dropped")
+        assert ticket is not None
+        clock.monotonic_value += 1
+        accepted = store.record_event(session, "beans_dropped")
+        cutoff = session.monotonic_start + accepted.monotonic_seconds
+        runtime.resolve_observation_boundary(session, ticket, cutoff_monotonic_seconds=cutoff)
+        assert observer.cutoff == cutoff
+        assert observer.deadline is not None
+        original_deadline = observer.deadline
+        assert clock.monotonic_value < original_deadline
+
+        if lifecycle == "stop":
+            runtime.stop_for_session(session.id, reason="ordinary lifecycle stop")
+        else:
+            state, _, pending = runtime.finalise_for_session(session.id)
+            assert state == "capture_still_running" and pending
+
+        # An ordinary stop/finalisation is not a new boundary: it must not
+        # freeze the blocked eligible result before the accepted event budget.
+        assert observer.summary is None
+        assert observer.cutoff == cutoff
+        assert observer.deadline == original_deadline
+        release.set()
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+    finally:
+        release.set()
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+
+    assert observer.summary is not None
+    assert observer.summary.outcome == "confirmed"
+    assert observer.summary.drop_cutoff.value is not None
+    assert (
+        observer.summary.drop_cutoff.value.session_relative_seconds.value
+        == accepted.monotonic_seconds
+    )
+    assert observer.summary.reason.value == "beans_dropped"
+    assert observer.confirmation is not None
+
+
+@pytest.mark.parametrize("lifecycle", ["stop", "finalise"])
+def test_manual_runtime_lifecycle_close_rejects_blocked_result_at_original_deadline(
+    tmp_path: Path, lifecycle: str
+) -> None:
+    """Lifecycle close cannot extend a resolved boundary's deadline."""
+    clock = ClockHarness()
+    runtime, captures, _ = _manual_runtime_fixture(tmp_path)
+    runtime._monotonic_now = clock.monotonic_now  # pyright: ignore[reportPrivateUsage] - injected clock witness
+    store = RoastSessionStore(
+        default_log_dir=tmp_path / "accepted-deadline",
+        monotonic_now=clock.monotonic_now,
+        utc_now=clock.utc_now,
+    )
+    inferred_negative, entered, release = Event(), Event(), Event()
+    original_loader = runtime._observation_model_loader  # pyright: ignore[reportPrivateUsage]
+
+    def loader(config: FirstCrackConfig):
+        loaded = original_loader(config)
+
+        def negative_then_blocked(window: AudioWindow) -> FirstCrackDetectorOutput:
+            del window
+            if not inferred_negative.is_set():
+                inferred_negative.set()
+                return FirstCrackDetectorOutput(confirmed=False, confidence=0.1)
+            entered.set()
+            assert release.wait(2)
+            return FirstCrackDetectorOutput(confirmed=False, confidence=0.1)
+
+        loaded.adapter.backend.detect = negative_then_blocked
+        return loaded
+
+    runtime._observation_model_loader = loader  # pyright: ignore[reportPrivateUsage] - injected backend witness
+    session = store.start_session()
+    runtime.start_for_session(session)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - public lifecycle witness
+    assert observer is not None and len(captures) == 1
+    try:
+        store.record_event(session, "beans_added")
+        runtime.notify_human_mark(session)
+        captures[0].add_window(
+            _audio_window(sequence_number=1, started_at_monotonic_seconds=clock.monotonic_value + 1)
+        )
+        captures[0].add_window(
+            _audio_window(
+                sequence_number=2,
+                started_at_monotonic_seconds=clock.monotonic_value + 1.5,
+            )
+        )
+        clock.monotonic_value += 3
+        assert inferred_negative.wait(2)
+        assert entered.wait(2)
+        ticket = runtime.begin_observation_boundary(session, reason="emergency_stop")
+        assert ticket is not None
+        clock.monotonic_value += 1
+        accepted = store.record_event(session, "fault")
+        runtime.resolve_observation_boundary(
+            session,
+            ticket,
+            cutoff_monotonic_seconds=session.monotonic_start + accepted.monotonic_seconds,
+        )
+        assert observer.deadline is not None
+        original_deadline = observer.deadline
+        if lifecycle == "stop":
+            runtime.stop_for_session(session.id, reason="ordinary lifecycle stop")
+        else:
+            state, _, pending = runtime.finalise_for_session(session.id)
+            assert state == "capture_still_running" and pending
+        assert observer.summary is None and observer.deadline == original_deadline
+
+        clock.monotonic_value = original_deadline
+        observer.check_deadline()
+        assert observer.summary is not None
+        assert observer.summary.outcome == "incomplete"
+        assert not observer.summary.coverage_complete
+        assert observer.summary.reason.value == "emergency_stop"
+        assert observer.confirmation is None
+        release.set()
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+    finally:
+        release.set()
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+
+
 def test_manual_capture_setup_failure_closes_running_observer_without_cutoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
