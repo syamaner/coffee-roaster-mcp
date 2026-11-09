@@ -412,6 +412,14 @@ class FirstCrackObserver:
         self.human_at: float | None = None
         self.charge_at: float | None = None
         self.cutoff: float | None = None
+        self._provisional_cutoff: float | None = None
+        self._pending_boundaries: set[object] = set()
+        self._held_observation: (
+            tuple[
+                AudioWindow, FirstCrackWindowObservation, float, float, AudioCaptureSnapshot, bool
+            ]
+            | None
+        ) = None
         self.deadline: float | None = None
         self.reason: str | None = None
         self.failed = False
@@ -525,6 +533,14 @@ class FirstCrackObserver:
 
     def close(self, *, cutoff: float, reason: str) -> None:
         with self.lock:
+            if self._pending_boundaries:
+                self.failed = True
+                self.reason = "boundary_not_observed"
+                self.deadline = self.now()
+                self._freeze_locked()
+                self.changed.set()
+                coordinator().wake.set()
+                return
             if self.deadline is None:
                 self.cutoff = cutoff
                 self.deadline = (
@@ -538,6 +554,52 @@ class FirstCrackObserver:
                 )
         self.changed.set()
         coordinator().wake.set()
+
+    def open_boundary(self, ticket: object, *, reason: str) -> None:
+        """Fence acceptance after a driver return and before canonical commit."""
+        with self.lock:
+            if not self.valid or self.summary is not None:
+                return
+            self._pending_boundaries.add(ticket)
+            if self.deadline is None:
+                self.deadline = (
+                    self.now() + self.config.first_crack.observation_closing_timeout_seconds
+                )
+                self.state = "closing"
+                self.reason = reason
+        self.changed.set()
+        coordinator().wake.set()
+
+    def resolve_boundary(self, ticket: object, *, cutoff: float) -> None:
+        """Resolve only the matching dispatch ticket with its accepted event time."""
+        with self.lock:
+            if not self.valid or self.summary is not None or ticket not in self._pending_boundaries:
+                return
+            self._pending_boundaries.remove(ticket)
+            self._provisional_cutoff = (
+                cutoff
+                if self._provisional_cutoff is None
+                else min(self._provisional_cutoff, cutoff)
+            )
+            if not self._pending_boundaries:
+                accepted = (self.cutoff, self._provisional_cutoff)
+                self.cutoff = min(value for value in accepted if value is not None)
+        self.changed.set()
+        coordinator().wake.set()
+
+    def freeze_pending_boundary(self, ticket: object, *, reason: str) -> None:
+        """Freeze incomplete observation without inventing a missing cutoff."""
+        with self.lock:
+            if self.summary is None and ticket in self._pending_boundaries:
+                self.failed = True
+                self.reason = reason
+                self.deadline = self.now()
+                self._freeze_locked()
+        self.changed.set()
+        coordinator().wake.set()
+
+    def _mapped_now_locked(self) -> float:
+        return self.clock.session_origin + max(0.0, self.now() - self.clock.session_origin)
 
     def _freeze_if_due_locked(self) -> None:
         if self._supervision_failed:
@@ -560,7 +622,8 @@ class FirstCrackObserver:
         with self.lock:
             if self.summary is None:
                 self.valid = False
-                self.cutoff = self.now() if self.cutoff is None else self.cutoff
+                if not self._pending_boundaries:
+                    self.cutoff = self.now() if self.cutoff is None else self.cutoff
                 self.deadline = self.now()
                 self.reason = "session_changed"
                 self._freeze_locked()
@@ -724,9 +787,18 @@ class FirstCrackObserver:
                     if self.summary is not None or self._supervision_failed:
                         break
                     charge = self.charge_at
-                    closing = self.deadline is not None
+                    closing = self.deadline is not None and not self._pending_boundaries
                 self._refresh_recording_origin()
                 self._write_human(sink)
+                with self.lock:
+                    held = None if self._pending_boundaries else self._held_observation
+                    if held is not None:
+                        self._held_observation = None
+                if held is not None:
+                    self._observe(sink, *held[:-1], inference_failed=held[-1])
+                    self.changed.wait(0.05)
+                    self.changed.clear()
+                    continue
                 if closing:
                     stopped_normally = self._stop_capture()
                     self.check_deadline()
@@ -739,6 +811,13 @@ class FirstCrackObserver:
                         self.changed.wait(0.05)
                         self.changed.clear()
                         continue
+                with self.lock:
+                    pending_boundary = bool(self._pending_boundaries)
+                    needs_batch = not self._owned_windows
+                if pending_boundary:
+                    self.changed.wait(0.05)
+                    self.changed.clear()
+                    continue
                 capture = self.pipeline.snapshot()
                 self.note_capture(capture)
                 if capture.latest_error is not None:
@@ -746,8 +825,6 @@ class FirstCrackObserver:
                         self.failed = True
                         self.reason = "capture_failed"
                     self.close(cutoff=self.now(), reason="capture_failed")
-                with self.lock:
-                    needs_batch = not self._owned_windows
                 if needs_batch:
                     windows = self.pipeline.drain_windows(
                         max_windows=max(1, capture.queued_window_count)
@@ -765,6 +842,8 @@ class FirstCrackObserver:
                     self.changed.wait(0.05)
                     self.changed.clear()
                     continue
+                cutoff: float | None = None
+                end = 0.0
                 with self.lock:
                     if window.sequence_number in self._seen_windows:
                         if (
@@ -774,16 +853,30 @@ class FirstCrackObserver:
                         ):
                             self._count(duplicate_confirmations_rejected=1)
                         continue
-                    self._seen_windows.add(window.sequence_number)
-                    cutoff = self.cutoff
-                    charge = self.charge_at
-                    # AudioWindow timestamps are capture times, not delivery times.
-                    end = window.started_at_monotonic_seconds + window.duration_seconds
-                    self._inflight = int(
-                        charge is not None
-                        and window.started_at_monotonic_seconds >= charge
-                        and (cutoff is None or end < cutoff)
-                    )
+                    if self._pending_boundaries:
+                        self._owned_windows.insert(0, window)
+                        window = None
+                    if window is not None:
+                        self._seen_windows.add(window.sequence_number)
+                        cutoff = self.cutoff
+                        charge = self.charge_at
+                        # AudioWindow timestamps are capture times, not delivery times.
+                        end = window.started_at_monotonic_seconds + window.duration_seconds
+                        strict_witness = cutoff is not None or end < self._mapped_now_locked()
+                        if not strict_witness:
+                            self._owned_windows.insert(0, window)
+                            self._seen_windows.discard(window.sequence_number)
+                            window = None
+                        else:
+                            self._inflight = int(
+                                charge is not None
+                                and window.started_at_monotonic_seconds >= charge
+                                and (cutoff is None or end < cutoff)
+                            )
+                if window is None:
+                    self.changed.wait(0.05)
+                    self.changed.clear()
+                    continue
                 if (
                     charge is None
                     or window.started_at_monotonic_seconds < charge
@@ -976,8 +1069,20 @@ class FirstCrackObserver:
             if self.summary is not None or not self.valid:
                 coordinator().note_late_result()
                 return
-            self._inflight = 0
             end = window.started_at_monotonic_seconds + window.duration_seconds
+            if self._pending_boundaries or (
+                self.cutoff is None and end >= self._mapped_now_locked()
+            ):
+                self._held_observation = (
+                    window,
+                    observation,
+                    available,
+                    duration,
+                    capture,
+                    inference_failed,
+                )
+                return
+            self._inflight = 0
             if self.cutoff is not None and end >= self.cutoff:
                 eligibility = "ineligible_post_drop"
             elif self.charge_at is None or window.started_at_monotonic_seconds < self.charge_at:
@@ -1067,7 +1172,8 @@ class FirstCrackObserver:
             return
         confirmation = self.confirmation
         coverage = (
-            not self.failed
+            not self._pending_boundaries
+            and not self.failed
             and not self._coverage_loss
             and self.identity.status == "resolved"
             and self._drain_complete
@@ -1090,7 +1196,11 @@ class FirstCrackObserver:
             )
         }
         self.counts = self.counts.model_copy(
-            update=dict(undecided_eligible_windows=self._inflight + len(pending_eligible))
+            update=dict(
+                undecided_eligible_windows=0
+                if self._pending_boundaries
+                else self._inflight + len(pending_eligible)
+            )
         )
         outcome = (
             "confirmed"
@@ -1142,7 +1252,11 @@ class FirstCrackObserver:
             decision_available_at=absent("no_confirmation")
             if confirmation is None
             else present(confirmation.decision_available_at),
-            drop_cutoff=absent() if self.cutoff is None else present(self.clock.at(self.cutoff)),
+            drop_cutoff=absent("not_yet_observed")
+            if self._pending_boundaries
+            else absent()
+            if self.cutoff is None
+            else present(self.clock.at(self.cutoff)),
             frozen_at=self.clock.at(self.now()),
             max_probability=absent(
                 "load_not_completed"

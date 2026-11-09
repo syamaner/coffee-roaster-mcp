@@ -323,6 +323,76 @@ def test_post_drop_window_cannot_add_confirmation(tmp_path: Path) -> None:
     assert row.payload.eligibility == "ineligible_post_drop"
 
 
+def test_ticket_cleanup_is_identity_scoped_and_keeps_earliest_cutoff(tmp_path: Path) -> None:
+    """A resolved or foreign ticket cannot freeze another pending dispatch."""
+    observer, _, _, _ = setup_observer(tmp_path)
+    earlier, later, foreign = object(), object(), object()
+    observer.open_boundary(earlier, reason="beans_dropped")
+    observer.open_boundary(later, reason="emergency_stop")
+    observer.resolve_boundary(later, cutoff=8)
+
+    observer.freeze_pending_boundary(later, reason="later_cleanup")
+    observer.freeze_pending_boundary(foreign, reason="foreign_cleanup")
+
+    assert observer.summary is None
+    assert earlier in observer._pending_boundaries
+    assert observer.cutoff is None
+    observer.resolve_boundary(earlier, cutoff=6)
+    assert observer.cutoff == 6
+
+
+def test_invalidation_with_pending_ticket_never_invents_public_cutoff(tmp_path: Path) -> None:
+    """Lifecycle invalidation freezes unresolved work as unknown evidence."""
+    now = [10.0]
+    observer, _, _, _ = setup_observer(tmp_path, now=now)
+    ticket = object()
+    observer.open_boundary(ticket, reason="beans_dropped")
+    observer.invalidate()
+
+    assert observer.summary is not None
+    assert observer.summary.drop_cutoff.value is None
+    assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
+    assert not observer.summary.coverage_complete
+    assert observer.summary.counts.undecided_eligible_windows == 0
+
+
+def test_resolved_boundary_cannot_replace_earlier_complete_cutoff(tmp_path: Path) -> None:
+    """A later accepted event folds into, rather than replaces, prior evidence."""
+    observer, _, _, _ = setup_observer(tmp_path)
+    observer.cutoff = 6
+    ticket = object()
+    observer.open_boundary(ticket, reason="emergency_stop")
+    observer.resolve_boundary(ticket, cutoff=8)
+
+    assert observer.cutoff == 6
+    observer.invalidate()
+    assert observer.summary is not None
+    frozen = observer.summary.model_dump_json()
+    observer.resolve_boundary(ticket, cutoff=4)
+    observer.freeze_pending_boundary(ticket, reason="stale_cleanup")
+    assert observer.summary.model_dump_json() == frozen
+
+
+def test_mapped_clock_equality_holds_window_without_raw_clock_admission(tmp_path: Path) -> None:
+    """The strict witness uses the session mapping, not a larger raw clock."""
+    origin = 5.948083016636624
+    raw_now = 15.538684000000002
+    observer, capture, sink, _ = setup_observer(tmp_path, now=[raw_now])
+    observer.clock = observer.clock.model_copy(update={"session_origin": origin})
+    observer.charge_at = 1
+    equal_window = window(start=14.538684)
+    output = observer.loader(observer.config.first_crack).adapter.process_window_observed(
+        equal_window
+    )
+
+    observer._observe(sink, equal_window, output, raw_now, 0, capture.snapshot())
+
+    assert observer._mapped_now_locked() == 15.538684
+    assert observer._held_observation is not None
+    assert observer.confirmation is None
+    assert not sink.rows
+
+
 def test_precharge_positive_window_cannot_confirm(tmp_path: Path) -> None:
     observer, capture, sink, _ = setup_observer(tmp_path)
     observer.charge_at = 6

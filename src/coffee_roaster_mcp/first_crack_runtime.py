@@ -719,6 +719,35 @@ class FirstCrackSessionRuntime:
                 )
             observer.close(cutoff=cutoff, reason=reason.replace(" ", "_"))
 
+    def begin_observation_boundary(self, session: RoastSession, *, reason: str) -> object | None:
+        """Open a manual-observation fence after a driver call returns."""
+        observer = self._observer
+        if (
+            self._config.first_crack.event_authority != "manual"
+            or observer is None
+            or observer.session_id != session.id
+        ):
+            return None
+        ticket = object()
+        observer.open_boundary(ticket, reason=reason.replace(" ", "_"))
+        return ticket
+
+    def resolve_observation_boundary(
+        self, session: RoastSession, ticket: object | None, *, cutoff_monotonic_seconds: float
+    ) -> None:
+        """Resolve a manual boundary using its own accepted canonical event."""
+        observer = self._observer
+        if ticket is not None and observer is not None and observer.session_id == session.id:
+            observer.resolve_boundary(ticket, cutoff=cutoff_monotonic_seconds)
+
+    def freeze_observation_boundary(
+        self, session: RoastSession, ticket: object | None, *, reason: str
+    ) -> None:
+        """Freeze an unresolved manual boundary without inventing an event time."""
+        observer = self._observer
+        if ticket is not None and observer is not None and observer.session_id == session.id:
+            observer.freeze_pending_boundary(ticket, reason=reason.replace(" ", "_"))
+
     def process_available_windows(
         self,
         *,

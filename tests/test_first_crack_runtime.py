@@ -3627,7 +3627,7 @@ def _accepted_emergency_clock_witness(
     cutoffs: list[float | None] = []
     original_emergency = context.roaster_driver.emergency_stop
     original_event = store.emergency_stop_snapshot
-    original_close = runtime.close_observation
+    original_resolve = runtime.resolve_observation_boundary
 
     def emergency(*, reason: str):
         result = original_emergency(reason=reason)
@@ -3640,22 +3640,17 @@ def _accepted_emergency_clock_witness(
         clock[0] += 10  # Delay only after the real accepted event exists.
         return result
 
-    def close(
-        session: RoastSession, *, reason: str, cutoff_monotonic_seconds: float | None = None
+    def resolve(
+        session: RoastSession, ticket: object | None, *, cutoff_monotonic_seconds: float
     ) -> None:
         assert trace[-1] == "accepted_event"
-        assert reason == (
-            "emergency_stop" if trigger == "public" else "autonomous_telemetry_sampler_failure"
-        )
         cutoffs.append(cutoff_monotonic_seconds)
-        trace.append("close")
-        return original_close(
-            session, reason=reason, cutoff_monotonic_seconds=cutoff_monotonic_seconds
-        )
+        trace.append("resolve")
+        return original_resolve(session, ticket, cutoff_monotonic_seconds=cutoff_monotonic_seconds)
 
     monkeypatch.setattr(context.roaster_driver, "emergency_stop", emergency)
     monkeypatch.setattr(store, "emergency_stop_snapshot", accepted)
-    monkeypatch.setattr(runtime, "close_observation", close)
+    monkeypatch.setattr(runtime, "resolve_observation_boundary", resolve)
     try:
         assert entered.wait(2)
         clock[0] = base + 1
@@ -3678,11 +3673,7 @@ def _accepted_emergency_clock_witness(
     finally:
         release.set()
         assert owner.reaped.wait(2)
-    assert [row.payload.eligibility for row in rows] == [
-        "eligible",
-        "ineligible_post_drop",
-        "ineligible_post_drop",
-    ]
+    assert rows == []
     assert owner.confirmation is None
     before = store.get_session_snapshot(session_id=session_id)
     assert before.first_crack_at_utc is None
@@ -3697,7 +3688,7 @@ def _accepted_emergency_clock_witness(
     after = store.get_session_snapshot(session_id=session_id)
     assert after.faulted_monotonic_seconds == 10
     assert [event.kind for event in after.event_timeline] == ["beans_added", "fault", "fault"]
-    assert trace == ["driver", "accepted_event", "close"] * 2
+    assert trace == ["driver", "accepted_event", "resolve"] * 2
 
 
 def _assert_empty_successor_capture(snapshot: FirstCrackRuntimeSnapshot) -> None:

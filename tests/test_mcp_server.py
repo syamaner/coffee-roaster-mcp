@@ -6056,29 +6056,27 @@ def test_guarded_drop_closes_only_manual_observation_after_dispatch(
             config, first_crack=dataclasses.replace(config.first_crack, event_authority=authority)
         ),
     )
-    closed: list[tuple[str, float | None, str]] = []
+    resolved: list[tuple[str, float]] = []
 
-    def close(
-        session: RoastSession, *, reason: str, cutoff_monotonic_seconds: float | None = None
+    def resolve(
+        session: RoastSession, ticket: object | None, *, cutoff_monotonic_seconds: float
     ) -> None:
         # Recovery preserves terminal canonical fields; its accepted event is
         # the diagnostic timing input, after real fake-driver dispatch.
         assert driver.actions[-1] == "drop_beans"
         event = next(event for event in session.event_timeline if event.kind == "beans_dropped")
         assert cutoff_monotonic_seconds == session.monotonic_start + event.monotonic_seconds
-        closed.append((session.id, cutoff_monotonic_seconds, reason))
+        resolved.append((session.id, cutoff_monotonic_seconds))
 
-    monkeypatch.setattr(context.first_crack_runtime, "close_observation", close)
+    monkeypatch.setattr(context.first_crack_runtime, "resolve_observation_boundary", resolve)
     result = _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
     assert result.event.kind == "beans_dropped"
     if authority == "manual":
         session = context.session_store.get_latest_session()
         assert session is not None
-        assert closed == [
-            (session_id, session.monotonic_start + result.event.monotonic_seconds, "beans_dropped")
-        ]
+        assert resolved == [(session_id, session.monotonic_start + result.event.monotonic_seconds)]
     else:
-        assert closed == []
+        assert resolved == []
 
 
 def test_manual_shadow_stdio_successor_refuses_unreaped_prior_observer(tmp_path: Path) -> None:

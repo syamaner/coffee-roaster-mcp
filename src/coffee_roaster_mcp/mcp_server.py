@@ -1134,12 +1134,6 @@ def create_mcp_server(
                 session,
                 reservation=reservation,
             )
-            if server_context.config.first_crack.event_authority == "manual":
-                server_context.first_crack_runtime.close_observation(
-                    session,
-                    reason="beans_dropped",
-                    cutoff_monotonic_seconds=session.monotonic_start + event.monotonic_seconds,
-                )
             return _serialize_event_result(snapshot=snapshot, event=event)
         # coffee-roaster-mcp#191: classify any detector window captured BEFORE
         # this drop but not yet drained by the poll cadence, so a genuine
@@ -1152,9 +1146,7 @@ def create_mcp_server(
         # first_crack_detected to the session event log — see
         # process_pending_windows_after_drop's docstring for why that stays
         # untouched by design.
-        if server_context.config.first_crack.event_authority == "manual":
-            server_context.first_crack_runtime.close_observation(session, reason="beans_dropped")
-        else:
+        if server_context.config.first_crack.event_authority != "manual":
             server_context.first_crack_runtime.process_pending_windows_after_drop(
                 session_store=server_context.session_store, session=session
             )
@@ -1280,7 +1272,7 @@ def create_mcp_server(
         session: RoastSession | None = None
         has_verified_containment = False
         primary_error: BaseException | None = None
-        observation_cutoff: float | None = None
+        observation_ticket: object | None = None
         try:
             with server_context.lifecycle_barrier:
                 if expected_session_id is None:
@@ -1294,6 +1286,12 @@ def create_mcp_server(
                     server_context.session_store.cancel_session_start_for_emergency_stop()
                 server_context.session_store.cancel_nonfinalisation_driver_command(session)
                 safety_payload = run_driver_emergency_stop(server_context, reason=reason)
+                if server_context.config.first_crack.event_authority == "manual":
+                    observation_ticket = (
+                        server_context.first_crack_runtime.begin_observation_boundary(
+                            session, reason="emergency_stop"
+                        )
+                    )
                 has_verified_containment = has_verified_emergency_containment(
                     safety_payload=safety_payload
                 )
@@ -1313,7 +1311,13 @@ def create_mcp_server(
                         safety_payload=safety_payload,
                         allow_stopped_latest=True,
                     )
-                    observation_cutoff = session.monotonic_start + event.monotonic_seconds
+                    if server_context.config.first_crack.event_authority == "manual":
+                        server_context.first_crack_runtime.resolve_observation_boundary(
+                            session,
+                            observation_ticket,
+                            cutoff_monotonic_seconds=session.monotonic_start
+                            + event.monotonic_seconds,
+                        )
                 except Exception as exc:
                     if expected_session_id is not None:
                         with suppress(Exception):  # Preserve the persistence failure.
@@ -1342,16 +1346,13 @@ def create_mcp_server(
                 cleanup_error: Exception | None = None
                 for stop_runtime in (
                     lambda: (
-                        server_context.first_crack_runtime.close_observation(
-                            session,
-                            reason="emergency_stop",
-                            cutoff_monotonic_seconds=observation_cutoff,
+                        server_context.first_crack_runtime.freeze_observation_boundary(
+                            session, observation_ticket, reason="emergency_stop"
                         )
                         if server_context.config.first_crack.event_authority == "manual"
-                        and observation_cutoff is not None
+                        and observation_ticket is not None
                         else server_context.first_crack_runtime.stop_for_session(
-                            session.id,
-                            reason="emergency stop",
+                            session.id, reason="emergency stop"
                         )
                     ),
                     lambda: server_context.telemetry_sampler.stop_for_session(
@@ -1655,18 +1656,34 @@ def _run_reserved_driver_drop(
         return drop_reservation.existing_event, drop_reservation.snapshot
 
     reservation = drop_reservation.reservation
+    observation_ticket: object | None = None
     try:
         driver_state = server_context.roaster_driver.drop_beans()
+        if server_context.config.first_crack.event_authority == "manual":
+            observation_ticket = server_context.first_crack_runtime.begin_observation_boundary(
+                session, reason="beans_dropped"
+            )
         try:
-            return server_context.session_store.complete_reserved_driver_drop_snapshot(
+            event, snapshot = server_context.session_store.complete_reserved_driver_drop_snapshot(
                 session,
                 reservation=reservation,
                 heat_level_percent=driver_state.heat_level_percent,
                 fan_level_percent=driver_state.fan_level_percent,
                 cooling_on=driver_state.cooling_on,
             )
+            if server_context.config.first_crack.event_authority == "manual":
+                server_context.first_crack_runtime.resolve_observation_boundary(
+                    session,
+                    observation_ticket,
+                    cutoff_monotonic_seconds=session.monotonic_start + event.monotonic_seconds,
+                )
+            return event, snapshot
         except SessionLifecycleError:
             _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
+            if server_context.config.first_crack.event_authority == "manual":
+                server_context.first_crack_runtime.freeze_observation_boundary(
+                    session, observation_ticket, reason="drop_recording_failed"
+                )
             raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
@@ -1744,6 +1761,7 @@ def _run_reserved_driver_fault_recovery(
     """
     command: Literal["drop", "start_cooling", "stop_cooling"] = "stop_cooling"
     driver_state: RoasterState | None = None
+    observation_ticket: object | None = None
     try:
         if reservation.kind == "drop":
             command = "drop"
@@ -1756,14 +1774,27 @@ def _run_reserved_driver_fault_recovery(
             driver_state = server_context.roaster_driver.stop_cooling()
         else:
             raise SessionLifecycleError("Unsupported stopped-fault recovery command.")
-        return server_context.session_store.complete_reserved_driver_fault_recovery_snapshot(
-            session,
-            reservation=reservation,
-            heat_level_percent=driver_state.heat_level_percent,
-            fan_level_percent=driver_state.fan_level_percent,
-            cooling_on=driver_state.cooling_on,
-            connected=driver_state.connected,
+        if command == "drop" and server_context.config.first_crack.event_authority == "manual":
+            observation_ticket = server_context.first_crack_runtime.begin_observation_boundary(
+                session, reason="beans_dropped"
+            )
+        event, snapshot = (
+            server_context.session_store.complete_reserved_driver_fault_recovery_snapshot(
+                session,
+                reservation=reservation,
+                heat_level_percent=driver_state.heat_level_percent,
+                fan_level_percent=driver_state.fan_level_percent,
+                cooling_on=driver_state.cooling_on,
+                connected=driver_state.connected,
+            )
         )
+        if command == "drop" and server_context.config.first_crack.event_authority == "manual":
+            server_context.first_crack_runtime.resolve_observation_boundary(
+                session,
+                observation_ticket,
+                cutoff_monotonic_seconds=session.monotonic_start + event.monotonic_seconds,
+            )
+        return event, snapshot
     except Exception:
         if command == "drop":
             server_context.session_store.retain_fault_drop_ambiguity_if_unrecorded(session)
@@ -1778,6 +1809,10 @@ def _run_reserved_driver_fault_recovery(
             or (command in {"drop", "start_cooling"} and driver_state.fan_level_percent != 100)
         ):
             server_context.session_store.retain_fault_recovery_admission_block(session)
+        if command == "drop" and server_context.config.first_crack.event_authority == "manual":
+            server_context.first_crack_runtime.freeze_observation_boundary(
+                session, observation_ticket, reason="fault_recovery_incomplete"
+            )
         raise
 
 
@@ -2149,6 +2184,7 @@ def _fault_active_session_after_sampler_failure(
 ) -> None:
     """Fail closed when autonomous sampling cannot safely continue."""
     reason = f"autonomous telemetry sampler failed: {type(error).__name__}: {error}"
+    observation_ticket: object | None = None
     try:
         with server_context.lifecycle_barrier:
             latest_session = server_context.session_store.get_latest_session()
@@ -2167,6 +2203,10 @@ def _fault_active_session_after_sampler_failure(
             ):
                 return
             safety_payload = run_driver_emergency_stop(server_context, reason=reason)
+            if server_context.config.first_crack.event_authority == "manual":
+                observation_ticket = server_context.first_crack_runtime.begin_observation_boundary(
+                    session, reason="autonomous_telemetry_sampler_failure"
+                )
             event, snapshot = server_context.session_store.emergency_stop_snapshot(
                 session,
                 reason=reason,
@@ -2174,11 +2214,15 @@ def _fault_active_session_after_sampler_failure(
                 allow_stopped_latest=True,
             )
     except SessionLifecycleError:
+        if server_context.config.first_crack.event_authority == "manual":
+            server_context.first_crack_runtime.freeze_observation_boundary(
+                session, observation_ticket, reason="sampler_fault_recording_failed"
+            )
         return
     if server_context.config.first_crack.event_authority == "manual":
-        server_context.first_crack_runtime.close_observation(
+        server_context.first_crack_runtime.resolve_observation_boundary(
             session,
-            reason="autonomous_telemetry_sampler_failure",
+            observation_ticket,
             cutoff_monotonic_seconds=session.monotonic_start + event.monotonic_seconds,
         )
     else:
