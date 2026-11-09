@@ -3912,16 +3912,44 @@ def _public_boundary_matrix_context(
     monkeypatch: pytest.MonkeyPatch,
     *,
     authority: str,
-) -> tuple[Any, Any, Any, Any, str, Any | None]:
+    negative_backend: bool = False,
+) -> tuple[Any, Any, Any, Any, str, Any | None, Event | None]:
     """Build an actual public context with only the admitted test seams."""
     from types import SimpleNamespace
 
+    from coffee_roaster_mcp.first_crack_observation import IdentityRecord, Record, WindowRecord
+    from coffee_roaster_mcp.first_crack_observer import JsonlObservationSink
     from coffee_roaster_mcp.mcp_server import build_server_context, create_mcp_server
 
     path = tmp_path / f"{authority}-public-boundary-context.yaml"
     path.write_text(f"logging:\n  log_dir: {tmp_path / 'context-logs'}\n", encoding="utf-8")
+    identity_ready: Event | None = None
     if authority == "manual":
         runtime, _captures, config = _manual_runtime_fixture(tmp_path)
+        identity_ready = Event()
+        window_recorded = Event()
+
+        if negative_backend:
+            original_loader = runtime._observation_model_loader  # pyright: ignore[reportPrivateUsage]
+
+            def loader(first_crack: FirstCrackConfig) -> Any:
+                loaded = original_loader(first_crack)
+                loaded.adapter.backend.detect = lambda window: FirstCrackDetectorOutput(
+                    confirmed=False, confidence=0.1
+                )
+                return loaded
+
+            runtime._observation_model_loader = loader  # pyright: ignore[reportPrivateUsage]
+
+        class ReadySink(JsonlObservationSink):
+            def append(self, record: Record) -> None:
+                super().append(record)
+                if isinstance(record, IdentityRecord):
+                    identity_ready.set()
+                if isinstance(record, WindowRecord):
+                    window_recorded.set()
+
+        runtime._observation_sink_factory = ReadySink  # pyright: ignore[reportPrivateUsage]
         context = build_server_context(config_path=path)
         object.__setattr__(context, "config", config)
         object.__setattr__(context, "first_crack_runtime", runtime)
@@ -3929,6 +3957,7 @@ def _public_boundary_matrix_context(
         # The real legacy default is disabled and receives no observer ack.
         context = build_server_context(config_path=path)
         runtime = context.first_crack_runtime
+        window_recorded = None
     server = create_mcp_server(config_path=path)
     ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=context))
 
@@ -3945,7 +3974,10 @@ def _public_boundary_matrix_context(
     context.telemetry_sampler.stop_for_session(session_id, reason="controlled matrix")
     call("mark_beans_added")
     observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - public lifecycle witness
-    return context, runtime, call, started, session_id, observer
+    if authority == "manual":
+        assert identity_ready is not None
+        assert identity_ready.wait(2)
+    return context, runtime, call, started, session_id, observer, window_recorded
 
 
 def _install_public_boundary_trace(
@@ -4003,9 +4035,10 @@ def _install_public_boundary_trace(
 
 
 def _assert_manual_public_boundary_trace(
-    trace: list[tuple[str, object]], *, reason: str, session: Any
+    trace: list[tuple[str, object]], *, reason: str, session: Any, target: Any
 ) -> None:
     """Check the ticket and accepted-event scalar stay with one dispatch."""
+    assert 4 <= len(trace) <= 5
     assert [entry[0] for entry in trace[:4]] == ["driver", "begin", "accepted", "resolve"]
     begin_reason, ticket = cast(tuple[str, object | None], trace[1][1])
     _method, event = cast(tuple[str, Any], trace[2][1])
@@ -4014,6 +4047,16 @@ def _assert_manual_public_boundary_trace(
     assert ticket is not None
     assert resolved_ticket is ticket
     assert cutoff == session.monotonic_start + event.monotonic_seconds
+    accepted_event = event.event if hasattr(event, "event") else event
+    returned_event = target.event if hasattr(target, "event") else target
+    assert accepted_event.kind == returned_event.kind
+    assert accepted_event.monotonic_seconds == returned_event.monotonic_seconds
+    accepted_utc = accepted_event.recorded_at_utc
+    returned_utc = returned_event.recorded_at_utc
+    assert (accepted_utc.isoformat() if hasattr(accepted_utc, "isoformat") else accepted_utc) == (
+        returned_utc.isoformat() if hasattr(returned_utc, "isoformat") else returned_utc
+    )
+    assert accepted_event.payload == returned_event.payload
     if len(trace) == 5:
         frozen_ticket, frozen_reason = cast(tuple[object | None, str], trace[4][1])
         assert trace[4][0] == "freeze"
@@ -4030,8 +4073,8 @@ def test_public_observation_boundary_dispatch_matrix(
     """Each public dispatch keeps manual boundaries causal; automatic stays legacy-disabled."""
     from coffee_roaster_mcp import mcp_server
 
-    context, runtime, call, _started, session_id, observer = _public_boundary_matrix_context(
-        tmp_path, monkeypatch, authority=authority
+    context, runtime, call, _started, session_id, observer, _window_recorded = (
+        _public_boundary_matrix_context(tmp_path, monkeypatch, authority=authority)
     )
     trace = _install_public_boundary_trace(monkeypatch, context, runtime)
     session = context.session_store.get_session_snapshot(session_id=session_id)
@@ -4069,7 +4112,9 @@ def test_public_observation_boundary_dispatch_matrix(
         snapshot = context.session_store.get_session_snapshot(session_id=session_id)
         assert snapshot.first_crack_at_utc is None
         if authority == "manual":
-            _assert_manual_public_boundary_trace(trace, reason=expected_reason, session=session)
+            _assert_manual_public_boundary_trace(
+                trace, reason=expected_reason, session=session, target=event
+            )
             if path == "stopped_fault_drop":
                 assert frozen_summary is not None
                 assert observer is not None and observer.summary.model_dump_json() == frozen_summary
@@ -4084,14 +4129,70 @@ def test_public_observation_boundary_dispatch_matrix(
 
 
 @pytest.mark.parametrize(
+    ("path", "reason"),
+    [
+        ("public_emergency", "public coverage fault"),
+        ("sampler_failure", "sampler coverage fault"),
+    ],
+)
+def test_public_fault_first_boundary_marks_processed_negative_prefix_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, reason: str
+) -> None:
+    """Public fault paths retain a negative prefix but never call it complete."""
+    from coffee_roaster_mcp import mcp_server
+
+    context, runtime, call, _started, session_id, observer, window_recorded = (
+        _public_boundary_matrix_context(
+            tmp_path, monkeypatch, authority="manual", negative_backend=True
+        )
+    )
+    assert observer is not None and window_recorded is not None
+    session = context.session_store.get_session_snapshot(session_id=session_id)
+    charge = session.event_timeline[-1]
+    observer.pipeline.add_window(  # pyright: ignore[reportPrivateUsage]
+        AudioWindow(
+            991,
+            None,
+            16000,
+            session.monotonic_start + charge.monotonic_seconds + 0.001,
+            0.001,
+            (0.0,) * 16,
+        )
+    )
+    observer.changed.set()
+    try:
+        assert window_recorded.wait(2), observer.snapshot()
+        if path == "public_emergency":
+            result = call("emergency_stop", reason=reason)
+            assert result.event.kind == "fault"
+        else:
+            active = context.session_store.get_active_session()
+            assert active is not None
+            mcp_server._fault_active_session_after_sampler_failure(  # pyright: ignore[reportPrivateUsage]
+                context, session=active, error=RuntimeError(reason)
+            )
+        assert observer.reaped.wait(2)
+    finally:
+        if not observer.reaped.is_set():
+            runtime.close_observation(session, reason="coverage diagnostic cleanup")
+            observer.changed.set()
+            assert observer.reaped.wait(2)
+
+    assert observer.summary is not None
+    assert observer.summary.counts.eligible_windows == 1
+    assert not observer.summary.coverage_complete
+    assert observer.summary.outcome == "incomplete"
+
+
+@pytest.mark.parametrize(
     "path", ["ordinary_retry", "stopped_fault_start_cooling", "stopped_fault_stop_cooling"]
 )
 def test_public_drop_retry_and_fault_cooling_do_not_open_new_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
 ) -> None:
     """Retries and cooling recovery retain their events without a new drop boundary."""
-    context, runtime, call, _started, session_id, observer = _public_boundary_matrix_context(
-        tmp_path, monkeypatch, authority="manual"
+    context, runtime, call, _started, session_id, observer, _window_recorded = (
+        _public_boundary_matrix_context(tmp_path, monkeypatch, authority="manual")
     )
     trace = _install_public_boundary_trace(monkeypatch, context, runtime)
     session = context.session_store.get_session_snapshot(session_id=session_id)
@@ -4138,8 +4239,8 @@ def test_manual_boundary_raised_dispatch_has_no_ticket(
     """A dispatch which raises before returning never opens a manual boundary."""
     import coffee_roaster_mcp.mcp_server as mcp_server
 
-    context, runtime, call, _started, session_id, observer = _public_boundary_matrix_context(
-        tmp_path, monkeypatch, authority="manual"
+    context, runtime, call, _started, session_id, observer, _window_recorded = (
+        _public_boundary_matrix_context(tmp_path, monkeypatch, authority="manual")
     )
     trace = _install_public_boundary_trace(monkeypatch, context, runtime)
     session = context.session_store.get_session_snapshot(session_id=session_id)
@@ -4175,9 +4276,7 @@ def test_manual_boundary_raised_dispatch_has_no_ticket(
                 with pytest.raises(RuntimeError, match="synthetic emergency before return"):
                     getattr(  # noqa: B009 - invokes the registered private callback.
                         mcp_server, "_fault_active_session_after_sampler_failure"
-                    )(
-                        context, session=active, error=RuntimeError("synthetic sampler callback")
-                    )
+                    )(context, session=active, error=RuntimeError("synthetic sampler callback"))
 
         assert not any(name in {"begin", "resolve"} for name, _ in trace)
         assert all(
@@ -4216,8 +4315,8 @@ def test_manual_boundary_failed_commit_and_failed_containment(
     import coffee_roaster_mcp.mcp_server as mcp_server
     from coffee_roaster_mcp.session import default_emergency_safety_payload
 
-    context, runtime, call, _started, session_id, observer = _public_boundary_matrix_context(
-        tmp_path, monkeypatch, authority="manual"
+    context, runtime, call, _started, session_id, observer, _window_recorded = (
+        _public_boundary_matrix_context(tmp_path, monkeypatch, authority="manual")
     )
     trace = _install_public_boundary_trace(monkeypatch, context, runtime)
     session = context.session_store.get_session_snapshot(session_id=session_id)
@@ -4275,9 +4374,7 @@ def test_manual_boundary_failed_commit_and_failed_containment(
                 assert active is not None
                 getattr(  # noqa: B009 - invokes the registered private callback.
                     mcp_server, "_fault_active_session_after_sampler_failure"
-                )(
-                    context, session=active, error=RuntimeError("synthetic sampler callback")
-                )
+                )(context, session=active, error=RuntimeError("synthetic sampler callback"))
                 assert ambient_stops == []
             expected_freeze = (
                 "emergency_stop" if path == "public_emergency" else "sampler_fault_recording_failed"
@@ -4306,7 +4403,13 @@ def test_manual_boundary_failed_commit_and_failed_containment(
         }
         if path == "returned_failed_containment":
             assert "accepted" in names and "resolve" in names
-            _assert_manual_public_boundary_trace(trace, reason="emergency_stop", session=session)
+            _method, accepted_event = cast(tuple[str, Any], trace[names.index("accepted")][1])
+            resolved_ticket, cutoff = cast(
+                tuple[object | None, float], trace[names.index("resolve")][1]
+            )
+            assert accepted_event.kind == "fault"
+            assert resolved_ticket is ticket
+            assert cutoff == session.monotonic_start + accepted_event.monotonic_seconds
         else:
             assert "resolve" not in names
             frozen_ticket, freeze_reason = cast(tuple[object | None, str], trace[-1][1])

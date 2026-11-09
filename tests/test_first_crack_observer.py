@@ -1564,6 +1564,103 @@ def test_pending_closing_drain_masks_cutoff_and_clean_coverage(tmp_path: Path) -
     assert observer.summary.counts.undecided_eligible_windows == 0
 
 
+@pytest.mark.parametrize(
+    ("reason", "coverage_complete", "outcome"),
+    [
+        ("beans_dropped", True, "no_confirmation"),
+        ("emergency_stop", False, "incomplete"),
+        ("autonomous_telemetry_sampler_failure", False, "incomplete"),
+    ],
+)
+def test_first_boundary_reason_preserves_negative_prefix_coverage(
+    tmp_path: Path, reason: str, coverage_complete: bool, outcome: str
+) -> None:
+    """Only a first ordinary drop can close a complete negative prefix."""
+
+    now = [10.0]
+    observer, capture, sink, backend = setup_observer(tmp_path, now=now)
+    backend.detect = lambda window: FirstCrackDetectorOutput(confirmed=False, confidence=0.1)
+    observer.update_boundaries(charge_at=1, human_at=None)
+    capture.windows.append(window())
+    assert observer.start()
+    try:
+        assert sink.appended.wait(2)
+        if reason == "beans_dropped":
+            observer.close(cutoff=8.0, reason=reason)
+        else:
+            ticket = object()
+            observer.open_boundary(ticket, reason=reason)
+            observer.resolve_boundary(ticket, cutoff=8.0)
+            now[0] = 20.0
+            observer.check_deadline()
+        assert observer.reaped.wait(2)
+    finally:
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+
+    assert observer.summary is not None
+    assert observer.summary.counts.eligible_windows == 1
+    assert observer.summary.coverage_complete is coverage_complete
+    assert observer.summary.outcome == outcome
+
+
+def test_pending_boundary_before_stop_claim_defers_normal_capture_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ticket opened before the normal stop claim defers the one real stop."""
+
+    stop_entered = Event()
+    release_stop_entry = Event()
+    pending_hold = Event()
+
+    class CountedCapture(Capture):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_calls = 0
+
+        def stop(self, *, timeout_seconds: float = 1) -> AudioCaptureSnapshot:
+            self.stop_calls += 1
+            return super().stop(timeout_seconds=timeout_seconds)
+
+    observer, _, _, _ = setup_observer(tmp_path)
+    capture = CountedCapture()
+    observer.pipeline = capture
+    original_stop = observer._stop_capture  # pyright: ignore[reportPrivateUsage]
+    original_wait = observer.changed.wait
+
+    def pause_before_stop_claim(*args: object, **kwargs: object) -> bool:
+        stop_entered.set()
+        assert release_stop_entry.wait(5)
+        return original_stop(*args, **kwargs)
+
+    def acknowledge_pending_hold(timeout: float | None = None) -> bool:
+        if observer._pending_boundaries:  # pyright: ignore[reportPrivateUsage]
+            pending_hold.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(observer, "_stop_capture", pause_before_stop_claim)
+    monkeypatch.setattr(observer.changed, "wait", acknowledge_pending_hold)
+    observer.close(cutoff=8.0, reason="beans_dropped")
+    assert observer.start()
+    ticket = object()
+    try:
+        assert stop_entered.wait(2)
+        observer.open_boundary(ticket, reason="emergency_stop")
+        release_stop_entry.set()
+        assert pending_hold.wait(2)
+        assert capture.stop_calls == 0 and not capture.stopped
+        observer.freeze_pending_boundary(ticket, reason="test_cleanup")
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+    finally:
+        release_stop_entry.set()
+        observer.freeze_pending_boundary(ticket, reason="test_cleanup")
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+
+    assert capture.stop_calls == 1 and capture.stopped
+
+
 def test_pending_freeze_hides_provisional_cutoff_and_clean_coverage(tmp_path: Path) -> None:
     """A resolved later scalar remains non-public while another ticket is owned."""
 

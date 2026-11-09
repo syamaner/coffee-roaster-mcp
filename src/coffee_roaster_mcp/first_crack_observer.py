@@ -476,14 +476,21 @@ class FirstCrackObserver:
                 self.failed = True
                 self.reason = "capture_stop_unconfirmed"
 
-    def _stop_capture(self, *, timeout: float | None = None) -> bool:
+    def _stop_capture(
+        self, *, timeout: float | None = None, require_frozen_boundary: bool = False
+    ) -> bool:
         # Claim only under the short guard; no lock is held across capture I/O.
         # A lifespan caller may boundedly observe an existing stop owner, never
         # join/wait for model work or run a second concurrent pipeline.stop.
-        with self._capture_stop_lock:
-            claimed = not self._capture_stop_attempted
-            if claimed:
-                self._capture_stop_attempted = True
+        # Lock order is observer state, then capture-stop ownership.  The
+        # owner guard is released before any capture call or owner wait.
+        with self.lock:
+            if require_frozen_boundary and self.summary is None and self._pending_boundaries:
+                return False
+            with self._capture_stop_lock:
+                claimed = not self._capture_stop_attempted
+                if claimed:
+                    self._capture_stop_attempted = True
         if not claimed:
             return (
                 self._capture_stop_finished.wait(
@@ -566,6 +573,8 @@ class FirstCrackObserver:
                     self.now() + self.config.first_crack.observation_closing_timeout_seconds
                 )
                 self.state = "closing"
+                if reason != "beans_dropped":
+                    self.failed = True
                 self.reason = reason
         self.changed.set()
         coordinator().wake.set()
@@ -800,7 +809,7 @@ class FirstCrackObserver:
                     self.changed.clear()
                     continue
                 if closing:
-                    stopped_normally = self._stop_capture()
+                    stopped_normally = self._stop_capture(require_frozen_boundary=True)
                     self.check_deadline()
                     with self.lock:
                         if self.summary is not None:
