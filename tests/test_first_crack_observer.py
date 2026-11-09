@@ -1314,3 +1314,185 @@ def test_process_error_then_normal_close_retains_window_evidence_and_incomplete_
     assert observer.confirmation is None and not observer._inference_failed
     # One free-text summary reason is not an exhaustive failure inventory or
     # a promised priority order. Per-window evidence carries the unusable output.
+
+
+def test_pending_ticket_fences_drain_returning_from_pre_ticket_snapshot(tmp_path: Path) -> None:
+    """A ticket opened during snapshot prevents a subsequent fresh drain claim."""
+
+    snapshot_entered = Event()
+    release_snapshot = Event()
+    drain_called = Event()
+    worker_held_pending = Event()
+
+    class SnapshotBlockedCapture(Capture):
+        def snapshot(self) -> AudioCaptureSnapshot:
+            snapshot_entered.set()
+            assert release_snapshot.wait(5)
+            return super().snapshot()
+
+        def drain_windows(self, *, max_windows: int | None = None) -> tuple[AudioWindow, ...]:
+            drain_called.set()
+            return super().drain_windows(max_windows=max_windows)
+
+    observer, _, _, _ = setup_observer(tmp_path)
+    capture = SnapshotBlockedCapture()
+    capture.windows.append(window())
+    observer.pipeline = capture
+    original_wait = observer.changed.wait
+
+    def acknowledge_pending_hold(timeout: float | None = None) -> bool:
+        if release_snapshot.is_set():
+            worker_held_pending.set()
+        return original_wait(timeout)
+
+    observer.changed.wait = acknowledge_pending_hold
+    ticket = object()
+    assert observer.start()
+    try:
+        assert snapshot_entered.wait(2)
+        observer.open_boundary(ticket, reason="beans_dropped")
+        release_snapshot.set()
+        assert worker_held_pending.wait(2)
+        assert not drain_called.is_set()
+        assert capture.windows and not capture.stopped
+        observer.freeze_pending_boundary(ticket, reason="test_cleanup")
+    finally:
+        release_snapshot.set()
+        observer.freeze_pending_boundary(ticket, reason="test_cleanup")
+        assert observer.reaped.wait(2)
+
+
+def test_running_worker_later_ticket_does_not_consume_earlier_pending_window(
+    tmp_path: Path,
+) -> None:
+    """A later resolution leaves earlier pending work owned and post-drop ineligible."""
+
+    now = [104.0]
+    observer, capture, sink, _ = setup_observer(tmp_path, now=now)
+    pending_hold = Event()
+    window_recorded = Event()
+    original_wait = observer.changed.wait
+    original_append = sink.append
+
+    def acknowledge_pending_hold(timeout: float | None = None) -> bool:
+        pending_hold.set()
+        return original_wait(timeout)
+
+    def append(record: Record) -> None:
+        original_append(record)
+        if isinstance(record, WindowRecord):
+            window_recorded.set()
+
+    observer.changed.wait = acknowledge_pending_hold
+    sink.append = append
+    observer.update_boundaries(charge_at=1, human_at=None)
+    capture.windows.append(window(start=105.0))
+    earlier, later = object(), object()
+    observer.open_boundary(earlier, reason="beans_dropped")
+    now[0] = 107.0
+    observer.open_boundary(later, reason="emergency_stop")
+    assert observer.start()
+    try:
+        observer.resolve_boundary(later, cutoff=108.0)
+        assert pending_hold.wait(2)
+        assert capture.windows
+        now[0] = 108.0
+        observer.resolve_boundary(earlier, cutoff=105.0)
+        assert window_recorded.wait(2)
+        row = next(row for row in sink.rows if isinstance(row, WindowRecord))
+        assert row.payload.eligibility == "ineligible_post_drop"
+        assert observer.confirmation is None and observer.cutoff == 105.0
+    finally:
+        observer.close(cutoff=105.0, reason="beans_dropped")
+        assert observer.reaped.wait(2)
+    assert observer.summary is not None and observer.summary.counts.eligible_windows == 0
+
+
+def test_running_worker_held_inference_retains_original_availability(tmp_path: Path) -> None:
+    """A result returned during a pending boundary keeps its original decision time."""
+
+    now = [7.0]
+    observer, capture, sink, backend = setup_observer(tmp_path, now=now)
+    held = Event()
+    original_wait = observer.changed.wait
+
+    def acknowledge_held_result(timeout: float | None = None) -> bool:
+        if backend.release.is_set():
+            held.set()
+        return original_wait(timeout)
+
+    observer.changed.wait = acknowledge_held_result
+    backend.release.clear()
+    observer.update_boundaries(charge_at=1, human_at=None)
+    capture.windows.append(window(start=5.0))
+    ticket = object()
+    assert observer.start()
+    try:
+        assert backend.entered.wait(2)
+        observer.open_boundary(ticket, reason="beans_dropped")
+        backend.release.set()
+        assert held.wait(2)
+        assert observer.confirmation is None
+        now[0] = 8.0
+        observer.resolve_boundary(ticket, cutoff=9.0)
+        assert sink.confirmed.wait(2)
+        assert observer.confirmation is not None
+        assert observer.confirmation.decision_available_at.session_relative_seconds.value == 7.0
+    finally:
+        backend.release.set()
+        observer.close(cutoff=9.0, reason="beans_dropped")
+        assert observer.reaped.wait(2)
+
+
+def test_running_worker_mapped_clock_tie_holds_until_strictly_advanced(tmp_path: Path) -> None:
+    """The worker rejects the mapped equality tie before accepting a later raw sample."""
+
+    origin = 5.948083016636624
+    raw_now = 15.538684000000002
+    now = [raw_now]
+    observer, capture, sink, _ = setup_observer(tmp_path, now=now)
+    observer.clock = observer.clock.model_copy(update={"session_origin": origin})
+    observer.update_boundaries(charge_at=1, human_at=None)
+    capture.windows.append(window(start=14.538684))
+    held = Event()
+    original_wait = observer.changed.wait
+
+    def acknowledge_tie_hold(timeout: float | None = None) -> bool:
+        held.set()
+        return original_wait(timeout)
+
+    observer.changed.wait = acknowledge_tie_hold
+    assert observer.start()
+    try:
+        assert held.wait(2)
+        assert observer.confirmation is None and not sink.confirmed.is_set()
+        now[0] = 15.538685
+        observer.changed.set()
+        assert sink.confirmed.wait(2)
+        assert observer.confirmation is not None
+        assert (
+            observer.confirmation.decision_available_at.session_relative_seconds.value
+            == 15.538685 - origin
+        )
+    finally:
+        observer.close(cutoff=16.0, reason="beans_dropped")
+        assert observer.reaped.wait(2)
+
+
+def test_pending_freeze_hides_provisional_cutoff_and_clean_coverage(tmp_path: Path) -> None:
+    """A resolved later scalar remains non-public while another ticket is owned."""
+
+    observer, _, _, _ = setup_observer(tmp_path)
+    earlier, later = object(), object()
+    observer.open_boundary(earlier, reason="beans_dropped")
+    observer.open_boundary(later, reason="emergency_stop")
+    observer.resolve_boundary(later, cutoff=8.0)
+    observer.identity = observer.loader(observer.config.first_crack).identity
+    observer._drain_complete = True
+    observer._eligible_inferred = 1
+    observer.freeze_pending_boundary(earlier, reason="test_cleanup")
+    assert observer.summary is not None
+    assert observer.summary.drop_cutoff.value is None
+    assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
+    assert not observer.summary.coverage_complete
+    assert observer.summary.counts.undecided_eligible_windows == 0

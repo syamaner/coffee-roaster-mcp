@@ -826,6 +826,19 @@ class FirstCrackObserver:
                         self.reason = "capture_failed"
                     self.close(cutoff=self.now(), reason="capture_failed")
                 if needs_batch:
+                    with self.lock:
+                        self._freeze_if_due_locked()
+                        needs_batch = (
+                            self.valid
+                            and self.summary is None
+                            and not self._supervision_failed
+                            and not self._pending_boundaries
+                            and not self._owned_windows
+                        )
+                    if not needs_batch:
+                        self.changed.wait(0.05)
+                        self.changed.clear()
+                        continue
                     windows = self.pipeline.drain_windows(
                         max_windows=max(1, capture.queued_window_count)
                     )
