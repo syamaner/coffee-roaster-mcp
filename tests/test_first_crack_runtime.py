@@ -3981,6 +3981,7 @@ def _install_public_boundary_trace(
 
     original_begin = runtime.begin_observation_boundary
     original_resolve = runtime.resolve_observation_boundary
+    original_freeze = runtime.freeze_observation_boundary
 
     def begin(*args: Any, **kwargs: Any) -> object | None:
         ticket = original_begin(*args, **kwargs)
@@ -3991,8 +3992,13 @@ def _install_public_boundary_trace(
         trace.append(("resolve", (args[1], kwargs["cutoff_monotonic_seconds"])))
         original_resolve(*args, **kwargs)
 
+    def freeze(*args: Any, **kwargs: Any) -> None:
+        trace.append(("freeze", (args[1], kwargs["reason"])))
+        original_freeze(*args, **kwargs)
+
     monkeypatch.setattr(runtime, "begin_observation_boundary", begin)
     monkeypatch.setattr(runtime, "resolve_observation_boundary", resolve)
+    monkeypatch.setattr(runtime, "freeze_observation_boundary", freeze)
     return trace
 
 
@@ -4000,13 +4006,18 @@ def _assert_manual_public_boundary_trace(
     trace: list[tuple[str, object]], *, reason: str, session: Any
 ) -> None:
     """Check the ticket and accepted-event scalar stay with one dispatch."""
-    assert [entry[0] for entry in trace] == ["driver", "begin", "accepted", "resolve"]
+    assert [entry[0] for entry in trace[:4]] == ["driver", "begin", "accepted", "resolve"]
     begin_reason, ticket = cast(tuple[str, object | None], trace[1][1])
     _method, event = cast(tuple[str, Any], trace[2][1])
     resolved_ticket, cutoff = cast(tuple[object | None, float], trace[3][1])
     assert begin_reason == reason
+    assert ticket is not None
     assert resolved_ticket is ticket
     assert cutoff == session.monotonic_start + event.monotonic_seconds
+    if len(trace) == 5:
+        frozen_ticket, frozen_reason = cast(tuple[object | None, str], trace[4][1])
+        assert trace[4][0] == "freeze"
+        assert frozen_ticket is ticket and frozen_reason == "emergency_stop"
 
 
 @pytest.mark.parametrize(
@@ -4114,6 +4125,205 @@ def test_public_drop_retry_and_fault_cooling_do_not_open_new_boundary(
     finally:
         if observer is not None and not observer.reaped.is_set():
             runtime.close_observation(session, reason="matrix diagnostic cleanup")
+            observer.changed.set()
+            assert observer.reaped.wait(2)
+
+
+@pytest.mark.parametrize(
+    "path", ["ordinary_drop", "stopped_fault_drop", "public_emergency", "sampler_failure"]
+)
+def test_manual_boundary_raised_dispatch_has_no_ticket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """A dispatch which raises before returning never opens a manual boundary."""
+    import coffee_roaster_mcp.mcp_server as mcp_server
+
+    context, runtime, call, _started, session_id, observer = _public_boundary_matrix_context(
+        tmp_path, monkeypatch, authority="manual"
+    )
+    trace = _install_public_boundary_trace(monkeypatch, context, runtime)
+    session = context.session_store.get_session_snapshot(session_id=session_id)
+    try:
+        if path == "stopped_fault_drop":
+            assert call("emergency_stop", reason="raised dispatch setup").event.kind == "fault"
+            assert observer is not None and observer.reaped.wait(2)
+            trace.clear()
+
+        if path in {"ordinary_drop", "stopped_fault_drop"}:
+
+            def raised_drop() -> Any:
+                raise RuntimeError("synthetic drop before return")
+
+            monkeypatch.setattr(context.roaster_driver, "drop_beans", raised_drop)
+            with pytest.raises(RuntimeError, match="synthetic drop before return"):
+                call(
+                    "drop_beans",
+                    **({"expected_session_id": session_id} if path == "stopped_fault_drop" else {}),
+                )
+        else:
+
+            def raised_dispatch(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+                raise RuntimeError("synthetic emergency before return")
+
+            monkeypatch.setattr(mcp_server, "run_driver_emergency_stop", raised_dispatch)
+            if path == "public_emergency":
+                with pytest.raises(RuntimeError, match="synthetic emergency before return"):
+                    call("emergency_stop", reason="raised public dispatch")
+            else:
+                active = context.session_store.get_active_session()
+                assert active is not None
+                with pytest.raises(RuntimeError, match="synthetic emergency before return"):
+                    getattr(  # noqa: B009 - invokes the registered private callback.
+                        mcp_server, "_fault_active_session_after_sampler_failure"
+                    )(
+                        context, session=active, error=RuntimeError("synthetic sampler callback")
+                    )
+
+        assert not any(name in {"begin", "resolve"} for name, _ in trace)
+        assert all(
+            ticket is None
+            for name, value in trace
+            if name == "freeze"
+            for ticket, _reason in [cast(tuple[object | None, str], value)]
+        )
+        snapshot = context.session_store.get_session_snapshot(session_id=session_id)
+        assert snapshot.first_crack_at_utc is None
+        if path == "ordinary_drop":
+            assert snapshot.beans_dropped_at_utc is None
+        if path == "stopped_fault_drop":
+            assert snapshot.phase == "fault"
+    finally:
+        if observer is not None and not observer.reaped.is_set():
+            runtime.close_observation(session, reason="raised dispatch diagnostic cleanup")
+            observer.changed.set()
+            assert observer.reaped.wait(2)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "ordinary_drop",
+        "public_emergency",
+        "sampler_failure",
+        "stopped_fault_drop",
+        "returned_failed_containment",
+    ],
+)
+def test_manual_boundary_failed_commit_and_failed_containment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Returned dispatches keep their own ticket through failure handling."""
+    import coffee_roaster_mcp.mcp_server as mcp_server
+    from coffee_roaster_mcp.session import default_emergency_safety_payload
+
+    context, runtime, call, _started, session_id, observer = _public_boundary_matrix_context(
+        tmp_path, monkeypatch, authority="manual"
+    )
+    trace = _install_public_boundary_trace(monkeypatch, context, runtime)
+    session = context.session_store.get_session_snapshot(session_id=session_id)
+    ambient_stops: list[str] = []
+    original_ambient_stop = context.ambient_runtime.stop_for_session
+
+    def ambient_stop(*args: Any, **kwargs: Any) -> Any:
+        ambient_stops.append(str(kwargs["reason"]))
+        return original_ambient_stop(*args, **kwargs)
+
+    monkeypatch.setattr(context.ambient_runtime, "stop_for_session", ambient_stop)
+    try:
+        if path == "stopped_fault_drop":
+            assert call("emergency_stop", reason="failed commit setup").event.kind == "fault"
+            assert observer is not None and observer.reaped.wait(2)
+            frozen_before = observer.summary.model_dump_json()
+            trace.clear()
+
+            def failed_recovery(*_args: Any, **_kwargs: Any) -> Any:
+                raise SessionLifecycleError("synthetic recovery persistence failure")
+
+            monkeypatch.setattr(
+                context.session_store,
+                "complete_reserved_driver_fault_recovery_snapshot",
+                failed_recovery,
+            )
+            with pytest.raises(
+                SessionLifecycleError, match="synthetic recovery persistence failure"
+            ):
+                call("drop_beans", expected_session_id=session_id)
+            assert observer.summary.model_dump_json() == frozen_before
+            expected_freeze = "fault_recovery_incomplete"
+        elif path == "ordinary_drop":
+
+            def failed_drop(*_args: Any, **_kwargs: Any) -> Any:
+                raise SessionLifecycleError("synthetic drop persistence failure")
+
+            monkeypatch.setattr(
+                context.session_store, "complete_reserved_driver_drop_snapshot", failed_drop
+            )
+            with pytest.raises(SessionLifecycleError, match="synthetic drop persistence failure"):
+                call("drop_beans")
+            expected_freeze = "drop_recording_failed"
+        elif path in {"public_emergency", "sampler_failure"}:
+
+            def failed_fault(*_args: Any, **_kwargs: Any) -> Any:
+                raise SessionLifecycleError("synthetic fault persistence failure")
+
+            monkeypatch.setattr(context.session_store, "emergency_stop_snapshot", failed_fault)
+            if path == "public_emergency":
+                with pytest.raises(SessionLifecycleError, match="fault recording failed"):
+                    call("emergency_stop", reason="failed public persistence")
+            else:
+                active = context.session_store.get_active_session()
+                assert active is not None
+                getattr(  # noqa: B009 - invokes the registered private callback.
+                    mcp_server, "_fault_active_session_after_sampler_failure"
+                )(
+                    context, session=active, error=RuntimeError("synthetic sampler callback")
+                )
+                assert ambient_stops == []
+            expected_freeze = (
+                "emergency_stop" if path == "public_emergency" else "sampler_fault_recording_failed"
+            )
+        else:
+
+            def failed_containment(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+                trace.append(("driver", "emergency_stop_returned_failed_containment"))
+                return default_emergency_safety_payload(
+                    driver="mock", driver_error="synthetic containment"
+                )
+
+            monkeypatch.setattr(mcp_server, "run_driver_emergency_stop", failed_containment)
+            with pytest.raises(SessionLifecycleError, match="did not report verified"):
+                call("emergency_stop", reason="returned failed containment")
+            expected_freeze = "emergency_stop"
+
+        names = [name for name, _ in trace]
+        assert names.index("driver") < names.index("begin")
+        begin_reason, ticket = cast(tuple[str, object | None], trace[names.index("begin")][1])
+        assert ticket is not None
+        assert begin_reason in {
+            "beans_dropped",
+            "emergency_stop",
+            "autonomous_telemetry_sampler_failure",
+        }
+        if path == "returned_failed_containment":
+            assert "accepted" in names and "resolve" in names
+            _assert_manual_public_boundary_trace(trace, reason="emergency_stop", session=session)
+        else:
+            assert "resolve" not in names
+            frozen_ticket, freeze_reason = cast(tuple[object | None, str], trace[-1][1])
+            assert trace[-1][0] == "freeze"
+            assert frozen_ticket is ticket and freeze_reason == expected_freeze
+            if path != "stopped_fault_drop":
+                assert observer is not None
+                runtime.close_observation(session, reason="failed commit lifecycle cleanup")
+                observer.changed.set()
+                assert observer.reaped.wait(2)
+                assert observer.summary is not None and observer.summary.drop_cutoff.value is None
+                assert observer.summary.coverage_complete is False
+        snapshot = context.session_store.get_session_snapshot(session_id=session_id)
+        assert snapshot.first_crack_at_utc is None
+    finally:
+        if observer is not None and not observer.reaped.is_set():
+            runtime.close_observation(session, reason="failed commit diagnostic cleanup")
             observer.changed.set()
             assert observer.reaped.wait(2)
 
