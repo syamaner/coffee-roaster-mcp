@@ -134,15 +134,29 @@ def setup_observer(
 
 def test_confirmation_is_diagnostic_durable_and_clock_mapped(tmp_path: Path) -> None:
     observer, capture, sink, backend = setup_observer(tmp_path)
+    calling_thread_id = get_ident()
+    loader_thread_id: list[int] = []
+    original_loader = observer.loader
+
+    def loader(config: FirstCrackConfig):
+        loader_thread_id.append(get_ident())
+        assert loader_thread_id[-1] != calling_thread_id
+        return original_loader(config)
+
+    observer.loader = loader
     observer.update_boundaries(charge_at=1, human_at=None)
     capture.windows.append(window())
     assert observer.start()
     assert backend.entered.wait(2)
     assert sink.confirmed.wait(2)
+    worker = observer._thread
+    assert worker is not None and worker.ident is not None
+    assert loader_thread_id == [worker.ident]
+    assert backend.thread_id == worker.ident
     confirmation = next(row for row in sink.rows if isinstance(row, ConfirmationRecord))
     assert confirmation.payload.decision_available_at.session_relative_seconds.value == 10
     assert confirmation.payload.model_onset.recording_relative_seconds.value == 3
-    assert backend.thread_id != get_ident()
+    assert backend.thread_id != calling_thread_id
     observer.update_boundaries(charge_at=1, human_at=11)
     observer.close(cutoff=12, reason="beans_dropped")
     assert observer.reaped.wait(2)
@@ -214,11 +228,17 @@ def test_capture_loss_never_yields_clean_negative(
 def test_hung_loader_freezes_without_join_and_blocks_new_worker(tmp_path: Path) -> None:
     now = [10.0]
     observer, capture, _, _ = setup_observer(tmp_path, now=now)
+    calling_thread_id = get_ident()
     entered = Event()
     release = Event()
     original = observer.loader
 
     def blocked(config: FirstCrackConfig):
+        loader_thread_id = get_ident()
+        worker = observer._thread
+        assert worker is not None and worker.ident is not None
+        assert loader_thread_id == worker.ident
+        assert loader_thread_id != calling_thread_id
         entered.set()
         assert release.wait(5)
         return original(config)
