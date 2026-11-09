@@ -543,7 +543,7 @@ class FirstCrackSessionRuntime:
                 self._reason = "manual_observation_capture_unavailable"
                 self._capture_start_failed_for_session = True
                 if observer is not None and observer.worker_running:
-                    observer.close(cutoff=self._monotonic_now(), reason="capture_setup_failed")
+                    observer.close(cutoff=None, reason="capture_setup_failed")
                 elif pipeline is not None or recorder is not None:
                     cleanup = CaptureCleanup(pipeline, recorder, self._stop_timeout_seconds)
                     self._capture_cleanup = cleanup
@@ -707,16 +707,12 @@ class FirstCrackSessionRuntime:
         reason: str,
         cutoff_monotonic_seconds: float | None = None,
     ) -> None:
-        """Called only after driver dispatch, with the accepted drop cutoff."""
+        """Close observation with an accepted event cutoff, when one exists."""
         observer = self._observer
         if observer is not None and observer.session_id == session.id:
             cutoff = cutoff_monotonic_seconds
-            if cutoff is None:
-                cutoff = (
-                    self._monotonic_now()
-                    if session.beans_dropped_monotonic_seconds is None
-                    else session.monotonic_start + session.beans_dropped_monotonic_seconds
-                )
+            if cutoff is None and session.beans_dropped_monotonic_seconds is not None:
+                cutoff = session.monotonic_start + session.beans_dropped_monotonic_seconds
             observer.close(cutoff=cutoff, reason=reason.replace(" ", "_"))
 
     def begin_observation_boundary(self, session: RoastSession, *, reason: str) -> object | None:
@@ -1000,7 +996,7 @@ class FirstCrackSessionRuntime:
         if self._config.first_crack.event_authority == "manual":
             observer = self._observer
             if observer is not None and observer.session_id == session_id:
-                observer.close(cutoff=self._monotonic_now(), reason=reason.replace(" ", "_"))
+                observer.close(cutoff=None, reason=reason.replace(" ", "_"))
             return self.snapshot()
         with self._lock:
             if self._active_session_id != session_id:
@@ -1027,7 +1023,7 @@ class FirstCrackSessionRuntime:
             observer = self._observer
             if observer is None or observer.session_id != session_id:
                 return "not_active", None, False
-            observer.close(cutoff=self._monotonic_now(), reason="finalisation")
+            observer.close(cutoff=None, reason="finalisation")
             if observer.reaped.is_set() and observer.pipeline.shutdown_confirmed:
                 with self._lock:
                     self._completed_observation = observer.snapshot()

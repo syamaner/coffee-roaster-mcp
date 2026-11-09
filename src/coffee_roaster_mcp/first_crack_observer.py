@@ -507,7 +507,7 @@ class FirstCrackObserver:
 
     def shutdown_capture(self, *, timeout: float) -> None:
         """Lifespan-only assurance: no wait/join on model load or inference."""
-        self.close(cutoff=self.now(), reason="process_shutdown")
+        self.close(cutoff=None, reason="process_shutdown")
         with self.lock:
             self.deadline = self.now()
             try:
@@ -538,11 +538,26 @@ class FirstCrackObserver:
                 self.human_at = human_at
         self.changed.set()
 
-    def close(self, *, cutoff: float, reason: str) -> None:
+    def close(self, *, cutoff: float | None, reason: str) -> None:
+        """Freeze a lifecycle close without treating its clock as an event."""
         with self.lock:
             if self._pending_boundaries:
                 self.failed = True
                 self.reason = "boundary_not_observed"
+                self.deadline = self.now()
+                self._freeze_locked()
+                self.changed.set()
+                coordinator().wake.set()
+                return
+            if cutoff is None:
+                # A lifecycle transition proves that no more observation work
+                # may be accepted.  It does not prove that beans were dropped
+                # (or that a fault/e-stop event was accepted), so do not turn
+                # the current clock into a public cutoff.
+                self.failed = True
+                self.reason = (
+                    reason if re.fullmatch(r"[a-z][a-z0-9_]{0,159}", reason) else "observer_stop"
+                )
                 self.deadline = self.now()
                 self._freeze_locked()
                 self.changed.set()
@@ -631,8 +646,6 @@ class FirstCrackObserver:
         with self.lock:
             if self.summary is None:
                 self.valid = False
-                if not self._pending_boundaries:
-                    self.cutoff = self.now() if self.cutoff is None else self.cutoff
                 self.deadline = self.now()
                 self.reason = "session_changed"
                 self._freeze_locked()
@@ -1217,16 +1230,18 @@ class FirstCrackObserver:
         )
         # This is owned, known eligible work only. An undrained capture queue
         # has unknown eligibility and keeps coverage incomplete via drain_complete.
+        # Without an accepted cutoff, the lifecycle clock is evidence only for
+        # work whose end is strictly before the mapped session-progress witness;
+        # it is never published as a drop cutoff.
+        progress = self._mapped_now_locked()
         pending_eligible = {
             item.sequence_number
             for item in self._owned_windows
             if item.sequence_number not in self._seen_windows
             and self.charge_at is not None
             and item.started_at_monotonic_seconds >= self.charge_at
-            and (
-                self.cutoff is None
-                or item.started_at_monotonic_seconds + item.duration_seconds < self.cutoff
-            )
+            and item.started_at_monotonic_seconds + item.duration_seconds
+            < (self.cutoff if self.cutoff is not None else progress)
         }
         self.counts = self.counts.model_copy(
             update=dict(

@@ -356,6 +356,69 @@ def test_invalidation_with_pending_ticket_never_invents_public_cutoff(tmp_path: 
     assert observer.summary.counts.undecided_eligible_windows == 0
 
 
+def test_lifecycle_close_freezes_only_proven_owned_work_without_a_cutoff(tmp_path: Path) -> None:
+    """A lifecycle clock proves progress, never a synthetic drop boundary."""
+    now = [10.0]
+    observer, capture, sink, backend = setup_observer(tmp_path, now=now)
+    backend.release.clear()
+    observer.update_boundaries(charge_at=1, human_at=None)
+    capture.windows.extend(
+        [
+            window(sequence=1, start=2),  # In flight after strict admission.
+            window(sequence=2, start=4),  # Owned and strictly before progress.
+            window(sequence=3, start=9),  # Tied with progress: unknown.
+            window(sequence=4, start=10),  # Future: unknown.
+        ]
+    )
+    assert observer.start()
+    try:
+        assert backend.entered.wait(2)
+        observer.close(cutoff=None, reason="session_finalisation")
+        assert observer.summary is not None
+        assert observer.summary.drop_cutoff.value is None
+        assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
+        assert observer.summary.counts.undecided_eligible_windows == 2
+        assert not observer.summary.coverage_complete
+        frozen = observer.summary.model_dump_json()
+        backend.release.set()
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+        assert observer.summary.model_dump_json() == frozen
+    finally:
+        backend.release.set()
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+    assert not any(isinstance(row, WindowRecord) for row in sink.rows)
+
+
+def test_lifecycle_close_retains_confirmation_without_creating_postdrop_rows(
+    tmp_path: Path,
+) -> None:
+    """A lifecycle freeze retains accepted confirmation but invents no drop evidence."""
+    observer, capture, sink, backend = setup_observer(tmp_path)
+    observer.update_boundaries(charge_at=1, human_at=9)
+    capture.windows.append(window(start=2))
+    assert observer.start()
+    try:
+        assert backend.entered.wait(2)
+        assert sink.confirmed.wait(2)
+        observer.close(cutoff=None, reason="process_shutdown")
+        assert observer.reaped.wait(2)
+    finally:
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+    assert observer.summary is not None
+    assert observer.summary.outcome == "confirmed"
+    assert observer.summary.first_confirmation_key.value is not None
+    assert observer.summary.drop_cutoff.value is None
+    assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
+    assert not observer.summary.coverage_complete
+    rows = [row.payload for row in sink.rows if isinstance(row, WindowRecord)]
+    assert len(rows) == 1
+    assert rows[0].eligibility == "eligible"
+    assert rows[0].availability_class == "drop_not_observed"
+
+
 def test_resolved_boundary_cannot_replace_earlier_complete_cutoff(tmp_path: Path) -> None:
     """A later accepted event folds into, rather than replaces, prior evidence."""
     observer, _, _, _ = setup_observer(tmp_path)
@@ -367,6 +430,8 @@ def test_resolved_boundary_cannot_replace_earlier_complete_cutoff(tmp_path: Path
     assert observer.cutoff == 6
     observer.invalidate()
     assert observer.summary is not None
+    assert observer.summary.drop_cutoff.value is not None
+    assert observer.summary.drop_cutoff.value.session_relative_seconds.value == 6
     frozen = observer.summary.model_dump_json()
     observer.resolve_boundary(ticket, cutoff=4)
     observer.freeze_pending_boundary(ticket, reason="stale_cleanup")

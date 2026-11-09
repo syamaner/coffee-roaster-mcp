@@ -26,6 +26,7 @@ from coffee_roaster_mcp.detector import (
     FirstCrackDetectorOutput,
     build_first_crack_detector_adapter,
 )
+from coffee_roaster_mcp.first_crack_observer import FirstCrackObserver
 from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackRuntimeSnapshot,
     FirstCrackSessionRuntime,
@@ -2740,6 +2741,56 @@ def _manual_runtime_fixture(
         ),
     )
     return runtime, captures, config
+
+
+@pytest.mark.parametrize("lifecycle", ["stop", "finalise"])
+def test_manual_runtime_lifecycle_close_has_no_synthetic_cutoff(
+    tmp_path: Path, lifecycle: str
+) -> None:
+    """Runtime stop/finalisation closes diagnostic acceptance without a drop event."""
+    runtime, captures, _ = _manual_runtime_fixture(tmp_path)
+    store = RoastSessionStore(default_log_dir=tmp_path / "lifecycle")
+    session = store.start_session()
+    runtime.start_for_session(session)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - public lifecycle witness
+    assert observer is not None and len(captures) == 1
+    if lifecycle == "stop":
+        runtime.stop_for_session(session.id, reason="process_shutdown")
+    else:
+        state, _, _ = runtime.finalise_for_session(session.id)
+        assert state in {"stopped", "capture_still_running"}
+    assert observer.reaped.wait(2)
+    assert observer.summary is not None
+    assert observer.summary.drop_cutoff.value is None
+    assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
+    assert not observer.summary.coverage_complete
+    assert captures[0].stopped
+
+
+def test_manual_capture_setup_failure_closes_running_observer_without_cutoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-start setup failure retains truthful null cutoff evidence."""
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+
+    runtime, captures, _ = _manual_runtime_fixture(tmp_path)
+    original_start = runtime_module.FirstCrackObserver.start
+
+    def start_then_fail(self: FirstCrackObserver, reservation: object | None = None) -> bool:
+        assert original_start(self, reservation)
+        raise RuntimeError("synthetic post-start setup failure")
+
+    monkeypatch.setattr(runtime_module.FirstCrackObserver, "start", start_then_fail)
+    store = RoastSessionStore(default_log_dir=tmp_path / "setup-failure")
+    runtime.start_for_session(store.start_session())
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - setup witness
+    assert observer is not None and len(captures) == 1
+    assert observer.reaped.wait(2)
+    assert observer.summary is not None
+    assert observer.summary.drop_cutoff.value is None
+    assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
+    assert not observer.summary.coverage_complete
+    assert captures[0].stopped
 
 
 @pytest.mark.parametrize(
