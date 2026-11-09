@@ -3852,7 +3852,7 @@ def _accepted_emergency_clock_witness(
     from coffee_roaster_mcp.session import RoastSession
 
     runtime, captures, config = _manual_runtime_fixture(tmp_path)
-    base = time.monotonic()
+    base = float(int(time.monotonic()))
     clock = [base]
     utc_origin = datetime(2026, 11, 8, tzinfo=UTC)
     store = RoastSessionStore(
@@ -4016,7 +4016,7 @@ def test_public_drop_pending_boundary_fences_post_accepted_positive_until_store_
     from coffee_roaster_mcp.mcp_server import build_server_context, create_mcp_server
 
     runtime, captures, config = _manual_runtime_fixture(tmp_path)
-    base = time.monotonic()
+    base = float(int(time.monotonic()))
     clock = [base]
     store = RoastSessionStore(
         default_log_dir=tmp_path / "public-drop-race",
@@ -4725,7 +4725,7 @@ def test_public_drop_pending_timeout_keeps_owned_result_cutoff_unknown(
     from coffee_roaster_mcp.mcp_server import build_server_context, create_mcp_server
 
     runtime, captures, config = _manual_runtime_fixture(tmp_path)
-    base = time.monotonic()
+    base = float(int(time.monotonic()))
     clock = [base]
     store = RoastSessionStore(
         default_log_dir=tmp_path / "public-drop-timeout",
@@ -4847,7 +4847,7 @@ def test_manual_public_generic_drop_commit_failure_freezes_at_original_deadline(
     from coffee_roaster_mcp.mcp_server import build_server_context, create_mcp_server
 
     runtime, captures, config = _manual_runtime_fixture(tmp_path)
-    base = time.monotonic()
+    base = float(int(time.monotonic()))
     clock = [base]
     store = RoastSessionStore(
         default_log_dir=tmp_path / "generic-drop",
