@@ -846,7 +846,7 @@ class FirstCrackObserver:
                     with self.lock:
                         self.failed = True
                         self.reason = "capture_failed"
-                    self.close(cutoff=self.now(), reason="capture_failed")
+                    self.close(cutoff=None, reason="capture_failed")
                 if needs_batch:
                     with self.lock:
                         self._freeze_if_due_locked()

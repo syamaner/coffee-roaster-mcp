@@ -294,6 +294,9 @@ def test_new_generation_rejects_blocked_prior_inference(tmp_path: Path) -> None:
     assert backend.entered.wait(2)
     observer.invalidate()
     assert observer.summary is not None
+    assert observer.summary.drop_cutoff.value is None
+    assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
+    assert not observer.summary.coverage_complete
     frozen = observer.summary.model_dump_json()
     assert observer.summary.counts.stale_results_discarded == 0
     assert observer.summary.counts.late_results_discarded_before_freeze == 0
@@ -419,6 +422,46 @@ def test_lifecycle_close_retains_confirmation_without_creating_postdrop_rows(
     assert rows[0].availability_class == "drop_not_observed"
 
 
+def test_capture_stream_error_freezes_without_fabricating_drop_cutoff(tmp_path: Path) -> None:
+    """A running worker treats capture loss as lifecycle evidence, never a drop."""
+    from dataclasses import replace
+
+    class StreamFailureCapture(Capture):
+        def __init__(self) -> None:
+            super().__init__()
+            self.latest_error: str | None = None
+            self.stop_calls = 0
+
+        def snapshot(self) -> AudioCaptureSnapshot:
+            return replace(super().snapshot(), latest_error=self.latest_error)
+
+        def stop(self, *, timeout_seconds: float = 1) -> AudioCaptureSnapshot:
+            self.stop_calls += 1
+            return super().stop(timeout_seconds=timeout_seconds)
+
+    now = [10.0]
+    observer, _, sink, _ = setup_observer(tmp_path, now=now)
+    capture = StreamFailureCapture()
+    observer.pipeline = capture
+    assert observer.config.first_crack.observation_closing_timeout_seconds > 0
+    assert observer.start()
+    try:
+        capture.latest_error = "synthetic_stream_lost"
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+    finally:
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+    assert observer.summary is not None
+    assert observer.summary.reason.value == "capture_failed"
+    assert observer.summary.drop_cutoff.value is None
+    assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
+    assert not observer.summary.coverage_complete
+    assert not any(isinstance(row, WindowRecord) for row in sink.rows)
+    assert capture.stopped and capture.shutdown_confirmed
+    assert capture.stop_calls == 1
+
+
 def test_resolved_boundary_cannot_replace_earlier_complete_cutoff(tmp_path: Path) -> None:
     """A later accepted event folds into, rather than replaces, prior evidence."""
     observer, _, _, _ = setup_observer(tmp_path)
@@ -436,6 +479,31 @@ def test_resolved_boundary_cannot_replace_earlier_complete_cutoff(tmp_path: Path
     observer.resolve_boundary(ticket, cutoff=4)
     observer.freeze_pending_boundary(ticket, reason="stale_cleanup")
     assert observer.summary.model_dump_json() == frozen
+
+
+def test_later_shutdown_preserves_an_accepted_cutoff_and_confirmed_row(tmp_path: Path) -> None:
+    """Later lifecycle finalisation never re-dates accepted event evidence."""
+    observer, capture, sink, backend = setup_observer(tmp_path)
+    observer.update_boundaries(charge_at=1, human_at=None)
+    capture.windows.append(window(start=2))
+    assert observer.start()
+    try:
+        assert backend.entered.wait(2)
+        assert sink.confirmed.wait(2)
+        observer.close(cutoff=6, reason="beans_dropped")
+        observer.shutdown_capture(timeout=0.1)
+        assert observer.reaped.wait(2)
+    finally:
+        observer.changed.set()
+        assert observer.reaped.wait(2)
+    assert observer.summary is not None
+    assert observer.summary.outcome == "confirmed"
+    assert observer.summary.drop_cutoff.value is not None
+    assert observer.summary.drop_cutoff.value.session_relative_seconds.value == 6
+    rows = [row.payload for row in sink.rows if isinstance(row, WindowRecord)]
+    assert len(rows) == 1
+    assert rows[0].eligibility == "eligible"
+    assert rows[0].availability_class == "drop_not_observed"
 
 
 def test_mapped_clock_equality_holds_window_without_raw_clock_admission(tmp_path: Path) -> None:
@@ -789,6 +857,8 @@ def test_shutdown_stops_capture_without_waiting_for_hung_loader(tmp_path: Path) 
     assert capture.stopped and capture.shutdown_confirmed
     assert not observer.reaped.is_set()
     assert observer.summary is not None and not observer.summary.coverage_complete
+    assert observer.summary.drop_cutoff.value is None
+    assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
     release.set()
     assert observer.reaped.wait(2)
 
