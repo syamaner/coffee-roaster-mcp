@@ -549,3 +549,14 @@ Historical in-process observation snapshots follow the actual session store's
 retention and never restore control across a restart. The manual protocol
 requires recording-capable capture: detector-paced WAV replay is refused;
 automatic paced replay and recording-capable realtime behaviour stay unchanged.
+
+### MCP239 — fixed-zero containment software boundary
+
+MCP239 adds `contain_heat_fixed_zero`, a strict `fixed_zero/v1` MCP request
+that selects one exact active session and invokes an explicitly declared
+driver capability at most once. Its returned eight-key command state and
+eleven-key result are in-memory command evidence only: they do not attest
+physical state, transport settlement, durable audit, a retry, or Agent-side
+uncertainty recovery. Invalid or missing driver evidence retains the matching
+containment reservation unresolved; superseded ownership is never recreated or
+cleared. Existing emergency and stopped-fault paths remain separate.

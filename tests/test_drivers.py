@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from threading import Event, Lock, Thread
 from time import monotonic, sleep
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -13,6 +13,7 @@ from coffee_roaster_mcp.drivers import (
     HOTTOP_PACKET_PREFIX,
     CommandStreaming,
     DriverLifecycleEvidence,
+    FixedZeroCommandedState,
     HottopRoasterDriver,
     HottopTemperatureUnit,
     MockRoasterDriver,
@@ -2108,3 +2109,95 @@ def test_hottop_cold_temperature_projection_reports_all_ignored_packets() -> Non
     assert projection.retained_bean_temp_c is None
     assert projection.retained_env_temp_c is None
     assert (projection.status_packet_count, projection.ignored_temperature_packet_count) == (1, 1)
+
+
+def test_fixed_zero_containment_preserves_nonheat_mock_and_hottop_command_state() -> None:
+    """Both supported adapters only change commanded heat and return closed evidence."""
+    mock = MockRoasterDriver()
+    mock.set_heat(heat_level_percent=47)
+    mock.set_fan(fan_level_percent=31)
+    object.__setattr__(mock, "_cooling_on", True)
+    object.__setattr__(mock, "_drum_motor_on", True)
+    object.__setattr__(mock, "_solenoid_open", True)
+    mock_evidence = mock.contain_heat_fixed_zero()
+
+    serial_factory = FakeSerialFactory()
+    hottop = HottopRoasterDriver(port="/dev/test-hottop", serial_factory=serial_factory)
+    object.__setattr__(hottop, "_heat_level_percent", 47)
+    object.__setattr__(hottop, "_roast_fan_level_percent", 23)
+    object.__setattr__(hottop, "_main_fan_level_percent", 31)
+    object.__setattr__(hottop, "_drum_motor_on", True)
+    object.__setattr__(hottop, "_cooling_motor_on", True)
+    object.__setattr__(hottop, "_solenoid_open", True)
+    writes_before = len(serial_factory.transport.writes)
+    hottop_evidence = hottop.contain_heat_fixed_zero()
+
+    for evidence, driver_name, roast_fan in (
+        (mock_evidence, "mock", 0),
+        (hottop_evidence, "hottop_kn8828b_2k_plus", 23),
+    ):
+        assert isinstance(evidence, FixedZeroCommandedState)
+        assert evidence.as_dict() == {
+            "driver": driver_name,
+            "capability_version": 1,
+            "heat_level_percent": 0,
+            "roast_fan_level_percent": roast_fan,
+            "main_fan_level_percent": 31,
+            "drum_motor_on": True,
+            "cooling_motor_on": True,
+            "solenoid_open": True,
+        }
+    assert len(serial_factory.transport.writes) == writes_before
+
+
+@pytest.mark.parametrize("invalid_version", [1.0, "1", True])
+def test_fixed_zero_commanded_state_rejects_nonexact_capability_version(
+    invalid_version: object,
+) -> None:
+    """Fixed-zero evidence does not coerce boolean, float, or string versions."""
+    with pytest.raises((TypeError, ValueError), match="capability_version"):
+        FixedZeroCommandedState(
+            driver="mock",
+            capability_version=cast(int, invalid_version),
+            heat_level_percent=0,
+            roast_fan_level_percent=0,
+            main_fan_level_percent=0,
+            drum_motor_on=False,
+            cooling_motor_on=False,
+            solenoid_open=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "exception"),
+    (
+        ("driver", "!mock!", ValueError),
+        ("driver", "x" * 65, ValueError),
+        ("heat_level_percent", True, TypeError),
+        ("heat_level_percent", 1, ValueError),
+        ("roast_fan_level_percent", 1.0, TypeError),
+        ("roast_fan_level_percent", 101, ValueError),
+        ("main_fan_level_percent", False, TypeError),
+        ("main_fan_level_percent", -1, ValueError),
+        ("drum_motor_on", 0, TypeError),
+        ("cooling_motor_on", "false", TypeError),
+        ("solenoid_open", None, TypeError),
+    ),
+)
+def test_fixed_zero_commanded_state_rejects_each_closed_field(
+    field: str, invalid_value: object, exception: type[Exception]
+) -> None:
+    """The driver-boundary eight-field value rejects every malformed dimension."""
+    values: dict[str, object] = {
+        "driver": "mock",
+        "capability_version": 1,
+        "heat_level_percent": 0,
+        "roast_fan_level_percent": 0,
+        "main_fan_level_percent": 0,
+        "drum_motor_on": False,
+        "cooling_motor_on": False,
+        "solenoid_open": False,
+    }
+    values[field] = invalid_value
+    with pytest.raises(exception):
+        FixedZeroCommandedState(**cast(dict[str, Any], values))

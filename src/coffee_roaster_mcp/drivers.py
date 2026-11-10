@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import import_module
 from math import isfinite
 from threading import Event, Lock, Thread
-from typing import Literal, Protocol, cast, runtime_checkable
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 from coffee_roaster_mcp.controls import validate_control_percent
 from coffee_roaster_mcp.session import EventPayloadValue
@@ -119,6 +120,67 @@ class RoasterCapabilities:
     actions: SupportedActions
     sensor_units: SensorUnits
     command_streaming: CommandStreaming
+    heat_containment_version: int | None = None
+
+
+@dataclass(frozen=True)
+class FixedZeroCommandedState:
+    """Closed command-state evidence returned by fixed-zero containment.
+
+    This value records driver command state only.  It is not a hardware
+    acknowledgement, a transport-settlement record, or a physical-safety claim.
+    """
+
+    driver: str
+    capability_version: int
+    heat_level_percent: int
+    roast_fan_level_percent: int
+    main_fan_level_percent: int
+    drum_motor_on: bool
+    cooling_motor_on: bool
+    solenoid_open: bool
+
+    def __post_init__(self) -> None:
+        """Validate the closed fixed-zero command-state grammar."""
+        driver: Any = self.driver
+        if not isinstance(driver, str) or not re.fullmatch(
+            r"[a-z][a-z0-9_-]{0,63}", driver, flags=re.ASCII
+        ):
+            raise ValueError("driver must be an ASCII fixed-zero driver identifier.")
+        capability_version: Any = self.capability_version
+        if (
+            isinstance(capability_version, bool)
+            or not isinstance(capability_version, int)
+            or capability_version != 1
+        ):
+            raise ValueError("capability_version must be the exact integer 1.")
+        for name in (
+            "heat_level_percent",
+            "roast_fan_level_percent",
+            "main_fan_level_percent",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an exact integer.")
+            if name == "heat_level_percent" and value != 0:
+                raise ValueError("heat_level_percent must be exactly 0.")
+            if name != "heat_level_percent" and not 0 <= value <= 100:
+                raise ValueError(f"{name} must be in the inclusive range 0..100.")
+        for name in ("drum_motor_on", "cooling_motor_on", "solenoid_open"):
+            _validate_exact_bool(getattr(self, name), label=name)
+
+    def as_dict(self) -> dict[str, str | int | bool]:
+        """Return the exact eight-key wire representation."""
+        return {
+            "driver": self.driver,
+            "capability_version": self.capability_version,
+            "heat_level_percent": self.heat_level_percent,
+            "roast_fan_level_percent": self.roast_fan_level_percent,
+            "main_fan_level_percent": self.main_fan_level_percent,
+            "drum_motor_on": self.drum_motor_on,
+            "cooling_motor_on": self.cooling_motor_on,
+            "solenoid_open": self.solenoid_open,
+        }
 
 
 @dataclass(frozen=True)
@@ -338,6 +400,15 @@ class RoasterDriver(Protocol):
 
 
 RoasterSafetyDriver = RoasterDriver
+
+
+@runtime_checkable
+class FixedZeroContainmentDriver(Protocol):
+    """Optional explicit fixed-zero containment capability port."""
+
+    def contain_heat_fixed_zero(self) -> FixedZeroCommandedState:
+        """Set only commanded heat to zero and return closed command evidence."""
+        ...
 
 
 class SerialTransport(Protocol):
@@ -644,6 +715,7 @@ class MockRoasterDriver:
                 environment_temperature="celsius",
             ),
             command_streaming=CommandStreaming(required=False),
+            heat_containment_version=1,
         )
 
     def connect(self) -> None:
@@ -707,6 +779,20 @@ class MockRoasterDriver:
         if self._heat_level_percent > 0:
             self._drum_motor_on = True
         return self._state_snapshot()
+
+    def contain_heat_fixed_zero(self) -> FixedZeroCommandedState:
+        """Set only mock commanded heat to zero and return command evidence."""
+        self._heat_level_percent = 0
+        return FixedZeroCommandedState(
+            driver=self.name,
+            capability_version=1,
+            heat_level_percent=self._heat_level_percent,
+            roast_fan_level_percent=0,
+            main_fan_level_percent=self._fan_level_percent,
+            drum_motor_on=self._drum_motor_on,
+            cooling_motor_on=self._cooling_on,
+            solenoid_open=self._solenoid_open,
+        )
 
     def set_fan(self, *, fan_level_percent: int) -> RoasterState:
         """Set mock fan and return normalized state."""
@@ -887,6 +973,7 @@ class HottopRoasterDriver:
                 required=True,
                 interval_seconds=self._command_interval_seconds,
             ),
+            heat_containment_version=1,
         )
 
     def connect(self) -> None:
@@ -1063,6 +1150,21 @@ class HottopRoasterDriver:
             if heat_level > 0:
                 self._drum_motor_on = True
         return self.read_state()
+
+    def contain_heat_fixed_zero(self) -> FixedZeroCommandedState:
+        """Set only Hottop commanded heat to zero and return command evidence."""
+        with self._state_lock:
+            self._heat_level_percent = 0
+            return FixedZeroCommandedState(
+                driver=self.name,
+                capability_version=1,
+                heat_level_percent=self._heat_level_percent,
+                roast_fan_level_percent=self._roast_fan_level_percent,
+                main_fan_level_percent=self._main_fan_level_percent,
+                drum_motor_on=self._drum_motor_on,
+                cooling_motor_on=self._cooling_motor_on,
+                solenoid_open=self._solenoid_open,
+            )
 
     def set_fan(self, *, fan_level_percent: int) -> RoasterState:
         """Set Hottop main-fan command state and return normalized state."""

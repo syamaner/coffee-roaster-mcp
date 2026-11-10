@@ -11,6 +11,7 @@ import pytest
 import coffee_roaster_mcp.session as session_module
 from coffee_roaster_mcp.exports import export_roast_snapshot
 from coffee_roaster_mcp.session import (
+    DriverCommandReservation,
     RoastEventKind,
     RoastSession,
     RoastSessionStore,
@@ -2557,3 +2558,80 @@ def test_atomic_emergency_cancellation_preserves_finalisation_reservation() -> N
 
     assert session.pending_driver_command_token == token
     assert session.pending_driver_command_kind == "finalisation"
+
+
+def test_fixed_zero_reservation_is_exact_active_owner_and_is_not_recreated_after_stop() -> None:
+    """Containment keeps only its matching active reservation under store locking."""
+    store = RoastSessionStore()
+    session = store.start_session()
+
+    admission = store.reserve_fixed_zero_containment(session.id)
+    assert admission.session is session
+    assert admission.reservation is not None
+    assert store.fixed_zero_containment_ownership_matches(session, admission.reservation)
+
+    store.stop_session()
+    assert not store.fixed_zero_containment_ownership_matches(session, admission.reservation)
+    snapshot = store.get_session_snapshot(session_id=session.id)
+    assert snapshot.pending_driver_command_token == admission.reservation.token
+    assert snapshot.pending_driver_command_kind == "heat_containment"
+    refused = store.reserve_fixed_zero_containment(session.id)
+    assert refused.identity_rejection == "session_not_active"
+    assert refused.reservation is None
+
+
+def test_fixed_zero_reservation_refuses_finalisation_and_command_conflicts() -> None:
+    """Fixed-zero admission reports the distinct closed busy reasons."""
+    store = RoastSessionStore()
+    cold_session = store.start_session(purpose="cold_characterisation")
+    admitted, rejection, _ = store.begin_finalisation(cold_session.id)
+    assert admitted is cold_session and rejection is None
+    finalisation = store.reserve_fixed_zero_containment(cold_session.id)
+    assert finalisation.busy_rejection == "finalisation_in_progress"
+
+    store = RoastSessionStore()
+    session = store.start_session()
+    reservation = store.reserve_driver_command(session, kind="control")
+    conflict = store.reserve_fixed_zero_containment(session.id)
+    assert conflict.busy_rejection == "command_in_progress"
+    assert session.pending_driver_command_token == reservation.token
+
+
+def test_fixed_zero_completion_rejects_token_and_kind_mismatch_without_cleanup() -> None:
+    """Completion cannot clear a different reservation token or kind."""
+    store = RoastSessionStore()
+    session = store.start_session()
+    reservation = store.reserve_fixed_zero_containment(session.id).reservation
+    assert reservation is not None
+    wrong_token = DriverCommandReservation(
+        session_id=session.id,
+        token="different-token",
+        kind="heat_containment",
+    )
+    wrong_kind = DriverCommandReservation(
+        session_id=session.id,
+        token=reservation.token,
+        kind="control",
+    )
+    for invalid in (wrong_token, wrong_kind):
+        with pytest.raises(SessionLifecycleError, match="reservation is no longer active"):
+            store.complete_fixed_zero_containment_snapshot(session, reservation=invalid)
+    snapshot = store.get_session_snapshot(session_id=session.id)
+    assert snapshot.pending_driver_command_token == reservation.token
+    assert snapshot.pending_driver_command_kind == "heat_containment"
+
+
+def test_fixed_zero_completion_rejects_matching_normal_control_token_without_cleanup() -> None:
+    """Helper-level defence: a valid non-containment reservation cannot commit heat zero."""
+    store = RoastSessionStore()
+    session = store.start_session()
+    store.set_heat(session, heat_level_percent=55)
+    control = store.reserve_driver_command(session, kind="control")
+
+    with pytest.raises(SessionLifecycleError, match="not fixed-zero containment"):
+        store.complete_fixed_zero_containment_snapshot(session, reservation=control)
+
+    snapshot = store.get_session_snapshot(session_id=session.id)
+    assert snapshot.heat_level_percent == 55
+    assert snapshot.pending_driver_command_token == control.token
+    assert snapshot.pending_driver_command_kind == "control"
