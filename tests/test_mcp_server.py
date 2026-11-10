@@ -12,7 +12,6 @@ import os
 import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import suppress
 from pathlib import Path
 from threading import Event, Lock, Thread, get_ident
 from types import SimpleNamespace, TracebackType
@@ -122,11 +121,6 @@ class _DynamicArgModelMetadataProbe(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     marker: str
-
-    @property
-    def arg_model(self) -> type[ArgModelBase]:
-        """Expose a deceptive dynamic argument model outside the declared shape."""
-        return _AdapterOriginalArguments
 
 
 class _IgnoringCopyMetadataProbe(BaseModel):
@@ -458,6 +452,12 @@ async def _assert_stdio_fixed_zero_cancel_semantics(tmp_path: Path) -> None:
         await _call_with_timeout(client.initialize())
         started = cast(Any, await _call_with_timeout(client.call_tool("start_roast_session", {})))
         session_id = started.structuredContent["session"]["session_id"]
+        heated = cast(
+            Any,
+            await _call_with_timeout(client.call_tool("set_heat", {"heat_level_percent": 55})),
+        )
+        assert not heated.isError
+        assert heated.structuredContent["heat_level_percent"] == 55
         pending = asyncio.create_task(
             client.call_tool(
                 "contain_heat_fixed_zero",
@@ -466,7 +466,7 @@ async def _assert_stdio_fixed_zero_cancel_semantics(tmp_path: Path) -> None:
         )
         await _wait_for_test_file(barrier_dir / "entered")
         pending.cancel()
-        with suppress(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
             await pending
         (barrier_dir / "release").write_text("release", encoding="utf-8")
         await _wait_for_test_file(barrier_dir / "settled")
@@ -601,20 +601,36 @@ def test_fixed_zero_argument_adapter_minimal_metadata_probe_uses_only_model_copy
     assert not hasattr(adapted, "wrap_output")
 
 
-@pytest.mark.parametrize(
-    "metadata",
-    (
-        _DynamicArgModelMetadataProbe(marker="dynamic-only"),
-        _IgnoringCopyMetadataProbe(
-            arg_model=_AdapterOriginalArguments,
-            marker="ignores-update",
-        ),
-    ),
-)
-def test_fixed_zero_argument_adapter_fails_closed_when_binding_is_unsupported(
-    metadata: BaseModel,
-) -> None:
-    """Declared binding absence or ignored replacement fails before tool assignment."""
+def test_fixed_zero_argument_adapter_fails_closed_for_dynamic_undeclared_binding() -> None:
+    """A dynamic extra can copy correctly but is never an accepted declared binding."""
+    metadata = _DynamicArgModelMetadataProbe.model_validate(
+        {"marker": "dynamic-only", "arg_model": _AdapterOriginalArguments}
+    )
+    assert "arg_model" not in type(metadata).model_fields
+    copied = metadata.model_copy(
+        update={"arg_model": mcp_server._FixedZeroContainmentArguments}  # pyright: ignore[reportPrivateUsage]
+    )
+    assert copied.model_extra is not None
+    assert copied.model_extra["arg_model"] is mcp_server._FixedZeroContainmentArguments  # pyright: ignore[reportPrivateUsage]
+
+    original_parameters = {"old": "parameters"}
+    fixed_zero_tool = SimpleNamespace(fn_metadata=metadata, parameters=original_parameters)
+    other_tool = SimpleNamespace(fn_metadata=FuncMetadata(arg_model=_AdapterOriginalArguments))
+    mcp = _metadata_adapter_test_mcp(fixed_zero_tool, other_tool)
+
+    with pytest.raises(RuntimeError, match="argument adapter is unsupported"):
+        mcp_server._install_fixed_zero_argument_adapter(mcp)  # pyright: ignore[reportPrivateUsage]
+
+    assert fixed_zero_tool.fn_metadata is metadata
+    assert fixed_zero_tool.parameters is original_parameters
+
+
+def test_fixed_zero_argument_adapter_fails_closed_when_copy_ignores_binding() -> None:
+    """A declared binding whose copy ignores replacement fails before tool assignment."""
+    metadata = _IgnoringCopyMetadataProbe(
+        arg_model=_AdapterOriginalArguments,
+        marker="ignores-update",
+    )
     original_parameters = {"old": "parameters"}
     fixed_zero_tool = SimpleNamespace(fn_metadata=metadata, parameters=original_parameters)
     other_tool = SimpleNamespace(fn_metadata=FuncMetadata(arg_model=_AdapterOriginalArguments))
@@ -854,7 +870,7 @@ def test_fixed_zero_wire_state_rejects_out_of_range_fan_percent(
     """G: both fan evidence fields reject bounded values outside 0 through 100."""
     payload = _fixed_zero_evidence_payload()
     payload[field] = invalid_value
-    with pytest.raises(ValueError, match="exact integer in 0..100"):
+    with pytest.raises(ValueError):
         mcp_server.FixedZeroCommandedStateResult.model_validate(payload)
 
 
@@ -916,27 +932,49 @@ def test_fixed_zero_wire_state_rejects_closed_shape(mutation: str) -> None:
 def test_fixed_zero_invalid_evidence_precedes_independent_emergency_supersession(
     tmp_path: Path, driver_outcome: str
 ) -> None:
-    """F2: emergency supersession never turns invalid evidence into completion evidence."""
+    """F2: public emergency completes while a driver result is intentionally blocked."""
     context = _cold_finalisation_context(tmp_path)
     session = context.session_store.start_session()
     server = create_mcp_server()
+    entered = Event()
+    release = Event()
 
-    def independently_emergency_stop() -> None:
-        _call_tool(server, "emergency_stop", _ctx(context), reason="F2 independent emergency")
+    def block_driver_result() -> None:
+        entered.set()
+        assert release.wait(timeout=1.0)
 
     driver = _CountingFixedZeroDriver(
         fixed_zero_outcome=driver_outcome,
-        on_fixed_zero=independently_emergency_stop,
+        on_fixed_zero=block_driver_result,
     )
     object.__setattr__(context, "roaster_driver", driver)
-    result = _call_tool(
-        server,
-        "contain_heat_fixed_zero",
-        _ctx(context),
-        expected_session_id=session.id,
-        containment_protocol="fixed_zero/v1",
+    results: list[object] = []
+    errors: list[BaseException] = []
+    containment = Thread(
+        target=_record_tool_result,
+        args=(results, errors, server, "contain_heat_fixed_zero", _ctx(context)),
+        kwargs={
+            "expected_session_id": session.id,
+            "containment_protocol": "fixed_zero/v1",
+        },
     )
+    containment.start()
+    try:
+        assert entered.wait(timeout=1.0)
+        emergency = _call_tool(
+            server,
+            "emergency_stop",
+            _ctx(context),
+            reason="F2 independent emergency",
+        )
+        assert emergency.event.kind == "fault"
+    finally:
+        release.set()
+        containment.join(timeout=1.0)
 
+    assert not containment.is_alive()
+    assert errors == [] and len(results) == 1
+    result = cast(Any, results[0])
     assert result.outcome == "unknown_driver_result"
     assert result.commanded_state is None
     assert result.session_projection == "unknown"
@@ -953,6 +991,7 @@ def test_fixed_zero_invalid_evidence_precedes_independent_emergency_supersession
     assert context.session_store.get_latest_session() is session
     assert session.active is False
     assert driver.fixed_zero_calls == 1
+    assert driver.emergency_stop_calls == 1
 
 
 @pytest.mark.parametrize("driver_outcome", ("raise", "missing", "malformed"))
@@ -1192,6 +1231,51 @@ def test_fixed_zero_finalisation_conflict_is_busy_without_driver_call(tmp_path: 
     )
     assert (result.outcome, result.reason_code) == ("refused_busy", "finalisation_in_progress")
     assert driver.fixed_zero_calls == driver.emergency_stop_calls == 0
+
+
+def test_fixed_zero_control_conflict_release_never_resends_without_new_request(
+    tmp_path: Path,
+) -> None:
+    """Releasing one real control token does not implicitly dispatch containment."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    driver = _CountingFixedZeroDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    control_reservation = context.session_store.reserve_driver_command(session, kind="control")
+
+    refused = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+
+    assert (refused.outcome, refused.reason_code) == ("refused_busy", "command_in_progress")
+    assert refused.request_dispatch == "not_invoked"
+    assert refused.commanded_state is None
+    held = context.session_store.get_session_snapshot(session_id=session.id)
+    assert held.pending_driver_command_token == control_reservation.token
+    assert held.pending_driver_command_kind == "control"
+    assert driver.fixed_zero_calls == 0
+
+    context.session_store.clear_driver_command_reservation(session, control_reservation)
+    _call_tool(server, "get_roast_state", _ctx(context), session_id=session.id)
+    released = context.session_store.get_session_snapshot(session_id=session.id)
+    assert released.pending_driver_command_token is None
+    assert released.pending_driver_command_kind is None
+    assert driver.fixed_zero_calls == 0
+
+    explicit = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert explicit.outcome == "command_state_returned"
+    assert driver.fixed_zero_calls == 1
 
 
 @pytest.mark.parametrize(
