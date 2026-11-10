@@ -80,6 +80,7 @@ from coffee_roaster_mcp.session import (
 )
 
 FixedZeroSessionId = Annotated[str, Strict(), StringConstraints(min_length=1, max_length=128)]
+_FIXED_ZERO_DRIVER_IDENTIFIER_PATTERN = r"[a-z][a-z0-9_-]{0,63}"
 FixedZeroOutcome = Literal[
     "refused_identity",
     "refused_capability",
@@ -122,7 +123,9 @@ class FixedZeroCommandedStateResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    driver: Annotated[str, Strict(), StringConstraints(pattern=r"[a-z][a-z0-9_-]{0,63}")]
+    driver: Annotated[
+        str, Strict(), StringConstraints(pattern=_FIXED_ZERO_DRIVER_IDENTIFIER_PATTERN)
+    ]
     capability_version: Literal[1]
     heat_level_percent: Literal[0]
     roast_fan_level_percent: Annotated[int, Strict(), Field(ge=0, le=100)]
@@ -141,7 +144,7 @@ class FixedZeroCommandedStateResult(BaseModel):
         driver = raw_value.get("driver")
         if (
             not isinstance(driver, str)
-            or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", driver, flags=re.ASCII) is None
+            or re.fullmatch(_FIXED_ZERO_DRIVER_IDENTIFIER_PATTERN, driver, flags=re.ASCII) is None
         ):
             raise ValueError("driver must be a full ASCII fixed-zero identifier.")
         for field_name, expected in (
@@ -1917,7 +1920,11 @@ def _fixed_zero_capability(
         containment_port = driver.contain_heat_fixed_zero
     except Exception:  # noqa: BLE001 - a property/port read is not command I/O.
         return None, "capability_unreadable"
-    if not isinstance(driver_name, str) or driver_name != capabilities.driver:
+    if (
+        not isinstance(driver_name, str)
+        or re.fullmatch(_FIXED_ZERO_DRIVER_IDENTIFIER_PATTERN, driver_name, flags=re.ASCII) is None
+        or driver_name != capabilities.driver
+    ):
         return None, "capability_malformed"
     if not callable(containment_port):
         return None, "capability_port_missing"

@@ -1288,6 +1288,7 @@ def test_fixed_zero_control_conflict_release_never_resends_without_new_request(
         ("wrong_declaration", "present", "capability_malformed"),
         ("unreadable", "present", "capability_unreadable"),
         ("identity_mismatch", "present", "capability_malformed"),
+        ("invalid_matching_identifier", "present", "capability_malformed"),
         ("supported", "missing", "capability_port_missing"),
         ("supported", "unreadable", "capability_unreadable"),
     ),
@@ -1311,6 +1312,9 @@ def test_fixed_zero_capability_refusals_are_zero_driver_paths(
     assert result.validated_session_id == session.id
     assert result.commanded_state is None
     assert driver.fixed_zero_calls == driver.emergency_stop_calls == 0
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.pending_driver_command_token is None
+    assert snapshot.heat_level_percent == 0
 
 
 def _fixed_zero_result_payload(outcome: str, reason_code: str | None) -> dict[str, object]:
@@ -1490,7 +1494,7 @@ class _ConfigurableFixedZeroDriver:
     """Capability declaration double for fixed-zero pre-dispatch refusal tests."""
 
     def __init__(self, *, capability_mode: str, port_mode: str) -> None:
-        self.name = "mock"
+        self.name = "bad!" if capability_mode == "invalid_matching_identifier" else "mock"
         self.fixed_zero_calls = 0
         self.emergency_stop_calls = 0
         self._capability_mode = capability_mode
@@ -1503,6 +1507,7 @@ class _ConfigurableFixedZeroDriver:
             "boolean_version": dataclasses.replace(base, heat_containment_version=True),
             "wrong_declaration": object(),
             "identity_mismatch": dataclasses.replace(base, driver="another-driver"),
+            "invalid_matching_identifier": dataclasses.replace(base, driver=self.name),
         }.get(capability_mode, base)
 
     @property
