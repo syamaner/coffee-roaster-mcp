@@ -11,11 +11,12 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from pathlib import Path
 from threading import Event, Lock, Thread, get_ident
 from types import SimpleNamespace, TracebackType
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import pytest
 from mcp import ClientSession, StdioServerParameters
@@ -85,12 +86,344 @@ from coffee_roaster_mcp.session import (
     SessionPurpose,
 )
 
+_T = TypeVar("_T")
+
 
 def test_sdk_request_logger_name_matches_installed_sdk() -> None:
     """The pinned SDK logger name must match the SDK we suppress, or the guard misses."""
     import mcp.server.lowlevel.server as sdk_server
 
     assert sdk_server.logger.name == SDK_REQUEST_LOGGER_NAME
+
+
+def test_stdio_fixed_zero_schema_is_exactly_two_closed_fields(
+    tmp_path: Path,
+) -> None:
+    """Real stdio exposes exactly the two closed fixed-zero request fields."""
+    asyncio.run(_assert_stdio_fixed_zero_schema(tmp_path))
+
+
+def test_stdio_fixed_zero_rejects_malformed_raw_arguments_before_counted_driver(
+    tmp_path: Path,
+) -> None:
+    """Raw malformed requests fail before the child driver is ever invoked."""
+    asyncio.run(_assert_stdio_fixed_zero_raw_boundary(tmp_path))
+
+
+def test_stdio_fixed_zero_local_cancel_does_not_claim_remote_preemption(tmp_path: Path) -> None:
+    """A cancelled local wait can lose its response while the bounded child settles once."""
+    asyncio.run(_assert_stdio_fixed_zero_cancel_semantics(tmp_path))
+
+
+def test_fixed_zero_postcommit_response_conversion_failure_keeps_domain_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An outer serialization failure cannot roll back or relabel committed containment."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    driver = _CountingFixedZeroDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    tool = server._tool_manager.get_tool("contain_heat_fixed_zero")  # pyright: ignore[reportPrivateUsage]
+    assert tool is not None
+
+    def fail_conversion(_metadata: object, _result: object) -> object:
+        raise RuntimeError("synthetic response serialization failure")
+
+    monkeypatch.setattr(type(tool.fn_metadata), "convert_result", fail_conversion)
+    with pytest.raises(ToolError, match="serialization failure"):
+        asyncio.run(
+            tool.run(
+                {"expected_session_id": session.id, "containment_protocol": "fixed_zero/v1"},
+                _ctx(context),
+                convert_result=True,
+            )
+        )
+
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.heat_level_percent == 0
+    assert snapshot.pending_driver_command_token is None
+    assert driver.fixed_zero_calls == 1
+    assert driver.emergency_stop_calls == 0
+
+
+def test_fixed_zero_success_commits_only_heat_clears_reservation_and_admits_control(
+    tmp_path: Path,
+) -> None:
+    """A confirmed command changes heat alone, clears its token, and admits later control."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    context.session_store.record_event(session, "beans_added")
+    context.session_store.apply_driver_control_state(
+        session,
+        heat_level_percent=55,
+        fan_level_percent=67,
+        cooling_on=True,
+    )
+    reservation_seen_by_driver: list[tuple[str | None, str | None]] = []
+
+    def record_reservation_before_completion() -> None:
+        reservation_seen_by_driver.append(
+            (session.pending_driver_command_token, session.pending_driver_command_kind)
+        )
+
+    driver = _CountingFixedZeroDriver(on_fixed_zero=record_reservation_before_completion)
+    driver.start_cooling()
+    driver.set_heat(heat_level_percent=55)
+    driver.set_fan(fan_level_percent=67)
+    object.__setattr__(context, "roaster_driver", driver)
+    events_before = tuple(session.event_timeline)
+    server = create_mcp_server()
+
+    result = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+
+    assert result.outcome == "command_state_returned"
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    driver_state = driver.read_state()
+    assert driver_state.heat_level_percent == snapshot.heat_level_percent == 0
+    assert snapshot.fan_level_percent == 67
+    assert snapshot.cooling_on is True
+    assert snapshot.phase == "roasting"
+    assert tuple(snapshot.event_timeline) == events_before
+    assert snapshot.pending_driver_command_token is None
+    assert snapshot.pending_driver_command_kind is None
+    assert len(reservation_seen_by_driver) == 1
+    assert reservation_seen_by_driver[0][0] is not None
+    assert reservation_seen_by_driver[0][1] == "heat_containment"
+    assert driver.fixed_zero_calls == 1
+
+    next_control = _call_tool(server, "set_heat", _ctx(context), heat_level_percent=42)
+    assert next_control.heat_level_percent == 42
+    assert (
+        context.session_store.get_session_snapshot(session_id=session.id).heat_level_percent == 42
+    )
+    assert driver.fixed_zero_calls == 1
+
+
+def _fixed_zero_stdio_child(
+    tmp_path: Path, *, blocked: bool
+) -> tuple[StdioServerParameters, Path, Path]:
+    """Create a test-only counted mock subprocess without altering production wiring."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("{}\n", encoding="utf-8")
+    count_path = tmp_path / "containment-calls.txt"
+    barrier_dir = tmp_path / "barriers"
+    barrier_dir.mkdir()
+    child_path = tmp_path / "counted_fixed_zero_child.py"
+    child_path.write_text(
+        """
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+
+from coffee_roaster_mcp import mcp_server
+from coffee_roaster_mcp.drivers import MockRoasterDriver
+
+
+config_path = Path(sys.argv[1])
+count_path = Path(sys.argv[2])
+barrier_dir = Path(sys.argv[3])
+blocked = sys.argv[4] == "blocked"
+
+
+class CountedMockDriver(MockRoasterDriver):
+    def contain_heat_fixed_zero(self):
+        with count_path.open("a", encoding="utf-8") as output:
+            output.write("contain\\n")
+        if blocked:
+            (barrier_dir / "entered").write_text("entered", encoding="utf-8")
+            deadline = time.monotonic() + 10
+            while not (barrier_dir / "release").exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("test containment barrier timed out")
+                time.sleep(0.01)
+        result = super().contain_heat_fixed_zero()
+        (barrier_dir / "settled").write_text("settled", encoding="utf-8")
+        return result
+
+
+mcp_server.create_roaster_driver = lambda *_args, **_kwargs: CountedMockDriver()
+mcp_server.create_mcp_server(config_path=config_path).run(transport="stdio")
+""".lstrip(),
+        encoding="utf-8",
+    )
+    root = Path(__file__).resolve().parents[1]
+    env = {"PYTHONPATH": str(root / "src")}
+    return (
+        StdioServerParameters(
+            command=sys.executable,
+            args=[
+                str(child_path),
+                str(config_path),
+                str(count_path),
+                str(barrier_dir),
+                "blocked" if blocked else "plain",
+            ],
+            env=env,
+            cwd=tmp_path,
+        ),
+        count_path,
+        barrier_dir,
+    )
+
+
+async def _wait_for_test_file(path: Path) -> None:
+    """Wait for a controlled child barrier, failing only if the test fixture stalls."""
+    deadline = time.monotonic() + 5
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"Timed out waiting for test barrier {path.name}.")
+        await asyncio.sleep(0.01)
+
+
+async def _call_with_timeout(awaitable: Awaitable[_T], timeout_seconds: float = 5.0) -> _T:
+    """Bound one real-stdio await so a stalled test child fails deterministically."""
+    return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+
+
+async def _assert_stdio_fixed_zero_schema(tmp_path: Path) -> None:
+    """Read the concrete fixed-zero stdio schema without dispatching a command."""
+    params, count_path, _ = _fixed_zero_stdio_child(tmp_path, blocked=False)
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await _call_with_timeout(client.initialize())
+        tools = cast(Any, await _call_with_timeout(client.list_tools()))
+        schema = next(
+            tool.inputSchema for tool in tools.tools if tool.name == "contain_heat_fixed_zero"
+        )
+        assert schema == {
+            "additionalProperties": False,
+            "description": "Strict raw SDK-boundary arguments for the fixed-zero containment tool.",
+            "properties": {
+                "expected_session_id": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "title": "Expected Session Id",
+                    "type": "string",
+                },
+                "containment_protocol": {
+                    "const": "fixed_zero/v1",
+                    "title": "Containment Protocol",
+                    "type": "string",
+                },
+            },
+            "required": ["expected_session_id", "containment_protocol"],
+            "title": "_FixedZeroContainmentArguments",
+            "type": "object",
+        }
+
+        assert not count_path.exists()
+
+
+async def _assert_stdio_fixed_zero_raw_boundary(tmp_path: Path) -> None:
+    """Send malformed requests and one valid dispatch through the real stdio transport."""
+    params, count_path, _ = _fixed_zero_stdio_child(tmp_path, blocked=False)
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await _call_with_timeout(client.initialize())
+        started = cast(Any, await _call_with_timeout(client.call_tool("start_roast_session", {})))
+        session_id = started.structuredContent["session"]["session_id"]
+        malformed: list[dict[str, object]] = [
+            {},
+            {"expected_session_id": session_id},
+            {"containment_protocol": "fixed_zero/v1"},
+            {"expected_session_id": "", "containment_protocol": "fixed_zero/v1"},
+            {"expected_session_id": False, "containment_protocol": "fixed_zero/v1"},
+            {"expected_session_id": 0, "containment_protocol": "fixed_zero/v1"},
+            {"expected_session_id": 0.0, "containment_protocol": "fixed_zero/v1"},
+            {"expected_session_id": None, "containment_protocol": "fixed_zero/v1"},
+            {"expected_session_id": session_id, "containment_protocol": False},
+            {"expected_session_id": session_id, "containment_protocol": "fixed_zero/v2"},
+            {
+                "expected_session_id": session_id,
+                "containment_protocol": "fixed_zero/v1",
+                "unknown": True,
+            },
+        ]
+        for value in (0, 1, False, 0.0, "0", None):
+            malformed.append(
+                {
+                    "expected_session_id": session_id,
+                    "containment_protocol": "fixed_zero/v1",
+                    "target_heat_level_percent": value,
+                }
+            )
+        for arguments in malformed:
+            result = cast(
+                Any,
+                await _call_with_timeout(client.call_tool("contain_heat_fixed_zero", arguments)),
+            )
+            assert result.isError
+            assert not count_path.exists()
+
+        contained = cast(
+            Any,
+            await _call_with_timeout(
+                client.call_tool(
+                    "contain_heat_fixed_zero",
+                    {"expected_session_id": session_id, "containment_protocol": "fixed_zero/v1"},
+                )
+            ),
+        )
+        assert not contained.isError
+        result = contained.structuredContent
+        assert result["outcome"] == "command_state_returned"
+        assert result["request_dispatch"] == "invoked"
+        assert result["commanded_state"] == {
+            "driver": "mock",
+            "capability_version": 1,
+            "heat_level_percent": 0,
+            "roast_fan_level_percent": 0,
+            "main_fan_level_percent": 0,
+            "drum_motor_on": False,
+            "cooling_motor_on": False,
+            "solenoid_open": False,
+        }
+        assert count_path.read_text(encoding="utf-8").splitlines() == ["contain"]
+        state = cast(
+            Any,
+            await _call_with_timeout(
+                client.call_tool("get_roast_state", {"session_id": session_id})
+            ),
+        )
+        assert state.structuredContent["heat_level_percent"] == 0
+        assert state.structuredContent["fan_level_percent"] == 0
+        assert state.structuredContent["cooling_on"] is False
+
+
+async def _assert_stdio_fixed_zero_cancel_semantics(tmp_path: Path) -> None:
+    """Cancel only the client wait, then release the server-owned fake command once."""
+    params, count_path, barrier_dir = _fixed_zero_stdio_child(tmp_path, blocked=True)
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await _call_with_timeout(client.initialize())
+        started = cast(Any, await _call_with_timeout(client.call_tool("start_roast_session", {})))
+        session_id = started.structuredContent["session"]["session_id"]
+        pending = asyncio.create_task(
+            client.call_tool(
+                "contain_heat_fixed_zero",
+                {"expected_session_id": session_id, "containment_protocol": "fixed_zero/v1"},
+            )
+        )
+        await _wait_for_test_file(barrier_dir / "entered")
+        pending.cancel()
+        with suppress(asyncio.CancelledError):
+            await pending
+        (barrier_dir / "release").write_text("release", encoding="utf-8")
+        await _wait_for_test_file(barrier_dir / "settled")
+        settled = cast(
+            Any,
+            await _call_with_timeout(
+                client.call_tool("get_roast_state", {"session_id": session_id})
+            ),
+        )
+        assert settled.structuredContent["heat_level_percent"] == 0
+        assert count_path.read_text(encoding="utf-8").splitlines() == ["contain"]
 
 
 def test_fixed_zero_registered_tool_rejects_raw_invalid_arguments_before_driver(

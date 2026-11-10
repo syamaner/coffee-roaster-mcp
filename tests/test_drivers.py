@@ -2112,7 +2112,7 @@ def test_hottop_cold_temperature_projection_reports_all_ignored_packets() -> Non
 
 
 def test_fixed_zero_containment_preserves_nonheat_mock_and_hottop_command_state() -> None:
-    """Both supported adapters only change commanded heat and return closed evidence."""
+    """Containment changes only heat; a released fake loop streams that command state."""
     mock = MockRoasterDriver()
     mock.set_heat(heat_level_percent=47)
     mock.set_fan(fan_level_percent=31)
@@ -2122,15 +2122,74 @@ def test_fixed_zero_containment_preserves_nonheat_mock_and_hottop_command_state(
     mock_evidence = mock.contain_heat_fixed_zero()
 
     serial_factory = FakeSerialFactory()
-    hottop = HottopRoasterDriver(port="/dev/test-hottop", serial_factory=serial_factory)
+    command_frame_started = Event()
+    release_command_frame = Event()
+    release_later_frames = Event()
+    frame_lock = Lock()
+    frame_call_count = 0
+    hottop: HottopRoasterDriver
+
+    def blocked_current_frame() -> bytes:
+        nonlocal frame_call_count
+        with frame_lock:
+            frame_call_count += 1
+            is_first_frame = frame_call_count == 1
+        command_frame_started.set()
+        if is_first_frame:
+            assert release_command_frame.wait(timeout=1.0)
+        else:
+            assert release_later_frames.wait(timeout=1.0)
+        return hottop._current_command_frame()  # pyright: ignore[reportPrivateUsage]
+
+    hottop = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory,
+        command_frame_provider=blocked_current_frame,
+    )
     object.__setattr__(hottop, "_heat_level_percent", 47)
     object.__setattr__(hottop, "_roast_fan_level_percent", 23)
     object.__setattr__(hottop, "_main_fan_level_percent", 31)
     object.__setattr__(hottop, "_drum_motor_on", True)
     object.__setattr__(hottop, "_cooling_motor_on", True)
     object.__setattr__(hottop, "_solenoid_open", True)
-    writes_before = len(serial_factory.transport.writes)
-    hottop_evidence = hottop.contain_heat_fixed_zero()
+    before_packet = build_hottop_command_packet(
+        heat_level_percent=47,
+        fan_level_percent=23,
+        main_fan_level_percent=31,
+        solenoid_open=True,
+        drum_motor_on=True,
+        cooling_motor_on=True,
+    )
+    hottop.connect()
+    try:
+        assert command_frame_started.wait(timeout=1.0)
+        writes_before = len(serial_factory.transport.writes_snapshot())
+        hottop_evidence = hottop.contain_heat_fixed_zero()
+        # The synchronous command-state call itself never writes; the separate
+        # command loop is deliberately released below to make one fake frame.
+        assert len(serial_factory.transport.writes_snapshot()) == writes_before
+        release_command_frame.set()
+        streamed_packet = _wait_for_hottop_write(
+            serial_factory.transport,
+            lambda write: (
+                is_hottop_command_packet(write)
+                and validate_hottop_packet_checksum(write)
+                and write[10] == 0
+                and write[11] == before_packet[11]
+                and write[12] == before_packet[12]
+                and write[16] == before_packet[16]
+                and write[17] == before_packet[17]
+                and write[18] == before_packet[18]
+            ),
+            start_index=writes_before,
+        )
+        writes_after_release = len(serial_factory.transport.writes_snapshot())
+        assert writes_after_release == writes_before + 1
+    finally:
+        release_command_frame.set()
+        release_later_frames.set()
+        hottop.disconnect()
 
     for evidence, driver_name, roast_fan in (
         (mock_evidence, "mock", 0),
@@ -2147,7 +2206,10 @@ def test_fixed_zero_containment_preserves_nonheat_mock_and_hottop_command_state(
             "cooling_motor_on": True,
             "solenoid_open": True,
         }
-    assert len(serial_factory.transport.writes) == writes_before
+    assert streamed_packet[35] == sum(streamed_packet[:35]) & 0xFF
+    assert streamed_packet[:10] == before_packet[:10]
+    assert streamed_packet[10] == 0
+    assert streamed_packet[11:35] == before_packet[11:35]
 
 
 @pytest.mark.parametrize("invalid_version", [1.0, "1", True])
