@@ -40,6 +40,17 @@ The first implementation milestone is a mock vertical slice that requires no roa
   environment approval, publication, and live artefact verification remain
   human-operator actions. #234 remains open for separate Agent pin/nested-suite
   work.
+- MCP239 source adds the exact-session `fixed_zero/v1` containment tool only;
+  it does not qualify a release, installed candidate, or live admission. Its
+  hardware-free boundary was resolved with Python 3.11.14, MCP 1.30.0, and
+  Pydantic 2.14.1 and is privately coupled to SDK metadata; strict-boundary
+  qualification for an installed candidate must rerun on its actual resolved
+  dependencies. See [MCP239 detail below](#mcp239--fixed-zero-containment-software-boundary).
+  Existing stale-completion handling may invoke the broader full emergency
+  profile, and `unknown_completion` command evidence can predate it rather than
+  describe latest or physical state. A matching unresolved reservation blocks
+  ordinary fan, cooling, and drop commands; an independent emergency retains
+  its existing admission rules.
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -2596,3 +2607,15 @@ Historical in-process observation snapshots follow the actual session store's
 retention and never restore control across a restart. The manual protocol
 requires recording-capable capture: detector-paced WAV replay is refused;
 automatic paced replay and recording-capable realtime behaviour stay unchanged.
+
+### MCP239 — fixed-zero containment software boundary
+
+This bounded software slice adds a versioned `fixed_zero/v1` exact-session MCP
+tool. It accepts no caller-selected heat level, rejects raw extra arguments,
+and calls the supported mock/Hottop fixed-zero port at most once. The closed
+driver command-state value and closed business result describe in-memory
+command evidence only. They do not establish physical safety, durable audit,
+transport settlement, automatic retry, or Agent-global uncertainty handling.
+Unknown driver/completion outcomes retain only a still-matching reservation;
+newer ownership is never restored or modified. Emergency and stopped-fault
+recovery semantics remain independent.

@@ -5,17 +5,28 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import re
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
-from typing import Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from mcp.server.session import ServerSession
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    Strict,
+    StrictBool,
+    StringConstraints,
+    model_validator,
+)
 
 from coffee_roaster_mcp import __version__
 from coffee_roaster_mcp.ambient_runtime import (
@@ -38,7 +49,9 @@ from coffee_roaster_mcp.config import (
 )
 from coffee_roaster_mcp.drivers import (
     DriverLifecycleEvidence,
+    FixedZeroCommandedState,
     LifecycleEvidenceDriver,
+    RoasterCapabilities,
     RoasterDriver,
     RoasterState,
     create_roaster_driver,
@@ -65,6 +78,225 @@ from coffee_roaster_mcp.session import (
     default_emergency_safety_payload,
     has_verified_emergency_containment,
 )
+
+FixedZeroSessionId = Annotated[str, Strict(), StringConstraints(min_length=1, max_length=128)]
+_FIXED_ZERO_DRIVER_IDENTIFIER_PATTERN = r"[a-z][a-z0-9_-]{0,63}"
+FixedZeroOutcome = Literal[
+    "refused_identity",
+    "refused_capability",
+    "refused_busy",
+    "command_state_returned",
+    "unknown_driver_result",
+    "unknown_completion",
+]
+FixedZeroReason = Literal[
+    "unknown_session",
+    "not_latest_session",
+    "session_not_active",
+    "session_faulted",
+    "capability_absent",
+    "capability_version_unsupported",
+    "capability_malformed",
+    "capability_unreadable",
+    "capability_port_missing",
+    "finalisation_in_progress",
+    "command_in_progress",
+    "driver_raised",
+    "driver_result_missing",
+    "driver_result_invalid",
+    "completion_ownership_changed",
+    "projection_unconfirmed",
+]
+
+
+class _FixedZeroContainmentArguments(ArgModelBase):
+    """Strict raw SDK-boundary arguments for the fixed-zero containment tool."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_session_id: FixedZeroSessionId
+    containment_protocol: Literal["fixed_zero/v1"]
+
+
+class FixedZeroCommandedStateResult(BaseModel):
+    """Exact eight-key driver command-state evidence exposed by the tool."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    driver: Annotated[
+        str, Strict(), StringConstraints(pattern=_FIXED_ZERO_DRIVER_IDENTIFIER_PATTERN)
+    ]
+    capability_version: Literal[1]
+    heat_level_percent: Literal[0]
+    roast_fan_level_percent: Annotated[int, Strict(), Field(ge=0, le=100)]
+    main_fan_level_percent: Annotated[int, Strict(), Field(ge=0, le=100)]
+    drum_motor_on: StrictBool
+    cooling_motor_on: StrictBool
+    solenoid_open: StrictBool
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw_fixed_zero_evidence(cls, value: object) -> object:
+        """Reject pre-coercion literals and non-full driver identities."""
+        if not isinstance(value, Mapping):
+            raise TypeError("Fixed-zero commanded state must be a mapping.")
+        raw_value = cast(Mapping[str, object], value)
+        driver = raw_value.get("driver")
+        if (
+            not isinstance(driver, str)
+            or re.fullmatch(_FIXED_ZERO_DRIVER_IDENTIFIER_PATTERN, driver, flags=re.ASCII) is None
+        ):
+            raise ValueError("driver must be a full ASCII fixed-zero identifier.")
+        for field_name, expected in (
+            ("capability_version", 1),
+            ("heat_level_percent", 0),
+        ):
+            raw = raw_value.get(field_name)
+            if type(raw) is not int or raw != expected:
+                raise ValueError(f"{field_name} must be the exact integer {expected}.")
+        for field_name in ("roast_fan_level_percent", "main_fan_level_percent"):
+            raw = raw_value.get(field_name)
+            if type(raw) is not int or not 0 <= raw <= 100:
+                raise ValueError(f"{field_name} must be an exact integer in 0..100.")
+        for field_name in ("drum_motor_on", "cooling_motor_on", "solenoid_open"):
+            if type(raw_value.get(field_name)) is not bool:
+                raise TypeError(f"{field_name} must be an exact boolean.")
+        return raw_value
+
+
+class FixedZeroContainmentResult(BaseModel):
+    """Closed eleven-field business result for fixed-zero containment."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    containment_protocol: Literal["fixed_zero/v1"]
+    containment_version: Literal[1]
+    outcome: FixedZeroOutcome
+    request_dispatch: Literal["not_invoked", "invoked"]
+    automatic_retry_permitted: Literal[False]
+    requested_session_id: FixedZeroSessionId
+    validated_session_id: FixedZeroSessionId | None
+    commanded_state: FixedZeroCommandedStateResult | None
+    session_projection: Literal["recorded_in_memory", "unknown", "not_changed"]
+    durability: Literal["not_provided_by_this_tool"]
+    reason_code: FixedZeroReason | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw_result_literals(cls, value: object) -> object:
+        """Reject Pydantic Literal coercion before closed-result validation."""
+        if not isinstance(value, Mapping):
+            raise TypeError("Fixed-zero result must be a mapping.")
+        raw_value = cast(Mapping[str, object], value)
+        if (
+            type(raw_value.get("containment_version")) is not int
+            or raw_value.get("containment_version") != 1
+        ):
+            raise ValueError("containment_version must be the exact integer 1.")
+        if (
+            type(raw_value.get("automatic_retry_permitted")) is not bool
+            or raw_value.get("automatic_retry_permitted") is not False
+        ):
+            raise ValueError("automatic_retry_permitted must be the exact boolean false.")
+        return raw_value
+
+    @model_validator(mode="after")
+    def _validate_outcome_row(self) -> FixedZeroContainmentResult:
+        """Reject every impossible cross-field outcome combination."""
+        accepted: dict[
+            FixedZeroOutcome,
+            tuple[str, bool, str, frozenset[FixedZeroReason] | None],
+        ] = {
+            "refused_identity": (
+                "not_invoked",
+                False,
+                "not_changed",
+                frozenset(
+                    {
+                        "unknown_session",
+                        "not_latest_session",
+                        "session_not_active",
+                        "session_faulted",
+                    }
+                ),
+            ),
+            "refused_capability": (
+                "not_invoked",
+                True,
+                "not_changed",
+                frozenset(
+                    {
+                        "capability_absent",
+                        "capability_version_unsupported",
+                        "capability_malformed",
+                        "capability_unreadable",
+                        "capability_port_missing",
+                    }
+                ),
+            ),
+            "refused_busy": (
+                "not_invoked",
+                True,
+                "not_changed",
+                frozenset({"finalisation_in_progress", "command_in_progress"}),
+            ),
+            "command_state_returned": ("invoked", True, "recorded_in_memory", None),
+            "unknown_driver_result": (
+                "invoked",
+                True,
+                "unknown",
+                frozenset({"driver_raised", "driver_result_missing", "driver_result_invalid"}),
+            ),
+            "unknown_completion": (
+                "invoked",
+                True,
+                "unknown",
+                frozenset({"completion_ownership_changed", "projection_unconfirmed"}),
+            ),
+        }
+        dispatch, requires_validated_id, projection, reasons = accepted[self.outcome]
+        if self.request_dispatch != dispatch or self.session_projection != projection:
+            raise ValueError("Fixed-zero result has an invalid outcome projection.")
+        if requires_validated_id != (self.validated_session_id is not None):
+            raise ValueError("Fixed-zero result has an invalid validated session id.")
+        if self.validated_session_id is not None and (
+            self.validated_session_id != self.requested_session_id
+        ):
+            raise ValueError("validated_session_id must equal requested_session_id.")
+        requires_state = self.outcome in {"command_state_returned", "unknown_completion"}
+        if requires_state != (self.commanded_state is not None):
+            raise ValueError("Fixed-zero result has an invalid commanded state.")
+        if reasons is None:
+            if self.reason_code is not None:
+                raise ValueError("Successful fixed-zero result cannot have a reason code.")
+        elif self.reason_code not in reasons:
+            raise ValueError("Fixed-zero result has an invalid reason code.")
+        return self
+
+
+def _install_fixed_zero_argument_adapter(mcp: FastMCP) -> None:
+    """Bind strict raw argument validation to only the new fixed-zero tool."""
+    tool = mcp._tool_manager.get_tool("contain_heat_fixed_zero")  # pyright: ignore[reportPrivateUsage]
+    if tool is None:
+        raise RuntimeError("Fixed-zero containment tool was not registered.")
+    existing_metadata = tool.fn_metadata
+    declared_metadata_fields = getattr(type(existing_metadata), "model_fields", None)
+    if (
+        not isinstance(declared_metadata_fields, Mapping)
+        or "arg_model" not in declared_metadata_fields
+    ):
+        raise RuntimeError("Fixed-zero containment argument adapter is unsupported.")
+    try:
+        adapted_metadata = existing_metadata.model_copy(
+            update={"arg_model": _FixedZeroContainmentArguments}
+        )
+        binds_fixed_zero_arguments = adapted_metadata.arg_model is _FixedZeroContainmentArguments
+    except Exception as exc:
+        raise RuntimeError("Fixed-zero containment argument adapter is unsupported.") from exc
+    if not binds_fixed_zero_arguments:
+        raise RuntimeError("Fixed-zero containment argument adapter is unsupported.")
+    tool.fn_metadata = adapted_metadata
+    tool.parameters = _FixedZeroContainmentArguments.model_json_schema(by_alias=True)
 
 
 @dataclass(frozen=True)
@@ -1053,6 +1285,25 @@ def create_mcp_server(
         return _serialize_control_result(snapshot)
 
     @mcp.tool()
+    def contain_heat_fixed_zero(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+        expected_session_id: str,
+        containment_protocol: Literal["fixed_zero/v1"],
+    ) -> FixedZeroContainmentResult:
+        """Contain commanded heat for one exact session with bounded command evidence.
+
+        The returned state is not evidence of physical heat removal, transport
+        settlement, or durable audit. Unknown outcomes block ordinary commands
+        and never permit automatic retry. Existing stale-completion handling may
+        apply the broader emergency profile after the returned evidence was read.
+        """
+        _ = containment_protocol
+        return _run_fixed_zero_heat_containment(
+            ctx.request_context.lifespan_context,
+            expected_session_id=expected_session_id,
+        )
+
+    @mcp.tool()
     def set_fan(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
         fan_level_percent: int,
@@ -1404,6 +1655,7 @@ def create_mcp_server(
         )
         return SetRecordingMetadataResult(origin=stored.origin, roast_num=stored.roast_num)
 
+    _install_fixed_zero_argument_adapter(mcp)
     return mcp
 
 
@@ -1614,6 +1866,213 @@ def _process_auto_t0_for_active_session(
         drop_threshold_c=server_context.config.session.auto_t0_drop_threshold_c,
     )
     return event is not None
+
+
+def _fixed_zero_result(
+    *,
+    outcome: FixedZeroOutcome,
+    requested_session_id: str,
+    validated_session_id: str | None,
+    commanded_state: FixedZeroCommandedStateResult | None,
+    session_projection: Literal["recorded_in_memory", "unknown", "not_changed"],
+    reason_code: FixedZeroReason | None,
+) -> FixedZeroContainmentResult:
+    """Build and validate one exact fixed-zero business result."""
+    return FixedZeroContainmentResult.model_validate(
+        {
+            "containment_protocol": "fixed_zero/v1",
+            "containment_version": 1,
+            "outcome": outcome,
+            "request_dispatch": "invoked"
+            if outcome in {"command_state_returned", "unknown_driver_result", "unknown_completion"}
+            else "not_invoked",
+            "automatic_retry_permitted": False,
+            "requested_session_id": requested_session_id,
+            "validated_session_id": validated_session_id,
+            "commanded_state": commanded_state,
+            "session_projection": session_projection,
+            "durability": "not_provided_by_this_tool",
+            "reason_code": reason_code,
+        }
+    )
+
+
+def _fixed_zero_capability(
+    server_context: ServerContext,
+) -> tuple[RoasterCapabilities | None, FixedZeroReason | None]:
+    """Return the explicit fixed-zero capability declaration without I/O."""
+    try:
+        capabilities: Any = server_context.roaster_driver.capabilities
+    except Exception:  # noqa: BLE001 - untrusted adapter declarations fail closed.
+        return None, "capability_unreadable"
+    if not isinstance(capabilities, RoasterCapabilities):
+        return None, "capability_malformed"
+    version: Any = capabilities.heat_containment_version
+    if version is None:
+        return None, "capability_absent"
+    if isinstance(version, bool) or not isinstance(version, int):
+        return None, "capability_malformed"
+    if version != 1:
+        return None, "capability_version_unsupported"
+    try:
+        driver: Any = server_context.roaster_driver
+        driver_name: Any = driver.name
+        containment_port = driver.contain_heat_fixed_zero
+    except Exception:  # noqa: BLE001 - a property/port read is not command I/O.
+        return None, "capability_unreadable"
+    if (
+        not isinstance(driver_name, str)
+        or re.fullmatch(_FIXED_ZERO_DRIVER_IDENTIFIER_PATTERN, driver_name, flags=re.ASCII) is None
+        or driver_name != capabilities.driver
+    ):
+        return None, "capability_malformed"
+    if not callable(containment_port):
+        return None, "capability_port_missing"
+    return capabilities, None
+
+
+def _validated_fixed_zero_commanded_state(
+    evidence: object,
+    *,
+    capability_driver: str,
+) -> FixedZeroCommandedStateResult | None:
+    """Validate one driver result without accepting coercion or extra fields."""
+    if not isinstance(evidence, FixedZeroCommandedState) or evidence.driver != capability_driver:
+        return None
+    try:
+        return FixedZeroCommandedStateResult.model_validate(evidence.as_dict())
+    except Exception:  # noqa: BLE001 - malformed driver evidence is a business outcome.
+        return None
+
+
+def _run_fixed_zero_heat_containment(
+    server_context: ServerContext,
+    *,
+    expected_session_id: str,
+) -> FixedZeroContainmentResult:
+    """Run one fixed-zero command with exact-session uncertainty preservation."""
+    identity_rejection = server_context.session_store.inspect_fixed_zero_containment_identity(
+        expected_session_id
+    )
+    if identity_rejection is not None:
+        return _fixed_zero_result(
+            outcome="refused_identity",
+            requested_session_id=expected_session_id,
+            validated_session_id=None,
+            commanded_state=None,
+            session_projection="not_changed",
+            reason_code=identity_rejection,
+        )
+    capabilities, capability_rejection = _fixed_zero_capability(server_context)
+    if capability_rejection is not None:
+        return _fixed_zero_result(
+            outcome="refused_capability",
+            requested_session_id=expected_session_id,
+            validated_session_id=expected_session_id,
+            commanded_state=None,
+            session_projection="not_changed",
+            reason_code=capability_rejection,
+        )
+    assert capabilities is not None
+    admission = server_context.session_store.reserve_fixed_zero_containment(expected_session_id)
+    if admission.identity_rejection is not None:
+        return _fixed_zero_result(
+            outcome="refused_identity",
+            requested_session_id=expected_session_id,
+            validated_session_id=None,
+            commanded_state=None,
+            session_projection="not_changed",
+            reason_code=admission.identity_rejection,
+        )
+    if admission.busy_rejection is not None:
+        return _fixed_zero_result(
+            outcome="refused_busy",
+            requested_session_id=expected_session_id,
+            validated_session_id=expected_session_id,
+            commanded_state=None,
+            session_projection="not_changed",
+            reason_code=admission.busy_rejection,
+        )
+    session = admission.session
+    reservation = admission.reservation
+    assert session is not None and reservation is not None
+    try:
+        driver: Any = server_context.roaster_driver
+        evidence: Any = driver.contain_heat_fixed_zero()
+    except Exception:  # noqa: BLE001 - a raised invocation has unknown settlement.
+        return _fixed_zero_result(
+            outcome="unknown_driver_result",
+            requested_session_id=expected_session_id,
+            validated_session_id=expected_session_id,
+            commanded_state=None,
+            session_projection="unknown",
+            reason_code="driver_raised",
+        )
+    if evidence is None:
+        return _fixed_zero_result(
+            outcome="unknown_driver_result",
+            requested_session_id=expected_session_id,
+            validated_session_id=expected_session_id,
+            commanded_state=None,
+            session_projection="unknown",
+            reason_code="driver_result_missing",
+        )
+    commanded_state = _validated_fixed_zero_commanded_state(
+        evidence, capability_driver=capabilities.driver
+    )
+    if commanded_state is None:
+        return _fixed_zero_result(
+            outcome="unknown_driver_result",
+            requested_session_id=expected_session_id,
+            validated_session_id=expected_session_id,
+            commanded_state=None,
+            session_projection="unknown",
+            reason_code="driver_result_invalid",
+        )
+    try:
+        server_context.session_store.complete_fixed_zero_containment_snapshot(
+            session, reservation=reservation
+        )
+    except SessionLifecycleError:
+        _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
+        return _fixed_zero_result(
+            outcome="unknown_completion",
+            requested_session_id=expected_session_id,
+            validated_session_id=expected_session_id,
+            commanded_state=commanded_state,
+            session_projection="unknown",
+            reason_code=(
+                "projection_unconfirmed"
+                if server_context.session_store.fixed_zero_containment_ownership_matches(
+                    session, reservation
+                )
+                else "completion_ownership_changed"
+            ),
+        )
+    except Exception:  # noqa: BLE001 - never clear or recreate an unconfirmed token.
+        reason: FixedZeroReason = (
+            "projection_unconfirmed"
+            if server_context.session_store.fixed_zero_containment_ownership_matches(
+                session, reservation
+            )
+            else "completion_ownership_changed"
+        )
+        return _fixed_zero_result(
+            outcome="unknown_completion",
+            requested_session_id=expected_session_id,
+            validated_session_id=expected_session_id,
+            commanded_state=commanded_state,
+            session_projection="unknown",
+            reason_code=reason,
+        )
+    return _fixed_zero_result(
+        outcome="command_state_returned",
+        requested_session_id=expected_session_id,
+        validated_session_id=expected_session_id,
+        commanded_state=commanded_state,
+        session_projection="recorded_in_memory",
+        reason_code=None,
+    )
 
 
 def _run_reserved_driver_control(

@@ -37,7 +37,21 @@ RoastEventKind = Literal[
 EventPayloadValue = str | int | float | bool | None
 SessionPurpose = Literal["roast", "cold_characterisation"]
 SessionPresence = Literal["none", "starting", "active", "stopped"]
-DriverCommandKind = Literal["control", "drop", "start_cooling", "stop_cooling", "finalisation"]
+DriverCommandKind = Literal[
+    "control",
+    "drop",
+    "start_cooling",
+    "stop_cooling",
+    "finalisation",
+    "heat_containment",
+]
+FixedZeroIdentityRejection = Literal[
+    "unknown_session",
+    "not_latest_session",
+    "session_not_active",
+    "session_faulted",
+]
+FixedZeroBusyRejection = Literal["finalisation_in_progress", "command_in_progress"]
 
 _SINGLETON_EVENT_KINDS: frozenset[RoastEventKind] = frozenset(
     {
@@ -247,6 +261,16 @@ class DriverCommandReservation:
     session_id: str
     token: str
     kind: DriverCommandKind
+
+
+@dataclass(frozen=True)
+class FixedZeroContainmentAdmission:
+    """Locked exact-session admission for one fixed-zero containment command."""
+
+    session: RoastSession | None
+    reservation: DriverCommandReservation | None
+    identity_rejection: FixedZeroIdentityRejection | None = None
+    busy_rejection: FixedZeroBusyRejection | None = None
 
 
 @dataclass(frozen=True)
@@ -1124,6 +1148,87 @@ class RoastSessionStore:
         with self._lock:
             self._assert_latest_active_session(session)
             return self._reserve_driver_command_locked(session, kind=kind)
+
+    def inspect_fixed_zero_containment_identity(
+        self, expected_session_id: str
+    ) -> FixedZeroIdentityRejection | None:
+        """Classify exact-session containment identity without reserving work."""
+        with self._lock:
+            return self._fixed_zero_identity_rejection_locked(expected_session_id)
+
+    def reserve_fixed_zero_containment(
+        self, expected_session_id: str
+    ) -> FixedZeroContainmentAdmission:
+        """Revalidate and reserve one fixed-zero containment command.
+
+        The returned live session is intentionally used only to invoke the driver
+        outside the store lock.  The result must be completed through the
+        matching fixed-zero completion method, which repeats all ownership checks.
+        """
+        with self._lock:
+            identity_rejection = self._fixed_zero_identity_rejection_locked(expected_session_id)
+            if identity_rejection is not None:
+                return FixedZeroContainmentAdmission(
+                    session=None,
+                    reservation=None,
+                    identity_rejection=identity_rejection,
+                )
+            session = self._latest_session
+            assert session is not None
+            if self._finalisation_blocks_mutation(session):
+                return FixedZeroContainmentAdmission(
+                    session=session,
+                    reservation=None,
+                    busy_rejection="finalisation_in_progress",
+                )
+            if session.pending_driver_command_token is not None:
+                return FixedZeroContainmentAdmission(
+                    session=session,
+                    reservation=None,
+                    busy_rejection="command_in_progress",
+                )
+            return FixedZeroContainmentAdmission(
+                session=session,
+                reservation=self._reserve_driver_command_locked(session, kind="heat_containment"),
+            )
+
+    def complete_fixed_zero_containment_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+    ) -> RoastSession:
+        """Commit only an admitted fixed-zero heat projection and clear its token.
+
+        All mutation precedes the success-only token clear.  Exceptions leave a
+        matching reservation in place so the caller can conservatively report an
+        unconfirmed completion rather than manufacture settlement.
+        """
+        with self._lock:
+            self._assert_driver_command_reservation(session, reservation)
+            if reservation.kind != "heat_containment":
+                raise SessionLifecycleError("Reservation is not fixed-zero containment.")
+            session.heat_level_percent = 0
+            snapshot = _copy_session_for_read(session)
+            self._clear_driver_command_reservation_locked(session, reservation)
+            return snapshot
+
+    def fixed_zero_containment_ownership_matches(
+        self,
+        session: RoastSession,
+        reservation: DriverCommandReservation,
+    ) -> bool:
+        """Return whether an unresolved containment token is still the current owner."""
+        with self._lock:
+            return (
+                self._latest_session is session
+                and session.active
+                and reservation.session_id == session.id
+                and reservation.kind == "heat_containment"
+                and session.pending_driver_command_token == reservation.token
+                and session.pending_driver_command_kind == reservation.kind
+                and not self._finalisation_blocks_mutation(session)
+            )
 
     def reserve_driver_drop(self, session: RoastSession) -> DriverDropReservation:
         """Reserve a driver drop command or return the existing drop event."""
@@ -2462,6 +2567,21 @@ class RoastSessionStore:
         self._assert_latest_session(session)
         if not session.active:
             raise SessionLifecycleError("Stopped sessions cannot be mutated.")
+
+    def _fixed_zero_identity_rejection_locked(
+        self, expected_session_id: str
+    ) -> FixedZeroIdentityRejection | None:
+        """Return the closed containment identity rejection under the store lock."""
+        latest = self._latest_session
+        if latest is None or expected_session_id not in self._sessions_by_id:
+            return "unknown_session"
+        if latest.id != expected_session_id:
+            return "not_latest_session"
+        if latest.faulted_at_utc is not None or latest.phase == "fault":
+            return "session_faulted"
+        if not latest.active:
+            return "session_not_active"
+        return None
 
     def _finalisation_blocks_mutation(self, session: RoastSession) -> bool:
         """Return whether a finalisation reservation excludes ordinary mutation."""

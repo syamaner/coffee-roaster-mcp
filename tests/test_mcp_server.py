@@ -11,15 +11,19 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from threading import Event, Lock, Thread, get_ident
 from types import SimpleNamespace, TracebackType
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase, FuncMetadata
+from pydantic import BaseModel, ConfigDict
 
 import coffee_roaster_mcp.mcp_server as mcp_server
 import coffee_roaster_mcp.session as session_module
@@ -39,6 +43,7 @@ from coffee_roaster_mcp.drivers import (
     HOTTOP_DRIVER_NAME,
     DriverLifecycleEvidence,
     EmergencyStopResult,
+    FixedZeroCommandedState,
     HottopRoasterDriver,
     MockRoasterDriver,
     RoasterState,
@@ -82,12 +87,1472 @@ from coffee_roaster_mcp.session import (
     SessionPurpose,
 )
 
+_T = TypeVar("_T")
+
+
+class _AdapterOriginalArguments(ArgModelBase):
+    """Minimal source argument model for fixed-zero adapter mechanism tests."""
+
+    marker: str
+
+
+class _AdapterOutput(BaseModel):
+    """Retained structured output model for the metadata-copy witness."""
+
+    marker: str
+
+
+class _ExtendedFuncMetadata(FuncMetadata):
+    """SDK-shaped metadata with one future field the adapter must retain."""
+
+    synthetic_metadata: str
+
+
+class _MinimalMetadataProbe(BaseModel):
+    """Local metadata-shaped Pydantic probe without structured-output attributes."""
+
+    arg_model: type[ArgModelBase]
+    marker: str
+
+
+class _DynamicArgModelMetadataProbe(BaseModel):
+    """Metadata probe whose dynamic attribute is not a declared Pydantic field."""
+
+    model_config = ConfigDict(extra="allow")
+
+    marker: str
+
+
+class _IgnoringCopyMetadataProbe(BaseModel):
+    """Metadata probe that returns itself rather than applying model-copy updates."""
+
+    arg_model: type[ArgModelBase]
+    marker: str
+
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> _IgnoringCopyMetadataProbe:
+        """Intentionally ignore the requested update for the fail-closed mechanism probe."""
+        _ = update, deep
+        return self
+
 
 def test_sdk_request_logger_name_matches_installed_sdk() -> None:
     """The pinned SDK logger name must match the SDK we suppress, or the guard misses."""
     import mcp.server.lowlevel.server as sdk_server
 
     assert sdk_server.logger.name == SDK_REQUEST_LOGGER_NAME
+
+
+def test_stdio_fixed_zero_schema_is_exactly_two_closed_fields(
+    tmp_path: Path,
+) -> None:
+    """Real stdio exposes exactly the two closed fixed-zero request fields."""
+    asyncio.run(_assert_stdio_fixed_zero_schema(tmp_path))
+
+
+def test_stdio_fixed_zero_rejects_malformed_raw_arguments_before_counted_driver(
+    tmp_path: Path,
+) -> None:
+    """Raw malformed requests fail before the child driver is ever invoked."""
+    asyncio.run(_assert_stdio_fixed_zero_raw_boundary(tmp_path))
+
+
+def test_stdio_fixed_zero_local_cancel_does_not_claim_remote_preemption(tmp_path: Path) -> None:
+    """A cancelled local wait can lose its response while the bounded child settles once."""
+    asyncio.run(_assert_stdio_fixed_zero_cancel_semantics(tmp_path))
+
+
+def test_fixed_zero_postcommit_response_conversion_failure_keeps_domain_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An outer serialization failure cannot roll back or relabel committed containment."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    driver = _CountingFixedZeroDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    tool = server._tool_manager.get_tool("contain_heat_fixed_zero")  # pyright: ignore[reportPrivateUsage]
+    assert tool is not None
+
+    def fail_conversion(_metadata: object, _result: object) -> object:
+        raise RuntimeError("synthetic response serialization failure")
+
+    monkeypatch.setattr(type(tool.fn_metadata), "convert_result", fail_conversion)
+    with pytest.raises(ToolError, match="serialization failure"):
+        asyncio.run(
+            tool.run(
+                {"expected_session_id": session.id, "containment_protocol": "fixed_zero/v1"},
+                _ctx(context),
+                convert_result=True,
+            )
+        )
+
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.heat_level_percent == 0
+    assert snapshot.pending_driver_command_token is None
+    assert driver.fixed_zero_calls == 1
+    assert driver.emergency_stop_calls == 0
+
+
+def test_fixed_zero_success_commits_only_heat_clears_reservation_and_admits_control(
+    tmp_path: Path,
+) -> None:
+    """A confirmed command changes heat alone, clears its token, and admits later control."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    context.session_store.record_event(session, "beans_added")
+    context.session_store.apply_driver_control_state(
+        session,
+        heat_level_percent=55,
+        fan_level_percent=67,
+        cooling_on=True,
+    )
+    reservation_seen_by_driver: list[tuple[str | None, str | None]] = []
+
+    def record_reservation_before_completion() -> None:
+        reservation_seen_by_driver.append(
+            (session.pending_driver_command_token, session.pending_driver_command_kind)
+        )
+
+    driver = _CountingFixedZeroDriver(on_fixed_zero=record_reservation_before_completion)
+    driver.start_cooling()
+    driver.set_heat(heat_level_percent=55)
+    driver.set_fan(fan_level_percent=67)
+    object.__setattr__(context, "roaster_driver", driver)
+    events_before = tuple(session.event_timeline)
+    server = create_mcp_server()
+
+    result = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+
+    assert result.outcome == "command_state_returned"
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    driver_state = driver.read_state()
+    assert driver_state.heat_level_percent == snapshot.heat_level_percent == 0
+    assert snapshot.fan_level_percent == 67
+    assert snapshot.cooling_on is True
+    assert snapshot.phase == "roasting"
+    assert tuple(snapshot.event_timeline) == events_before
+    assert snapshot.pending_driver_command_token is None
+    assert snapshot.pending_driver_command_kind is None
+    assert len(reservation_seen_by_driver) == 1
+    assert reservation_seen_by_driver[0][0] is not None
+    assert reservation_seen_by_driver[0][1] == "heat_containment"
+    assert driver.fixed_zero_calls == 1
+
+    next_control = _call_tool(server, "set_heat", _ctx(context), heat_level_percent=42)
+    assert next_control.heat_level_percent == 42
+    assert (
+        context.session_store.get_session_snapshot(session_id=session.id).heat_level_percent == 42
+    )
+    assert driver.fixed_zero_calls == 1
+
+
+def _fixed_zero_stdio_child(
+    tmp_path: Path, *, blocked: bool
+) -> tuple[StdioServerParameters, Path, Path]:
+    """Create a test-only counted mock subprocess without altering production wiring."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text("{}\n", encoding="utf-8")
+    count_path = tmp_path / "containment-calls.txt"
+    barrier_dir = tmp_path / "barriers"
+    barrier_dir.mkdir()
+    child_path = tmp_path / "counted_fixed_zero_child.py"
+    child_path.write_text(
+        """
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+
+from coffee_roaster_mcp import mcp_server
+from coffee_roaster_mcp.drivers import MockRoasterDriver
+
+
+config_path = Path(sys.argv[1])
+count_path = Path(sys.argv[2])
+barrier_dir = Path(sys.argv[3])
+blocked = sys.argv[4] == "blocked"
+
+
+class CountedMockDriver(MockRoasterDriver):
+    def contain_heat_fixed_zero(self):
+        with count_path.open("a", encoding="utf-8") as output:
+            output.write("contain\\n")
+        if blocked:
+            (barrier_dir / "entered").write_text("entered", encoding="utf-8")
+            deadline = time.monotonic() + 10
+            while not (barrier_dir / "release").exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("test containment barrier timed out")
+                time.sleep(0.01)
+        result = super().contain_heat_fixed_zero()
+        (barrier_dir / "settled").write_text("settled", encoding="utf-8")
+        return result
+
+
+mcp_server.create_roaster_driver = lambda *_args, **_kwargs: CountedMockDriver()
+mcp_server.create_mcp_server(config_path=config_path).run(transport="stdio")
+""".lstrip(),
+        encoding="utf-8",
+    )
+    root = Path(__file__).resolve().parents[1]
+    env = {"PYTHONPATH": str(root / "src")}
+    return (
+        StdioServerParameters(
+            command=sys.executable,
+            args=[
+                str(child_path),
+                str(config_path),
+                str(count_path),
+                str(barrier_dir),
+                "blocked" if blocked else "plain",
+            ],
+            env=env,
+            cwd=tmp_path,
+        ),
+        count_path,
+        barrier_dir,
+    )
+
+
+async def _wait_for_test_file(path: Path) -> None:
+    """Wait for a controlled child barrier, failing only if the test fixture stalls."""
+    deadline = time.monotonic() + 5
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"Timed out waiting for test barrier {path.name}.")
+        await asyncio.sleep(0.01)
+
+
+async def _call_with_timeout(awaitable: Awaitable[_T], timeout_seconds: float = 5.0) -> _T:
+    """Bound one real-stdio await so a stalled test child fails deterministically."""
+    return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+
+
+async def _assert_stdio_fixed_zero_schema(tmp_path: Path) -> None:
+    """Read the concrete fixed-zero stdio schema without dispatching a command."""
+    params, count_path, _ = _fixed_zero_stdio_child(tmp_path, blocked=False)
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await _call_with_timeout(client.initialize())
+        tools = cast(Any, await _call_with_timeout(client.list_tools()))
+        schema = next(
+            tool.inputSchema for tool in tools.tools if tool.name == "contain_heat_fixed_zero"
+        )
+        assert schema == {
+            "additionalProperties": False,
+            "description": "Strict raw SDK-boundary arguments for the fixed-zero containment tool.",
+            "properties": {
+                "expected_session_id": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "title": "Expected Session Id",
+                    "type": "string",
+                },
+                "containment_protocol": {
+                    "const": "fixed_zero/v1",
+                    "title": "Containment Protocol",
+                    "type": "string",
+                },
+            },
+            "required": ["expected_session_id", "containment_protocol"],
+            "title": "_FixedZeroContainmentArguments",
+            "type": "object",
+        }
+
+        assert not count_path.exists()
+
+
+async def _assert_stdio_fixed_zero_raw_boundary(tmp_path: Path) -> None:
+    """Send malformed requests and one valid dispatch through the real stdio transport."""
+    params, count_path, _ = _fixed_zero_stdio_child(tmp_path, blocked=False)
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await _call_with_timeout(client.initialize())
+        started = cast(Any, await _call_with_timeout(client.call_tool("start_roast_session", {})))
+        session_id = started.structuredContent["session"]["session_id"]
+        malformed: list[dict[str, object]] = [
+            {},
+            {"expected_session_id": session_id},
+            {"containment_protocol": "fixed_zero/v1"},
+            {"expected_session_id": "", "containment_protocol": "fixed_zero/v1"},
+            {"expected_session_id": False, "containment_protocol": "fixed_zero/v1"},
+            {"expected_session_id": 0, "containment_protocol": "fixed_zero/v1"},
+            {"expected_session_id": 0.0, "containment_protocol": "fixed_zero/v1"},
+            {"expected_session_id": None, "containment_protocol": "fixed_zero/v1"},
+            {"expected_session_id": session_id, "containment_protocol": False},
+            {"expected_session_id": session_id, "containment_protocol": "fixed_zero/v2"},
+            {
+                "expected_session_id": session_id,
+                "containment_protocol": "fixed_zero/v1",
+                "unknown": True,
+            },
+        ]
+        for value in (0, 1, False, 0.0, "0", None):
+            malformed.append(
+                {
+                    "expected_session_id": session_id,
+                    "containment_protocol": "fixed_zero/v1",
+                    "target_heat_level_percent": value,
+                }
+            )
+        for arguments in malformed:
+            result = cast(
+                Any,
+                await _call_with_timeout(client.call_tool("contain_heat_fixed_zero", arguments)),
+            )
+            assert result.isError
+            assert not count_path.exists()
+
+        contained = cast(
+            Any,
+            await _call_with_timeout(
+                client.call_tool(
+                    "contain_heat_fixed_zero",
+                    {"expected_session_id": session_id, "containment_protocol": "fixed_zero/v1"},
+                )
+            ),
+        )
+        assert not contained.isError
+        result = contained.structuredContent
+        assert result["outcome"] == "command_state_returned"
+        assert result["request_dispatch"] == "invoked"
+        assert result["commanded_state"] == {
+            "driver": "mock",
+            "capability_version": 1,
+            "heat_level_percent": 0,
+            "roast_fan_level_percent": 0,
+            "main_fan_level_percent": 0,
+            "drum_motor_on": False,
+            "cooling_motor_on": False,
+            "solenoid_open": False,
+        }
+        assert count_path.read_text(encoding="utf-8").splitlines() == ["contain"]
+        state = cast(
+            Any,
+            await _call_with_timeout(
+                client.call_tool("get_roast_state", {"session_id": session_id})
+            ),
+        )
+        assert state.structuredContent["heat_level_percent"] == 0
+        assert state.structuredContent["fan_level_percent"] == 0
+        assert state.structuredContent["cooling_on"] is False
+
+
+async def _assert_stdio_fixed_zero_cancel_semantics(tmp_path: Path) -> None:
+    """Cancel only the client wait, then release the server-owned fake command once."""
+    params, count_path, barrier_dir = _fixed_zero_stdio_child(tmp_path, blocked=True)
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await _call_with_timeout(client.initialize())
+        started = cast(Any, await _call_with_timeout(client.call_tool("start_roast_session", {})))
+        session_id = started.structuredContent["session"]["session_id"]
+        heated = cast(
+            Any,
+            await _call_with_timeout(client.call_tool("set_heat", {"heat_level_percent": 55})),
+        )
+        assert not heated.isError
+        assert heated.structuredContent["heat_level_percent"] == 55
+        pending = asyncio.create_task(
+            client.call_tool(
+                "contain_heat_fixed_zero",
+                {"expected_session_id": session_id, "containment_protocol": "fixed_zero/v1"},
+            )
+        )
+        await _wait_for_test_file(barrier_dir / "entered")
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        (barrier_dir / "release").write_text("release", encoding="utf-8")
+        await _wait_for_test_file(barrier_dir / "settled")
+        settled = cast(
+            Any,
+            await _call_with_timeout(
+                client.call_tool("get_roast_state", {"session_id": session_id})
+            ),
+        )
+        assert settled.structuredContent["heat_level_percent"] == 0
+        assert count_path.read_text(encoding="utf-8").splitlines() == ["contain"]
+
+
+def test_fixed_zero_registered_tool_rejects_raw_invalid_arguments_before_driver(
+    tmp_path: Path,
+) -> None:
+    """The SDK adapter rejects coercion and extras before fixed-zero dispatch."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    driver = _CountingFixedZeroDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    tool = server._tool_manager.get_tool("contain_heat_fixed_zero")  # pyright: ignore[reportPrivateUsage]
+    assert tool is not None
+    assert tool.parameters["additionalProperties"] is False
+
+    invalid_arguments: tuple[dict[str, object], ...] = (
+        {},
+        {"expected_session_id": "", "containment_protocol": "fixed_zero/v1"},
+        {"expected_session_id": False, "containment_protocol": "fixed_zero/v1"},
+        {"expected_session_id": 1, "containment_protocol": "fixed_zero/v1"},
+        {"expected_session_id": session.id, "containment_protocol": "wrong/v1"},
+        {
+            "expected_session_id": session.id,
+            "containment_protocol": "fixed_zero/v1",
+            "target_heat_level_percent": 0,
+        },
+    )
+    for arguments in invalid_arguments:
+        with pytest.raises(ToolError):
+            asyncio.run(tool.run(arguments, _ctx(context)))
+    assert driver.fixed_zero_calls == 0
+
+    result = asyncio.run(
+        tool.run(
+            {"expected_session_id": session.id, "containment_protocol": "fixed_zero/v1"},
+            _ctx(context),
+        )
+    )
+    assert result.outcome == "command_state_returned"
+    assert result.commanded_state.heat_level_percent == 0
+    assert driver.fixed_zero_calls == 1
+
+
+@pytest.mark.parametrize(
+    "raw_session_id",
+    ("true", "false", "null", "{}", "[1]", '"quoted"', "123", "0.0"),
+)
+def test_fixed_zero_sdk_preparse_preserves_json_looking_string_session_ids(
+    tmp_path: Path, raw_session_id: str
+) -> None:
+    """SDK metadata keeps strict string identities raw before model validation."""
+    context = _cold_finalisation_context(tmp_path)
+    server = create_mcp_server()
+    tool = server._tool_manager.get_tool("contain_heat_fixed_zero")  # pyright: ignore[reportPrivateUsage]
+    assert tool is not None
+    raw_arguments = {
+        "expected_session_id": raw_session_id,
+        "containment_protocol": "fixed_zero/v1",
+    }
+
+    pre_parsed = tool.fn_metadata.pre_parse_json(raw_arguments)
+    assert pre_parsed == raw_arguments
+    assert pre_parsed["expected_session_id"] == raw_session_id
+
+    result = asyncio.run(tool.run(raw_arguments, _ctx(context)))
+    assert (result.outcome, result.reason_code) == ("refused_identity", "unknown_session")
+    assert result.requested_session_id == raw_session_id
+
+
+def test_fixed_zero_argument_adapter_copies_extended_metadata_without_field_selection() -> None:
+    """The new tool replaces only arguments and retains opaque metadata fields."""
+    original = _ExtendedFuncMetadata(
+        arg_model=_AdapterOriginalArguments,
+        output_schema={"type": "object", "title": "retained"},
+        output_model=_AdapterOutput,
+        wrap_output=True,
+        synthetic_metadata="retain-me",
+    )
+    fixed_zero_tool = SimpleNamespace(fn_metadata=original, parameters={"old": "parameters"})
+    other_metadata = FuncMetadata(arg_model=_AdapterOriginalArguments)
+    other_tool = SimpleNamespace(fn_metadata=other_metadata, parameters={"other": "parameters"})
+    mcp = _metadata_adapter_test_mcp(fixed_zero_tool, other_tool)
+
+    mcp_server._install_fixed_zero_argument_adapter(mcp)  # pyright: ignore[reportPrivateUsage]
+
+    adapted = fixed_zero_tool.fn_metadata
+    assert isinstance(adapted, _ExtendedFuncMetadata)
+    assert adapted is not original
+    assert original.arg_model is _AdapterOriginalArguments
+    assert adapted.arg_model is mcp_server._FixedZeroContainmentArguments  # pyright: ignore[reportPrivateUsage]
+    assert adapted.output_schema == {"type": "object", "title": "retained"}
+    assert adapted.output_model is _AdapterOutput
+    assert adapted.wrap_output is True
+    assert adapted.synthetic_metadata == "retain-me"
+    assert fixed_zero_tool.parameters == (
+        mcp_server._FixedZeroContainmentArguments.model_json_schema(by_alias=True)  # pyright: ignore[reportPrivateUsage]
+    )
+    assert other_tool.fn_metadata is other_metadata
+    assert other_tool.parameters == {"other": "parameters"}
+
+
+def test_fixed_zero_argument_adapter_minimal_metadata_probe_uses_only_model_copy() -> None:
+    """Local mechanism probe, not old-SDK compatibility: no output attributes are read."""
+    original = _MinimalMetadataProbe(
+        arg_model=_AdapterOriginalArguments,
+        marker="minimal-metadata-probe",
+    )
+    fixed_zero_tool = SimpleNamespace(fn_metadata=original, parameters={})
+    other_tool = SimpleNamespace(fn_metadata=FuncMetadata(arg_model=_AdapterOriginalArguments))
+    mcp = _metadata_adapter_test_mcp(fixed_zero_tool, other_tool)
+
+    mcp_server._install_fixed_zero_argument_adapter(mcp)  # pyright: ignore[reportPrivateUsage]
+
+    adapted = fixed_zero_tool.fn_metadata
+    assert isinstance(adapted, _MinimalMetadataProbe)
+    assert adapted.marker == "minimal-metadata-probe"
+    assert original.arg_model is _AdapterOriginalArguments
+    assert adapted.arg_model is mcp_server._FixedZeroContainmentArguments  # pyright: ignore[reportPrivateUsage]
+    assert not hasattr(adapted, "output_schema")
+    assert not hasattr(adapted, "output_model")
+    assert not hasattr(adapted, "wrap_output")
+
+
+def test_fixed_zero_argument_adapter_fails_closed_for_dynamic_undeclared_binding() -> None:
+    """A dynamic extra can copy correctly but is never an accepted declared binding."""
+    metadata = _DynamicArgModelMetadataProbe.model_validate(
+        {"marker": "dynamic-only", "arg_model": _AdapterOriginalArguments}
+    )
+    assert "arg_model" not in type(metadata).model_fields
+    copied = metadata.model_copy(
+        update={"arg_model": mcp_server._FixedZeroContainmentArguments}  # pyright: ignore[reportPrivateUsage]
+    )
+    assert copied.model_extra is not None
+    assert copied.model_extra["arg_model"] is mcp_server._FixedZeroContainmentArguments  # pyright: ignore[reportPrivateUsage]
+
+    original_parameters = {"old": "parameters"}
+    fixed_zero_tool = SimpleNamespace(fn_metadata=metadata, parameters=original_parameters)
+    other_tool = SimpleNamespace(fn_metadata=FuncMetadata(arg_model=_AdapterOriginalArguments))
+    mcp = _metadata_adapter_test_mcp(fixed_zero_tool, other_tool)
+
+    with pytest.raises(RuntimeError, match="argument adapter is unsupported"):
+        mcp_server._install_fixed_zero_argument_adapter(mcp)  # pyright: ignore[reportPrivateUsage]
+
+    assert fixed_zero_tool.fn_metadata is metadata
+    assert fixed_zero_tool.parameters is original_parameters
+
+
+def test_fixed_zero_argument_adapter_fails_closed_when_copy_ignores_binding() -> None:
+    """A declared binding whose copy ignores replacement fails before tool assignment."""
+    metadata = _IgnoringCopyMetadataProbe(
+        arg_model=_AdapterOriginalArguments,
+        marker="ignores-update",
+    )
+    original_parameters = {"old": "parameters"}
+    fixed_zero_tool = SimpleNamespace(fn_metadata=metadata, parameters=original_parameters)
+    other_tool = SimpleNamespace(fn_metadata=FuncMetadata(arg_model=_AdapterOriginalArguments))
+    mcp = _metadata_adapter_test_mcp(fixed_zero_tool, other_tool)
+
+    with pytest.raises(RuntimeError, match="argument adapter is unsupported"):
+        mcp_server._install_fixed_zero_argument_adapter(mcp)  # pyright: ignore[reportPrivateUsage]
+
+    assert fixed_zero_tool.fn_metadata is metadata
+    assert fixed_zero_tool.parameters is original_parameters
+
+
+def _metadata_adapter_test_mcp(
+    fixed_zero_tool: SimpleNamespace, other_tool: SimpleNamespace
+) -> FastMCP:
+    """Build the smallest private-manager shape needed to exercise the adapter."""
+    tools = {"contain_heat_fixed_zero": fixed_zero_tool, "unaffected": other_tool}
+
+    def get_tool(name: str) -> SimpleNamespace | None:
+        return tools.get(name)
+
+    return cast(FastMCP, SimpleNamespace(_tool_manager=SimpleNamespace(get_tool=get_tool)))
+
+
+def test_fixed_zero_unknown_driver_result_retains_only_matching_reservation(tmp_path: Path) -> None:
+    """A raised command result blocks ordinary retries without a cleanup fallback."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    driver = _CountingFixedZeroDriver(raise_on_fixed_zero=True)
+    object.__setattr__(context, "roaster_driver", driver)
+    result = _call_tool(
+        create_mcp_server(),
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert result.outcome == "unknown_driver_result"
+    assert result.reason_code == "driver_raised"
+    assert result.commanded_state is None
+    assert result.session_projection == "unknown"
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.pending_driver_command_kind == "heat_containment"
+    retry = _call_tool(
+        create_mcp_server(),
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert retry.outcome == "refused_busy"
+    assert retry.reason_code == "command_in_progress"
+    assert driver.fixed_zero_calls == 1
+
+
+def test_fixed_zero_typed_malformed_driver_evidence_is_unknown_without_cleanup(
+    tmp_path: Path,
+) -> None:
+    """A malformed instance of the typed driver value is not trusted by its class alone."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    driver = _CountingFixedZeroDriver(fixed_zero_outcome="typed_malformed")
+    object.__setattr__(context, "roaster_driver", driver)
+    result = _call_tool(
+        create_mcp_server(),
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert (result.outcome, result.reason_code) == (
+        "unknown_driver_result",
+        "driver_result_invalid",
+    )
+    assert result.commanded_state is None
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.pending_driver_command_kind == "heat_containment"
+    assert driver.fixed_zero_calls == 1
+    assert driver.emergency_stop_calls == 0
+
+
+def test_fixed_zero_valid_but_different_driver_identity_is_unknown_without_cleanup(
+    tmp_path: Path,
+) -> None:
+    """A typed zero-state from another valid driver never settles mock ownership."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    driver = _CountingFixedZeroDriver(fixed_zero_outcome="driver_identity_mismatch")
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+
+    result = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+
+    assert (result.outcome, result.reason_code) == (
+        "unknown_driver_result",
+        "driver_result_invalid",
+    )
+    assert result.commanded_state is None
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.pending_driver_command_token is not None
+    assert snapshot.pending_driver_command_kind == "heat_containment"
+    assert driver.fixed_zero_calls == 1
+    assert driver.emergency_stop_calls == 0
+    retry = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert (retry.outcome, retry.reason_code) == ("refused_busy", "command_in_progress")
+    assert driver.fixed_zero_calls == 1
+
+
+def test_fixed_zero_stale_completion_uses_existing_fail_closed_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid result with lifecycle loss preserves the existing stale fallback."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    driver = _CountingFixedZeroDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+
+    def stale_completion(*_args: object, **_kwargs: object) -> RoastSession:
+        raise SessionLifecycleError("synthetic ownership changed")
+
+    monkeypatch.setattr(
+        context.session_store, "complete_fixed_zero_containment_snapshot", stale_completion
+    )
+    result = _call_tool(
+        create_mcp_server(),
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert result.outcome == "unknown_completion"
+    assert result.reason_code == "projection_unconfirmed"
+    assert result.commanded_state is not None
+    assert driver.emergency_stop_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (("containment_version", 1.0), ("containment_version", True), ("automatic_retry_permitted", 0)),
+)
+def test_fixed_zero_result_rejects_coercible_closed_literals(
+    field: str, invalid_value: object
+) -> None:
+    """Closed result literals reject values Pydantic Literal would otherwise coerce."""
+    payload: dict[str, object] = {
+        "containment_protocol": "fixed_zero/v1",
+        "containment_version": 1,
+        "outcome": "command_state_returned",
+        "request_dispatch": "invoked",
+        "automatic_retry_permitted": False,
+        "requested_session_id": "session",
+        "validated_session_id": "session",
+        "commanded_state": {
+            "driver": "mock",
+            "capability_version": 1,
+            "heat_level_percent": 0,
+            "roast_fan_level_percent": 0,
+            "main_fan_level_percent": 0,
+            "drum_motor_on": False,
+            "cooling_motor_on": False,
+            "solenoid_open": False,
+        },
+        "session_projection": "recorded_in_memory",
+        "durability": "not_provided_by_this_tool",
+        "reason_code": None,
+    }
+    payload[field] = invalid_value
+    with pytest.raises(ValueError):
+        mcp_server.FixedZeroContainmentResult.model_validate(payload)
+
+
+@pytest.mark.parametrize("invalid_driver", ("!mock!", "mock\\n", "Mock"))
+def test_fixed_zero_result_requires_full_ascii_driver_identity(invalid_driver: str) -> None:
+    """Driver identity is full-match ASCII grammar, never a substring search."""
+    with pytest.raises(ValueError, match="full ASCII"):
+        mcp_server.FixedZeroCommandedStateResult.model_validate(
+            {
+                "driver": invalid_driver,
+                "capability_version": 1,
+                "heat_level_percent": 0,
+                "roast_fan_level_percent": 0,
+                "main_fan_level_percent": 0,
+                "drum_motor_on": False,
+                "cooling_motor_on": False,
+                "solenoid_open": False,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (("capability_version", 1.0), ("capability_version", True), ("heat_level_percent", False)),
+)
+def test_fixed_zero_wire_state_rejects_coercible_literals(
+    field: str, invalid_value: object
+) -> None:
+    """Nested closed evidence rejects coercible version and fixed-zero literals."""
+    payload: dict[str, object] = {
+        "driver": "mock",
+        "capability_version": 1,
+        "heat_level_percent": 0,
+        "roast_fan_level_percent": 0,
+        "main_fan_level_percent": 0,
+        "drum_motor_on": False,
+        "cooling_motor_on": False,
+        "solenoid_open": False,
+    }
+    payload[field] = invalid_value
+    with pytest.raises(ValueError):
+        mcp_server.FixedZeroCommandedStateResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (
+        ("roast_fan_level_percent", -1),
+        ("roast_fan_level_percent", 101),
+        ("main_fan_level_percent", -1),
+        ("main_fan_level_percent", 101),
+    ),
+)
+def test_fixed_zero_wire_state_rejects_out_of_range_fan_percent(
+    field: str, invalid_value: int
+) -> None:
+    """G: both fan evidence fields reject bounded values outside 0 through 100."""
+    payload = _fixed_zero_evidence_payload()
+    payload[field] = invalid_value
+    with pytest.raises(ValueError):
+        mcp_server.FixedZeroCommandedStateResult.model_validate(payload)
+
+
+def test_fixed_zero_result_rejects_nonmapping_business_value() -> None:
+    """G: the outer closed business result must be a mapping before row validation."""
+    with pytest.raises(TypeError, match="result must be a mapping"):
+        mcp_server.FixedZeroContainmentResult.model_validate([])
+
+
+def test_fixed_zero_result_rejects_unequal_requested_and_validated_ids() -> None:
+    """G: a valid row still refuses a validated identity from another session."""
+    payload = _fixed_zero_result_payload("refused_capability", "capability_absent")
+    payload["validated_session_id"] = "different-session"
+    with pytest.raises(ValueError, match="must equal requested_session_id"):
+        mcp_server.FixedZeroContainmentResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "valid_reason", "inappropriate_reason", "message"),
+    (
+        ("refused_identity", "unknown_session", None, "invalid reason code"),
+        ("refused_capability", "capability_absent", "driver_raised", "invalid reason code"),
+        ("refused_busy", "command_in_progress", None, "invalid reason code"),
+        ("command_state_returned", None, "driver_raised", "Successful fixed-zero result"),
+        ("unknown_driver_result", "driver_raised", None, "invalid reason code"),
+        ("unknown_completion", "projection_unconfirmed", "driver_raised", "invalid reason code"),
+    ),
+)
+def test_fixed_zero_result_rejects_inappropriate_or_null_reason_in_each_row(
+    outcome: str,
+    valid_reason: str | None,
+    inappropriate_reason: str | None,
+    message: str,
+) -> None:
+    """G: each otherwise-valid outcome row requires exactly its permitted reason shape."""
+    payload = _fixed_zero_result_payload(outcome, valid_reason)
+    payload["reason_code"] = inappropriate_reason
+    with pytest.raises(ValueError, match=message):
+        mcp_server.FixedZeroContainmentResult.model_validate(payload)
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra", "not_mapping"))
+def test_fixed_zero_wire_state_rejects_closed_shape(mutation: str) -> None:
+    """The eight-key evidence DTO rejects missing/extra keys and non-mappings."""
+    payload: object = _fixed_zero_evidence_payload()
+    if mutation == "missing":
+        assert isinstance(payload, dict)
+        del payload["solenoid_open"]
+    elif mutation == "extra":
+        assert isinstance(payload, dict)
+        payload["unexpected"] = True
+    else:
+        payload = []
+    with pytest.raises((TypeError, ValueError)):
+        mcp_server.FixedZeroCommandedStateResult.model_validate(payload)
+
+
+@pytest.mark.parametrize("driver_outcome", ("raise", "missing", "malformed"))
+def test_fixed_zero_invalid_evidence_precedes_independent_emergency_supersession(
+    tmp_path: Path, driver_outcome: str
+) -> None:
+    """F2: public emergency completes while a driver result is intentionally blocked."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    server = create_mcp_server()
+    entered = Event()
+    release = Event()
+
+    def block_driver_result() -> None:
+        entered.set()
+        assert release.wait(timeout=1.0)
+
+    driver = _CountingFixedZeroDriver(
+        fixed_zero_outcome=driver_outcome,
+        on_fixed_zero=block_driver_result,
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+    results: list[object] = []
+    errors: list[BaseException] = []
+    containment = Thread(
+        target=_record_tool_result,
+        args=(results, errors, server, "contain_heat_fixed_zero", _ctx(context)),
+        kwargs={
+            "expected_session_id": session.id,
+            "containment_protocol": "fixed_zero/v1",
+        },
+    )
+    containment.start()
+    try:
+        assert entered.wait(timeout=1.0)
+        emergency = _call_tool(
+            server,
+            "emergency_stop",
+            _ctx(context),
+            reason="F2 independent emergency",
+        )
+        assert emergency.event.kind == "fault"
+    finally:
+        release.set()
+        containment.join(timeout=1.0)
+
+    assert not containment.is_alive()
+    assert errors == [] and len(results) == 1
+    result = cast(Any, results[0])
+    assert result.outcome == "unknown_driver_result"
+    assert result.commanded_state is None
+    assert result.session_projection == "unknown"
+    assert (
+        result.reason_code
+        == {
+            "raise": "driver_raised",
+            "missing": "driver_result_missing",
+            "malformed": "driver_result_invalid",
+        }[driver_outcome]
+    )
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.pending_driver_command_token is None
+    assert context.session_store.get_latest_session() is session
+    assert session.active is False
+    assert driver.fixed_zero_calls == 1
+    assert driver.emergency_stop_calls == 1
+
+
+@pytest.mark.parametrize("driver_outcome", ("raise", "missing", "malformed"))
+def test_fixed_zero_invalid_evidence_precedes_controlled_replacement_ownership(
+    tmp_path: Path, driver_outcome: str
+) -> None:
+    """F2 controlled fault injection: new ownership cannot rewrite invalid evidence."""
+    context = _cold_finalisation_context(tmp_path)
+    old_session = context.session_store.start_session()
+    server = create_mcp_server()
+
+    def replace_session_for_controlled_fault_injection() -> None:
+        context.session_store.stop_session()
+        context.session_store.start_session()
+
+    driver = _CountingFixedZeroDriver(
+        fixed_zero_outcome=driver_outcome,
+        on_fixed_zero=replace_session_for_controlled_fault_injection,
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+    result = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=old_session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+
+    assert result.outcome == "unknown_driver_result"
+    assert result.commanded_state is None
+    assert result.session_projection == "unknown"
+    old_snapshot = context.session_store.get_session_snapshot(session_id=old_session.id)
+    new_session = context.session_store.get_active_session()
+    assert new_session is not None and new_session.id != old_session.id
+    assert old_snapshot.pending_driver_command_kind == "heat_containment"
+    assert new_session.pending_driver_command_token is None
+    assert driver.emergency_stop_calls == 0
+
+
+def test_fixed_zero_valid_evidence_with_controlled_replacement_is_unknown_completion(
+    tmp_path: Path,
+) -> None:
+    """F2 controlled fault injection: valid evidence plus ownership loss is distinct."""
+    context = _cold_finalisation_context(tmp_path)
+    old_session = context.session_store.start_session()
+    server = create_mcp_server()
+
+    def replace_session_for_controlled_fault_injection() -> None:
+        context.session_store.stop_session()
+        context.session_store.start_session()
+
+    driver = _CountingFixedZeroDriver(
+        on_fixed_zero=replace_session_for_controlled_fault_injection,
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+    result = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=old_session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+
+    assert result.outcome == "unknown_completion"
+    assert result.reason_code == "completion_ownership_changed"
+    assert result.commanded_state is not None
+    assert result.session_projection == "unknown"
+    new_session = context.session_store.get_active_session()
+    assert new_session is not None and new_session.id != old_session.id
+    assert new_session.pending_driver_command_token is None
+    assert driver.emergency_stop_calls == 0
+
+
+@pytest.mark.parametrize("partial_projection", (False, True))
+def test_fixed_zero_matching_projection_failure_retains_exact_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, partial_projection: bool
+) -> None:
+    """Matching-owner projection failure never clears, retries, or calls stale fallback."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    context.session_store.set_heat(session, heat_level_percent=55)
+    driver = _CountingFixedZeroDriver()
+    driver.set_heat(heat_level_percent=55)
+    object.__setattr__(context, "roaster_driver", driver)
+
+    def fail_projection(
+        supplied_session: RoastSession, *, reservation: DriverCommandReservation
+    ) -> RoastSession:
+        assert supplied_session is session
+        assert reservation.kind == "heat_containment"
+        if partial_projection:
+            session.heat_level_percent = 0
+        raise RuntimeError("synthetic projection failure")
+
+    monkeypatch.setattr(
+        context.session_store, "complete_fixed_zero_containment_snapshot", fail_projection
+    )
+    server = create_mcp_server()
+    result = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+
+    assert result.outcome == "unknown_completion"
+    assert result.reason_code == "projection_unconfirmed"
+    assert result.commanded_state is not None
+    assert result.session_projection == "unknown"
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.pending_driver_command_kind == "heat_containment"
+    assert snapshot.heat_level_percent == (0 if partial_projection else 55)
+    assert driver.fixed_zero_calls == 1
+    assert driver.emergency_stop_calls == 0
+    retry = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert retry.outcome == "refused_busy"
+    assert driver.fixed_zero_calls == 1
+
+
+def test_fixed_zero_unresolved_reservation_blocks_real_public_session_replacement(
+    tmp_path: Path,
+) -> None:
+    """The public lifecycle refuses replacement while matching uncertainty remains."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    driver = _CountingFixedZeroDriver(fixed_zero_outcome="raise")
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    with pytest.raises(SessionLifecycleError, match="active roast session"):
+        _call_tool(server, "start_roast_session", _ctx(context))
+    assert context.session_store.get_active_session() is session
+    assert session.pending_driver_command_kind == "heat_containment"
+
+
+@pytest.mark.parametrize(
+    ("setup", "expected_reason"),
+    (
+        ("none", "unknown_session"),
+        ("unknown", "unknown_session"),
+        ("older", "not_latest_session"),
+        ("stopped", "session_not_active"),
+        ("faulted", "session_faulted"),
+    ),
+)
+def test_fixed_zero_identity_refusals_never_invoke_driver(
+    tmp_path: Path, setup: str, expected_reason: str
+) -> None:
+    """A/B: every current-identity rejection is a zero-driver refusal."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = _CountingFixedZeroDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    expected_session_id = "unknown"
+    if setup != "none":
+        selected = context.session_store.start_session()
+        expected_session_id = selected.id if setup != "unknown" else "unknown"
+        if setup == "older":
+            context.session_store.stop_session()
+            context.session_store.start_session()
+        elif setup == "stopped":
+            context.session_store.stop_session()
+        elif setup == "faulted":
+            context.session_store.record_event(selected, "fault")
+    result = _call_tool(
+        create_mcp_server(),
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=expected_session_id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert result.outcome == "refused_identity"
+    assert result.reason_code == expected_reason
+    assert result.validated_session_id is None
+    assert result.commanded_state is None
+    assert driver.fixed_zero_calls == driver.emergency_stop_calls == 0
+
+
+def test_fixed_zero_revalidates_identity_at_reservation_without_driver_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B: replacement after initial identity inspection remains a refusal."""
+    context = _cold_finalisation_context(tmp_path)
+    old_session = context.session_store.start_session()
+    driver = _CountingFixedZeroDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    inspect_identity = context.session_store.inspect_fixed_zero_containment_identity
+
+    def replace_after_inspection(expected_session_id: str) -> str | None:
+        result = inspect_identity(expected_session_id)
+        context.session_store.stop_session()
+        context.session_store.start_session()
+        return result
+
+    monkeypatch.setattr(
+        context.session_store,
+        "inspect_fixed_zero_containment_identity",
+        replace_after_inspection,
+    )
+    result = _call_tool(
+        create_mcp_server(),
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=old_session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert (result.outcome, result.reason_code) == ("refused_identity", "not_latest_session")
+    assert driver.fixed_zero_calls == driver.emergency_stop_calls == 0
+
+
+def test_fixed_zero_finalisation_conflict_is_busy_without_driver_call(tmp_path: Path) -> None:
+    """B: finalisation owns admission before containment can dispatch."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    admitted, rejection, _ = context.session_store.begin_finalisation(session.id)
+    assert admitted is session and rejection is None
+    driver = _CountingFixedZeroDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    result = _call_tool(
+        create_mcp_server(),
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert (result.outcome, result.reason_code) == ("refused_busy", "finalisation_in_progress")
+    assert driver.fixed_zero_calls == driver.emergency_stop_calls == 0
+
+
+def test_fixed_zero_control_conflict_release_never_resends_without_new_request(
+    tmp_path: Path,
+) -> None:
+    """Releasing one real control token does not implicitly dispatch containment."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    driver = _CountingFixedZeroDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    control_reservation = context.session_store.reserve_driver_command(session, kind="control")
+
+    refused = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+
+    assert (refused.outcome, refused.reason_code) == ("refused_busy", "command_in_progress")
+    assert refused.request_dispatch == "not_invoked"
+    assert refused.commanded_state is None
+    held = context.session_store.get_session_snapshot(session_id=session.id)
+    assert held.pending_driver_command_token == control_reservation.token
+    assert held.pending_driver_command_kind == "control"
+    assert driver.fixed_zero_calls == 0
+
+    context.session_store.clear_driver_command_reservation(session, control_reservation)
+    _call_tool(server, "get_roast_state", _ctx(context), session_id=session.id)
+    released = context.session_store.get_session_snapshot(session_id=session.id)
+    assert released.pending_driver_command_token is None
+    assert released.pending_driver_command_kind is None
+    assert driver.fixed_zero_calls == 0
+
+    explicit = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert explicit.outcome == "command_state_returned"
+    assert driver.fixed_zero_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("capability", "port", "expected_reason"),
+    (
+        ("absent", "present", "capability_absent"),
+        ("unsupported", "present", "capability_version_unsupported"),
+        ("wrong_version_type", "present", "capability_malformed"),
+        ("boolean_version", "present", "capability_malformed"),
+        ("wrong_declaration", "present", "capability_malformed"),
+        ("unreadable", "present", "capability_unreadable"),
+        ("identity_mismatch", "present", "capability_malformed"),
+        ("invalid_matching_identifier", "present", "capability_malformed"),
+        ("supported", "missing", "capability_port_missing"),
+        ("supported", "unreadable", "capability_unreadable"),
+    ),
+)
+def test_fixed_zero_capability_refusals_are_zero_driver_paths(
+    tmp_path: Path, capability: str, port: str, expected_reason: str
+) -> None:
+    """C: declaration/port variants fail closed before containment or fallback."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    driver = _ConfigurableFixedZeroDriver(capability_mode=capability, port_mode=port)
+    object.__setattr__(context, "roaster_driver", driver)
+    result = _call_tool(
+        create_mcp_server(),
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert (result.outcome, result.reason_code) == ("refused_capability", expected_reason)
+    assert result.validated_session_id == session.id
+    assert result.commanded_state is None
+    assert driver.fixed_zero_calls == driver.emergency_stop_calls == 0
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.pending_driver_command_token is None
+    assert snapshot.heat_level_percent == 0
+
+
+def _fixed_zero_result_payload(outcome: str, reason_code: str | None) -> dict[str, object]:
+    """Build one valid result-matrix row for closed-wire validation tests."""
+    invoked = outcome in {"command_state_returned", "unknown_driver_result", "unknown_completion"}
+    evidence_required = outcome in {"command_state_returned", "unknown_completion"}
+    return {
+        "containment_protocol": "fixed_zero/v1",
+        "containment_version": 1,
+        "outcome": outcome,
+        "request_dispatch": "invoked" if invoked else "not_invoked",
+        "automatic_retry_permitted": False,
+        "requested_session_id": "session",
+        "validated_session_id": None if outcome == "refused_identity" else "session",
+        "commanded_state": _fixed_zero_evidence_payload() if evidence_required else None,
+        "session_projection": (
+            "recorded_in_memory"
+            if outcome == "command_state_returned"
+            else "unknown"
+            if invoked
+            else "not_changed"
+        ),
+        "durability": "not_provided_by_this_tool",
+        "reason_code": reason_code,
+    }
+
+
+def _fixed_zero_evidence_payload() -> dict[str, object]:
+    """Build the one valid eight-field fixed-zero evidence value."""
+    return {
+        "driver": "mock",
+        "capability_version": 1,
+        "heat_level_percent": 0,
+        "roast_fan_level_percent": 0,
+        "main_fan_level_percent": 0,
+        "drum_motor_on": False,
+        "cooling_motor_on": False,
+        "solenoid_open": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("outcome", "reason_code"),
+    (
+        ("refused_identity", "unknown_session"),
+        ("refused_identity", "not_latest_session"),
+        ("refused_identity", "session_not_active"),
+        ("refused_identity", "session_faulted"),
+        ("refused_capability", "capability_absent"),
+        ("refused_capability", "capability_version_unsupported"),
+        ("refused_capability", "capability_malformed"),
+        ("refused_capability", "capability_unreadable"),
+        ("refused_capability", "capability_port_missing"),
+        ("refused_busy", "finalisation_in_progress"),
+        ("refused_busy", "command_in_progress"),
+        ("command_state_returned", None),
+        ("unknown_driver_result", "driver_raised"),
+        ("unknown_driver_result", "driver_result_missing"),
+        ("unknown_driver_result", "driver_result_invalid"),
+        ("unknown_completion", "completion_ownership_changed"),
+        ("unknown_completion", "projection_unconfirmed"),
+    ),
+)
+def test_fixed_zero_result_accepts_every_closed_matrix_row(
+    outcome: str, reason_code: str | None
+) -> None:
+    """G: each allowed outcome/reason row is accepted without coercion."""
+    result = mcp_server.FixedZeroContainmentResult.model_validate(
+        _fixed_zero_result_payload(outcome, reason_code)
+    )
+    assert result.outcome == outcome
+    assert result.reason_code == reason_code
+
+
+@pytest.mark.parametrize(
+    ("outcome", "field", "value"),
+    (
+        ("refused_identity", "request_dispatch", "invoked"),
+        ("refused_capability", "validated_session_id", None),
+        ("refused_busy", "commanded_state", _fixed_zero_evidence_payload()),
+        ("command_state_returned", "reason_code", "driver_raised"),
+        ("unknown_driver_result", "commanded_state", _fixed_zero_evidence_payload()),
+        ("unknown_completion", "session_projection", "recorded_in_memory"),
+    ),
+)
+def test_fixed_zero_result_rejects_cross_outcome_combinations(
+    outcome: str, field: str, value: object
+) -> None:
+    """G: each outcome row rejects a causal impossible wire combination."""
+    reasons = {
+        "refused_identity": "unknown_session",
+        "refused_capability": "capability_absent",
+        "refused_busy": "command_in_progress",
+        "command_state_returned": None,
+        "unknown_driver_result": "driver_raised",
+        "unknown_completion": "projection_unconfirmed",
+    }
+    payload = _fixed_zero_result_payload(outcome, reasons[outcome])
+    payload[field] = value
+    with pytest.raises(ValueError):
+        mcp_server.FixedZeroContainmentResult.model_validate(payload)
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra", "blank_id", "long_id"))
+def test_fixed_zero_result_rejects_missing_extra_and_invalid_session_grammar(mutation: str) -> None:
+    """G: result keys and bounded request identity stay closed."""
+    payload = _fixed_zero_result_payload("command_state_returned", None)
+    if mutation == "missing":
+        del payload["durability"]
+    elif mutation == "extra":
+        payload["unexpected"] = "value"
+    else:
+        payload["requested_session_id"] = "" if mutation == "blank_id" else "x" * 129
+    with pytest.raises(ValueError):
+        mcp_server.FixedZeroContainmentResult.model_validate(payload)
+
+
+class _CountingFixedZeroDriver(MockRoasterDriver):
+    """Mock-safe containment double with explicit invocation evidence."""
+
+    def __init__(
+        self,
+        *,
+        raise_on_fixed_zero: bool = False,
+        fixed_zero_outcome: str = "valid",
+        on_fixed_zero: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__()
+        self.fixed_zero_calls = 0
+        self.emergency_stop_calls = 0
+        self.raise_on_fixed_zero = raise_on_fixed_zero
+        self.fixed_zero_outcome = "raise" if raise_on_fixed_zero else fixed_zero_outcome
+        self.on_fixed_zero = on_fixed_zero
+
+    def contain_heat_fixed_zero(self) -> FixedZeroCommandedState:
+        """Count one fixed-zero invocation before returning or raising."""
+        self.fixed_zero_calls += 1
+        if self.on_fixed_zero is not None:
+            self.on_fixed_zero()
+        if self.fixed_zero_outcome == "raise":
+            raise RuntimeError("synthetic fixed-zero result loss")
+        if self.fixed_zero_outcome == "missing":
+            return cast(FixedZeroCommandedState, None)
+        if self.fixed_zero_outcome == "malformed":
+            return cast(FixedZeroCommandedState, object())
+        if self.fixed_zero_outcome == "typed_malformed":
+            evidence = object.__new__(FixedZeroCommandedState)
+            object.__setattr__(evidence, "driver", "mock")
+            object.__setattr__(evidence, "capability_version", 1)
+            object.__setattr__(evidence, "heat_level_percent", 1)
+            object.__setattr__(evidence, "roast_fan_level_percent", 0)
+            object.__setattr__(evidence, "main_fan_level_percent", 0)
+            object.__setattr__(evidence, "drum_motor_on", False)
+            object.__setattr__(evidence, "cooling_motor_on", False)
+            object.__setattr__(evidence, "solenoid_open", False)
+            return evidence
+        if self.fixed_zero_outcome == "driver_identity_mismatch":
+            return FixedZeroCommandedState(
+                driver="other_driver",
+                capability_version=1,
+                heat_level_percent=0,
+                roast_fan_level_percent=0,
+                main_fan_level_percent=0,
+                drum_motor_on=False,
+                cooling_motor_on=False,
+                solenoid_open=False,
+            )
+        return super().contain_heat_fixed_zero()
+
+    def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
+        """Count use of the existing stale-completion containment fallback."""
+        self.emergency_stop_calls += 1
+        return super().emergency_stop(reason=reason)
+
+
+class _ConfigurableFixedZeroDriver:
+    """Capability declaration double for fixed-zero pre-dispatch refusal tests."""
+
+    def __init__(self, *, capability_mode: str, port_mode: str) -> None:
+        self.name = "bad!" if capability_mode == "invalid_matching_identifier" else "mock"
+        self.fixed_zero_calls = 0
+        self.emergency_stop_calls = 0
+        self._capability_mode = capability_mode
+        self._port_mode = port_mode
+        base = MockRoasterDriver().capabilities
+        self._declared_capabilities: object = {
+            "absent": dataclasses.replace(base, heat_containment_version=None),
+            "unsupported": dataclasses.replace(base, heat_containment_version=2),
+            "wrong_version_type": dataclasses.replace(base, heat_containment_version="1"),
+            "boolean_version": dataclasses.replace(base, heat_containment_version=True),
+            "wrong_declaration": object(),
+            "identity_mismatch": dataclasses.replace(base, driver="another-driver"),
+            "invalid_matching_identifier": dataclasses.replace(base, driver=self.name),
+        }.get(capability_mode, base)
+
+    @property
+    def capabilities(self) -> object:
+        """Return a selected declaration or fail before any containment dispatch."""
+        if self._capability_mode == "unreadable":
+            raise RuntimeError("synthetic unreadable capability")
+        return self._declared_capabilities
+
+    def __getattribute__(self, name: str) -> object:
+        """Expose, omit, or fail the optional port without performing I/O."""
+        if name == "contain_heat_fixed_zero":
+            port_mode = object.__getattribute__(self, "_port_mode")
+            if port_mode == "unreadable":
+                raise RuntimeError("synthetic unreadable containment port")
+            if port_mode == "missing":
+                return None
+            return object.__getattribute__(self, "_contain_heat_fixed_zero")
+        return object.__getattribute__(self, name)
+
+    def _contain_heat_fixed_zero(self) -> FixedZeroCommandedState:
+        """Provide valid command evidence when the optional port is present."""
+        self.fixed_zero_calls += 1
+        return FixedZeroCommandedState(
+            driver="mock",
+            capability_version=1,
+            heat_level_percent=0,
+            roast_fan_level_percent=0,
+            main_fan_level_percent=0,
+            drum_motor_on=False,
+            cooling_motor_on=False,
+            solenoid_open=False,
+        )
+
+    def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
+        """Count forbidden fallback dispatches in capability-refusal cases."""
+        _ = reason
+        self.emergency_stop_calls += 1
+        return EmergencyStopResult(
+            driver="mock",
+            safety_method="emergency_stop",
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
+        )
 
 
 def test_cold_characterisation_finalisation_is_clean_and_idempotent(tmp_path: Path) -> None:

@@ -51,6 +51,18 @@ creation, protected `release` environment approval, publication, and live
 artefact verification remain human-operator actions. #234 remains open for the
 separately contracted Agent pin/nested-suite work.
 
+MCP239 source adds the exact-session `fixed_zero/v1` containment tool only; it
+does not qualify a release, installed candidate, or live admission. Its
+hardware-free boundary was resolved with Python 3.11.14, MCP 1.30.0, and
+Pydantic 2.14.1 and is privately coupled to SDK metadata; strict-boundary
+qualification for an installed candidate must rerun on its actual resolved
+dependencies. See [MCP239 detail below](#mcp239--fixed-zero-containment-software-boundary).
+Existing stale-completion handling may invoke the broader full emergency
+profile, and `unknown_completion` command evidence can predate it rather than
+describe latest or physical state. A matching unresolved reservation blocks
+ordinary fan, cooling, and drop commands; an independent emergency retains its
+existing admission rules.
+
 ## Historical Narrative (Superseded For Current Delivery)
 
 The narrative below preserves prior evidence and release history. It is not
@@ -549,3 +561,14 @@ Historical in-process observation snapshots follow the actual session store's
 retention and never restore control across a restart. The manual protocol
 requires recording-capable capture: detector-paced WAV replay is refused;
 automatic paced replay and recording-capable realtime behaviour stay unchanged.
+
+### MCP239 — fixed-zero containment software boundary
+
+MCP239 adds `contain_heat_fixed_zero`, a strict `fixed_zero/v1` MCP request
+that selects one exact active session and invokes an explicitly declared
+driver capability at most once. Its returned eight-key command state and
+eleven-key result are in-memory command evidence only: they do not attest
+physical state, transport settlement, durable audit, a retry, or Agent-side
+uncertainty recovery. Invalid or missing driver evidence retains the matching
+containment reservation unresolved; superseded ownership is never recreated or
+cleared. Existing emergency and stopped-fault paths remain separate.

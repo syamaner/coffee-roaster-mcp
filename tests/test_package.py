@@ -369,6 +369,7 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
         tools = cast(Any, await _call_with_timeout(session.list_tools()))
         tool_names = {tool.name for tool in tools.tools}
         assert tool_names == {
+            "contain_heat_fixed_zero",
             "drop_beans",
             "emergency_stop",
             "export_roast_log",
@@ -386,6 +387,26 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
             "stop_cooling",
         }
         tool_schemas = {tool.name: tool.inputSchema for tool in tools.tools}
+        assert tool_schemas["contain_heat_fixed_zero"] == {
+            "additionalProperties": False,
+            "description": "Strict raw SDK-boundary arguments for the fixed-zero containment tool.",
+            "properties": {
+                "expected_session_id": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "title": "Expected Session Id",
+                    "type": "string",
+                },
+                "containment_protocol": {
+                    "const": "fixed_zero/v1",
+                    "title": "Containment Protocol",
+                    "type": "string",
+                },
+            },
+            "required": ["expected_session_id", "containment_protocol"],
+            "title": "_FixedZeroContainmentArguments",
+            "type": "object",
+        }
         assert tool_schemas["finalise_cold_characterisation_session"] == {
             "properties": {"session_id": {"title": "Session Id", "type": "string"}},
             "required": ["session_id"],
@@ -424,6 +445,37 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
         assert runtime_config.structuredContent["first_crack_mode"] == "disabled"
         assert runtime_config.structuredContent["first_crack_event_authority"] == "automatic"
         assert runtime_config.structuredContent["first_crack_observer_protocol"] is None
+
+        started = cast(Any, await _call_with_timeout(session.call_tool("start_roast_session", {})))
+        session_id = started.structuredContent["session"]["session_id"]
+        rejected = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool(
+                    "contain_heat_fixed_zero",
+                    {
+                        "expected_session_id": session_id,
+                        "containment_protocol": "fixed_zero/v1",
+                        "target_heat_level_percent": 0,
+                    },
+                )
+            ),
+        )
+        assert rejected.isError
+        contained = cast(
+            Any,
+            await _call_with_timeout(
+                session.call_tool(
+                    "contain_heat_fixed_zero",
+                    {
+                        "expected_session_id": session_id,
+                        "containment_protocol": "fixed_zero/v1",
+                    },
+                )
+            ),
+        )
+        assert not contained.isError
+        assert contained.structuredContent["outcome"] == "command_state_returned"
 
 
 def test_stdio_server_supports_basic_mock_roast_tool_flow(tmp_path: Path) -> None:
