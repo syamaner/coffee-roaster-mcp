@@ -23,6 +23,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase, FuncMetadata
+from pydantic import BaseModel
 
 import coffee_roaster_mcp.mcp_server as mcp_server
 import coffee_roaster_mcp.session as session_module
@@ -87,6 +89,31 @@ from coffee_roaster_mcp.session import (
 )
 
 _T = TypeVar("_T")
+
+
+class _AdapterOriginalArguments(ArgModelBase):
+    """Minimal source argument model for fixed-zero adapter mechanism tests."""
+
+    marker: str
+
+
+class _AdapterOutput(BaseModel):
+    """Retained structured output model for the metadata-copy witness."""
+
+    marker: str
+
+
+class _ExtendedFuncMetadata(FuncMetadata):
+    """SDK-shaped metadata with one future field the adapter must retain."""
+
+    synthetic_metadata: str
+
+
+class _MinimalMetadataProbe(BaseModel):
+    """Local metadata-shaped Pydantic probe without structured-output attributes."""
+
+    arg_model: type[ArgModelBase]
+    marker: str
 
 
 def test_sdk_request_logger_name_matches_installed_sdk() -> None:
@@ -465,6 +492,72 @@ def test_fixed_zero_registered_tool_rejects_raw_invalid_arguments_before_driver(
     assert result.outcome == "command_state_returned"
     assert result.commanded_state.heat_level_percent == 0
     assert driver.fixed_zero_calls == 1
+
+
+def test_fixed_zero_argument_adapter_copies_extended_metadata_without_field_selection() -> None:
+    """The new tool replaces only arguments and retains opaque metadata fields."""
+    original = _ExtendedFuncMetadata(
+        arg_model=_AdapterOriginalArguments,
+        output_schema={"type": "object", "title": "retained"},
+        output_model=_AdapterOutput,
+        wrap_output=True,
+        synthetic_metadata="retain-me",
+    )
+    fixed_zero_tool = SimpleNamespace(fn_metadata=original, parameters={"old": "parameters"})
+    other_metadata = FuncMetadata(arg_model=_AdapterOriginalArguments)
+    other_tool = SimpleNamespace(fn_metadata=other_metadata, parameters={"other": "parameters"})
+    mcp = _metadata_adapter_test_mcp(fixed_zero_tool, other_tool)
+
+    mcp_server._install_fixed_zero_argument_adapter(mcp)  # pyright: ignore[reportPrivateUsage]
+
+    adapted = fixed_zero_tool.fn_metadata
+    assert isinstance(adapted, _ExtendedFuncMetadata)
+    assert adapted is not original
+    assert original.arg_model is _AdapterOriginalArguments
+    assert adapted.arg_model is mcp_server._FixedZeroContainmentArguments  # pyright: ignore[reportPrivateUsage]
+    assert adapted.output_schema == {"type": "object", "title": "retained"}
+    assert adapted.output_model is _AdapterOutput
+    assert adapted.wrap_output is True
+    assert adapted.synthetic_metadata == "retain-me"
+    assert fixed_zero_tool.parameters == (
+        mcp_server._FixedZeroContainmentArguments.model_json_schema(by_alias=True)  # pyright: ignore[reportPrivateUsage]
+    )
+    assert other_tool.fn_metadata is other_metadata
+    assert other_tool.parameters == {"other": "parameters"}
+
+
+def test_fixed_zero_argument_adapter_minimal_metadata_probe_uses_only_model_copy() -> None:
+    """Local mechanism probe, not old-SDK compatibility: no output attributes are read."""
+    original = _MinimalMetadataProbe(
+        arg_model=_AdapterOriginalArguments,
+        marker="minimal-metadata-probe",
+    )
+    fixed_zero_tool = SimpleNamespace(fn_metadata=original, parameters={})
+    other_tool = SimpleNamespace(fn_metadata=FuncMetadata(arg_model=_AdapterOriginalArguments))
+    mcp = _metadata_adapter_test_mcp(fixed_zero_tool, other_tool)
+
+    mcp_server._install_fixed_zero_argument_adapter(mcp)  # pyright: ignore[reportPrivateUsage]
+
+    adapted = fixed_zero_tool.fn_metadata
+    assert isinstance(adapted, _MinimalMetadataProbe)
+    assert adapted.marker == "minimal-metadata-probe"
+    assert original.arg_model is _AdapterOriginalArguments
+    assert adapted.arg_model is mcp_server._FixedZeroContainmentArguments  # pyright: ignore[reportPrivateUsage]
+    assert not hasattr(adapted, "output_schema")
+    assert not hasattr(adapted, "output_model")
+    assert not hasattr(adapted, "wrap_output")
+
+
+def _metadata_adapter_test_mcp(
+    fixed_zero_tool: SimpleNamespace, other_tool: SimpleNamespace
+) -> FastMCP:
+    """Build the smallest private-manager shape needed to exercise the adapter."""
+    tools = {"contain_heat_fixed_zero": fixed_zero_tool, "unaffected": other_tool}
+
+    def get_tool(name: str) -> SimpleNamespace | None:
+        return tools.get(name)
+
+    return cast(FastMCP, SimpleNamespace(_tool_manager=SimpleNamespace(get_tool=get_tool)))
 
 
 def test_fixed_zero_unknown_driver_result_retains_only_matching_reservation(tmp_path: Path) -> None:

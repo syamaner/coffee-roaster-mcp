@@ -16,7 +16,7 @@ from threading import Event, Lock, RLock, Thread
 from typing import Annotated, Any, Literal, cast
 
 from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase, FuncMetadata
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from mcp.server.session import ServerSession
 from pydantic import (
     BaseModel,
@@ -277,11 +277,8 @@ def _install_fixed_zero_argument_adapter(mcp: FastMCP) -> None:
     if tool is None:
         raise RuntimeError("Fixed-zero containment tool was not registered.")
     existing_metadata = tool.fn_metadata
-    tool.fn_metadata = FuncMetadata(
-        arg_model=_FixedZeroContainmentArguments,
-        output_schema=existing_metadata.output_schema,
-        output_model=existing_metadata.output_model,
-        wrap_output=existing_metadata.wrap_output,
+    tool.fn_metadata = existing_metadata.model_copy(
+        update={"arg_model": _FixedZeroContainmentArguments}
     )
     tool.parameters = _FixedZeroContainmentArguments.model_json_schema(by_alias=True)
 
