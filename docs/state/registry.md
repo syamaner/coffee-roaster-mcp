@@ -51,6 +51,18 @@ creation, protected `release` environment approval, publication, and live
 artefact verification remain human-operator actions. #234 remains open for the
 separately contracted Agent pin/nested-suite work.
 
+MCP239 source adds the exact-session `fixed_zero/v1` containment tool only; it
+does not qualify a release, installed candidate, or live admission. Its
+hardware-free boundary was resolved with Python 3.11.14, MCP 1.30.0, and
+Pydantic 2.14.1 and is privately coupled to SDK metadata; strict-boundary
+qualification for an installed candidate must rerun on its actual resolved
+dependencies. See [MCP239 detail below](#mcp239--fixed-zero-containment-software-boundary).
+Existing stale-completion handling may invoke the broader full emergency
+profile, and `unknown_completion` command evidence can predate it rather than
+describe latest or physical state. A matching unresolved reservation blocks
+ordinary fan, cooling, and drop commands; an independent emergency retains its
+existing admission rules.
+
 ## Historical Narrative (Superseded For Current Delivery)
 
 The narrative below preserves prior evidence and release history. It is not

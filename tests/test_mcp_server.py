@@ -11,7 +11,7 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
 from threading import Event, Lock, Thread, get_ident
@@ -24,7 +24,7 @@ from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase, FuncMetadata
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 import coffee_roaster_mcp.mcp_server as mcp_server
 import coffee_roaster_mcp.session as session_module
@@ -114,6 +114,33 @@ class _MinimalMetadataProbe(BaseModel):
 
     arg_model: type[ArgModelBase]
     marker: str
+
+
+class _DynamicArgModelMetadataProbe(BaseModel):
+    """Metadata probe whose dynamic attribute is not a declared Pydantic field."""
+
+    model_config = ConfigDict(extra="allow")
+
+    marker: str
+
+    @property
+    def arg_model(self) -> type[ArgModelBase]:
+        """Expose a deceptive dynamic argument model outside the declared shape."""
+        return _AdapterOriginalArguments
+
+
+class _IgnoringCopyMetadataProbe(BaseModel):
+    """Metadata probe that returns itself rather than applying model-copy updates."""
+
+    arg_model: type[ArgModelBase]
+    marker: str
+
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> _IgnoringCopyMetadataProbe:
+        """Intentionally ignore the requested update for the fail-closed mechanism probe."""
+        _ = update, deep
+        return self
 
 
 def test_sdk_request_logger_name_matches_installed_sdk() -> None:
@@ -494,6 +521,32 @@ def test_fixed_zero_registered_tool_rejects_raw_invalid_arguments_before_driver(
     assert driver.fixed_zero_calls == 1
 
 
+@pytest.mark.parametrize(
+    "raw_session_id",
+    ("true", "false", "null", "{}", "[1]", '"quoted"', "123", "0.0"),
+)
+def test_fixed_zero_sdk_preparse_preserves_json_looking_string_session_ids(
+    tmp_path: Path, raw_session_id: str
+) -> None:
+    """SDK metadata keeps strict string identities raw before model validation."""
+    context = _cold_finalisation_context(tmp_path)
+    server = create_mcp_server()
+    tool = server._tool_manager.get_tool("contain_heat_fixed_zero")  # pyright: ignore[reportPrivateUsage]
+    assert tool is not None
+    raw_arguments = {
+        "expected_session_id": raw_session_id,
+        "containment_protocol": "fixed_zero/v1",
+    }
+
+    pre_parsed = tool.fn_metadata.pre_parse_json(raw_arguments)
+    assert pre_parsed == raw_arguments
+    assert pre_parsed["expected_session_id"] == raw_session_id
+
+    result = asyncio.run(tool.run(raw_arguments, _ctx(context)))
+    assert (result.outcome, result.reason_code) == ("refused_identity", "unknown_session")
+    assert result.requested_session_id == raw_session_id
+
+
 def test_fixed_zero_argument_adapter_copies_extended_metadata_without_field_selection() -> None:
     """The new tool replaces only arguments and retains opaque metadata fields."""
     original = _ExtendedFuncMetadata(
@@ -546,6 +599,32 @@ def test_fixed_zero_argument_adapter_minimal_metadata_probe_uses_only_model_copy
     assert not hasattr(adapted, "output_schema")
     assert not hasattr(adapted, "output_model")
     assert not hasattr(adapted, "wrap_output")
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    (
+        _DynamicArgModelMetadataProbe(marker="dynamic-only"),
+        _IgnoringCopyMetadataProbe(
+            arg_model=_AdapterOriginalArguments,
+            marker="ignores-update",
+        ),
+    ),
+)
+def test_fixed_zero_argument_adapter_fails_closed_when_binding_is_unsupported(
+    metadata: BaseModel,
+) -> None:
+    """Declared binding absence or ignored replacement fails before tool assignment."""
+    original_parameters = {"old": "parameters"}
+    fixed_zero_tool = SimpleNamespace(fn_metadata=metadata, parameters=original_parameters)
+    other_tool = SimpleNamespace(fn_metadata=FuncMetadata(arg_model=_AdapterOriginalArguments))
+    mcp = _metadata_adapter_test_mcp(fixed_zero_tool, other_tool)
+
+    with pytest.raises(RuntimeError, match="argument adapter is unsupported"):
+        mcp_server._install_fixed_zero_argument_adapter(mcp)  # pyright: ignore[reportPrivateUsage]
+
+    assert fixed_zero_tool.fn_metadata is metadata
+    assert fixed_zero_tool.parameters is original_parameters
 
 
 def _metadata_adapter_test_mcp(
@@ -615,6 +694,45 @@ def test_fixed_zero_typed_malformed_driver_evidence_is_unknown_without_cleanup(
     assert snapshot.pending_driver_command_kind == "heat_containment"
     assert driver.fixed_zero_calls == 1
     assert driver.emergency_stop_calls == 0
+
+
+def test_fixed_zero_valid_but_different_driver_identity_is_unknown_without_cleanup(
+    tmp_path: Path,
+) -> None:
+    """A typed zero-state from another valid driver never settles mock ownership."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    driver = _CountingFixedZeroDriver(fixed_zero_outcome="driver_identity_mismatch")
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+
+    result = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+
+    assert (result.outcome, result.reason_code) == (
+        "unknown_driver_result",
+        "driver_result_invalid",
+    )
+    assert result.commanded_state is None
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.pending_driver_command_token is not None
+    assert snapshot.pending_driver_command_kind == "heat_containment"
+    assert driver.fixed_zero_calls == 1
+    assert driver.emergency_stop_calls == 0
+    retry = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        _ctx(context),
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert (retry.outcome, retry.reason_code) == ("refused_busy", "command_in_progress")
+    assert driver.fixed_zero_calls == 1
 
 
 def test_fixed_zero_stale_completion_uses_existing_fail_closed_fallback(
@@ -719,6 +837,63 @@ def test_fixed_zero_wire_state_rejects_coercible_literals(
     payload[field] = invalid_value
     with pytest.raises(ValueError):
         mcp_server.FixedZeroCommandedStateResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (
+        ("roast_fan_level_percent", -1),
+        ("roast_fan_level_percent", 101),
+        ("main_fan_level_percent", -1),
+        ("main_fan_level_percent", 101),
+    ),
+)
+def test_fixed_zero_wire_state_rejects_out_of_range_fan_percent(
+    field: str, invalid_value: int
+) -> None:
+    """G: both fan evidence fields reject bounded values outside 0 through 100."""
+    payload = _fixed_zero_evidence_payload()
+    payload[field] = invalid_value
+    with pytest.raises(ValueError, match="exact integer in 0..100"):
+        mcp_server.FixedZeroCommandedStateResult.model_validate(payload)
+
+
+def test_fixed_zero_result_rejects_nonmapping_business_value() -> None:
+    """G: the outer closed business result must be a mapping before row validation."""
+    with pytest.raises(TypeError, match="result must be a mapping"):
+        mcp_server.FixedZeroContainmentResult.model_validate([])
+
+
+def test_fixed_zero_result_rejects_unequal_requested_and_validated_ids() -> None:
+    """G: a valid row still refuses a validated identity from another session."""
+    payload = _fixed_zero_result_payload("refused_capability", "capability_absent")
+    payload["validated_session_id"] = "different-session"
+    with pytest.raises(ValueError, match="must equal requested_session_id"):
+        mcp_server.FixedZeroContainmentResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "valid_reason", "inappropriate_reason", "message"),
+    (
+        ("refused_identity", "unknown_session", None, "invalid reason code"),
+        ("refused_capability", "capability_absent", "driver_raised", "invalid reason code"),
+        ("refused_busy", "command_in_progress", None, "invalid reason code"),
+        ("command_state_returned", None, "driver_raised", "Successful fixed-zero result"),
+        ("unknown_driver_result", "driver_raised", None, "invalid reason code"),
+        ("unknown_completion", "projection_unconfirmed", "driver_raised", "invalid reason code"),
+    ),
+)
+def test_fixed_zero_result_rejects_inappropriate_or_null_reason_in_each_row(
+    outcome: str,
+    valid_reason: str | None,
+    inappropriate_reason: str | None,
+    message: str,
+) -> None:
+    """G: each otherwise-valid outcome row requires exactly its permitted reason shape."""
+    payload = _fixed_zero_result_payload(outcome, valid_reason)
+    payload["reason_code"] = inappropriate_reason
+    with pytest.raises(ValueError, match=message):
+        mcp_server.FixedZeroContainmentResult.model_validate(payload)
 
 
 @pytest.mark.parametrize("mutation", ("missing", "extra", "not_mapping"))
@@ -1208,6 +1383,17 @@ class _CountingFixedZeroDriver(MockRoasterDriver):
             object.__setattr__(evidence, "cooling_motor_on", False)
             object.__setattr__(evidence, "solenoid_open", False)
             return evidence
+        if self.fixed_zero_outcome == "driver_identity_mismatch":
+            return FixedZeroCommandedState(
+                driver="other_driver",
+                capability_version=1,
+                heat_level_percent=0,
+                roast_fan_level_percent=0,
+                main_fan_level_percent=0,
+                drum_motor_on=False,
+                cooling_motor_on=False,
+                solenoid_open=False,
+            )
         return super().contain_heat_fixed_zero()
 
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:

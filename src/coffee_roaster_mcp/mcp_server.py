@@ -277,9 +277,22 @@ def _install_fixed_zero_argument_adapter(mcp: FastMCP) -> None:
     if tool is None:
         raise RuntimeError("Fixed-zero containment tool was not registered.")
     existing_metadata = tool.fn_metadata
-    tool.fn_metadata = existing_metadata.model_copy(
-        update={"arg_model": _FixedZeroContainmentArguments}
-    )
+    declared_metadata_fields = getattr(type(existing_metadata), "model_fields", None)
+    if (
+        not isinstance(declared_metadata_fields, Mapping)
+        or "arg_model" not in declared_metadata_fields
+    ):
+        raise RuntimeError("Fixed-zero containment argument adapter is unsupported.")
+    try:
+        adapted_metadata = existing_metadata.model_copy(
+            update={"arg_model": _FixedZeroContainmentArguments}
+        )
+        binds_fixed_zero_arguments = adapted_metadata.arg_model is _FixedZeroContainmentArguments
+    except Exception as exc:
+        raise RuntimeError("Fixed-zero containment argument adapter is unsupported.") from exc
+    if not binds_fixed_zero_arguments:
+        raise RuntimeError("Fixed-zero containment argument adapter is unsupported.")
+    tool.fn_metadata = adapted_metadata
     tool.parameters = _FixedZeroContainmentArguments.model_json_schema(by_alias=True)
 
 
@@ -1274,7 +1287,13 @@ def create_mcp_server(
         expected_session_id: str,
         containment_protocol: Literal["fixed_zero/v1"],
     ) -> FixedZeroContainmentResult:
-        """Contain only commanded heat at fixed zero for one exact active session."""
+        """Contain commanded heat for one exact session with bounded command evidence.
+
+        The returned state is not evidence of physical heat removal, transport
+        settlement, or durable audit. Unknown outcomes block ordinary commands
+        and never permit automatic retry. Existing stale-completion handling may
+        apply the broader emergency profile after the returned evidence was read.
+        """
         _ = containment_protocol
         return _run_fixed_zero_heat_containment(
             ctx.request_context.lifespan_context,
