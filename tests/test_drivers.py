@@ -17,6 +17,7 @@ from coffee_roaster_mcp.drivers import (
     HottopRoasterDriver,
     HottopTemperatureUnit,
     MockRoasterDriver,
+    RoasterCapabilities,
     RoasterDriver,
     RoasterState,
     SerialTransportFactory,
@@ -412,6 +413,16 @@ def test_create_roaster_driver_rejects_unsupported_driver() -> None:
 
 def test_mock_driver_satisfies_roaster_driver_contract() -> None:
     _assert_roaster_driver_contract(MockRoasterDriver())
+
+
+def test_manual_first_crack_capability_is_declared_only_by_mock() -> None:
+    """The static manual adapter declaration stays closed to the mock boundary."""
+    mock_capabilities = MockRoasterDriver().capabilities
+    hottop_capabilities = HottopRoasterDriver(serial_factory=FakeSerialFactory()).capabilities
+
+    assert isinstance(mock_capabilities, RoasterCapabilities)
+    assert mock_capabilities.manual_first_crack_version == 1
+    assert hottop_capabilities.manual_first_crack_version is None
 
 
 def test_hottop_driver_capabilities_require_command_streaming() -> None:

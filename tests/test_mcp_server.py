@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from threading import Event, Lock, Thread, get_ident
 from types import SimpleNamespace, TracebackType
-from typing import Any, TypeVar, cast
+from typing import Any, Never, TypeVar, cast
 
 import pytest
 from mcp import ClientSession, StdioServerParameters
@@ -34,7 +34,7 @@ from coffee_roaster_mcp.cold_temperature import (
     COLD_TEMPERATURE_NOT_ELIGIBLE,
     ColdTemperatureProjection,
 )
-from coffee_roaster_mcp.config import AppConfig, FirstCrackConfig
+from coffee_roaster_mcp.config import AppConfig, ConfigError, FirstCrackConfig, RecordingConfig
 from coffee_roaster_mcp.detector import (
     FirstCrackDetectorOutput,
     build_first_crack_detector_adapter,
@@ -46,6 +46,7 @@ from coffee_roaster_mcp.drivers import (
     FixedZeroCommandedState,
     HottopRoasterDriver,
     MockRoasterDriver,
+    RoasterCapabilities,
     RoasterState,
 )
 from coffee_roaster_mcp.first_crack_runtime import (
@@ -7394,6 +7395,75 @@ async def _manual_shadow_blocked_stdio(tmp_path: Path, stage: str) -> None:
         assert summary["order"] == expected_order
 
 
+class _ManualAuthorityMockDriver(MockRoasterDriver):
+    """Mock-family double with a selectable static manual declaration."""
+
+    def __init__(
+        self,
+        *,
+        driver_name: str = "mock",
+        capabilities: object | None = None,
+        fail_name_read: bool = False,
+        fail_capabilities_read: bool = False,
+    ) -> None:
+        """Initialize one non-actuating manual-authority test double."""
+        super().__init__()
+        self.name = driver_name
+        self._declared_capabilities = capabilities
+        self._fail_name_read = fail_name_read
+        self._fail_capabilities_read = fail_capabilities_read
+        self.connect_calls = 0
+        self.capability_reads = 0
+
+    def __getattribute__(self, name: str) -> object:
+        """Make the declared adapter identity unreadable when requested."""
+        if name == "name" and object.__getattribute__(self, "_fail_name_read"):
+            raise RuntimeError("SENSITIVE-adapter-identity")
+        return super().__getattribute__(name)
+
+    @property
+    def capabilities(self) -> RoasterCapabilities:
+        """Return the selected declaration or prove declaration reads fail closed."""
+        self.capability_reads += 1
+        if self._fail_capabilities_read:
+            raise RuntimeError("SENSITIVE-adapter-capabilities")
+        if self._declared_capabilities is not None:
+            return cast(RoasterCapabilities, self._declared_capabilities)
+        return super().capabilities
+
+    def connect(self) -> None:
+        """Record an attempted lifecycle transition."""
+        self.connect_calls += 1
+        super().connect()
+
+
+class _MockNamedImitation:
+    """Non-mock adapter that attempts to imitate the supported declaration."""
+
+    name = "mock"
+
+    @property
+    def capabilities(self) -> RoasterCapabilities:
+        """Return an otherwise valid declaration without a supported implementation type."""
+        return MockRoasterDriver().capabilities
+
+
+class _MockFamilyEqualitySpoof:
+    """Malformed family value that claims equality with the supported family."""
+
+    def __eq__(self, other: object) -> bool:
+        """Claim to match the supported family without being a string."""
+        return other == "mock"
+
+
+def _manual_authority_config() -> AppConfig:
+    """Return the existing effective configuration shape for manual authority."""
+    return AppConfig(
+        first_crack=FirstCrackConfig(mode="audio", event_authority="manual"),
+        recording=RecordingConfig(enabled=True, autocapture=True),
+    )
+
+
 def test_manual_authority_composition_refuses_before_driver_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7413,6 +7483,305 @@ def test_manual_authority_composition_refuses_before_driver_creation(
     with pytest.raises(ConfigError, match="requires mock driver"):
         build_server_context(config_path=tmp_path / "not-read.yaml")
     assert not calls
+
+
+@pytest.mark.parametrize("version", [None, True, "1", 0, 2])
+def test_manual_authority_composition_refuses_invalid_declaration_before_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: object
+) -> None:
+    """Malformed manual declarations cannot reach any later composition factory."""
+    base = MockRoasterDriver().capabilities
+    driver = _ManualAuthorityMockDriver(
+        capabilities=dataclasses.replace(base, manual_first_crack_version=version)
+    )
+    effects: list[str] = []
+
+    def fake_load(**_kwargs: object) -> AppConfig:
+        return _manual_authority_config()
+
+    def fake_driver(*_args: object, **_kwargs: object) -> MockRoasterDriver:
+        return driver
+
+    monkeypatch.setattr(mcp_server, "load_config", fake_load)
+    monkeypatch.setattr(mcp_server, "create_roaster_driver", fake_driver)
+
+    def forbid(factory: str):
+        def forbidden(*_args: object, **_kwargs: object) -> None:
+            effects.append(factory)
+            raise AssertionError(f"manual declaration reached {factory}")
+
+        return forbidden
+
+    monkeypatch.setattr(mcp_server, "_TelemetrySampler", forbid("telemetry_sampler"))
+    monkeypatch.setattr(mcp_server, "RoastSessionStore", forbid("session_store"))
+    monkeypatch.setattr(
+        mcp_server,
+        "build_first_crack_session_runtime",
+        forbid("first_crack_runtime"),
+    )
+    monkeypatch.setattr(mcp_server, "build_ambient_session_runtime", forbid("ambient_runtime"))
+    with pytest.raises(
+        ConfigError,
+        match="Composed driver does not support configured manual first-crack authority.",
+    ):
+        build_server_context(config_path=tmp_path / "not-read.yaml")
+
+    assert not effects
+    assert driver.connect_calls == 0
+
+
+@pytest.mark.parametrize("manual_declaration", [None, 1])
+def test_manual_authority_composition_refuses_hottop_before_setup_or_transport_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manual_declaration: int | None
+) -> None:
+    """A Hottop declaration cannot grant manual authority or open its transport."""
+    transport_opens: list[tuple[object, ...]] = []
+
+    def fail_on_open(*args: object, **_kwargs: object) -> Never:
+        transport_opens.append(args)
+        raise AssertionError("manual authority attempted to open Hottop transport")
+
+    driver = HottopRoasterDriver(
+        port="/dev/fake-manual-authority",
+        serial_factory=fail_on_open,
+    )
+    if manual_declaration is not None:
+        original_capabilities = HottopRoasterDriver.capabilities
+        assert isinstance(original_capabilities, property)
+
+        def declared_capabilities(instance: HottopRoasterDriver) -> RoasterCapabilities:
+            base = original_capabilities.__get__(instance, HottopRoasterDriver)
+            return dataclasses.replace(base, manual_first_crack_version=manual_declaration)
+
+        monkeypatch.setattr(HottopRoasterDriver, "capabilities", property(declared_capabilities))
+    effects: list[str] = []
+
+    def fake_load(**_kwargs: object) -> AppConfig:
+        return _manual_authority_config()
+
+    def fake_driver(*_args: object, **_kwargs: object) -> HottopRoasterDriver:
+        return driver
+
+    monkeypatch.setattr(mcp_server, "load_config", fake_load)
+    monkeypatch.setattr(mcp_server, "create_roaster_driver", fake_driver)
+
+    def forbid(factory: str):
+        def forbidden(*_args: object, **_kwargs: object) -> None:
+            effects.append(factory)
+            raise AssertionError(f"Hottop manual authority reached {factory}")
+
+        return forbidden
+
+    monkeypatch.setattr(mcp_server, "_TelemetrySampler", forbid("telemetry_sampler"))
+    monkeypatch.setattr(mcp_server, "RoastSessionStore", forbid("session_store"))
+    monkeypatch.setattr(
+        mcp_server,
+        "build_first_crack_session_runtime",
+        forbid("first_crack_runtime"),
+    )
+    monkeypatch.setattr(mcp_server, "build_ambient_session_runtime", forbid("ambient_runtime"))
+    with pytest.raises(
+        ConfigError,
+        match="Composed driver does not support configured manual first-crack authority.",
+    ):
+        build_server_context(config_path=tmp_path / "not-read.yaml")
+
+    assert not effects
+    assert not transport_opens
+
+
+@pytest.mark.parametrize("manual_declaration", [None, 1])
+def test_manual_start_refuses_hottop_before_reservation_or_transport_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manual_declaration: int | None
+) -> None:
+    """Registered Start rejects real Hottop adapters before every side effect."""
+    transport_opens: list[tuple[object, ...]] = []
+
+    def fail_on_open(*args: object, **_kwargs: object) -> Never:
+        transport_opens.append(args)
+        raise AssertionError("manual authority attempted to open Hottop transport")
+
+    driver = HottopRoasterDriver(
+        port="/dev/fake-manual-authority",
+        serial_factory=fail_on_open,
+    )
+    if manual_declaration is not None:
+        original_capabilities = HottopRoasterDriver.capabilities
+        assert isinstance(original_capabilities, property)
+
+        def declared_capabilities(instance: HottopRoasterDriver) -> RoasterCapabilities:
+            base = original_capabilities.__get__(instance, HottopRoasterDriver)
+            return dataclasses.replace(base, manual_first_crack_version=manual_declaration)
+
+        monkeypatch.setattr(HottopRoasterDriver, "capabilities", property(declared_capabilities))
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    object.__setattr__(context, "roaster_driver", driver)
+    effects: list[str] = []
+
+    def forbid(effect: str):
+        def forbidden(*_args: object, **_kwargs: object) -> None:
+            effects.append(effect)
+            raise AssertionError(f"Hottop manual authority reached {effect}")
+
+        return forbidden
+
+    monkeypatch.setattr(context.session_store, "reserve_session_start", forbid("reservation"))
+    monkeypatch.setattr(driver, "connect", forbid("connect"))
+    monkeypatch.setattr(context.first_crack_runtime, "start_for_session", forbid("runtime"))
+    monkeypatch.setattr(context.ambient_runtime, "start_for_session", forbid("ambient"))
+    monkeypatch.setattr(context.telemetry_sampler, "start_for_session", forbid("capture"))
+    with pytest.raises(
+        ConfigError,
+        match="Composed driver does not support configured manual first-crack authority.",
+    ):
+        _call_tool(
+            create_mcp_server(),
+            "start_roast_session",
+            _ctx(context),
+            first_crack_observer_ack="manual/v1",
+        )
+
+    assert not effects
+    assert not transport_opens
+    assert context.session_store.get_active_session() is None
+
+
+def test_manual_authority_composition_refuses_spoofed_composed_family_before_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-string composed family cannot invoke equality to gain authority."""
+    driver = _ManualAuthorityMockDriver(driver_name=cast(str, _MockFamilyEqualitySpoof()))
+    effects: list[str] = []
+
+    def fake_load(**_kwargs: object) -> AppConfig:
+        return _manual_authority_config()
+
+    def fake_driver(*_args: object, **_kwargs: object) -> MockRoasterDriver:
+        return driver
+
+    monkeypatch.setattr(mcp_server, "load_config", fake_load)
+    monkeypatch.setattr(mcp_server, "create_roaster_driver", fake_driver)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        effects.append("later_factory")
+        raise AssertionError("spoofed family reached a later composition factory")
+
+    monkeypatch.setattr(mcp_server, "RoastSessionStore", forbidden)
+    with pytest.raises(
+        ConfigError,
+        match="Composed driver does not support configured manual first-crack authority.",
+    ):
+        build_server_context(config_path=tmp_path / "not-read.yaml")
+
+    assert not effects
+    assert driver.connect_calls == 0
+
+
+@pytest.mark.parametrize(
+    "driver",
+    [
+        _MockNamedImitation(),
+        _ManualAuthorityMockDriver(driver_name="different"),
+        _ManualAuthorityMockDriver(capabilities=object()),
+        _ManualAuthorityMockDriver(fail_name_read=True),
+        _ManualAuthorityMockDriver(fail_capabilities_read=True),
+    ],
+)
+def test_manual_authority_validator_refuses_imitation_mismatch_and_unreadable_adapter(
+    driver: object,
+) -> None:
+    """Manual authority does not reveal adapter detail while failing closed."""
+    with pytest.raises(
+        ConfigError,
+        match="Composed driver does not support configured manual first-crack authority.",
+    ) as error:
+        mcp_server._validate_composed_manual_first_crack_authority(  # pyright: ignore[reportPrivateUsage]
+            _manual_authority_config(), cast(Any, driver)
+        )
+
+    assert "SENSITIVE" not in str(error.value)
+
+
+def test_automatic_authority_does_not_read_composed_manual_declaration() -> None:
+    """Automatic authority retains no dependency on the manual adapter declaration."""
+    driver = _ManualAuthorityMockDriver(fail_name_read=True, fail_capabilities_read=True)
+
+    mcp_server._validate_composed_manual_first_crack_authority(  # pyright: ignore[reportPrivateUsage]
+        AppConfig(), driver
+    )
+    assert driver.capability_reads == 0
+
+
+def test_manual_start_refuses_spoofed_capability_family_before_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-string declared family cannot invoke equality during registered Start."""
+    context = _cold_finalisation_context(tmp_path)
+    capabilities = dataclasses.replace(
+        MockRoasterDriver().capabilities,
+        driver=cast(str, _MockFamilyEqualitySpoof()),
+    )
+    driver = _ManualAuthorityMockDriver(capabilities=capabilities)
+    object.__setattr__(context, "config", _manual_authority_config())
+    object.__setattr__(context, "roaster_driver", driver)
+    effects: list[str] = []
+
+    def forbidden_reservation() -> None:
+        effects.append("reservation")
+        raise AssertionError("spoofed family reserved a session")
+
+    monkeypatch.setattr(context.session_store, "reserve_session_start", forbidden_reservation)
+    server = create_mcp_server()
+    with pytest.raises(
+        ConfigError,
+        match="Composed driver does not support configured manual first-crack authority.",
+    ):
+        _call_tool(
+            server,
+            "start_roast_session",
+            _ctx(context),
+            first_crack_observer_ack="manual/v1",
+        )
+
+    assert not effects
+    assert driver.connect_calls == 0
+    assert context.session_store.get_active_session() is None
+
+
+def test_manual_start_validates_ack_before_adapter_and_adapter_before_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Start preserves acknowledgement ordering and blocks all effects on mismatch."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = _ManualAuthorityMockDriver(driver_name="different")
+    object.__setattr__(context, "config", _manual_authority_config())
+    object.__setattr__(context, "roaster_driver", driver)
+    effects: list[str] = []
+
+    def forbidden_reservation() -> None:
+        effects.append("reservation")
+        raise AssertionError("manual adapter mismatch reserved a session")
+
+    monkeypatch.setattr(context.session_store, "reserve_session_start", forbidden_reservation)
+    server = create_mcp_server()
+    with pytest.raises(ValueError, match="observer protocol does not match"):
+        _call_tool(server, "start_roast_session", _ctx(context))
+    assert driver.capability_reads == 0
+
+    with pytest.raises(
+        ConfigError,
+        match="Composed driver does not support configured manual first-crack authority.",
+    ):
+        _call_tool(
+            server,
+            "start_roast_session",
+            _ctx(context),
+            first_crack_observer_ack="manual/v1",
+        )
+    assert not effects
+    assert driver.connect_calls == 0
+    assert context.session_store.get_active_session() is None
 
 
 def test_lifespan_shutdown_finalises_synthetic_recording_with_loader_hung(tmp_path: Path) -> None:
