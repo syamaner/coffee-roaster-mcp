@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from threading import Event, Lock, Thread, get_ident
 from types import SimpleNamespace, TracebackType
-from typing import Any, TypeVar, cast
+from typing import Any, Never, TypeVar, cast
 
 import pytest
 from mcp import ClientSession, StdioServerParameters
@@ -7505,11 +7505,21 @@ def test_manual_authority_composition_refuses_invalid_declaration_before_setup(
     monkeypatch.setattr(mcp_server, "load_config", fake_load)
     monkeypatch.setattr(mcp_server, "create_roaster_driver", fake_driver)
 
-    def forbidden(*_args: object, **_kwargs: object) -> None:
-        effects.append("later_factory")
-        raise AssertionError("manual declaration reached a later composition factory")
+    def forbid(factory: str):
+        def forbidden(*_args: object, **_kwargs: object) -> None:
+            effects.append(factory)
+            raise AssertionError(f"manual declaration reached {factory}")
 
-    monkeypatch.setattr(mcp_server, "RoastSessionStore", forbidden)
+        return forbidden
+
+    monkeypatch.setattr(mcp_server, "_TelemetrySampler", forbid("telemetry_sampler"))
+    monkeypatch.setattr(mcp_server, "RoastSessionStore", forbid("session_store"))
+    monkeypatch.setattr(
+        mcp_server,
+        "build_first_crack_session_runtime",
+        forbid("first_crack_runtime"),
+    )
+    monkeypatch.setattr(mcp_server, "build_ambient_session_runtime", forbid("ambient_runtime"))
     with pytest.raises(
         ConfigError,
         match="Composed driver does not support configured manual first-crack authority.",
@@ -7518,6 +7528,123 @@ def test_manual_authority_composition_refuses_invalid_declaration_before_setup(
 
     assert not effects
     assert driver.connect_calls == 0
+
+
+@pytest.mark.parametrize("manual_declaration", [None, 1])
+def test_manual_authority_composition_refuses_hottop_before_setup_or_transport_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manual_declaration: int | None
+) -> None:
+    """A Hottop declaration cannot grant manual authority or open its transport."""
+    transport_opens: list[tuple[object, ...]] = []
+
+    def fail_on_open(*args: object, **_kwargs: object) -> Never:
+        transport_opens.append(args)
+        raise AssertionError("manual authority attempted to open Hottop transport")
+
+    driver = HottopRoasterDriver(
+        port="/dev/fake-manual-authority",
+        serial_factory=fail_on_open,
+    )
+    if manual_declaration is not None:
+        original_capabilities = HottopRoasterDriver.capabilities
+        assert isinstance(original_capabilities, property)
+
+        def declared_capabilities(instance: HottopRoasterDriver) -> RoasterCapabilities:
+            base = original_capabilities.__get__(instance, HottopRoasterDriver)
+            return dataclasses.replace(base, manual_first_crack_version=manual_declaration)
+
+        monkeypatch.setattr(HottopRoasterDriver, "capabilities", property(declared_capabilities))
+    effects: list[str] = []
+
+    def fake_load(**_kwargs: object) -> AppConfig:
+        return _manual_authority_config()
+
+    def fake_driver(*_args: object, **_kwargs: object) -> HottopRoasterDriver:
+        return driver
+
+    monkeypatch.setattr(mcp_server, "load_config", fake_load)
+    monkeypatch.setattr(mcp_server, "create_roaster_driver", fake_driver)
+
+    def forbid(factory: str):
+        def forbidden(*_args: object, **_kwargs: object) -> None:
+            effects.append(factory)
+            raise AssertionError(f"Hottop manual authority reached {factory}")
+
+        return forbidden
+
+    monkeypatch.setattr(mcp_server, "_TelemetrySampler", forbid("telemetry_sampler"))
+    monkeypatch.setattr(mcp_server, "RoastSessionStore", forbid("session_store"))
+    monkeypatch.setattr(
+        mcp_server,
+        "build_first_crack_session_runtime",
+        forbid("first_crack_runtime"),
+    )
+    monkeypatch.setattr(mcp_server, "build_ambient_session_runtime", forbid("ambient_runtime"))
+    with pytest.raises(
+        ConfigError,
+        match="Composed driver does not support configured manual first-crack authority.",
+    ):
+        build_server_context(config_path=tmp_path / "not-read.yaml")
+
+    assert not effects
+    assert not transport_opens
+
+
+@pytest.mark.parametrize("manual_declaration", [None, 1])
+def test_manual_start_refuses_hottop_before_reservation_or_transport_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manual_declaration: int | None
+) -> None:
+    """Registered Start rejects real Hottop adapters before every side effect."""
+    transport_opens: list[tuple[object, ...]] = []
+
+    def fail_on_open(*args: object, **_kwargs: object) -> Never:
+        transport_opens.append(args)
+        raise AssertionError("manual authority attempted to open Hottop transport")
+
+    driver = HottopRoasterDriver(
+        port="/dev/fake-manual-authority",
+        serial_factory=fail_on_open,
+    )
+    if manual_declaration is not None:
+        original_capabilities = HottopRoasterDriver.capabilities
+        assert isinstance(original_capabilities, property)
+
+        def declared_capabilities(instance: HottopRoasterDriver) -> RoasterCapabilities:
+            base = original_capabilities.__get__(instance, HottopRoasterDriver)
+            return dataclasses.replace(base, manual_first_crack_version=manual_declaration)
+
+        monkeypatch.setattr(HottopRoasterDriver, "capabilities", property(declared_capabilities))
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    object.__setattr__(context, "roaster_driver", driver)
+    effects: list[str] = []
+
+    def forbid(effect: str):
+        def forbidden(*_args: object, **_kwargs: object) -> None:
+            effects.append(effect)
+            raise AssertionError(f"Hottop manual authority reached {effect}")
+
+        return forbidden
+
+    monkeypatch.setattr(context.session_store, "reserve_session_start", forbid("reservation"))
+    monkeypatch.setattr(driver, "connect", forbid("connect"))
+    monkeypatch.setattr(context.first_crack_runtime, "start_for_session", forbid("runtime"))
+    monkeypatch.setattr(context.ambient_runtime, "start_for_session", forbid("ambient"))
+    monkeypatch.setattr(context.telemetry_sampler, "start_for_session", forbid("capture"))
+    with pytest.raises(
+        ConfigError,
+        match="Composed driver does not support configured manual first-crack authority.",
+    ):
+        _call_tool(
+            create_mcp_server(),
+            "start_roast_session",
+            _ctx(context),
+            first_crack_observer_ack="manual/v1",
+        )
+
+    assert not effects
+    assert not transport_opens
+    assert context.session_store.get_active_session() is None
 
 
 def test_manual_authority_composition_refuses_spoofed_composed_family_before_setup(
