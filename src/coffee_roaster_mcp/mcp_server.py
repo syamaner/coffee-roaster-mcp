@@ -51,6 +51,7 @@ from coffee_roaster_mcp.drivers import (
     DriverLifecycleEvidence,
     FixedZeroCommandedState,
     LifecycleEvidenceDriver,
+    MockRoasterDriver,
     RoasterCapabilities,
     RoasterDriver,
     RoasterState,
@@ -984,6 +985,64 @@ class SessionFinalisationResult:
     session_phase_after: RoastPhase | None
 
 
+def _validate_composed_manual_first_crack_authority(
+    config: AppConfig, driver: RoasterDriver
+) -> None:
+    """Require the closed mock declaration for manual first-crack authority.
+
+    Automatic authority has no adapter declaration dependency. Manual authority
+    remains limited to the built-in mock family and its exact versioned
+    declaration; this check deliberately performs no driver lifecycle or
+    transport operation.
+
+    Args:
+        config: Effective immutable server configuration.
+        driver: Driver instance returned by the configured adapter factory.
+
+    Raises:
+        ConfigError: If the composed adapter cannot prove the supported manual
+            first-crack declaration.
+    """
+    if config.first_crack.event_authority == "automatic":
+        return
+
+    try:
+        driver_name = driver.name
+        capabilities = cast(object, driver.capabilities)
+    except Exception:
+        raise ConfigError(
+            "Composed driver does not support configured manual first-crack authority."
+        ) from None
+
+    if not isinstance(capabilities, RoasterCapabilities):
+        raise ConfigError(
+            "Composed driver does not support configured manual first-crack authority."
+        )
+
+    try:
+        capability_driver = capabilities.driver
+        manual_first_crack_version = capabilities.manual_first_crack_version
+    except Exception:
+        raise ConfigError(
+            "Composed driver does not support configured manual first-crack authority."
+        ) from None
+
+    if (
+        not isinstance(driver, MockRoasterDriver)
+        or type(config.roaster.driver) is not str
+        or config.roaster.driver != "mock"
+        or type(driver_name) is not str
+        or driver_name != "mock"
+        or type(capability_driver) is not str
+        or capability_driver != "mock"
+        or type(manual_first_crack_version) is not int
+        or manual_first_crack_version != 1
+    ):
+        raise ConfigError(
+            "Composed driver does not support configured manual first-crack authority."
+        )
+
+
 def build_server_context(
     *,
     config_path: str | Path | None = None,
@@ -1010,6 +1069,7 @@ def build_server_context(
         )
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
+    _validate_composed_manual_first_crack_authority(config, roaster_driver)
     server_context: ServerContext | None = None
 
     def sample_active_session(session_id: str) -> bool:
@@ -1165,6 +1225,9 @@ def create_mcp_server(
             raise ValueError(
                 "Requested first-crack observer protocol does not match configured authority."
             )
+        _validate_composed_manual_first_crack_authority(
+            server_context.config, server_context.roaster_driver
+        )
         with server_context.lifecycle_barrier:
             reservation = server_context.session_store.reserve_session_start()
         try:

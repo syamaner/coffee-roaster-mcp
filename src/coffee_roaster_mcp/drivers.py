@@ -112,6 +112,8 @@ class RoasterCapabilities:
         actions: Supported control actions.
         sensor_units: Units used by normalized temperature readings.
         command_streaming: Driver command-streaming requirements.
+        heat_containment_version: Supported fixed-zero containment declaration.
+        manual_first_crack_version: Supported manual first-crack declaration.
     """
 
     driver: str
@@ -121,6 +123,7 @@ class RoasterCapabilities:
     sensor_units: SensorUnits
     command_streaming: CommandStreaming
     heat_containment_version: int | None = None
+    manual_first_crack_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -716,6 +719,7 @@ class MockRoasterDriver:
             ),
             command_streaming=CommandStreaming(required=False),
             heat_containment_version=1,
+            manual_first_crack_version=1,
         )
 
     def connect(self) -> None:
