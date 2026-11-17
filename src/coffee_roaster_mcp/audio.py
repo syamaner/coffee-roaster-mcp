@@ -926,6 +926,15 @@ class EvidenceRoastRecorder:
         self._detector_input_opened = False
         self._detector_identity_proved = False
         self._detector_input_frames = 0
+        # The pipeline's reader owns the detector input close. It opts into
+        # this fence before starting workers; direct recorder use has no such
+        # reader boundary and retains its existing writer-only semantics.
+        self._detector_close_confirmation_required = False
+        self._detector_input_close_confirmed: bool | None = None
+        self._detector_writer_finalized = False
+        self._detector_writer_close_confirmed = False
+        self._detector_writer_receipts_published = False
+        self._detector_close_lock = Lock()
         if isinstance(recorder, (RoastAudioRecorder, MultiDeviceRoastRecorder)):
             self._delegate_reports_boundaries = True
             recorder.set_capture_evidence_observer(self)
@@ -993,6 +1002,24 @@ class EvidenceRoastRecorder:
     def detector_input_observed(self) -> bool:
         """Return whether this generation published a detector-open observation."""
         return self._detector_input_opened
+
+    def require_detector_input_close_confirmation(self) -> None:
+        """Require the pipeline reader's close before a detector row is closed."""
+        with self._detector_close_lock:
+            self._detector_close_confirmation_required = True
+
+    def confirm_detector_input_closed(self, *, confirmed: bool) -> None:
+        """Publish the detector reader owner's observed input-close result."""
+        with self._detector_close_lock:
+            self._detector_input_close_confirmed = confirmed
+            may_confirm_close = (
+                confirmed
+                and self._detector_writer_finalized
+                and self._detector_writer_close_confirmed
+                and self._detector_writer_receipts_published
+            )
+        if may_confirm_close:
+            self.close_input(slot=1, confirmed=confirmed)
 
     def observe_independent_input(
         self, *, slot: int, backend_input_id: int | None, reported_rate_hz: float | None
@@ -1092,12 +1119,22 @@ class EvidenceRoastRecorder:
         wav_header_rate_hz: float | None = None,
     ) -> None:
         """Publish one terminal disposition with its final writer receipts."""
+        reader_close_confirmed: bool | None = None
+        close_required = False
+        if slot == 1:
+            with self._detector_close_lock:
+                self._detector_writer_finalized = True
+                self._detector_writer_close_confirmed = confirmed and failure is None
+                reader_close_confirmed = self._detector_input_close_confirmed
+                close_required = self._detector_close_confirmation_required
+            if close_required:
+                confirmed = self._detector_writer_close_confirmed and reader_close_confirmed is True
         if slot == 1:
             # The tee receives source frames before a writer may reject them.
             # Never replace that source receipt with accepted writer frames at
             # terminal finalisation.
             input_frames = self._detector_input_frames
-        self._publisher.finalize_input(
+        receipts_published = self._publisher.finalize_input(
             session_id=self._session_id,
             ownership_sequence=self._ownership_sequence,
             recorder_generation=self._recorder_generation,
@@ -1110,6 +1147,16 @@ class EvidenceRoastRecorder:
             failure=failure,
             wav_header_rate_hz=wav_header_rate_hz,
         )
+        if slot == 1 and close_required:
+            with self._detector_close_lock:
+                self._detector_writer_receipts_published = receipts_published
+                may_confirm_close = (
+                    receipts_published
+                    and self._detector_writer_close_confirmed
+                    and self._detector_input_close_confirmed is True
+                )
+            if may_confirm_close:
+                self.close_input(slot=1, confirmed=True)
 
     def write_samples(self, samples: Sequence[float]) -> None:
         """Write before advancing attributable accepted detector-stream frames."""
@@ -2483,6 +2530,8 @@ class AudioCapturePipeline:
                     "cannot start a second reader against the same input."
                 )
             self._reset_run_state_locked()
+            if isinstance(self._recorder, EvidenceRoastRecorder):
+                self._recorder.require_detector_input_close_confirmation()
             self._stop_requested.clear()
             # Two threads (#190): the reader does ONLY stream.read() + enqueue,
             # so PortAudio's ring buffer is drained on a cadence that never
@@ -2819,7 +2868,18 @@ class AudioCapturePipeline:
             # Close the audio input on the same thread that owns its reads —
             # see the docstring above; this is the load-bearing invariant
             # #190 must not disturb.
-            _close_audio_input_if_supported(self._audio_input)
+            input_close_confirmed = False
+            try:
+                _close_audio_input_if_supported(self._audio_input)
+                input_close_confirmed = True
+            except Exception as exc:  # noqa: BLE001 - backend close errors vary.
+                with self._state_lock:
+                    self._latest_error = str(exc)
+                _LOGGER.warning("Audio input close failed: %s", exc)
+            finally:
+                recorder = self._recorder
+                if isinstance(recorder, EvidenceRoastRecorder):
+                    recorder.confirm_detector_input_closed(confirmed=input_close_confirmed)
             # Sentinel: wake a processing thread that is blocked waiting for
             # the next chunk so it notices shutdown promptly even if
             # _stop_requested was set for a reason other than the caller's

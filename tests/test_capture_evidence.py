@@ -2120,3 +2120,281 @@ def test_multi_input_recorder_publishes_actual_aliases_and_boundaries(tmp_path: 
     assert (detector.input_frames, additional.input_frames) == (1_600, 4_000)
     assert (detector.accepted_frames, additional.accepted_frames) == (1_600, 4_000)
     assert (detector.flushed_frames, additional.flushed_frames) == (1_600, 4_000)
+
+
+class _EventGatedInput(AudioInput):
+    """Causal fake input that can block either its first or second read."""
+
+    def __init__(
+        self, *, first_chunk: Sequence[float], blocked_chunk: Sequence[float] = ()
+    ) -> None:
+        self._first_chunk = tuple(first_chunk)
+        self._blocked_chunk = tuple(blocked_chunk)
+        self._release = Event()
+        self.read_started = Event()
+        self.closed = Event()
+        self._read_count = 0
+        self.close_error: Exception | None = None
+
+    def read_samples(self, sample_count: int) -> Sequence[float]:
+        del sample_count
+        self._read_count += 1
+        if self._read_count == 1 and self._first_chunk:
+            return self._first_chunk
+        self.read_started.set()
+        assert self._release.wait(timeout=1.0)
+        return self._blocked_chunk
+
+    def release(self) -> None:
+        """Allow the current blocked reader call to return."""
+        self._release.set()
+
+    def close(self) -> None:
+        """Record the reader-owned close without changing read behaviour."""
+        self.closed.set()
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def _evidence_pipeline(
+    tmp_path: Path, audio_input: AudioInput, *, multi_device: bool = False
+) -> tuple[AudioCapturePipeline, CaptureEvidencePublisher]:
+    """Build one real-WAV detector pipeline with bounded evidence enabled."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    if multi_device:
+        recorder = MultiDeviceRoastRecorder(
+            detector_wav_path=tmp_path / "detector.wav",
+            detector_device_label=None,
+            sidecar_path=tmp_path / "recording.json",
+            sample_rate=16_000,
+            session_id="session",
+        )
+    else:
+        recorder = RoastAudioRecorder(
+            wav_path=tmp_path / "detector.wav",
+            sidecar_path=tmp_path / "recording.json",
+            sample_rate=16_000,
+            session_id="session",
+        )
+    evidence = EvidenceRoastRecorder(
+        recorder=recorder,
+        publisher=publisher,
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    return (
+        AudioCapturePipeline(
+            settings=AudioCaptureSettings(
+                input_device=None,
+                sample_rate=16_000,
+                window_seconds=0.1,
+                idle_sleep_seconds=0.001,
+            ),
+            audio_input=audio_input,
+            recorder=evidence,
+        ),
+        publisher,
+    )
+
+
+def test_writer_finalisation_before_first_reader_observation_fences_late_open(
+    tmp_path: Path,
+) -> None:
+    """A valid empty WAV cannot let a released first read resurrect capture."""
+    audio_input = _EventGatedInput(first_chunk=(), blocked_chunk=(0.25,) * 1_600)
+    pipeline, publisher = _evidence_pipeline(tmp_path, audio_input)
+    pipeline.start()
+    assert audio_input.read_started.wait(timeout=1.0)
+
+    pipeline.stop(timeout_seconds=0.0)
+    with wave.open(str(tmp_path / "detector.wav"), "rb") as wav_file:
+        assert wav_file.getnframes() == 0
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    assert (snapshot.inputs[0].state, snapshot.inputs[0].input_generation) == ("closing", None)
+
+    audio_input.release()
+    assert audio_input.closed.wait(timeout=1.0)
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.state, row.failure, row.input_generation) == ("closed", None, 1)
+
+
+@pytest.mark.parametrize("multi_device", (False, True))
+def test_detector_close_requires_reader_and_writer_confirmation(
+    tmp_path: Path, multi_device: bool
+) -> None:
+    """A finalised nonempty WAV stays closing until its reader closes the input."""
+    audio_input = _EventGatedInput(first_chunk=(0.25,) * 1_600)
+    pipeline, publisher = _evidence_pipeline(tmp_path, audio_input, multi_device=multi_device)
+    pipeline.start()
+    assert audio_input.read_started.wait(timeout=1.0)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        snapshot = publisher.try_snapshot()
+        if (
+            snapshot is not False
+            and snapshot is not None
+            and snapshot.inputs[0].accepted_frames == 1_600
+        ):
+            break
+        time.sleep(0.001)
+    else:
+        pytest.fail("Timed out waiting for the detector writer receipt.")
+
+    pipeline.stop(timeout_seconds=0.0)
+    with wave.open(str(tmp_path / "detector.wav"), "rb") as wav_file:
+        assert wav_file.getnframes() == 1_600
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    assert (snapshot.inputs[0].state, audio_input.closed.is_set()) == ("closing", False)
+
+    audio_input.release()
+    assert audio_input.closed.wait(timeout=1.0)
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    assert (snapshot.inputs[0].state, snapshot.inputs[0].failure) == ("closed", None)
+
+
+def test_detector_close_failure_keeps_finalised_wav_explicitly_unconfirmed(tmp_path: Path) -> None:
+    """A reader-close exception cannot be upgraded by a valid WAV receipt."""
+    audio_input = _EventGatedInput(first_chunk=(0.25,) * 1_600)
+    audio_input.close_error = OSError("synthetic input close failure")
+    pipeline, publisher = _evidence_pipeline(tmp_path, audio_input)
+    pipeline.start()
+    assert audio_input.read_started.wait(timeout=1.0)
+    pipeline.stop(timeout_seconds=0.0)
+
+    audio_input.release()
+    assert audio_input.closed.wait(timeout=1.0)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        snapshot = publisher.try_snapshot()
+        if snapshot is not False and snapshot is not None and snapshot.inputs[0].state == "closing":
+            break
+        time.sleep(0.001)
+    else:
+        pytest.fail("Timed out waiting for the failed reader-close disposition.")
+    assert snapshot.inputs[0].failure == "close_unconfirmed"
+
+
+def test_unconfirmed_writer_close_cannot_be_certified_by_late_reader_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reader close cannot promote a WAV whose writer close was unconfirmed."""
+    audio_input = _EventGatedInput(first_chunk=(0.25,) * 160)
+    pipeline, publisher = _evidence_pipeline(tmp_path, audio_input)
+    pipeline.start()
+    assert audio_input.read_started.wait(timeout=1.0)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        snapshot = publisher.try_snapshot()
+        if (
+            snapshot is not False
+            and snapshot is not None
+            and snapshot.inputs[0].accepted_frames == 160
+        ):
+            break
+        time.sleep(0.001)
+    else:
+        pytest.fail("Timed out waiting for the detector writer receipt.")
+
+    evidence = pipeline._recorder  # pyright: ignore[reportPrivateUsage] - causal owner witness
+    assert isinstance(evidence, EvidenceRoastRecorder)
+    recorder = evidence._recorder  # pyright: ignore[reportPrivateUsage] - real WAV owner witness
+    assert isinstance(recorder, RoastAudioRecorder)
+    wav_file = recorder._writer._wav  # pyright: ignore[reportPrivateUsage] - close boundary witness
+    assert wav_file is not None
+
+    def fail_close() -> None:
+        raise OSError("synthetic WAV close failure after flush")
+
+    monkeypatch.setattr(wav_file, "close", fail_close)
+    pipeline.stop(timeout_seconds=0.0)
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.state, row.failure, row.accepted_frames, row.flushed_frames) == (
+        "closing",
+        "close_unconfirmed",
+        160,
+        160,
+    )
+
+    audio_input.release()
+    assert audio_input.closed.wait(timeout=1.0)
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.state, row.failure, row.accepted_frames, row.flushed_frames) == (
+        "closing",
+        "close_unconfirmed",
+        160,
+        160,
+    )
+
+
+def test_reader_close_waits_for_final_writer_receipt_before_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reader-first close cannot erase a paused real-WAV final receipt."""
+    audio_input = _EventGatedInput(first_chunk=(0.25,) * 160)
+    pipeline, publisher = _evidence_pipeline(tmp_path, audio_input)
+    pipeline.start()
+    assert audio_input.read_started.wait(timeout=1.0)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        snapshot = publisher.try_snapshot()
+        if (
+            snapshot is not False
+            and snapshot is not None
+            and snapshot.inputs[0].accepted_frames == 160
+        ):
+            break
+        time.sleep(0.001)
+    else:
+        pytest.fail("Timed out waiting for the detector writer receipt.")
+
+    final_publication_started = Event()
+    release_final_publication = Event()
+    original_finalize = publisher.finalize_input
+
+    def pause_final_publication(**kwargs: object) -> bool:
+        final_publication_started.set()
+        assert release_final_publication.wait(timeout=1.0)
+        return original_finalize(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(publisher, "finalize_input", pause_final_publication)
+    stop_thread = Thread(target=pipeline.stop, kwargs={"timeout_seconds": 0.0})
+    stop_thread.start()
+    assert final_publication_started.wait(timeout=1.0)
+
+    audio_input.release()
+    assert audio_input.closed.wait(timeout=1.0)
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    assert snapshot.inputs[0].state == "capturing"
+
+    release_final_publication.set()
+    stop_thread.join(timeout=1.0)
+    assert not stop_thread.is_alive()
+    with wave.open(str(tmp_path / "detector.wav"), "rb") as wav_file:
+        assert wav_file.getnframes() == 160
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.state, row.failure, row.accepted_frames, row.flushed_frames) == (
+        "closed",
+        None,
+        160,
+        160,
+    )

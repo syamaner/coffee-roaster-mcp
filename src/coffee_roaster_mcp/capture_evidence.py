@@ -305,6 +305,25 @@ class CaptureEvidencePublisher:
             if input_generation == known_generation:
                 if row.state == "failed":
                     return None
+                if row.state == "closing":
+                    # Writer finalisation can win before the reader's first
+                    # observation. Record the late actual input proof, but do
+                    # not let it reopen a finalised attempt as capturing.
+                    return replace(
+                        row,
+                        input_generation=input_generation,
+                        opened_input_token=candidate_token if valid_id else None,
+                        identity="unresolved" if not valid_id else "resolved",
+                        reported_rate_hz=reported_rate_hz if valid_rate else None,
+                        wav_header_rate_hz=(
+                            wav_header_rate_hz if valid_header else row.wav_header_rate_hz
+                        ),
+                        input_frames=0,
+                        accepted_frames=0,
+                        flushed_frames=0,
+                        backend_input_id=backend_input_id if valid_id else None,
+                        identity_collision=False,
+                    )
                 # A generic processor may have published an unresolved row
                 # before the actual PortAudio owner reports its proved input.
                 # Only that proved identity may refine the same generation.
@@ -407,12 +426,14 @@ class CaptureEvidencePublisher:
         """Publish owner-observed input close, preserving partial finalisation."""
 
         def update(row: CaptureInputEvidence) -> CaptureInputEvidence | None:
-            if row.input_generation != input_generation or row.state != "capturing":
+            if row.state not in {"capturing", "closing"} or (
+                row.input_generation != input_generation
+            ):
                 return None
             return replace(
                 row,
                 state="closed" if confirmed else "closing",
-                failure=None if confirmed else "close_unconfirmed",
+                failure=None if confirmed else row.failure or "close_unconfirmed",
             )
 
         self._update_row(
@@ -439,19 +460,30 @@ class CaptureEvidencePublisher:
         confirmed: bool,
         failure: CaptureFailure | None = None,
         wav_header_rate_hz: float | None = None,
-    ) -> None:
+    ) -> bool:
         """Atomically publish final receipts and one terminal owner disposition."""
         totals = (input_frames, accepted_frames, flushed_frames)
         if any(total is not None and (type(total) is not int or total < 0) for total in totals):
-            return
+            return False
         if (
             accepted_frames is not None
             and flushed_frames is not None
             and flushed_frames > accepted_frames
         ):
-            return
+            return False
 
         def update(row: CaptureInputEvidence) -> CaptureInputEvidence | None:
+            if row.state == "pending":
+                # The writer can complete while the owning reader is still
+                # blocked in its first read. Fence that exact attempt before
+                # it returns: a later reader callback must not resurrect this
+                # finalised recorder as a healthy capturing row.
+                return replace(
+                    row,
+                    attempted_input_generation=input_generation,
+                    state="closing",
+                    failure="close_unconfirmed",
+                )
             if row.input_generation != input_generation or row.state not in {"capturing", "failed"}:
                 return None
             updated_totals = _terminal_totals(row, totals)
@@ -491,7 +523,7 @@ class CaptureEvidencePublisher:
                 failure=terminal_failure,
             )
 
-        self._update_row(
+        return self._update_row(
             session_id,
             ownership_sequence,
             recorder_generation,
