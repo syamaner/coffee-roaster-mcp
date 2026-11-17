@@ -2478,6 +2478,94 @@ def test_terminal_identity_refinement_retains_nonzero_final_receipts() -> None:
     )
 
 
+def test_late_identity_settlement_retains_reconciled_writer_and_source_receipts() -> None:
+    """Wire evidence retains newer source totals through late identity and reader close."""
+    store = RoastSessionStore()
+    session = store.start_session()
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id=session.id,
+        ownership_sequence=session.capture_ownership_sequence,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    assert publisher.open_input(
+        session_id=session.id,
+        ownership_sequence=session.capture_ownership_sequence,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        reported_rate_hz=16_000.0,
+    )
+    assert publisher.publish_progress(
+        session_id=session.id,
+        ownership_sequence=session.capture_ownership_sequence,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=320,
+        accepted_frames=160,
+        flushed_frames=160,
+    )
+    assert publisher.finalize_input(
+        session_id=session.id,
+        ownership_sequence=session.capture_ownership_sequence,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=160,
+        accepted_frames=160,
+        flushed_frames=160,
+        confirmed=True,
+        input_close_required=True,
+        wav_header_rate_hz=16_000.0,
+    )
+    assert publisher.open_input(
+        session_id=session.id,
+        ownership_sequence=session.capture_ownership_sequence,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        backend_input_id=7,
+        reported_rate_hz=16_000.0,
+    )
+
+    closing = _read_capture_evidence(_context(store, publisher), session.id)
+    assert (closing.outcome, closing.inputs[0].identity, closing.inputs[0].state) == (
+        "observed",
+        "resolved",
+        "closing",
+    )
+    assert (
+        closing.inputs[0].input_frames,
+        closing.inputs[0].accepted_frames,
+        closing.inputs[0].flushed_frames,
+    ) == (320, 160, 160)
+    assert closing.inputs[0].wav_header_rate_hz == 16_000.0
+
+    publisher.close_input(
+        session_id=session.id,
+        ownership_sequence=session.capture_ownership_sequence,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        confirmed=True,
+        require_writer_confirmation=True,
+    )
+
+    closed = _read_capture_evidence(_context(store, publisher), session.id)
+    assert (closed.outcome, closed.inputs[0].identity, closed.inputs[0].state) == (
+        "observed",
+        "resolved",
+        "closed",
+    )
+    assert (
+        closed.inputs[0].input_frames,
+        closed.inputs[0].accepted_frames,
+        closed.inputs[0].flushed_frames,
+    ) == (320, 160, 160)
+
+
 def test_identity_refinement_without_rate_preserves_proved_rate() -> None:
     """A late backend identity does not erase a same-generation reported rate."""
     publisher = CaptureEvidencePublisher()

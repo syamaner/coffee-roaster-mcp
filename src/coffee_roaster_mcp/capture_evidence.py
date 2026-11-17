@@ -629,10 +629,21 @@ class CaptureEvidencePublisher:
                 # blocked in its first read. Fence that exact attempt before
                 # it returns, retaining its private receipt so a later exact
                 # input-open proof can expose it without resurrecting capture.
+                updated_totals = (
+                    _terminal_totals(row, totals) if row.input_generation is not None else None
+                )
+                if row.input_generation is not None and updated_totals is None:
+                    # The two-owner join has the same contradictory-receipt
+                    # boundary as the ordinary finalizer.  Preserve the
+                    # already-proved totals, but fence the generation as an
+                    # explicit terminal uncertainty; a later reader close
+                    # must not certify this writer receipt.
+                    return replace(row, state="failed", failure=failure or "unknown")
+                receipt_totals = updated_totals if updated_totals is not None else totals
                 receipt = _PendingFinalReceipt(
-                    input_frames=input_frames,
-                    accepted_frames=accepted_frames,
-                    flushed_frames=flushed_frames,
+                    input_frames=receipt_totals[0],
+                    accepted_frames=receipt_totals[1],
+                    flushed_frames=receipt_totals[2],
                     confirmed=confirmed,
                     failure=failure,
                     wav_header_rate_hz=(
@@ -648,16 +659,6 @@ class CaptureEvidencePublisher:
                 definite_failure = failure is not None and (
                     row.input_generation is not None or failure != "close_unconfirmed"
                 )
-                updated_totals = (
-                    _terminal_totals(row, totals) if row.input_generation is not None else None
-                )
-                if row.input_generation is not None and updated_totals is None:
-                    # The two-owner join has the same contradictory-receipt
-                    # boundary as the ordinary finalizer.  Preserve the
-                    # already-proved totals, but fence the generation as an
-                    # explicit terminal uncertainty; a later reader close
-                    # must not certify this writer receipt.
-                    return replace(row, state="failed", failure=failure or "unknown")
                 settled = (
                     not definite_failure
                     and confirmed
