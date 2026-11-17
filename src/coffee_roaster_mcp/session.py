@@ -249,6 +249,19 @@ class SessionStartReservation:
 
 
 @dataclass(frozen=True)
+class CaptureSubject:
+    """Nonblocking identity sample for a capture-evidence read.
+
+    ``None`` from :meth:`RoastSessionStore.try_get_capture_subject` means the
+    store lock contended. A ``presence`` of ``none`` is an acquired empty sample.
+    """
+
+    presence: SessionPresence
+    session_id: str | None
+    ownership_sequence: int | None
+
+
+@dataclass(frozen=True)
 class DriverCommandReservation:
     """Reservation for one non-emergency driver command.
 
@@ -376,6 +389,7 @@ class RoastSession:
     id: str
     created_at_utc: datetime
     monotonic_start: float
+    capture_ownership_sequence: int = field(default=0, kw_only=True, compare=False, repr=False)
     purpose: SessionPurpose = "roast"
     phase: RoastPhase = "pre_roast"
     beans_added_at_utc: datetime | None = None
@@ -816,6 +830,7 @@ class RoastSessionStore:
         self._default_log_dir = default_log_dir
         self._lock = RLock()
         self._latest_session: RoastSession | None = None
+        self._capture_ownership_sequence = 0
         self._sessions_by_id: dict[str, RoastSession] = {}
         self._session_id_order: deque[str] = deque()
         self._pending_session_start_token: str | None = None
@@ -2393,6 +2408,32 @@ class RoastSessionStore:
                 return "active"
             return "stopped"
 
+    def try_get_capture_subject(self) -> CaptureSubject | None:
+        """Take one nonblocking capture-subject sample without lifecycle effects.
+
+        The returned value deliberately contains no mutable session object. The
+        internal sequence distinguishes replacement sessions even if an injected
+        test identity reuses the same session id.
+        """
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            if (
+                self._pending_session_start_token is not None
+                or self._session_start_in_flight_token is not None
+            ):
+                return CaptureSubject("starting", None, None)
+            session = self._latest_session
+            if session is None:
+                return CaptureSubject("none", None, None)
+            return CaptureSubject(
+                "active" if session.active else "stopped",
+                session.id,
+                session.capture_ownership_sequence,
+            )
+        finally:
+            self._lock.release()
+
     def get_session_snapshot(
         self,
         *,
@@ -2723,10 +2764,12 @@ class RoastSessionStore:
             raise SessionLifecycleError("An active roast session already exists.")
 
         session_id = self._session_id_factory()
+        self._capture_ownership_sequence += 1
         session = RoastSession(
             id=session_id,
             created_at_utc=self._utc_now(),
             monotonic_start=self._monotonic_now(),
+            capture_ownership_sequence=self._capture_ownership_sequence,
             purpose=purpose,
             log_writer=LogWriterReference(
                 session_id=session_id,
@@ -3157,6 +3200,7 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         id=session.id,
         created_at_utc=session.created_at_utc,
         monotonic_start=session.monotonic_start,
+        capture_ownership_sequence=session.capture_ownership_sequence,
         purpose=session.purpose,
         phase=session.phase,
         beans_added_at_utc=session.beans_added_at_utc,

@@ -21,12 +21,14 @@ from coffee_roaster_mcp.audio import (
     AudioCapturePipeline,
     AudioCaptureSnapshot,
     AudioWindow,
+    EvidenceRoastRecorder,
     MultiDeviceRoastRecorder,
     RoastAudioRecorder,
     RoastRecorder,
     audio_capture_settings_from_config,
     build_audio_capture_pipeline,
 )
+from coffee_roaster_mcp.capture_evidence import CaptureEvidencePublisher
 from coffee_roaster_mcp.config import (
     AppConfig,
     AudioConfig,
@@ -186,6 +188,7 @@ class FirstCrackSessionRuntime:
         observation_sink_factory: Callable[[Path], ObservationSink] | None = None,
         observation_model_loader: Callable[[FirstCrackConfig], ObservationModel] | None = None,
         session_is_retained: Callable[[str], bool] | None = None,
+        capture_evidence: CaptureEvidencePublisher | None = None,
     ) -> None:
         """Initialize a session-owned first-crack runtime.
 
@@ -276,6 +279,8 @@ class FirstCrackSessionRuntime:
         self._recovered_first_crack_holder: list[float | None] = []
         self._active_recorder: RoastRecorder | None = None
         self._recording_plan: RecordingArtifactPlan | None = None
+        self._capture_evidence = capture_evidence
+        self._capture_recorder_generation = 0
         if config.first_crack.event_authority == "manual":
             try:
                 validate_first_crack_authority(config)
@@ -331,9 +336,55 @@ class FirstCrackSessionRuntime:
             )
             return self._recording_metadata
 
+    def set_capture_evidence_publisher(self, publisher: CaptureEvidencePublisher) -> None:
+        """Attach the static manual-mock evidence publisher before any session starts."""
+        with self._lock:
+            if self._active_session_id is not None:
+                raise RuntimeError("Capture evidence publisher cannot change during a session.")
+            self._capture_evidence = publisher
+
     def _build_default_audio_pipeline(self, config: AudioConfig) -> AudioCapturePipeline:
         """Build the real capture pipeline, teeing the pending session recorder."""
         return build_audio_capture_pipeline(config, recorder=self._pending_recorder)
+
+    def _wrap_manual_recorder_for_evidence(
+        self, session: RoastSession, recorder: RoastRecorder | None
+    ) -> RoastRecorder | None:
+        """Attach the optional manual-mock publisher without changing capture wiring."""
+        publisher = self._capture_evidence
+        if publisher is None or self._config.first_crack.event_authority != "manual":
+            return recorder
+        devices = self._config.recording.devices or ()
+        slot_count = max(1, len(devices))
+        if slot_count > 8:
+            return recorder
+        additional_rate = self._config.recording.sample_rate or self._config.audio.sample_rate
+        requested_rates = (self._config.audio.sample_rate,) + (additional_rate,) * (slot_count - 1)
+        self._capture_recorder_generation += 1
+        generation = self._capture_recorder_generation
+        published = publisher.publish_setup(
+            session_id=session.id,
+            ownership_sequence=session.capture_ownership_sequence,
+            recorder_generation=generation,
+            requested_rates_hz=requested_rates,
+        )
+        if not published:
+            return recorder
+        if recorder is None:
+            publisher.publish_recorder_unavailable(
+                session_id=session.id,
+                ownership_sequence=session.capture_ownership_sequence,
+                recorder_generation=generation,
+            )
+            return None
+        return EvidenceRoastRecorder(
+            recorder=recorder,
+            publisher=publisher,
+            session_id=session.id,
+            ownership_sequence=session.capture_ownership_sequence,
+            recorder_generation=generation,
+            requested_rates_hz=requested_rates,
+        )
 
     def start_for_session(self, session: RoastSession) -> FirstCrackRuntimeSnapshot:
         """Start or prepare first-crack detection for a roast session."""
@@ -377,6 +428,7 @@ class FirstCrackSessionRuntime:
                 metadata=self._recording_metadata,
                 recovered_first_crack_holder=self._recovered_first_crack_holder,
             )
+            recorder = self._wrap_manual_recorder_for_evidence(session, recorder)
             self._active_recorder = recorder
             self._recording_plan = plan_session_recording_artifacts(
                 self._config, session, self._recording_metadata
@@ -495,6 +547,7 @@ class FirstCrackSessionRuntime:
                     metadata=self._recording_metadata,
                     recovered_first_crack_holder=self._recovered_first_crack_holder,
                 )
+                recorder = self._wrap_manual_recorder_for_evidence(session, recorder)
                 self._active_recorder = recorder
                 self._recording_session_id = session.id
                 self._recording_plan = plan_session_recording_artifacts(
@@ -1350,6 +1403,7 @@ def build_first_crack_session_runtime(
     audio_pipeline_factory: FirstCrackAudioPipelineFactory | None = None,
     detector_adapter_factory: FirstCrackDetectorAdapterFactory | None = None,
     session_is_retained: Callable[[str], bool] | None = None,
+    capture_evidence: CaptureEvidencePublisher | None = None,
 ) -> FirstCrackSessionRuntime:
     """Build the configured session-owned first-crack runtime."""
     return FirstCrackSessionRuntime(
@@ -1357,6 +1411,7 @@ def build_first_crack_session_runtime(
         audio_pipeline_factory=audio_pipeline_factory,
         detector_adapter_factory=detector_adapter_factory,
         session_is_retained=session_is_retained,
+        capture_evidence=capture_evidence,
     )
 
 
