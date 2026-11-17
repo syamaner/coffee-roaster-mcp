@@ -924,6 +924,7 @@ class EvidenceRoastRecorder:
         self._input_generations = tuple(1 for _ in requested_rates_hz)
         self._requested_rates_hz = requested_rates_hz
         self._detector_input_opened = False
+        self._detector_identity_proved = False
         self._detector_input_frames = 0
         if isinstance(recorder, (RoastAudioRecorder, MultiDeviceRoastRecorder)):
             self._delegate_reports_boundaries = True
@@ -940,6 +941,11 @@ class EvidenceRoastRecorder:
     def shutdown_confirmed(self) -> bool:
         """Return the delegate recorder's shutdown observation."""
         return self._recorder.shutdown_confirmed
+
+    @property
+    def overflow_snapshot(self) -> OverflowSnapshot | None:
+        """Preserve optional recorder overflow diagnostics through this wrapper."""
+        return cast("OverflowSnapshot | None", getattr(self._recorder, "overflow_snapshot", None))
 
     def begin(self) -> None:
         """Begin the delegate then publish attributable opened input rows."""
@@ -961,9 +967,14 @@ class EvidenceRoastRecorder:
         self, *, backend_input_id: int | None, reported_rate_hz: float | None
     ) -> None:
         """Publish the actual current mono input after its first successful read."""
-        if self._detector_input_opened:
+        has_proved_identity = type(backend_input_id) is int and backend_input_id >= 0
+        if self._detector_input_opened and (
+            not has_proved_identity or self._detector_identity_proved
+        ):
             return
-        self._detector_input_opened = self._publisher.open_input(
+        # This method is called by the PortAudio reader. It must not inspect a
+        # writer or acquire its lock: header proof belongs to the writer owner.
+        published = self._publisher.open_input(
             session_id=self._session_id,
             ownership_sequence=self._ownership_sequence,
             recorder_generation=self._recorder_generation,
@@ -971,13 +982,26 @@ class EvidenceRoastRecorder:
             input_generation=self._input_generations[0],
             backend_input_id=backend_input_id,
             reported_rate_hz=reported_rate_hz,
-            wav_header_rate_hz=float(self._requested_rates_hz[0]),
+            wav_header_rate_hz=None,
         )
+        self._detector_input_opened = self._detector_input_opened or published
+        self._detector_identity_proved = self._detector_identity_proved or (
+            published and has_proved_identity
+        )
+
+    @property
+    def detector_input_observed(self) -> bool:
+        """Return whether this generation published a detector-open observation."""
+        return self._detector_input_opened
 
     def observe_independent_input(
         self, *, slot: int, backend_input_id: int | None, reported_rate_hz: float | None
     ) -> bool:
-        """Publish an independently opened input from its owning capture thread."""
+        """Publish an independently opened input from its owning capture thread.
+
+        Header proof is deliberately published with the subsequent writer
+        receipt, rather than by reading the writer from this input owner.
+        """
         return self._publisher.open_input(
             session_id=self._session_id,
             ownership_sequence=self._ownership_sequence,
@@ -986,7 +1010,7 @@ class EvidenceRoastRecorder:
             input_generation=self._input_generations[slot - 1],
             backend_input_id=backend_input_id,
             reported_rate_hz=reported_rate_hz,
-            wav_header_rate_hz=float(self._requested_rates_hz[slot - 1]),
+            wav_header_rate_hz=None,
         )
 
     def observe_progress(
@@ -996,6 +1020,7 @@ class EvidenceRoastRecorder:
         input_frames: int | None,
         accepted_frames: int | None,
         flushed_frames: int | None,
+        wav_header_rate_hz: float | None = None,
     ) -> None:
         """Publish one source-owned absolute progress observation."""
         # The detector input is sourced by the pipeline before the writer
@@ -1012,6 +1037,7 @@ class EvidenceRoastRecorder:
             input_frames=input_frames,
             accepted_frames=accepted_frames,
             flushed_frames=flushed_frames,
+            wav_header_rate_hz=wav_header_rate_hz,
         )
 
     def fail_input(
@@ -1032,6 +1058,14 @@ class EvidenceRoastRecorder:
             failure=failure,
         )
 
+    def publish_setup_failure(self) -> None:
+        """Publish this exact wrapper generation's setup failure disposition."""
+        self._publisher.publish_setup_failure(
+            session_id=self._session_id,
+            ownership_sequence=self._ownership_sequence,
+            recorder_generation=self._recorder_generation,
+        )
+
     def close_input(self, *, slot: int, confirmed: bool) -> None:
         """Publish an owner-observed terminal input disposition."""
         self._publisher.close_input(
@@ -1041,6 +1075,40 @@ class EvidenceRoastRecorder:
             slot=slot,
             input_generation=self._input_generations[slot - 1],
             confirmed=confirmed,
+        )
+
+    def finalize_input(
+        self,
+        *,
+        slot: int,
+        input_frames: int | None,
+        accepted_frames: int | None,
+        flushed_frames: int | None,
+        confirmed: bool,
+        failure: Literal[
+            "open_failed", "read_failed", "write_failed", "close_unconfirmed", "unknown"
+        ]
+        | None = None,
+        wav_header_rate_hz: float | None = None,
+    ) -> None:
+        """Publish one terminal disposition with its final writer receipts."""
+        if slot == 1:
+            # The tee receives source frames before a writer may reject them.
+            # Never replace that source receipt with accepted writer frames at
+            # terminal finalisation.
+            input_frames = self._detector_input_frames
+        self._publisher.finalize_input(
+            session_id=self._session_id,
+            ownership_sequence=self._ownership_sequence,
+            recorder_generation=self._recorder_generation,
+            slot=slot,
+            input_generation=self._input_generations[slot - 1],
+            input_frames=input_frames,
+            accepted_frames=accepted_frames,
+            flushed_frames=flushed_frames,
+            confirmed=confirmed,
+            failure=failure,
+            wav_header_rate_hz=wav_header_rate_hz,
         )
 
     def write_samples(self, samples: Sequence[float]) -> None:
@@ -1137,6 +1205,10 @@ class _WavStreamWriter:
         self._pending: list[float] = []
         self._frames_written = 0
         self._accepted_frames = 0
+        # Opening/configuring ``wave.Wave_write`` does not emit a WAV header.
+        # This becomes true only at a successful write boundary or a fully
+        # successful finalization (including an attributable empty WAV).
+        self._header_rate_proved = False
         self._closed = False
         self._close_confirmed = False
         # Serialises write_samples / close so the capture worker and a stop-caller
@@ -1169,10 +1241,14 @@ class _WavStreamWriter:
         """Return frames accepted into this writer's buffer or WAV boundary."""
         return self._accepted_frames
 
-    def evidence_frame_totals(self) -> tuple[int, int]:
-        """Return accepted and flushed totals under the writer ownership lock."""
+    def evidence_receipt(self) -> tuple[int, int, float | None]:
+        """Return writer-owned progress and causally proved header evidence."""
         with self._lock:
-            return self._accepted_frames, self._frames_written
+            return (
+                self._accepted_frames,
+                self._frames_written,
+                float(self._sample_rate) if self._header_rate_proved else None,
+            )
 
     @property
     def close_confirmed(self) -> bool:
@@ -1243,6 +1319,11 @@ class _WavStreamWriter:
                     pass
                 else:
                     self._close_confirmed = flush_confirmed
+                    if flush_confirmed:
+                        # ``wave`` writes the header when an empty writer is
+                        # closed. A non-raising close is therefore the only
+                        # writer boundary that can prove a zero-frame header.
+                        self._header_rate_proved = True
                 self._wav = None
 
     def sidecar_entry(self) -> dict[str, object]:
@@ -1272,6 +1353,9 @@ class _WavStreamWriter:
         pcm16 = np.rint(samples * _RECORDER_PCM16_MAX).astype("<i2")
         self._wav.writeframes(pcm16.tobytes())
         self._frames_written += len(self._pending)
+        # A successful writeframes call commits enough WAV structure to prove
+        # the configured header rate without rereading the file.
+        self._header_rate_proved = True
         self._pending.clear()
 
 
@@ -1498,19 +1582,26 @@ class _IndependentCaptureStream:
                     )
                     return
                 if observer is not None:
-                    accepted_frames, flushed_frames = self._writer.evidence_frame_totals()
+                    accepted_frames, flushed_frames, header_rate_hz = (
+                        self._writer.evidence_receipt()
+                    )
                     observer.observe_progress(
                         slot=self.slot,
                         input_frames=self._input_frame_total,
                         accepted_frames=accepted_frames,
                         flushed_frames=flushed_frames,
+                        wav_header_rate_hz=header_rate_hz,
                     )
         except Exception as exc:  # noqa: BLE001 - one stream failing must not kill others.
             observer = self._capture_evidence_observer
             if observer is not None:
                 observer.fail_input(
                     slot=self.slot,
-                    failure="read_failed" if self._input_observed else "open_failed",
+                    # A first failed read does not prove whether a synthetic
+                    # or backend input ever opened.  Do not manufacture an
+                    # open failure; a prior successful evidence observation
+                    # is the only local proof for read_failed.
+                    failure="read_failed" if self._input_observed else "unknown",
                 )
             _LOGGER.warning(
                 "Independent recording stream %s failed; dropping it: %s",
@@ -1646,12 +1737,13 @@ class RoastAudioRecorder:
         self._writer.write_samples(samples)
         observer = self._capture_evidence_observer
         if observer is not None:
-            accepted_frames, flushed_frames = self._writer.evidence_frame_totals()
+            accepted_frames, flushed_frames, header_rate_hz = self._writer.evidence_receipt()
             observer.observe_progress(
                 slot=1,
                 input_frames=accepted_frames,
                 accepted_frames=accepted_frames,
                 flushed_frames=flushed_frames,
+                wav_header_rate_hz=header_rate_hz,
             )
 
     def close(self) -> None:
@@ -1673,25 +1765,30 @@ class RoastAudioRecorder:
             except Exception:
                 observer = self._capture_evidence_observer
                 if observer is not None:
-                    accepted_frames, flushed_frames = self._writer.evidence_frame_totals()
-                    observer.observe_progress(
+                    accepted_frames, flushed_frames, header_rate_hz = (
+                        self._writer.evidence_receipt()
+                    )
+                    observer.finalize_input(
                         slot=1,
                         input_frames=accepted_frames,
                         accepted_frames=accepted_frames,
                         flushed_frames=flushed_frames,
+                        confirmed=False,
+                        failure="close_unconfirmed",
+                        wav_header_rate_hz=header_rate_hz,
                     )
-                    observer.fail_input(slot=1, failure="close_unconfirmed")
                 raise
             observer = self._capture_evidence_observer
             if observer is not None:
-                accepted_frames, flushed_frames = self._writer.evidence_frame_totals()
-                observer.observe_progress(
+                accepted_frames, flushed_frames, header_rate_hz = self._writer.evidence_receipt()
+                observer.finalize_input(
                     slot=1,
                     input_frames=accepted_frames,
                     accepted_frames=accepted_frames,
                     flushed_frames=flushed_frames,
+                    confirmed=self._writer.close_confirmed,
+                    wav_header_rate_hz=header_rate_hz,
                 )
-                observer.close_input(slot=1, confirmed=self._writer.close_confirmed)
             _write_recording_sidecar(
                 sidecar_path=self._sidecar_path,
                 session_id=self._session_id,
@@ -1926,6 +2023,9 @@ class MultiDeviceRoastRecorder:
             try:
                 stream.start()
             except Exception as exc:  # noqa: BLE001 - one stream must not block the others.
+                observer = self._capture_evidence_observer
+                if observer is not None:
+                    observer.fail_input(slot=stream.slot, failure="open_failed")
                 _LOGGER.warning(
                     "Could not start independent recording stream %s; dropping it: %s",
                     stream.writer.wav_path.name,
@@ -1938,12 +2038,15 @@ class MultiDeviceRoastRecorder:
         self._detector_writer.write_samples(samples)
         observer = self._capture_evidence_observer
         if observer is not None:
-            accepted_frames, flushed_frames = self._detector_writer.evidence_frame_totals()
+            accepted_frames, flushed_frames, header_rate_hz = (
+                self._detector_writer.evidence_receipt()
+            )
             observer.observe_progress(
                 slot=1,
                 input_frames=self._detector_input_frame_total,
                 accepted_frames=accepted_frames,
                 flushed_frames=flushed_frames,
+                wav_header_rate_hz=header_rate_hz,
             )
 
     def close(self) -> None:
@@ -1969,49 +2072,63 @@ class MultiDeviceRoastRecorder:
                 self._detector_writer.close()
             except Exception:
                 if observer is not None:
-                    accepted_frames, flushed_frames = self._detector_writer.evidence_frame_totals()
-                    observer.observe_progress(
+                    accepted_frames, flushed_frames, header_rate_hz = (
+                        self._detector_writer.evidence_receipt()
+                    )
+                    observer.finalize_input(
                         slot=1,
                         input_frames=self._detector_input_frame_total,
                         accepted_frames=accepted_frames,
                         flushed_frames=flushed_frames,
+                        confirmed=False,
+                        failure="close_unconfirmed",
+                        wav_header_rate_hz=header_rate_hz,
                     )
-                    observer.fail_input(slot=1, failure="close_unconfirmed")
+                    for stream in self._additional_streams:
+                        observer.close_input(slot=stream.slot, confirmed=False)
                 raise
             if observer is not None:
-                accepted_frames, flushed_frames = self._detector_writer.evidence_frame_totals()
-                observer.observe_progress(
+                accepted_frames, flushed_frames, header_rate_hz = (
+                    self._detector_writer.evidence_receipt()
+                )
+                observer.finalize_input(
                     slot=1,
                     input_frames=self._detector_input_frame_total,
                     accepted_frames=accepted_frames,
                     flushed_frames=flushed_frames,
+                    confirmed=self._detector_writer.close_confirmed,
+                    wav_header_rate_hz=header_rate_hz,
                 )
-                observer.close_input(slot=1, confirmed=self._detector_writer.close_confirmed)
             for stream in self._additional_streams:
                 try:
                     stream.writer.close()
                 except Exception:
                     if observer is not None:
-                        accepted_frames, flushed_frames = stream.writer.evidence_frame_totals()
-                        observer.observe_progress(
+                        accepted_frames, flushed_frames, header_rate_hz = (
+                            stream.writer.evidence_receipt()
+                        )
+                        observer.finalize_input(
                             slot=stream.slot,
                             input_frames=stream.input_frame_total,
                             accepted_frames=accepted_frames,
                             flushed_frames=flushed_frames,
+                            confirmed=False,
+                            failure="close_unconfirmed",
+                            wav_header_rate_hz=header_rate_hz,
                         )
-                        observer.fail_input(slot=stream.slot, failure="close_unconfirmed")
-                if observer is not None:
-                    accepted_frames, flushed_frames = stream.writer.evidence_frame_totals()
-                    observer.observe_progress(
-                        slot=stream.slot,
-                        input_frames=stream.input_frame_total,
-                        accepted_frames=accepted_frames,
-                        flushed_frames=flushed_frames,
-                    )
-                    observer.close_input(
-                        slot=stream.slot,
-                        confirmed=stream.shutdown_confirmed and stream.writer.close_confirmed,
-                    )
+                else:
+                    if observer is not None:
+                        accepted_frames, flushed_frames, header_rate_hz = (
+                            stream.writer.evidence_receipt()
+                        )
+                        observer.finalize_input(
+                            slot=stream.slot,
+                            input_frames=stream.input_frame_total,
+                            accepted_frames=accepted_frames,
+                            flushed_frames=flushed_frames,
+                            confirmed=stream.shutdown_confirmed and stream.writer.close_confirmed,
+                            wav_header_rate_hz=header_rate_hz,
+                        )
             streams = [self._detector_writer, *(s.writer for s in self._additional_streams)]
             _write_recording_sidecar(
                 sidecar_path=self._sidecar_path,
@@ -2689,7 +2806,14 @@ class AudioCapturePipeline:
                 self._latest_error = str(exc)
             recorder = self._recorder
             if isinstance(recorder, EvidenceRoastRecorder):
-                recorder.fail_input(slot=1, failure="read_failed")
+                # A failed first read (including a normalisation error after
+                # no accepted open publication) does not establish that this
+                # generation's input was ever opened.  Only an earlier
+                # evidence observation supports the stronger read diagnosis.
+                recorder.fail_input(
+                    slot=1,
+                    failure="read_failed" if recorder.detector_input_observed else "unknown",
+                )
             self._stop_requested.set()
         finally:
             # Close the audio input on the same thread that owns its reads —

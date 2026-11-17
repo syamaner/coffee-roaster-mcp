@@ -2458,7 +2458,9 @@ def test_wav_writer_zero_frames_finalises_valid_header(tmp_path: Path) -> None:
         flush_sample_threshold=1,
     )
     writer.begin()
+    assert writer.evidence_receipt() == (0, 0, None)
     writer.close()
+    assert writer.evidence_receipt() == (0, 0, 16_000.0)
 
     # After close the WAV is a valid, finalised file (>=44-byte header, 0 frames),
     # not a 0-byte file — even though no samples were ever written.

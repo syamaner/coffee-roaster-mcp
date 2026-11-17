@@ -377,14 +377,52 @@ class FirstCrackSessionRuntime:
                 recorder_generation=generation,
             )
             return None
-        return EvidenceRoastRecorder(
-            recorder=recorder,
-            publisher=publisher,
+        try:
+            return EvidenceRoastRecorder(
+                recorder=recorder,
+                publisher=publisher,
+                session_id=session.id,
+                ownership_sequence=session.capture_ownership_sequence,
+                recorder_generation=generation,
+                requested_rates_hz=requested_rates,
+            )
+        except Exception:
+            publisher.publish_setup_failure(
+                session_id=session.id,
+                ownership_sequence=session.capture_ownership_sequence,
+                recorder_generation=generation,
+            )
+            raise
+
+    def _publish_manual_setup_failure(self, session: RoastSession) -> None:
+        """Publish an admitted manual-mock setup refusal when no wrapper exists.
+
+        Recorder construction can fail before a recorder object exists.  The
+        current owner still needs its exact generation's typed disposition;
+        this helper creates no recorder, reservation, or retry path.
+        """
+        publisher = self._capture_evidence
+        if publisher is None or self._config.first_crack.event_authority != "manual":
+            return
+        devices = self._config.recording.devices or ()
+        slot_count = max(1, len(devices))
+        if slot_count > 8:
+            return
+        additional_rate = self._config.recording.sample_rate or self._config.audio.sample_rate
+        requested_rates = (self._config.audio.sample_rate,) + (additional_rate,) * (slot_count - 1)
+        self._capture_recorder_generation += 1
+        generation = self._capture_recorder_generation
+        if publisher.publish_setup(
             session_id=session.id,
             ownership_sequence=session.capture_ownership_sequence,
             recorder_generation=generation,
             requested_rates_hz=requested_rates,
-        )
+        ):
+            publisher.publish_setup_failure(
+                session_id=session.id,
+                ownership_sequence=session.capture_ownership_sequence,
+                recorder_generation=generation,
+            )
 
     def start_for_session(self, session: RoastSession) -> FirstCrackRuntimeSnapshot:
         """Start or prepare first-crack detection for a roast session."""
@@ -592,6 +630,10 @@ class FirstCrackSessionRuntime:
                 if not observer.start(token):
                     raise RuntimeError("Observation worker could not acquire its reservation.")
             except Exception:  # noqa: BLE001 - no fall back to automatic authority.
+                if isinstance(recorder, EvidenceRoastRecorder):
+                    recorder.publish_setup_failure()
+                else:
+                    self._publish_manual_setup_failure(session)
                 self._status = "unavailable"
                 self._reason = "manual_observation_capture_unavailable"
                 self._capture_start_failed_for_session = True

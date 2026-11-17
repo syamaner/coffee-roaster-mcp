@@ -169,7 +169,9 @@ class CaptureEvidenceInputResult(BaseModel):
     slot: Annotated[int, Strict(), Field(ge=1, le=8)]
     role: Literal["detector_teed", "additional_independent"]
     input_generation: Annotated[int, Strict(), Field(ge=1, le=2**63 - 1)] | None
-    opened_input_token: Annotated[str, Strict(), StringConstraints(pattern=r"[0-9a-f]{32}")] | None
+    opened_input_token: (
+        Annotated[str, Strict(), StringConstraints(pattern=r"^[0-9a-f]{32}$")] | None
+    )
     identity: Literal["unopened", "unresolved", "resolved", "aliased"]
     requested_rate_hz: Annotated[int, Strict(), Field(gt=0, le=2**63 - 1)]
     reported_rate_hz: Annotated[float, Strict(), Field(gt=0, allow_inf_nan=False)] | None
@@ -514,6 +516,12 @@ def _install_capture_evidence_argument_adapter(mcp: FastMCP) -> None:
     if tool is None:
         raise RuntimeError("Capture evidence tool was not registered.")
     metadata = tool.fn_metadata
+    declared_metadata_fields = getattr(type(metadata), "model_fields", None)
+    if (
+        not isinstance(declared_metadata_fields, Mapping)
+        or "arg_model" not in declared_metadata_fields
+    ):
+        raise RuntimeError("Capture evidence argument adapter is unsupported.")
     try:
         adapted = metadata.model_copy(update={"arg_model": _CaptureEvidenceArguments})
     except Exception as exc:
@@ -522,6 +530,7 @@ def _install_capture_evidence_argument_adapter(mcp: FastMCP) -> None:
         raise RuntimeError("Capture evidence argument adapter is unsupported.")
     tool.fn_metadata = adapted
     tool.parameters = {
+        "type": "object",
         "oneOf": [
             {
                 "type": "object",
@@ -542,7 +551,7 @@ def _install_capture_evidence_argument_adapter(mcp: FastMCP) -> None:
                     "expected_session_id": {"type": "string", "minLength": 1, "maxLength": 128},
                 },
             },
-        ]
+        ],
     }
 
 
@@ -2170,6 +2179,8 @@ def _read_capture_evidence(
         return empty("refused", "no_session")
     if first.session_id != expected_session_id:
         return empty("refused", "wrong_session")
+    if first.session_id is None or first.ownership_sequence is None:
+        return empty("unavailable", "subject_changed")
     snapshot = server_context.capture_evidence_publisher.try_snapshot()
     if snapshot is False:
         return empty("unavailable", "publication_contended")

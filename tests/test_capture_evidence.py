@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import time
+import wave
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -12,8 +15,11 @@ import pytest
 from pydantic import ValidationError
 
 import coffee_roaster_mcp.capture_evidence as capture_evidence
+import coffee_roaster_mcp.mcp_server as mcp_server
 from coffee_roaster_mcp.audio import (
     AdditionalRecordingDevice,
+    AudioCapturePipeline,
+    AudioCaptureSettings,
     AudioInput,
     EvidenceRoastRecorder,
     MultiDeviceRoastRecorder,
@@ -40,6 +46,73 @@ def _context(store: RoastSessionStore, publisher: CaptureEvidencePublisher) -> S
             capture_evidence_publisher=publisher,
         ),
     )
+
+
+def _current_progress_lock(publisher: CaptureEvidencePublisher) -> object:
+    """Expose the actual current-generation lock for contention witnesses."""
+    authority = publisher._authority  # pyright: ignore[reportPrivateUsage]
+    assert authority is not None
+    return authority._lock  # pyright: ignore[reportPrivateUsage]
+
+
+def _two_open_inputs() -> CaptureEvidencePublisher:
+    """Return a current generation with two independently opened inputs."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000, 16_000),
+    )
+    for slot in (1, 2):
+        assert publisher.open_input(
+            session_id="session",
+            ownership_sequence=1,
+            recorder_generation=1,
+            slot=slot,
+            input_generation=1,
+            backend_input_id=slot,
+            reported_rate_hz=16_000.0,
+        )
+    return publisher
+
+
+def _publish_winner_after_loser_starts(
+    publisher: CaptureEvidencePublisher,
+    winner: Callable[[], None],
+    loser: Callable[[], None],
+) -> None:
+    """Make a losing nonblocking update observe a winner's immutable result."""
+    authority = publisher._authority  # pyright: ignore[reportPrivateUsage]
+    assert authority is not None
+    original_lock = authority._lock  # pyright: ignore[reportPrivateUsage]
+    assert original_lock.acquire(blocking=False)
+
+    class PublishThenRefuseLock:
+        """Release the held lock for one linked winner before refusing its loser."""
+
+        def __init__(self) -> None:
+            self._published = False
+
+        def acquire(self, blocking: bool = True) -> bool:
+            if original_lock.acquire(blocking=blocking):
+                return True
+            if not self._published:
+                self._published = True
+                original_lock.release()
+                winner()
+            return False
+
+        def release(self) -> None:
+            original_lock.release()
+
+    object.__setattr__(authority, "_lock", PublishThenRefuseLock())
+    try:
+        # The loser starts while the original lock is held. The proxy publishes
+        # the winner before returning the loser's failed lock attempt.
+        loser()
+    finally:
+        object.__setattr__(authority, "_lock", original_lock)
 
 
 def test_subject_sequence_advances_and_copy_retains_it() -> None:
@@ -114,6 +187,132 @@ def test_reader_returns_observed_only_for_exact_current_subject() -> None:
     assert wrong.inputs == ()
 
 
+def test_store_reservation_maps_to_start_in_flight_without_a_publication_read() -> None:
+    """An actual store reservation supplies no capture subject or evidence."""
+    store = RoastSessionStore()
+    publisher = CaptureEvidencePublisher()
+    reservation = store.reserve_session_start()
+    try:
+        result = _read_capture_evidence(_context(store, publisher), "expected")
+    finally:
+        store.clear_session_start_reservation(reservation)
+
+    assert (result.outcome, result.reason, result.session_id, result.inputs) == (
+        "unavailable",
+        "start_in_flight",
+        None,
+        (),
+    )
+
+
+def test_active_subject_before_its_runtime_setup_is_capture_pending() -> None:
+    """A new active store owner never receives an older recorder projection."""
+    store = RoastSessionStore()
+    session = store.start_session()
+
+    result = _read_capture_evidence(_context(store, CaptureEvidencePublisher()), session.id)
+
+    assert (result.outcome, result.reason, result.session_id, result.session_state) == (
+        "unavailable",
+        "capture_pending",
+        session.id,
+        "active",
+    )
+
+
+def test_stopped_subject_remains_explicit_without_proving_active_capture() -> None:
+    """A stopped matching subject retains its own projection and state only."""
+    store = RoastSessionStore()
+    session = store.start_session()
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id=session.id,
+        ownership_sequence=session.capture_ownership_sequence,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    store.stop_session()
+
+    result = _read_capture_evidence(_context(store, publisher), session.id)
+
+    assert (result.outcome, result.session_id, result.session_state) == (
+        "observed",
+        session.id,
+        "stopped",
+    )
+
+
+@pytest.mark.parametrize("now", [-1.0, float("inf"), float("nan")])
+def test_unreliable_clock_never_clamps_capture_evidence_age(
+    monkeypatch: pytest.MonkeyPatch, now: float
+) -> None:
+    """Finite-negative and nonfinite reader clocks are unavailable, not fresh."""
+    store = RoastSessionStore()
+    session = store.start_session()
+    publisher = CaptureEvidencePublisher(monotonic_now=lambda: 1.0)
+    assert publisher.publish_setup(
+        session_id=session.id,
+        ownership_sequence=session.capture_ownership_sequence,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    monkeypatch.setattr(mcp_server.time, "monotonic", lambda: now)
+
+    result = _read_capture_evidence(_context(store, publisher), session.id)
+
+    assert (result.outcome, result.reason, result.age_seconds) == (
+        "unavailable",
+        "clock_unreliable",
+        None,
+    )
+
+
+def test_inventory_larger_than_eight_refuses_without_snapshot_truncation() -> None:
+    """The reader rejects an oversized configured inventory before sampling evidence."""
+    store = RoastSessionStore()
+    context = _context(store, CaptureEvidencePublisher())
+    object.__setattr__(
+        context,
+        "config",
+        SimpleNamespace(recording=SimpleNamespace(devices=tuple(range(9)))),
+    )
+
+    result = _read_capture_evidence(context, "expected")
+
+    assert (result.outcome, result.reason, result.inputs) == (
+        "refused",
+        "inventory_too_large",
+        (),
+    )
+
+
+def test_missing_recorder_after_setup_maps_to_recorder_unavailable() -> None:
+    """A matched setup disposition exposes no partial input projection."""
+    store = RoastSessionStore()
+    session = store.start_session()
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id=session.id,
+        ownership_sequence=session.capture_ownership_sequence,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    publisher.publish_recorder_unavailable(
+        session_id=session.id,
+        ownership_sequence=session.capture_ownership_sequence,
+        recorder_generation=1,
+    )
+
+    result = _read_capture_evidence(_context(store, publisher), session.id)
+
+    assert (result.outcome, result.reason, result.session_id, result.inputs) == (
+        "unavailable",
+        "recorder_unavailable",
+        session.id,
+        (),
+    )
+
+
 def test_stale_owner_updates_cannot_replace_successor_projection() -> None:
     """Old recorder progress and close cannot alter a newer store owner."""
     publisher = CaptureEvidencePublisher()
@@ -147,6 +346,78 @@ def test_stale_owner_updates_cannot_replace_successor_projection() -> None:
     assert snapshot.inputs[0].identity == "unopened"
 
 
+def test_paused_old_authority_cannot_mutate_immediately_readable_same_id_successor() -> None:
+    """A newer exact owner replaces an old paused publication, even with the same id."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="same", ownership_sequence=1, recorder_generation=1, requested_rates_hz=(16_000,)
+    )
+    old_authority = publisher._authority  # pyright: ignore[reportPrivateUsage]
+    assert old_authority is not None
+    entered = Event()
+    release = Event()
+
+    def pause_old_update() -> None:
+        def update(
+            snapshot: capture_evidence.CaptureEvidenceSnapshot,
+        ) -> capture_evidence.CaptureEvidenceSnapshot:
+            entered.set()
+            assert release.wait(timeout=1)
+            return replace(snapshot, publication_sequence=snapshot.publication_sequence + 1)
+
+        assert old_authority.try_replace(update)
+
+    worker = Thread(target=pause_old_update)
+    worker.start()
+    assert entered.wait(timeout=1)
+    assert publisher.publish_setup(
+        session_id="same", ownership_sequence=2, recorder_generation=1, requested_rates_hz=(16_000,)
+    )
+    successor = publisher.try_snapshot()
+    assert successor is not False and successor is not None
+    assert (successor.ownership_sequence, successor.publication_sequence) == (2, 2)
+    release.set()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    current = publisher.try_snapshot()
+    assert current is not False and current is not None
+    assert (current.ownership_sequence, current.publication_sequence) == (2, 2)
+
+
+def test_same_id_replacement_between_store_samples_is_subject_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement after the snapshot cannot reuse same-id evidence as current."""
+    store = RoastSessionStore(session_id_factory=lambda: "same")
+    first = store.start_session()
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id=first.id,
+        ownership_sequence=first.capture_ownership_sequence,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    original_snapshot = publisher.try_snapshot
+
+    def replace_after_snapshot() -> capture_evidence.CaptureEvidenceSnapshot | None | bool:
+        snapshot = original_snapshot()
+        store.stop_session()
+        successor = store.start_session_snapshot()
+        assert successor.id == first.id
+        assert successor.capture_ownership_sequence != first.capture_ownership_sequence
+        return snapshot
+
+    monkeypatch.setattr(publisher, "try_snapshot", replace_after_snapshot)
+    result = _read_capture_evidence(_context(store, publisher), first.id)
+
+    assert (result.outcome, result.reason, result.session_id, result.inputs) == (
+        "unavailable",
+        "subject_changed",
+        None,
+        (),
+    )
+
+
 def test_setup_failure_is_attributable_to_its_exact_current_owner() -> None:
     """Setup failure changes no ownership coordinate or prior successor state."""
     publisher = CaptureEvidencePublisher()
@@ -177,7 +448,8 @@ def test_lost_setup_failure_is_publicly_unavailable_for_its_current_owner() -> N
         recorder_generation=1,
         requested_rates_hz=(16_000,),
     )
-    assert publisher._lock.acquire(blocking=False)  # pyright: ignore[reportPrivateUsage]
+    progress_lock = _current_progress_lock(publisher)
+    assert progress_lock.acquire(blocking=False)  # type: ignore[attr-defined]
     try:
         publisher.publish_setup_failure(
             session_id=session.id,
@@ -185,12 +457,43 @@ def test_lost_setup_failure_is_publicly_unavailable_for_its_current_owner() -> N
             recorder_generation=1,
         )
     finally:
-        publisher._lock.release()  # pyright: ignore[reportPrivateUsage]
+        progress_lock.release()  # type: ignore[attr-defined]
 
     result = _read_capture_evidence(_context(store, publisher), session.id)
 
     assert result.outcome == "unavailable"
     assert result.reason == "publication_contended"
+
+
+def test_setup_installs_while_old_generation_reader_is_contended() -> None:
+    """A successor setup does not contend with an old generation's reader lock."""
+    store = RoastSessionStore(session_id_factory=lambda: "same")
+    session = store.start_session()
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id=session.id,
+        ownership_sequence=session.capture_ownership_sequence,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    progress_lock = _current_progress_lock(publisher)
+    assert progress_lock.acquire(blocking=False)  # type: ignore[attr-defined]
+    try:
+        store.stop_session()
+        successor = store.start_session_snapshot()
+        assert publisher.publish_setup(
+            session_id=successor.id,
+            ownership_sequence=successor.capture_ownership_sequence,
+            recorder_generation=2,
+            requested_rates_hz=(16_000,),
+        )
+        result = _read_capture_evidence(_context(store, publisher), successor.id)
+    finally:
+        progress_lock.release()  # type: ignore[attr-defined]
+
+    assert successor.id == session.id
+    assert successor.capture_ownership_sequence != session.capture_ownership_sequence
+    assert (result.outcome, result.reason) == ("observed", None)
 
 
 def test_absolute_progress_restores_lost_counts_before_flush() -> None:
@@ -209,7 +512,8 @@ def test_absolute_progress_restores_lost_counts_before_flush() -> None:
         slot=1,
         input_generation=1,
     )
-    assert publisher._lock.acquire(blocking=False)  # pyright: ignore[reportPrivateUsage]
+    progress_lock = _current_progress_lock(publisher)
+    assert progress_lock.acquire(blocking=False)  # type: ignore[attr-defined]
     try:
         assert not publisher.publish_progress(
             session_id="session",
@@ -222,7 +526,7 @@ def test_absolute_progress_restores_lost_counts_before_flush() -> None:
             flushed_frames=0,
         )
     finally:
-        publisher._lock.release()  # pyright: ignore[reportPrivateUsage]
+        progress_lock.release()  # type: ignore[attr-defined]
     assert publisher.publish_progress(
         session_id="session",
         ownership_sequence=1,
@@ -255,7 +559,8 @@ def test_absolute_progress_restores_a_lost_input_read() -> None:
         slot=1,
         input_generation=1,
     )
-    assert publisher._lock.acquire(blocking=False)  # pyright: ignore[reportPrivateUsage]
+    progress_lock = _current_progress_lock(publisher)
+    assert progress_lock.acquire(blocking=False)  # type: ignore[attr-defined]
     try:
         assert not publisher.publish_progress(
             session_id="session",
@@ -268,7 +573,7 @@ def test_absolute_progress_restores_a_lost_input_read() -> None:
             flushed_frames=0,
         )
     finally:
-        publisher._lock.release()  # pyright: ignore[reportPrivateUsage]
+        progress_lock.release()  # type: ignore[attr-defined]
     assert publisher.publish_progress(
         session_id="session",
         ownership_sequence=1,
@@ -301,7 +606,8 @@ def test_lost_current_terminal_update_latches_unavailability_without_stale_poiso
         slot=1,
         input_generation=1,
     )
-    assert publisher._lock.acquire(blocking=False)  # pyright: ignore[reportPrivateUsage]
+    progress_lock = _current_progress_lock(publisher)
+    assert progress_lock.acquire(blocking=False)  # type: ignore[attr-defined]
     try:
         publisher.fail_input(
             session_id="current",
@@ -312,7 +618,7 @@ def test_lost_current_terminal_update_latches_unavailability_without_stale_poiso
             failure="write_failed",
         )
     finally:
-        publisher._lock.release()  # pyright: ignore[reportPrivateUsage]
+        progress_lock.release()  # type: ignore[attr-defined]
     assert publisher.try_snapshot() is False
 
     assert publisher.publish_setup(
@@ -324,6 +630,160 @@ def test_lost_current_terminal_update_latches_unavailability_without_stale_poiso
     snapshot = publisher.try_snapshot()
     assert snapshot is not False and snapshot is not None
     assert snapshot.session_id == "successor"
+
+
+def test_unopened_terminal_attempt_fences_late_same_generation_open() -> None:
+    """An open failure remains terminal without exposing an opened generation."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    publisher.fail_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        failure="open_failed",
+    )
+
+    assert not publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        backend_input_id=2,
+    )
+    snapshot = publisher.try_snapshot()
+
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.input_generation, row.identity, row.state, row.failure) == (
+        None,
+        "unopened",
+        "failed",
+        "open_failed",
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=2,
+        backend_input_id=2,
+    )
+
+
+def test_contended_pending_open_failure_latches_that_attempt_only() -> None:
+    """A lost pending failure cannot be mistaken for a healthy pending row."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000, 16_000),
+    )
+    progress_lock = _current_progress_lock(publisher)
+    assert progress_lock.acquire(blocking=False)  # type: ignore[attr-defined]
+    try:
+        publisher.fail_input(
+            session_id="session",
+            ownership_sequence=1,
+            recorder_generation=1,
+            slot=1,
+            input_generation=1,
+            failure="open_failed",
+        )
+    finally:
+        progress_lock.release()  # type: ignore[attr-defined]
+
+    assert publisher.try_snapshot() is False
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=2,
+        input_generation=1,
+        backend_input_id=3,
+    )
+
+
+def test_lost_close_on_pending_row_fences_later_same_generation_open() -> None:
+    """A pending row cannot make a lost close look like a redundant no-op."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    progress_lock = _current_progress_lock(publisher)
+    assert progress_lock.acquire(blocking=False)  # type: ignore[attr-defined]
+    try:
+        # The close samples the old pending projection when its nonblocking
+        # publication loses.  The same attempt's open wins only afterwards.
+        publisher.close_input(
+            session_id="session",
+            ownership_sequence=1,
+            recorder_generation=1,
+            slot=1,
+            input_generation=1,
+            confirmed=True,
+        )
+    finally:
+        progress_lock.release()  # type: ignore[attr-defined]
+
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        backend_input_id=2,
+    )
+    # The later open cannot re-establish liveness after a close disposition
+    # was lost while the row was still pending.
+    assert publisher.try_snapshot() is False
+
+
+def test_same_generation_header_receipt_can_arrive_after_unresolved_open() -> None:
+    """A writer receipt refines its own unresolved input without inferring identity."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        reported_rate_hz=12_000.0,
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        wav_header_rate_hz=22_050.0,
+    )
+    snapshot = publisher.try_snapshot()
+
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.identity, row.reported_rate_hz, row.wav_header_rate_hz) == (
+        "unresolved",
+        12_000.0,
+        22_050.0,
+    )
 
 
 def test_stale_reopen_failure_does_not_latch_current_generation() -> None:
@@ -349,7 +809,8 @@ def test_stale_reopen_failure_does_not_latch_current_generation() -> None:
         slot=1,
         input_generation=2,
     )
-    assert publisher._lock.acquire(blocking=False)  # pyright: ignore[reportPrivateUsage]
+    progress_lock = _current_progress_lock(publisher)
+    assert progress_lock.acquire(blocking=False)  # type: ignore[attr-defined]
     try:
         publisher.fail_input(
             session_id="session",
@@ -360,7 +821,7 @@ def test_stale_reopen_failure_does_not_latch_current_generation() -> None:
             failure="read_failed",
         )
     finally:
-        publisher._lock.release()  # pyright: ignore[reportPrivateUsage]
+        progress_lock.release()  # type: ignore[attr-defined]
     snapshot = publisher.try_snapshot()
     assert snapshot is not False and snapshot is not None
     assert snapshot.inputs[0].input_generation == 2
@@ -406,6 +867,276 @@ def test_confirmed_close_does_not_infer_flush_progress() -> None:
     assert snapshot.inputs[0].state == "closed"
     assert snapshot.inputs[0].accepted_frames == 4
     assert snapshot.inputs[0].flushed_frames == 0
+
+
+def test_late_failure_cannot_replace_confirmed_close() -> None:
+    """A definitive close rejects a later competing failure in the same generation."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+    )
+    publisher.close_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        confirmed=True,
+    )
+    publisher.fail_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        failure="read_failed",
+    )
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    assert (snapshot.inputs[0].state, snapshot.inputs[0].failure) == ("closed", None)
+
+
+def test_contended_late_failure_after_confirmed_close_does_not_latch_unavailable() -> None:
+    """A stale failure observes closed evidence before it can mark a lost terminal receipt."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+    )
+    publisher.close_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        confirmed=True,
+    )
+    progress_lock = _current_progress_lock(publisher)
+    assert progress_lock.acquire(blocking=False)  # type: ignore[attr-defined]
+    try:
+        publisher.fail_input(
+            session_id="session",
+            ownership_sequence=1,
+            recorder_generation=1,
+            slot=1,
+            input_generation=1,
+            failure="read_failed",
+        )
+    finally:
+        progress_lock.release()  # type: ignore[attr-defined]
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    assert (snapshot.inputs[0].state, snapshot.inputs[0].failure) == ("closed", None)
+
+
+def test_contended_duplicate_failure_after_linked_winner_is_not_lost() -> None:
+    """A failed lock attempt sees the winner's identical failure as a no-op."""
+    publisher = _two_open_inputs()
+
+    def report_failure() -> None:
+        publisher.fail_input(
+            session_id="session",
+            ownership_sequence=1,
+            recorder_generation=1,
+            slot=1,
+            input_generation=1,
+            failure="read_failed",
+        )
+
+    _publish_winner_after_loser_starts(publisher, report_failure, report_failure)
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    assert (snapshot.inputs[0].state, snapshot.inputs[0].failure) == ("failed", "read_failed")
+    assert snapshot.inputs[1].state == "capturing"
+
+
+def test_contended_duplicate_confirmed_close_after_linked_winner_is_not_lost() -> None:
+    """A confirmed close already published by the winner remains observable."""
+    publisher = _two_open_inputs()
+
+    def close() -> None:
+        publisher.close_input(
+            session_id="session",
+            ownership_sequence=1,
+            recorder_generation=1,
+            slot=1,
+            input_generation=1,
+            confirmed=True,
+        )
+
+    _publish_winner_after_loser_starts(publisher, close, close)
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    assert (snapshot.inputs[0].state, snapshot.inputs[0].failure) == ("closed", None)
+    assert snapshot.inputs[1].state == "capturing"
+
+
+def test_contended_identical_final_receipt_after_linked_winner_is_not_lost() -> None:
+    """An exact final receipt does not latch loss after the winner publishes it."""
+    publisher = _two_open_inputs()
+
+    def finalize() -> None:
+        publisher.finalize_input(
+            session_id="session",
+            ownership_sequence=1,
+            recorder_generation=1,
+            slot=1,
+            input_generation=1,
+            input_frames=4,
+            accepted_frames=4,
+            flushed_frames=4,
+            confirmed=True,
+            wav_header_rate_hz=22_050.0,
+        )
+
+    _publish_winner_after_loser_starts(publisher, finalize, finalize)
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.state, row.failure) == ("closed", None)
+    assert (row.input_frames, row.accepted_frames, row.flushed_frames) == (4, 4, 4)
+    assert row.wav_header_rate_hz == 22_050.0
+    assert snapshot.inputs[1].state == "capturing"
+
+
+def test_contended_newer_failed_final_receipt_remains_lost_until_successor() -> None:
+    """A changed failed-row receipt remains unavailable and survives unrelated updates."""
+    publisher = _two_open_inputs()
+    publisher.fail_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        failure="write_failed",
+    )
+
+    def older_receipt() -> None:
+        publisher.finalize_input(
+            session_id="session",
+            ownership_sequence=1,
+            recorder_generation=1,
+            slot=1,
+            input_generation=1,
+            input_frames=1,
+            accepted_frames=1,
+            flushed_frames=1,
+            confirmed=True,
+            wav_header_rate_hz=16_000.0,
+        )
+
+    def newer_receipt() -> None:
+        publisher.finalize_input(
+            session_id="session",
+            ownership_sequence=1,
+            recorder_generation=1,
+            slot=1,
+            input_generation=1,
+            input_frames=2,
+            accepted_frames=2,
+            flushed_frames=2,
+            confirmed=True,
+            wav_header_rate_hz=22_050.0,
+        )
+
+    _publish_winner_after_loser_starts(publisher, older_receipt, newer_receipt)
+    assert publisher.try_snapshot() is False
+
+    assert publisher.publish_progress(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=2,
+        input_generation=1,
+        input_frames=3,
+        accepted_frames=3,
+        flushed_frames=3,
+    )
+    assert publisher.try_snapshot() is False
+
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=2,
+        backend_input_id=1,
+        reported_rate_hz=16_000.0,
+    )
+    successor = publisher.try_snapshot()
+    assert successor is not False and successor is not None
+    assert successor.inputs[0].input_generation == 2
+    assert successor.inputs[0].state == "capturing"
+
+
+def test_duplicate_failure_preserves_first_reason_while_closing_failure_remains_admitted() -> None:
+    """Real failures still fence active or unresolved-close rows without reason rewrites."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+    )
+    publisher.close_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        confirmed=False,
+    )
+    publisher.fail_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        failure="write_failed",
+    )
+    publisher.fail_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        failure="read_failed",
+    )
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    assert (snapshot.inputs[0].state, snapshot.inputs[0].failure) == ("failed", "write_failed")
 
 
 def test_routine_concurrent_progress_does_not_latch_publication() -> None:
@@ -478,17 +1209,24 @@ def test_single_recorder_publishes_actual_writer_receipts_and_close(tmp_path: Pa
     )
 
     evidence.begin()
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    assert snapshot.inputs[0].wav_header_rate_hz is None
     evidence.observe_detector_input(backend_input_id=None, reported_rate_hz=None)
     evidence.write_samples([0.0] * 160)
     snapshot = publisher.try_snapshot()
     assert snapshot is not False and snapshot is not None
     assert (snapshot.inputs[0].input_frames, snapshot.inputs[0].accepted_frames) == (160, 160)
     assert snapshot.inputs[0].flushed_frames == 0
+    # Buffered acceptance leaves stdlib's WAV file empty: it is not header proof.
+    assert snapshot.inputs[0].wav_header_rate_hz is None
+    assert (tmp_path / "roast.wav").stat().st_size == 0
 
     evidence.write_samples([0.0] * 40)
     snapshot = publisher.try_snapshot()
     assert snapshot is not False and snapshot is not None
     assert snapshot.inputs[0].flushed_frames == 200
+    assert snapshot.inputs[0].wav_header_rate_hz == 16_000.0
 
     evidence.close()
     evidence.write_samples([0.0])
@@ -496,6 +1234,216 @@ def test_single_recorder_publishes_actual_writer_receipts_and_close(tmp_path: Pa
     assert snapshot is not False and snapshot is not None
     row = snapshot.inputs[0]
     assert (row.input_frames, row.accepted_frames, row.flushed_frames) == (200, 200, 200)
+    assert (row.state, row.failure) == ("closed", None)
+
+
+def test_finalizer_keeps_newer_tee_receipt_while_confirming_real_wav_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late final source receipt cannot turn a confirmed writer close into loss."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    recorder = RoastAudioRecorder(
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.json",
+        sample_rate=16_000,
+        session_id="session",
+        flush_sample_threshold=200,
+    )
+    evidence = EvidenceRoastRecorder(
+        recorder=recorder,
+        publisher=publisher,
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    evidence.begin()
+    evidence.observe_detector_input(backend_input_id=None, reported_rate_hz=None)
+    evidence.write_samples([0.0] * 160)
+
+    original_finalize = publisher.finalize_input
+
+    def publish_late_tee_receipt(**kwargs: object) -> None:
+        # The finalizer has already sampled the first tee total (160). Model
+        # the in-flight tee's independent second total before it is published.
+        evidence._detector_input_frames += 160  # pyright: ignore[reportPrivateUsage] - tee-boundary witness
+        evidence.observe_progress(
+            slot=1,
+            input_frames=None,
+            accepted_frames=160,
+            flushed_frames=160,
+            wav_header_rate_hz=16_000.0,
+        )
+        original_finalize(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(publisher, "finalize_input", publish_late_tee_receipt)
+    evidence.close()
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.input_frames, row.accepted_frames, row.flushed_frames) == (320, 160, 160)
+    assert (row.wav_header_rate_hz, row.state, row.failure) == (16_000.0, "closed", None)
+    with wave.open(str(tmp_path / "roast.wav"), "rb") as wav_file:
+        assert (wav_file.getframerate(), wav_file.getnframes()) == (16_000, 160)
+
+
+def test_finalizer_does_not_accept_regressive_writer_receipts() -> None:
+    """A source-only exception does not make contradictory writer receipts healthy."""
+    publisher = _two_open_inputs()
+    assert publisher.publish_progress(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=320,
+        accepted_frames=160,
+        flushed_frames=160,
+    )
+
+    publisher.finalize_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=160,
+        accepted_frames=159,
+        flushed_frames=159,
+        confirmed=True,
+    )
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.input_frames, row.accepted_frames, row.flushed_frames) == (320, 160, 160)
+    assert (row.state, row.failure) == ("failed", "unknown")
+
+
+def test_writer_header_rate_is_not_inferred_from_requested_or_backend_rate(tmp_path: Path) -> None:
+    """Evidence distinguishes request, backend report, and writer header receipts."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    recorder = RoastAudioRecorder(
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.json",
+        sample_rate=22_050,
+        session_id="session",
+        flush_sample_threshold=1,
+    )
+    evidence = EvidenceRoastRecorder(
+        recorder=recorder,
+        publisher=publisher,
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+
+    evidence.begin()
+    evidence.observe_detector_input(backend_input_id=3, reported_rate_hz=12_000.0)
+    # The writer owner, not the input reader, supplies the committed header
+    # receipt alongside an actual writer boundary.
+    evidence.write_samples([0.0])
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.requested_rate_hz, row.reported_rate_hz, row.wav_header_rate_hz) == (
+        16_000,
+        12_000.0,
+        22_050.0,
+    )
+
+
+def test_reader_identity_observation_does_not_wait_for_held_writer_lock(tmp_path: Path) -> None:
+    """Reader-side identity reports never inspect the WAV writer lock."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    recorder = RoastAudioRecorder(
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.json",
+        sample_rate=16_000,
+        session_id="session",
+    )
+    evidence = EvidenceRoastRecorder(
+        recorder=recorder,
+        publisher=publisher,
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    evidence.begin()
+    writer_lock = recorder._writer._lock  # pyright: ignore[reportPrivateUsage]
+    assert writer_lock.acquire(blocking=False)
+    completed = Event()
+    try:
+
+        def report_reader_identity() -> None:
+            evidence.observe_detector_input(backend_input_id=7, reported_rate_hz=16_000.0)
+            # A repeated proved identity is the exact reader duplicate path.
+            evidence.observe_detector_input(backend_input_id=7, reported_rate_hz=16_000.0)
+            completed.set()
+
+        reader = Thread(target=report_reader_identity)
+        reader.start()
+        assert completed.wait(timeout=0.2)
+        reader.join(timeout=1)
+        assert not reader.is_alive()
+    finally:
+        writer_lock.release()
+
+
+def test_terminal_uses_tee_input_count_when_writer_rejects_submission(tmp_path: Path) -> None:
+    """A rejected writer submission cannot replace the tee's input receipt."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    recorder = RoastAudioRecorder(
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.json",
+        sample_rate=16_000,
+        session_id="session",
+    )
+    evidence = EvidenceRoastRecorder(
+        recorder=recorder,
+        publisher=publisher,
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    evidence.begin()
+    evidence.observe_detector_input(backend_input_id=None, reported_rate_hz=None)
+    recorder._writer.write_samples = lambda samples: None  # pyright: ignore[reportPrivateUsage, method-assign]
+    evidence.write_samples([0.0] * 160)
+    evidence.close()
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.input_frames, row.accepted_frames, row.flushed_frames) == (160, 0, 0)
     assert (row.state, row.failure) == ("closed", None)
 
 
@@ -541,6 +1489,150 @@ def test_single_recorder_final_flush_failure_publishes_unconfirmed_receipt(
     row = snapshot.inputs[0]
     assert (row.input_frames, row.accepted_frames, row.flushed_frames) == (160, 160, 0)
     assert (row.state, row.failure) == ("failed", "close_unconfirmed")
+    assert row.wav_header_rate_hz is None
+
+
+def test_confirmed_empty_close_propagates_header_proof(tmp_path: Path) -> None:
+    """A real, attributable zero-frame WAV proves its header only after close."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    recorder = RoastAudioRecorder(
+        wav_path=tmp_path / "empty.wav",
+        sidecar_path=tmp_path / "empty.json",
+        sample_rate=16_000,
+        session_id="session",
+    )
+    evidence = EvidenceRoastRecorder(
+        recorder=recorder,
+        publisher=publisher,
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+
+    evidence.begin()
+    evidence.observe_detector_input(backend_input_id=None, reported_rate_hz=None)
+    evidence.close()
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.accepted_frames, row.flushed_frames, row.wav_header_rate_hz) == (0, 0, 16_000.0)
+    assert (row.state, row.failure) == ("closed", None)
+    with wave.open(str(tmp_path / "empty.wav"), "rb") as wav_file:
+        assert (wav_file.getframerate(), wav_file.getnframes()) == (16_000, 0)
+
+
+def test_failed_first_writer_flush_retains_failure_and_later_close_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed write remains failed while its later close reports actual totals."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    recorder = RoastAudioRecorder(
+        wav_path=tmp_path / "roast.wav",
+        sidecar_path=tmp_path / "roast.json",
+        sample_rate=16_000,
+        session_id="session",
+        flush_sample_threshold=160,
+    )
+    evidence = EvidenceRoastRecorder(
+        recorder=recorder,
+        publisher=publisher,
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    evidence.begin()
+    evidence.observe_detector_input(backend_input_id=None, reported_rate_hz=None)
+    original_flush = recorder._writer._flush_locked  # pyright: ignore[reportPrivateUsage]
+    attempts = 0
+
+    def fail_first_flush() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("synthetic first writer flush failure")
+        original_flush()
+
+    monkeypatch.setattr(recorder._writer, "_flush_locked", fail_first_flush)  # pyright: ignore[reportPrivateUsage] - writer-boundary witness
+    with pytest.raises(OSError, match="first writer flush"):
+        evidence.write_samples([0.0] * 160)
+    evidence.close()
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.input_frames, row.accepted_frames, row.flushed_frames) == (160, 160, 160)
+    assert (row.state, row.failure) == ("failed", "write_failed")
+
+
+def test_stale_late_finalizer_cannot_fill_successor_generation() -> None:
+    """A late terminal receipt cannot alter an input reopened by its successor."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+    )
+    publisher.fail_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        failure="write_failed",
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=2,
+    )
+
+    publisher.finalize_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=160,
+        accepted_frames=160,
+        flushed_frames=160,
+        confirmed=True,
+    )
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.input_generation, row.input_frames, row.accepted_frames, row.flushed_frames) == (
+        2,
+        0,
+        0,
+        0,
+    )
+    assert (row.state, row.failure) == ("capturing", None)
 
 
 def test_multi_recorder_final_flush_failures_are_per_input(
@@ -607,9 +1699,150 @@ def test_multi_recorder_final_flush_failures_are_per_input(
     assert snapshot is not False and snapshot is not None
     detector, additional = snapshot.inputs
     assert (detector.state, detector.failure) == ("failed", "close_unconfirmed")
-    # The raised detector close leaves additional finalisation to the existing
-    # owner path; it is not falsely claimed as closed by this failure.
-    assert additional.state == "capturing"
+    # The raised detector close does not claim that a peer is healthy: its
+    # existing owner reports the unconfirmed terminal disposition.
+    assert (additional.state, additional.failure) == ("closing", "close_unconfirmed")
+
+
+def test_independent_read_failure_is_attributed_to_only_its_opened_peer(tmp_path: Path) -> None:
+    """A later peer read error fences that peer without stopping detector recording."""
+
+    class FailingAfterFirstRead(AudioInput):
+        def __init__(self) -> None:
+            self.first_read = Event()
+            self.failed = Event()
+            self._reads = 0
+
+        def read_samples(self, sample_count: int) -> list[float]:
+            del sample_count
+            self._reads += 1
+            if self._reads == 1:
+                self.first_read.set()
+                return [0.0] * 40
+            self.failed.set()
+            raise OSError("synthetic peer read failure")
+
+        def close(self) -> None:
+            return None
+
+    peer_input = FailingAfterFirstRead()
+    recorder = MultiDeviceRoastRecorder(
+        detector_wav_path=tmp_path / "detector.wav",
+        detector_device_label=None,
+        sidecar_path=tmp_path / "recording.json",
+        sample_rate=16_000,
+        session_id="session",
+        additional_devices=(
+            AdditionalRecordingDevice("additional", tmp_path / "additional.wav", 16_000),
+        ),
+        additional_input_factory=lambda _device: peer_input,
+        flush_sample_threshold=200,
+    )
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000, 16_000),
+    )
+    evidence = EvidenceRoastRecorder(
+        recorder=recorder,
+        publisher=publisher,
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000, 16_000),
+    )
+
+    evidence.begin()
+    evidence.observe_detector_input(backend_input_id=None, reported_rate_hz=None)
+    evidence.write_samples([0.0] * 160)
+    assert peer_input.first_read.wait(timeout=1)
+    assert peer_input.failed.wait(timeout=1)
+    evidence.close()
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    detector, peer = snapshot.inputs
+    assert (detector.state, detector.failure, detector.accepted_frames) == ("closed", None, 160)
+    assert (peer.state, peer.failure, peer.input_frames) == ("failed", "read_failed", 40)
+
+
+@pytest.mark.parametrize(
+    ("first_read_succeeds", "expected_failure"),
+    ((False, "unknown"), (True, "read_failed")),
+)
+def test_pipeline_reader_failure_requires_a_prior_detector_open_observation(
+    first_read_succeeds: bool, expected_failure: str
+) -> None:
+    """The normal reader path does not over-attribute an unproved first read."""
+
+    class CausalInput(AudioInput):
+        def __init__(self) -> None:
+            self._reads = 0
+            self.failed = Event()
+
+        def read_samples(self, sample_count: int) -> list[float]:
+            del sample_count
+            self._reads += 1
+            if first_read_succeeds and self._reads == 1:
+                return [0.0]
+            self.failed.set()
+            raise OSError("synthetic reader failure")
+
+        def close(self) -> None:
+            return None
+
+    class InertRecorder:
+        @property
+        def started_monotonic_seconds(self) -> float | None:
+            return None
+
+        @property
+        def shutdown_confirmed(self) -> bool:
+            return True
+
+        def begin(self) -> None:
+            return None
+
+        def write_samples(self, samples: Sequence[float]) -> None:
+            del samples
+
+        def close(self) -> None:
+            return None
+
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(4,),
+    )
+    recorder = EvidenceRoastRecorder(
+        recorder=InertRecorder(),
+        publisher=publisher,
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(4,),
+    )
+    source = CausalInput()
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(input_device=None, sample_rate=4, idle_sleep_seconds=0.001),
+        audio_input=source,
+        recorder=recorder,
+    )
+
+    pipeline.start()
+    assert source.failed.wait(timeout=1)
+    pipeline.stop()
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    assert (snapshot.inputs[0].state, snapshot.inputs[0].failure) == (
+        "failed",
+        expected_failure,
+    )
 
 
 def test_additional_final_flush_failure_is_not_misreported_as_read_failure(
@@ -789,6 +2022,23 @@ def test_closed_result_grammar_rejects_crossed_outcomes_and_token_identity() -> 
             state="capturing",
             failure=None,
         )
+    for invalid_token in ("a" * 31, "a" * 33, "x" + "a" * 32, "a" * 32 + "x"):
+        with pytest.raises(ValidationError):
+            CaptureEvidenceInputResult(
+                slot=1,
+                role="detector_teed",
+                input_generation=1,
+                opened_input_token=invalid_token,
+                identity="resolved",
+                requested_rate_hz=16_000,
+                reported_rate_hz=None,
+                wav_header_rate_hz=None,
+                input_frames=0,
+                accepted_frames=0,
+                flushed_frames=0,
+                state="capturing",
+                failure=None,
+            )
 
 
 def test_multi_input_recorder_publishes_actual_aliases_and_boundaries(tmp_path: Path) -> None:
