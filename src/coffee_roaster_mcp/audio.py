@@ -1095,6 +1095,9 @@ class EvidenceRoastRecorder:
 
     def close_input(self, *, slot: int, confirmed: bool) -> None:
         """Publish an owner-observed terminal input disposition."""
+        require_writer_confirmation = (
+            slot == 1 and self._detector_close_confirmation_required
+        ) or (slot != 1 and self._delegate_reports_boundaries)
         self._publisher.close_input(
             session_id=self._session_id,
             ownership_sequence=self._ownership_sequence,
@@ -1102,6 +1105,7 @@ class EvidenceRoastRecorder:
             slot=slot,
             input_generation=self._input_generations[slot - 1],
             confirmed=confirmed,
+            require_writer_confirmation=require_writer_confirmation,
         )
 
     def finalize_input(
@@ -1119,16 +1123,12 @@ class EvidenceRoastRecorder:
         wav_header_rate_hz: float | None = None,
     ) -> None:
         """Publish one terminal disposition with its final writer receipts."""
-        reader_close_confirmed: bool | None = None
         close_required = False
         if slot == 1:
             with self._detector_close_lock:
                 self._detector_writer_finalized = True
                 self._detector_writer_close_confirmed = confirmed and failure is None
-                reader_close_confirmed = self._detector_input_close_confirmed
                 close_required = self._detector_close_confirmation_required
-            if close_required:
-                confirmed = self._detector_writer_close_confirmed and reader_close_confirmed is True
         if slot == 1:
             # The tee receives source frames before a writer may reject them.
             # Never replace that source receipt with accepted writer frames at
@@ -1146,6 +1146,9 @@ class EvidenceRoastRecorder:
             confirmed=confirmed,
             failure=failure,
             wav_header_rate_hz=wav_header_rate_hz,
+            input_close_required=(
+                close_required or (slot != 1 and self._delegate_reports_boundaries)
+            ),
         )
         if slot == 1 and close_required:
             with self._detector_close_lock:
@@ -1538,7 +1541,6 @@ class _IndependentCaptureStream:
         self._slot: int | None = None
         self._input_observed = False
         self._input_frame_total = 0
-        self._input_close_confirmed: bool | None = None
 
     @property
     def writer(self) -> _WavStreamWriter:
@@ -1554,11 +1556,6 @@ class _IndependentCaptureStream:
     def input_frame_total(self) -> int:
         """Return this input owner's cumulative attributable read total."""
         return self._input_frame_total
-
-    @property
-    def input_close_confirmed(self) -> bool | None:
-        """Return this input owner's close result when evidence observes it."""
-        return self._input_close_confirmed
 
     def set_capture_evidence_observer(self, observer: EvidenceRoastRecorder, *, slot: int) -> None:
         """Attach the bounded observer to this existing capture owner."""
@@ -1678,7 +1675,7 @@ class _IndependentCaptureStream:
                         confirmed = True
                     except Exception as exc:  # noqa: BLE001 - close diagnostics vary.
                         _LOGGER.warning("Independent audio input close failed: %s", exc)
-                self._input_close_confirmed = confirmed
+                observer.close_input(slot=self.slot, confirmed=confirmed)
 
 
 class RoastAudioRecorder:
@@ -2192,11 +2189,11 @@ class MultiDeviceRoastRecorder:
                             input_frames=stream.input_frame_total,
                             accepted_frames=accepted_frames,
                             flushed_frames=flushed_frames,
-                            confirmed=(
-                                stream.shutdown_confirmed
-                                and stream.writer.close_confirmed
-                                and stream.input_close_confirmed is True
-                            ),
+                            # The reader publishes its own close proof, which
+                            # may arrive after this bounded stop join. Preserve
+                            # the writer proof independently so the exact
+                            # generation can settle when that owner returns.
+                            confirmed=stream.writer.close_confirmed,
                             wav_header_rate_hz=header_rate_hz,
                         )
             streams = [self._detector_writer, *(s.writer for s in self._additional_streams)]

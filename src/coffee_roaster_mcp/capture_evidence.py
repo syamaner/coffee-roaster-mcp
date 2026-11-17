@@ -50,6 +50,10 @@ class CaptureInputEvidence:
     # null, but a same-attempt first open can later attach the writer truth.
     pending_final_receipt: _PendingFinalReceipt | None = None
     attempted_input_close_confirmed: bool | None = None
+    # Some recorder owners finalise their writer independently of the input
+    # reader.  Keep that private join requirement so neither owner alone can
+    # certify a terminal row.
+    awaiting_writer_close_confirmation: bool = False
     opened_input_token: str | None = None
     identity: CaptureIdentity = "unopened"
     reported_rate_hz: float | None = None
@@ -342,7 +346,11 @@ class CaptureEvidencePublisher:
                         if receipt.failure not in {None, "close_unconfirmed"}:
                             state = "failed"
                             failure = receipt.failure
-                        elif receipt.confirmed and row.attempted_input_close_confirmed is not False:
+                        elif receipt.confirmed and (
+                            row.attempted_input_close_confirmed is True
+                            if row.awaiting_writer_close_confirmation
+                            else row.attempted_input_close_confirmed is not False
+                        ):
                             state = "closed"
                             failure = None
                     # A late observation may fill only evidence that this
@@ -409,7 +417,7 @@ class CaptureEvidencePublisher:
                         row,
                         opened_input_token=candidate_token,
                         identity="resolved",
-                        reported_rate_hz=reported_rate_hz if valid_rate else None,
+                        reported_rate_hz=(reported_rate_hz if valid_rate else row.reported_rate_hz),
                         wav_header_rate_hz=(
                             wav_header_rate_hz if valid_header else row.wav_header_rate_hz
                         ),
@@ -433,6 +441,7 @@ class CaptureEvidencePublisher:
                 # earlier attempt's terminal disposition.
                 pending_final_receipt=None,
                 attempted_input_close_confirmed=None,
+                awaiting_writer_close_confirmation=False,
                 opened_input_token=candidate_token if valid_id else None,
                 identity="unresolved" if not valid_id else "resolved",
                 reported_rate_hz=reported_rate_hz if valid_rate else None,
@@ -505,6 +514,7 @@ class CaptureEvidencePublisher:
         slot: int,
         input_generation: int,
         confirmed: bool,
+        require_writer_confirmation: bool = False,
     ) -> None:
         """Publish owner-observed input close, preserving partial finalisation."""
 
@@ -516,6 +526,7 @@ class CaptureEvidencePublisher:
                     row,
                     attempted_input_generation=input_generation,
                     attempted_input_close_confirmed=confirmed,
+                    awaiting_writer_close_confirmation=require_writer_confirmation,
                     state="closing",
                     failure=None if confirmed else "close_unconfirmed",
                 )
@@ -527,6 +538,7 @@ class CaptureEvidencePublisher:
                 return replace(
                     row,
                     attempted_input_close_confirmed=confirmed,
+                    awaiting_writer_close_confirmation=require_writer_confirmation,
                     state="closed" if settled else "closing",
                     failure=None if settled else row.failure or "close_unconfirmed",
                 )
@@ -534,6 +546,21 @@ class CaptureEvidencePublisher:
                 return None
             if row.state not in {"capturing", "closing"}:
                 return None
+            if require_writer_confirmation or row.awaiting_writer_close_confirmation:
+                receipt = row.pending_final_receipt
+                settled = (
+                    confirmed
+                    and receipt is not None
+                    and receipt.confirmed
+                    and receipt.failure is None
+                )
+                return replace(
+                    row,
+                    attempted_input_close_confirmed=confirmed,
+                    awaiting_writer_close_confirmation=True,
+                    state="closed" if settled else "closing",
+                    failure=None if settled else row.failure or "close_unconfirmed",
+                )
             return replace(
                 row,
                 state="closed" if confirmed else "closing",
@@ -564,6 +591,7 @@ class CaptureEvidencePublisher:
         confirmed: bool,
         failure: CaptureFailure | None = None,
         wav_header_rate_hz: float | None = None,
+        input_close_required: bool = False,
     ) -> bool:
         """Atomically publish final receipts and one terminal owner disposition."""
         totals = (input_frames, accepted_frames, flushed_frames)
@@ -577,10 +605,25 @@ class CaptureEvidencePublisher:
             return False
 
         def update(row: CaptureInputEvidence) -> CaptureInputEvidence | None:
-            if row.state == "pending" or (
-                row.state == "closing"
-                and row.input_generation is None
-                and row.attempted_input_generation == input_generation
+            # A writer receipt can join only its currently opened generation,
+            # or an as-yet-unopened attempt already fenced by that same
+            # generation. A stale writer must not enter the two-owner branch
+            # merely because a successor is capturing.
+            if row.input_generation is not None:
+                if row.input_generation != input_generation:
+                    return None
+            elif (
+                row.attempted_input_generation is not None
+                and row.attempted_input_generation != input_generation
+            ):
+                return None
+            if (input_close_required and row.state in {"pending", "capturing", "closing"}) or (
+                row.state == "pending"
+                or (
+                    row.state == "closing"
+                    and row.input_generation is None
+                    and row.attempted_input_generation == input_generation
+                )
             ):
                 # The writer can complete while the owning reader is still
                 # blocked in its first read. Fence that exact attempt before
@@ -598,7 +641,23 @@ class CaptureEvidencePublisher:
                         else None
                     ),
                 )
-                definite_failure = failure not in {None, "close_unconfirmed"}
+                # Existing opened rows already have attributable input proof,
+                # so retain an explicit writer-finalisation failure exactly as
+                # before. An unopened attempt has no public input generation;
+                # there, close uncertainty remains a fenced pending receipt.
+                definite_failure = failure is not None and (
+                    row.input_generation is not None or failure != "close_unconfirmed"
+                )
+                updated_totals = (
+                    _terminal_totals(row, totals) if row.input_generation is not None else None
+                )
+                if row.input_generation is not None and updated_totals is None:
+                    # The two-owner join has the same contradictory-receipt
+                    # boundary as the ordinary finalizer.  Preserve the
+                    # already-proved totals, but fence the generation as an
+                    # explicit terminal uncertainty; a later reader close
+                    # must not certify this writer receipt.
+                    return replace(row, state="failed", failure=failure or "unknown")
                 settled = (
                     not definite_failure
                     and confirmed
@@ -608,6 +667,25 @@ class CaptureEvidencePublisher:
                     row,
                     attempted_input_generation=input_generation,
                     pending_final_receipt=receipt,
+                    awaiting_writer_close_confirmation=input_close_required,
+                    input_frames=(
+                        updated_totals[0] if updated_totals is not None else row.input_frames
+                    ),
+                    accepted_frames=(
+                        updated_totals[1] if updated_totals is not None else row.accepted_frames
+                    ),
+                    flushed_frames=(
+                        updated_totals[2] if updated_totals is not None else row.flushed_frames
+                    ),
+                    wav_header_rate_hz=(
+                        float(wav_header_rate_hz)
+                        if (
+                            row.input_generation is not None
+                            and wav_header_rate_hz is not None
+                            and _positive_finite(wav_header_rate_hz)
+                        )
+                        else row.wav_header_rate_hz
+                    ),
                     state="failed" if definite_failure else ("closed" if settled else "closing"),
                     failure=(
                         failure

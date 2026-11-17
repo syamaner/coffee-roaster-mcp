@@ -2311,6 +2311,117 @@ def test_writer_finalisation_before_first_reader_observation_fences_late_open(
     )
 
 
+def test_late_secondary_input_close_settles_its_existing_writer_receipt(tmp_path: Path) -> None:
+    """A late secondary reader close joins its exact already-finalized WAV receipt."""
+    detector_input = _EventGatedInput(first_chunk=())
+    secondary_input = _EventGatedInput(first_chunk=(0.25,) * 40)
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000, 16_000),
+    )
+    recorder = MultiDeviceRoastRecorder(
+        detector_wav_path=tmp_path / "detector.wav",
+        detector_device_label=None,
+        sidecar_path=tmp_path / "recording.json",
+        sample_rate=16_000,
+        session_id="session",
+        additional_devices=(
+            AdditionalRecordingDevice("secondary", tmp_path / "secondary.wav", 16_000),
+        ),
+        additional_input_factory=lambda _device: secondary_input,
+        flush_sample_threshold=200,
+        stop_timeout_seconds=0.0,
+    )
+    evidence = EvidenceRoastRecorder(
+        recorder=recorder,
+        publisher=publisher,
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000, 16_000),
+    )
+    pipeline = AudioCapturePipeline(
+        settings=AudioCaptureSettings(
+            input_device=None,
+            sample_rate=16_000,
+            window_seconds=0.1,
+            idle_sleep_seconds=0.001,
+        ),
+        audio_input=detector_input,
+        recorder=evidence,
+    )
+    pipeline.start()
+    assert secondary_input.read_started.wait(timeout=1.0)
+    pipeline.stop(timeout_seconds=0.0)
+    with wave.open(str(tmp_path / "secondary.wav"), "rb") as wav_file:
+        assert wav_file.getnframes() == 40
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[1]
+    assert (row.state, row.failure, row.input_frames, row.accepted_frames, row.flushed_frames) == (
+        "closing",
+        "close_unconfirmed",
+        40,
+        40,
+        40,
+    )
+
+    secondary_input.release()
+    assert secondary_input.closed.wait(timeout=1.0)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        snapshot = publisher.try_snapshot()
+        if snapshot is not False and snapshot is not None and snapshot.inputs[1].state == "closed":
+            break
+        time.sleep(0.001)
+    else:
+        pytest.fail("Timed out waiting for the secondary input-close publication.")
+    row = snapshot.inputs[1]
+    assert (row.state, row.failure, row.input_frames, row.accepted_frames, row.flushed_frames) == (
+        "closed",
+        None,
+        40,
+        40,
+        40,
+    )
+    detector_input.release()
+
+
+def test_reader_starting_after_stop_settles_an_unopened_writer_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-read input stays unopened while its later close settles the writer proof."""
+    reader_may_start = Event()
+    original_reader_loop = AudioCapturePipeline._run_reader_loop  # pyright: ignore[reportPrivateUsage] - event-gated reader owner witness
+
+    def hold_reader_until_stop(self: AudioCapturePipeline) -> None:
+        assert reader_may_start.wait(timeout=1.0)
+        original_reader_loop(self)
+
+    monkeypatch.setattr(AudioCapturePipeline, "_run_reader_loop", hold_reader_until_stop)
+    audio_input = _EventGatedInput(first_chunk=(0.25,) * 160)
+    pipeline, publisher = _evidence_pipeline(tmp_path, audio_input)
+    pipeline.start()
+    pipeline.stop(timeout_seconds=0.0)
+    reader_may_start.set()
+    assert audio_input.closed.wait(timeout=1.0)
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.state, row.failure, row.input_generation, row.identity, row.opened_input_token) == (
+        "closed",
+        None,
+        None,
+        "unopened",
+        None,
+    )
+    assert (row.reported_rate_hz, row.wav_header_rate_hz, row.input_frames) == (None, None, None)
+
+
 def test_terminal_identity_refinement_retains_nonzero_final_receipts() -> None:
     """A late proved identity cannot erase an exact same-attempt terminal receipt."""
     publisher = CaptureEvidencePublisher()
@@ -2365,6 +2476,229 @@ def test_terminal_identity_refinement_retains_nonzero_final_receipts() -> None:
         "closing",
         "close_unconfirmed",
     )
+
+
+def test_identity_refinement_without_rate_preserves_proved_rate() -> None:
+    """A late backend identity does not erase a same-generation reported rate."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        reported_rate_hz=16_000.0,
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        backend_input_id=7,
+    )
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    public_row = CaptureEvidenceInputResult(
+        slot=row.slot,
+        role=row.role,
+        input_generation=row.input_generation,
+        opened_input_token=row.opened_input_token,
+        identity=row.identity,
+        requested_rate_hz=row.requested_rate_hz,
+        reported_rate_hz=row.reported_rate_hz,
+        wav_header_rate_hz=row.wav_header_rate_hz,
+        input_frames=row.input_frames,
+        accepted_frames=row.accepted_frames,
+        flushed_frames=row.flushed_frames,
+        state=row.state,
+        failure=row.failure,
+    )
+    assert (public_row.identity, public_row.reported_rate_hz) == ("resolved", 16_000.0)
+
+
+def test_joined_writer_receipt_with_regressive_writer_totals_fails_before_reader_close() -> None:
+    """A contradictory writer receipt cannot be certified by a later reader close."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        backend_input_id=7,
+        reported_rate_hz=16_000.0,
+        wav_header_rate_hz=16_000.0,
+    )
+    assert publisher.publish_progress(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=160,
+        accepted_frames=160,
+        flushed_frames=160,
+    )
+    assert publisher.finalize_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=80,
+        accepted_frames=80,
+        flushed_frames=80,
+        confirmed=True,
+        input_close_required=True,
+        wav_header_rate_hz=8_000.0,
+    )
+    publisher.close_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        confirmed=True,
+        require_writer_confirmation=True,
+    )
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.state, row.failure) == ("failed", "unknown")
+    assert (row.input_frames, row.accepted_frames, row.flushed_frames) == (160, 160, 160)
+    assert row.wav_header_rate_hz == 16_000.0
+
+
+def test_joined_reader_close_with_regressive_writer_totals_fails() -> None:
+    """Reader-first joining uses the same conservative contradictory-receipt fence."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        backend_input_id=7,
+        reported_rate_hz=16_000.0,
+        wav_header_rate_hz=16_000.0,
+    )
+    assert publisher.publish_progress(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=160,
+        accepted_frames=160,
+        flushed_frames=160,
+    )
+    publisher.close_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        confirmed=True,
+        require_writer_confirmation=True,
+    )
+    assert publisher.finalize_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=80,
+        accepted_frames=80,
+        flushed_frames=80,
+        confirmed=True,
+        input_close_required=True,
+        wav_header_rate_hz=8_000.0,
+    )
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.state, row.failure) == ("failed", "unknown")
+    assert (row.input_frames, row.accepted_frames, row.flushed_frames) == (160, 160, 160)
+    assert row.wav_header_rate_hz == 16_000.0
+
+
+def test_joined_writer_receipt_allows_only_a_stale_source_total() -> None:
+    """A stale source total alone remains a valid writer receipt."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        backend_input_id=7,
+    )
+    assert publisher.publish_progress(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=160,
+        accepted_frames=160,
+        flushed_frames=160,
+    )
+    assert publisher.finalize_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=80,
+        accepted_frames=160,
+        flushed_frames=160,
+        confirmed=True,
+        input_close_required=True,
+    )
+    publisher.close_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        confirmed=True,
+        require_writer_confirmation=True,
+    )
+
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.state, row.failure) == ("closed", None)
+    assert (row.input_frames, row.accepted_frames, row.flushed_frames) == (160, 160, 160)
 
 
 def test_terminal_identity_causal_transition_table() -> None:
@@ -2691,6 +3025,127 @@ def test_higher_input_generation_discards_only_prior_private_receipts() -> None:
         "close_unconfirmed",
     )
     assert (row.input_frames, row.accepted_frames, row.flushed_frames) == (500, 500, 500)
+
+
+def test_writer_receipt_before_late_open_requires_reader_close_proof() -> None:
+    """A late open cannot certify a two-owner close before its reader confirms."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    assert publisher.finalize_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=160,
+        accepted_frames=160,
+        flushed_frames=160,
+        confirmed=True,
+        input_close_required=True,
+        wav_header_rate_hz=16_000.0,
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        backend_input_id=7,
+        reported_rate_hz=16_000.0,
+    )
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.state, row.failure, row.identity, row.input_generation) == (
+        "closing",
+        "close_unconfirmed",
+        "resolved",
+        1,
+    )
+    assert (row.input_frames, row.accepted_frames, row.flushed_frames) == (160, 160, 160)
+
+    publisher.close_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        confirmed=True,
+        require_writer_confirmation=True,
+    )
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    row = snapshot.inputs[0]
+    assert (row.state, row.failure, row.identity, row.input_generation) == (
+        "closed",
+        None,
+        "resolved",
+        1,
+    )
+
+
+def test_stale_writer_finalization_cannot_overwrite_successor_generation() -> None:
+    """A stale two-owner writer receipt leaves its reopened successor unchanged."""
+    publisher = CaptureEvidencePublisher()
+    assert publisher.publish_setup(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        requested_rates_hz=(16_000,),
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        backend_input_id=7,
+        reported_rate_hz=16_000.0,
+    )
+    assert publisher.open_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=2,
+        backend_input_id=8,
+        reported_rate_hz=22_050.0,
+    )
+    assert publisher.publish_progress(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=2,
+        input_frames=500,
+        accepted_frames=480,
+        flushed_frames=320,
+    )
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    before = snapshot.inputs[0]
+
+    assert not publisher.finalize_input(
+        session_id="session",
+        ownership_sequence=1,
+        recorder_generation=1,
+        slot=1,
+        input_generation=1,
+        input_frames=160,
+        accepted_frames=160,
+        flushed_frames=160,
+        confirmed=True,
+        input_close_required=True,
+        wav_header_rate_hz=16_000.0,
+    )
+    snapshot = publisher.try_snapshot()
+    assert snapshot is not False and snapshot is not None
+    assert snapshot.inputs[0] == before
 
 
 @pytest.mark.parametrize("multi_device", (False, True))
