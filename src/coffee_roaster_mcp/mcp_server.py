@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
 import re
 import time
 from collections.abc import AsyncGenerator, Callable, Mapping
@@ -33,6 +34,10 @@ from coffee_roaster_mcp.ambient_runtime import (
     AmbientRuntimeSnapshot,
     AmbientSessionRuntime,
     build_ambient_session_runtime,
+)
+from coffee_roaster_mcp.capture_evidence import (
+    CaptureEvidencePublisher,
+    CaptureEvidenceSnapshot,
 )
 from coffee_roaster_mcp.cold_temperature import (
     COLD_TEMPERATURE_NOT_ELIGIBLE,
@@ -66,6 +71,7 @@ from coffee_roaster_mcp.first_crack_runtime import (
     build_first_crack_session_runtime,
 )
 from coffee_roaster_mcp.session import (
+    CaptureSubject,
     DriverCommandReservation,
     EventPayloadValue,
     RoastEvent,
@@ -108,6 +114,210 @@ FixedZeroReason = Literal[
     "completion_ownership_changed",
     "projection_unconfirmed",
 ]
+CaptureEvidenceSessionId = Annotated[str, Strict(), StringConstraints(min_length=1, max_length=128)]
+CaptureEvidenceOutcome = Literal["refused", "unavailable", "observed"]
+CaptureEvidenceReason = Literal[
+    "not_configured",
+    "no_session",
+    "wrong_session",
+    "inventory_too_large",
+    "store_contended",
+    "publication_contended",
+    "subject_changed",
+    "start_in_flight",
+    "clock_unreliable",
+    "capture_pending",
+    "setup_failed",
+    "recorder_unavailable",
+]
+
+
+class _CaptureEvidenceArguments(ArgModelBase):
+    """Strict raw SDK-boundary arguments for capture evidence."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    capture_protocol: Literal["capture_evidence/v1"]
+    intent: Literal["bootstrap", "current_session"]
+    expected_session_id: CaptureEvidenceSessionId | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_exact_variant(cls, value: object) -> object:
+        """Reject nulls, coercion, extras, and mixed request variants."""
+        if not isinstance(value, Mapping):
+            raise TypeError("Capture evidence arguments must be a mapping.")
+        raw = cast(Mapping[str, object], value)
+        intent = raw.get("intent")
+        required = {"capture_protocol", "intent"}
+        if intent == "current_session":
+            required.add("expected_session_id")
+        if set(raw) != required:
+            raise ValueError("Capture evidence request has an invalid field set.")
+        if type(raw.get("capture_protocol")) is not str or type(intent) is not str:
+            raise TypeError("Capture evidence protocol and intent must be strings.")
+        if intent == "current_session" and type(raw.get("expected_session_id")) is not str:
+            raise TypeError("expected_session_id must be a string.")
+        return raw
+
+
+class CaptureEvidenceInputResult(BaseModel):
+    """Closed public row for one current capture input."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    slot: Annotated[int, Strict(), Field(ge=1, le=8)]
+    role: Literal["detector_teed", "additional_independent"]
+    input_generation: Annotated[int, Strict(), Field(ge=1, le=2**63 - 1)] | None
+    opened_input_token: (
+        Annotated[str, Strict(), StringConstraints(pattern=r"^[0-9a-f]{32}$")] | None
+    )
+    identity: Literal["unopened", "unresolved", "resolved", "aliased"]
+    requested_rate_hz: Annotated[int, Strict(), Field(gt=0, le=2**63 - 1)]
+    reported_rate_hz: Annotated[float, Strict(), Field(gt=0, allow_inf_nan=False)] | None
+    wav_header_rate_hz: Annotated[float, Strict(), Field(gt=0, allow_inf_nan=False)] | None
+    input_frames: Annotated[int, Strict(), Field(ge=0, le=2**63 - 1)] | None
+    accepted_frames: Annotated[int, Strict(), Field(ge=0, le=2**63 - 1)] | None
+    flushed_frames: Annotated[int, Strict(), Field(ge=0, le=2**63 - 1)] | None
+    state: Literal["pending", "capturing", "closing", "closed", "failed"]
+    failure: (
+        Literal["open_failed", "read_failed", "write_failed", "close_unconfirmed", "unknown"] | None
+    )
+
+    @model_validator(mode="after")
+    def _validate_row(self) -> CaptureEvidenceInputResult:
+        """Reject impossible identity, terminal, and counter combinations."""
+        tokened = self.identity in {"resolved", "aliased"}
+        if tokened != (self.opened_input_token is not None):
+            raise ValueError("Capture token must exactly follow resolved identity.")
+        if self.identity == "unopened":
+            if self.input_generation is not None or any(
+                value is not None
+                for value in (
+                    self.reported_rate_hz,
+                    self.wav_header_rate_hz,
+                    self.input_frames,
+                    self.accepted_frames,
+                    self.flushed_frames,
+                )
+            ):
+                raise ValueError("Unopened input cannot have a generation.")
+        elif self.input_generation is None:
+            raise ValueError("Opened input requires a generation.")
+        if self.state == "failed":
+            if self.failure is None:
+                raise ValueError("Failed input requires a failure reason.")
+        elif self.state == "closing":
+            if self.failure not in {None, "close_unconfirmed"}:
+                raise ValueError("Closing input has an invalid failure reason.")
+        elif self.failure is not None:
+            raise ValueError("Only failed or closing input may carry failure.")
+        if (
+            self.flushed_frames is not None
+            and self.accepted_frames is not None
+            and self.flushed_frames > self.accepted_frames
+        ):
+            raise ValueError("Flushed frames cannot exceed accepted frames.")
+        return self
+
+
+class CaptureEvidenceBootstrapResult(BaseModel):
+    """Exact static bootstrap response for capture evidence."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    capture_protocol: Literal["capture_evidence/v1"]
+    intent: Literal["bootstrap"]
+    capability: Literal["manual_mock_capture", "not_configured"]
+
+
+class CaptureEvidenceResult(BaseModel):
+    """Exact public current-session response for bounded evidence."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    capture_protocol: Literal["capture_evidence/v1"]
+    intent: Literal["current_session"]
+    outcome: CaptureEvidenceOutcome
+    reason: CaptureEvidenceReason | None
+    session_id: CaptureEvidenceSessionId | None = None
+    session_state: Literal["active", "stopped"] | None = None
+    recorder_generation: Annotated[int, Strict(), Field(ge=1, le=2**63 - 1)] | None = None
+    publication_sequence: Annotated[int, Strict(), Field(ge=1, le=2**63 - 1)] | None = None
+    age_seconds: Annotated[float, Strict(), Field(ge=0, allow_inf_nan=False)] | None = None
+    inputs: tuple[CaptureEvidenceInputResult, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_variant(self) -> CaptureEvidenceResult:
+        """Keep current-session result combinations closed and explicit."""
+        observed = self.outcome == "observed"
+        fields = (
+            self.session_id,
+            self.session_state,
+            self.recorder_generation,
+            self.publication_sequence,
+            self.age_seconds,
+        )
+        if observed:
+            if self.reason is not None or any(value is None for value in fields) or not self.inputs:
+                raise ValueError("Observed response requires complete evidence.")
+            if tuple(row.slot for row in self.inputs) != tuple(range(1, len(self.inputs) + 1)):
+                raise ValueError("Observed inventory slots must be contiguous.")
+            if any(
+                row.role != ("detector_teed" if row.slot == 1 else "additional_independent")
+                for row in self.inputs
+            ):
+                raise ValueError("Observed inventory roles must match slot order.")
+            token_counts = {
+                token: sum(row.opened_input_token == token for row in self.inputs)
+                for token in {
+                    row.opened_input_token for row in self.inputs if row.opened_input_token
+                }
+            }
+            if any(
+                row.identity == "aliased"
+                and (row.opened_input_token is None or token_counts[row.opened_input_token] < 2)
+                for row in self.inputs
+            ):
+                raise ValueError("Aliased input requires a shared current token.")
+            for row in self.inputs:
+                if row.opened_input_token is None:
+                    continue
+                shared = token_counts[row.opened_input_token]
+                if (row.identity == "aliased") != (shared > 1):
+                    raise ValueError("Capture token identity must agree in both directions.")
+            return self
+        if self.reason is None:
+            raise ValueError("Non-observed response requires a reason.")
+        if self.outcome == "refused" and self.reason not in {
+            "not_configured",
+            "no_session",
+            "wrong_session",
+            "inventory_too_large",
+        }:
+            raise ValueError("Refused response has an invalid reason.")
+        if self.outcome == "unavailable" and self.reason not in {
+            "store_contended",
+            "publication_contended",
+            "subject_changed",
+            "start_in_flight",
+            "clock_unreliable",
+            "capture_pending",
+            "setup_failed",
+            "recorder_unavailable",
+        }:
+            raise ValueError("Unavailable response has an invalid reason.")
+        if self.reason in {"capture_pending", "setup_failed", "recorder_unavailable"}:
+            if (
+                self.session_id is None
+                or self.session_state is None
+                or any(value is not None for value in fields[2:])
+                or self.inputs
+            ):
+                raise ValueError("Matched unavailable response has an invalid payload.")
+        elif any(value is not None for value in fields) or self.inputs:
+            raise ValueError("Safe empty response cannot carry session evidence.")
+        return self
 
 
 class _FixedZeroContainmentArguments(ArgModelBase):
@@ -300,6 +510,51 @@ def _install_fixed_zero_argument_adapter(mcp: FastMCP) -> None:
     tool.parameters = _FixedZeroContainmentArguments.model_json_schema(by_alias=True)
 
 
+def _install_capture_evidence_argument_adapter(mcp: FastMCP) -> None:
+    """Bind strict raw argument validation to the capture-evidence tool only."""
+    tool = mcp._tool_manager.get_tool("get_capture_evidence")  # pyright: ignore[reportPrivateUsage]
+    if tool is None:
+        raise RuntimeError("Capture evidence tool was not registered.")
+    metadata = tool.fn_metadata
+    declared_metadata_fields = getattr(type(metadata), "model_fields", None)
+    if (
+        not isinstance(declared_metadata_fields, Mapping)
+        or "arg_model" not in declared_metadata_fields
+    ):
+        raise RuntimeError("Capture evidence argument adapter is unsupported.")
+    try:
+        adapted = metadata.model_copy(update={"arg_model": _CaptureEvidenceArguments})
+    except Exception as exc:
+        raise RuntimeError("Capture evidence argument adapter is unsupported.") from exc
+    if adapted.arg_model is not _CaptureEvidenceArguments:
+        raise RuntimeError("Capture evidence argument adapter is unsupported.")
+    tool.fn_metadata = adapted
+    tool.parameters = {
+        "type": "object",
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["capture_protocol", "intent"],
+                "properties": {
+                    "capture_protocol": {"const": "capture_evidence/v1"},
+                    "intent": {"const": "bootstrap"},
+                },
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["capture_protocol", "intent", "expected_session_id"],
+                "properties": {
+                    "capture_protocol": {"const": "capture_evidence/v1"},
+                    "intent": {"const": "current_session"},
+                    "expected_session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                },
+            },
+        ],
+    }
+
+
 @dataclass(frozen=True)
 class ServerContext:
     """Server bootstrap context.
@@ -323,6 +578,8 @@ class ServerContext:
     ambient_runtime: AmbientSessionRuntime
     telemetry_sampler: _TelemetrySampler
     started_at_utc: datetime
+    capture_evidence_publisher: CaptureEvidencePublisher
+    capture_evidence_configured: bool
     lifecycle_barrier: Lock = field(default_factory=Lock)
 
 
@@ -1018,7 +1275,6 @@ def _validate_composed_manual_first_crack_authority(
         raise ConfigError(
             "Composed driver does not support configured manual first-crack authority."
         )
-
     try:
         capability_driver = capabilities.driver
         manual_first_crack_version = capabilities.manual_first_crack_version
@@ -1041,6 +1297,17 @@ def _validate_composed_manual_first_crack_authority(
         raise ConfigError(
             "Composed driver does not support configured manual first-crack authority."
         )
+
+
+def _manual_mock_capture_configured(config: AppConfig, driver: RoasterDriver) -> bool:
+    """Return the closed composition predicate for capture-evidence capability."""
+    return bool(
+        config.first_crack.event_authority == "manual"
+        and isinstance(driver, MockRoasterDriver)
+        and config.roaster.driver == "mock"
+        and config.recording.enabled
+        and config.recording.autocapture
+    )
 
 
 def build_server_context(
@@ -1070,6 +1337,8 @@ def build_server_context(
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     _validate_composed_manual_first_crack_authority(config, roaster_driver)
+    capture_evidence_configured = _manual_mock_capture_configured(config, roaster_driver)
+    capture_evidence_publisher = CaptureEvidencePublisher()
     server_context: ServerContext | None = None
 
     def sample_active_session(session_id: str) -> bool:
@@ -1093,17 +1362,22 @@ def build_server_context(
             return False
         return True
 
+    first_crack_runtime = build_first_crack_session_runtime(
+        config, session_is_retained=session_is_retained
+    )
+    if capture_evidence_configured:
+        first_crack_runtime.set_capture_evidence_publisher(capture_evidence_publisher)
     server_context = ServerContext(
         config=config,
         transport=transport,
         session_store=session_store,
         roaster_driver=roaster_driver,
-        first_crack_runtime=build_first_crack_session_runtime(
-            config, session_is_retained=session_is_retained
-        ),
+        first_crack_runtime=first_crack_runtime,
         ambient_runtime=build_ambient_session_runtime(config),
         telemetry_sampler=telemetry_sampler,
         started_at_utc=datetime.now(UTC),
+        capture_evidence_publisher=capture_evidence_publisher,
+        capture_evidence_configured=capture_evidence_configured,
     )
     return server_context
 
@@ -1180,6 +1454,29 @@ def create_mcp_server(
             ),
             started_at_utc=server_context.started_at_utc.isoformat(),
         )
+
+    @mcp.tool()
+    def get_capture_evidence(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+        capture_protocol: Literal["capture_evidence/v1"],
+        intent: Literal["bootstrap", "current_session"],
+        expected_session_id: CaptureEvidenceSessionId | None = None,
+    ) -> CaptureEvidenceBootstrapResult | CaptureEvidenceResult:
+        """Read one bounded, non-actuating manual-capture evidence projection."""
+        server_context = ctx.request_context.lifespan_context
+        if intent == "bootstrap":
+            return CaptureEvidenceBootstrapResult(
+                capture_protocol=capture_protocol,
+                intent="bootstrap",
+                capability=(
+                    "manual_mock_capture"
+                    if server_context.capture_evidence_configured
+                    else "not_configured"
+                ),
+            )
+        if expected_session_id is None:
+            raise ValueError("expected_session_id is required for current_session.")
+        return _read_capture_evidence(server_context, expected_session_id)
 
     @mcp.tool()
     def get_runtime_config(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -1719,6 +2016,7 @@ def create_mcp_server(
         return SetRecordingMetadataResult(origin=stored.origin, roast_num=stored.roast_num)
 
     _install_fixed_zero_argument_adapter(mcp)
+    _install_capture_evidence_argument_adapter(mcp)
     return mcp
 
 
@@ -1860,6 +2158,128 @@ def _start_first_crack_runtime(
 ) -> None:
     """Start first-crack runtime preparation for a newly created session."""
     server_context.first_crack_runtime.start_for_session(session)
+
+
+def _read_capture_evidence(
+    server_context: ServerContext, expected_session_id: str
+) -> CaptureEvidenceResult:
+    """Bracket one immutable publication with two nonblocking store samples."""
+    empty = _capture_evidence_empty
+    if not server_context.capture_evidence_configured:
+        return empty("refused", "not_configured")
+    slot_count = max(1, len(server_context.config.recording.devices or ()))
+    if slot_count > 8:
+        return empty("refused", "inventory_too_large")
+    first = server_context.session_store.try_get_capture_subject()
+    if first is None:
+        return empty("unavailable", "store_contended")
+    if first.presence == "starting":
+        return empty("unavailable", "start_in_flight")
+    if first.presence == "none":
+        return empty("refused", "no_session")
+    if first.session_id != expected_session_id:
+        return empty("refused", "wrong_session")
+    if first.session_id is None or first.ownership_sequence is None:
+        return empty("unavailable", "subject_changed")
+    snapshot = server_context.capture_evidence_publisher.try_snapshot()
+    if snapshot is False:
+        return empty("unavailable", "publication_contended")
+    second = server_context.session_store.try_get_capture_subject()
+    if second is None:
+        return empty("unavailable", "store_contended")
+    if not _same_capture_subject(first, second):
+        return empty("unavailable", "subject_changed")
+    if snapshot is None or not _snapshot_belongs_to_subject(snapshot, first):
+        return _capture_evidence_empty("unavailable", "capture_pending", subject=first)
+    if snapshot.setup_failed:
+        return _capture_evidence_empty("unavailable", "setup_failed", subject=first)
+    if snapshot.recorder_unavailable:
+        return _capture_evidence_empty("unavailable", "recorder_unavailable", subject=first)
+    now = time.monotonic()
+    age = now - snapshot.published_at_monotonic_seconds
+    if not math.isfinite(now) or not math.isfinite(age) or age < 0:
+        return empty("unavailable", "clock_unreliable")
+    inputs = tuple(
+        CaptureEvidenceInputResult(
+            slot=row.slot,
+            role=row.role,
+            input_generation=row.input_generation,
+            opened_input_token=row.opened_input_token,
+            identity=row.identity,
+            requested_rate_hz=row.requested_rate_hz,
+            reported_rate_hz=(
+                float(row.reported_rate_hz) if row.reported_rate_hz is not None else None
+            ),
+            wav_header_rate_hz=(
+                float(row.wav_header_rate_hz) if row.wav_header_rate_hz is not None else None
+            ),
+            input_frames=row.input_frames,
+            accepted_frames=row.accepted_frames,
+            flushed_frames=row.flushed_frames,
+            state=row.state,
+            failure=row.failure,
+        )
+        for row in snapshot.inputs
+    )
+    return CaptureEvidenceResult(
+        capture_protocol="capture_evidence/v1",
+        intent="current_session",
+        outcome="observed",
+        reason=None,
+        session_id=first.session_id,
+        session_state=first.presence,
+        recorder_generation=snapshot.recorder_generation,
+        publication_sequence=snapshot.publication_sequence,
+        age_seconds=float(age),
+        inputs=inputs,
+    )
+
+
+def _capture_evidence_empty(
+    outcome: CaptureEvidenceOutcome,
+    reason: CaptureEvidenceReason,
+    *,
+    subject: CaptureSubject | None = None,
+) -> CaptureEvidenceResult:
+    """Build one exact empty current-session response without a fallback cache."""
+    matched = reason in {"capture_pending", "setup_failed", "recorder_unavailable"}
+    return CaptureEvidenceResult(
+        capture_protocol="capture_evidence/v1",
+        intent="current_session",
+        outcome=outcome,
+        reason=reason,
+        session_id=subject.session_id if matched and subject is not None else None,
+        session_state=(
+            cast(Literal["active", "stopped"], subject.presence)
+            if matched and subject is not None
+            else None
+        ),
+        recorder_generation=None,
+        publication_sequence=None,
+        age_seconds=None,
+        inputs=(),
+    )
+
+
+def _same_capture_subject(left: CaptureSubject, right: CaptureSubject) -> bool:
+    """Return exact equality for the bounded store-read bracket."""
+    return (
+        left.presence == right.presence
+        and left.session_id == right.session_id
+        and left.ownership_sequence == right.ownership_sequence
+    )
+
+
+def _snapshot_belongs_to_subject(
+    snapshot: CaptureEvidenceSnapshot, subject: CaptureSubject
+) -> bool:
+    """Return whether immutable evidence is owned by the sampled subject."""
+    return (
+        subject.session_id is not None
+        and subject.ownership_sequence is not None
+        and snapshot.session_id == subject.session_id
+        and snapshot.ownership_sequence == subject.ownership_sequence
+    )
 
 
 def _process_first_crack_runtime_for_active_session(

@@ -7258,6 +7258,164 @@ def test_cold_temperature_projection_schema_is_additive_and_closed() -> None:
     assert "cold_temperature_projection" not in cast(list[str], schema.get("required", []))
 
 
+def test_capture_evidence_real_stdio_has_closed_boundary_and_stopped_owner(tmp_path: Path) -> None:
+    """The registered tool preserves legacy discovery and SDK-boundary semantics."""
+    asyncio.run(_capture_evidence_real_stdio(tmp_path))
+
+
+async def _capture_evidence_real_stdio(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = tmp_path / "capture-evidence.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "none",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+    bootstrap = {"capture_protocol": "capture_evidence/v1", "intent": "bootstrap"}
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        tools = cast(Any, await asyncio.wait_for(client.list_tools(), 5))
+        names = {tool.name for tool in tools.tools}
+        assert {"get_capture_evidence", "get_server_info", "start_roast_session"} <= names
+        schema = next(
+            tool.inputSchema for tool in tools.tools if tool.name == "get_capture_evidence"
+        )
+        assert schema["type"] == "object"
+        assert len(schema["oneOf"]) == 2
+
+        malformed = await asyncio.wait_for(
+            client.call_tool("get_capture_evidence", {**bootstrap, "extra": True}), 5
+        )
+        assert malformed.isError
+        for malformed_request in (
+            {"capture_protocol": None, "intent": "bootstrap"},
+            {"capture_protocol": "capture_evidence/v1", "intent": "current_session"},
+            {
+                "capture_protocol": "capture_evidence/v1",
+                "intent": "current_session",
+                "expected_session_id": 7,
+            },
+        ):
+            malformed = await asyncio.wait_for(
+                client.call_tool("get_capture_evidence", malformed_request), 5
+            )
+            assert malformed.isError
+        typed_empty = await asyncio.wait_for(
+            client.call_tool(
+                "get_capture_evidence",
+                {
+                    "capture_protocol": "capture_evidence/v1",
+                    "intent": "current_session",
+                    "expected_session_id": "unknown",
+                },
+            ),
+            5,
+        )
+        assert typed_empty.structuredContent == {
+            "result": {
+                "capture_protocol": "capture_evidence/v1",
+                "intent": "current_session",
+                "outcome": "refused",
+                "reason": "no_session",
+                "session_id": None,
+                "session_state": None,
+                "recorder_generation": None,
+                "publication_sequence": None,
+                "age_seconds": None,
+                "inputs": [],
+            }
+        }
+        bootstrapped = await asyncio.wait_for(
+            client.call_tool("get_capture_evidence", bootstrap), 5
+        )
+        assert bootstrapped.structuredContent == {
+            "result": {
+                "capture_protocol": "capture_evidence/v1",
+                "intent": "bootstrap",
+                "capability": "manual_mock_capture",
+            }
+        }
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert started.structuredContent is not None
+        session_id = cast(str, started.structuredContent["session"]["session_id"])
+        wrong = await asyncio.wait_for(
+            client.call_tool(
+                "get_capture_evidence",
+                {
+                    "capture_protocol": "capture_evidence/v1",
+                    "intent": "current_session",
+                    "expected_session_id": "other-session",
+                },
+            ),
+            5,
+        )
+        assert wrong.structuredContent is not None
+        assert wrong.structuredContent["result"]["reason"] == "wrong_session"
+        assert wrong.structuredContent["result"]["session_id"] is None
+        stopped = await asyncio.wait_for(client.call_tool("emergency_stop", {}), 5)
+        assert not stopped.isError
+        evidence = await asyncio.wait_for(
+            client.call_tool(
+                "get_capture_evidence",
+                {
+                    "capture_protocol": "capture_evidence/v1",
+                    "intent": "current_session",
+                    "expected_session_id": session_id,
+                },
+            ),
+            5,
+        )
+        assert evidence.structuredContent is not None
+        assert evidence.structuredContent["result"]["session_id"] == session_id
+        assert evidence.structuredContent["result"]["session_state"] == "stopped"
+
+
+def test_capture_evidence_argument_adapter_fails_closed_for_undeclared_or_ignored_binding() -> None:
+    """The capture adapter accepts only a declared, copied SDK argument binding."""
+    for metadata in (
+        _DynamicArgModelMetadataProbe.model_validate(
+            {"marker": "dynamic-only", "arg_model": _AdapterOriginalArguments}
+        ),
+        _IgnoringCopyMetadataProbe(
+            arg_model=_AdapterOriginalArguments,
+            marker="ignores-update",
+        ),
+    ):
+        parameters = {"old": "parameters"}
+        tool = SimpleNamespace(fn_metadata=metadata, parameters=parameters)
+
+        def get_capture_tool(
+            name: str, *, capture_tool: SimpleNamespace = tool
+        ) -> SimpleNamespace | None:
+            """Return only the bounded capture-evidence metadata probe."""
+            return capture_tool if name == "get_capture_evidence" else None
+
+        mcp = cast(
+            FastMCP,
+            SimpleNamespace(_tool_manager=SimpleNamespace(get_tool=get_capture_tool)),
+        )
+        with pytest.raises(RuntimeError, match="argument adapter is unsupported"):
+            mcp_server._install_capture_evidence_argument_adapter(mcp)  # pyright: ignore[reportPrivateUsage]
+        assert tool.fn_metadata is metadata
+        assert tool.parameters is parameters
+
+
 @pytest.mark.parametrize("stage", ["loader", "backend", "sink", "none"])
 def test_manual_shadow_real_stdio_dispatch_survives_blocked_observer(
     tmp_path: Path, stage: str
@@ -7711,6 +7869,37 @@ def test_automatic_authority_does_not_read_composed_manual_declaration() -> None
         AppConfig(), driver
     )
     assert driver.capability_reads == 0
+
+
+@pytest.mark.parametrize(
+    ("config", "driver", "expected"),
+    [
+        (_manual_authority_config(), MockRoasterDriver(), True),
+        (
+            AppConfig(
+                first_crack=FirstCrackConfig(mode="audio", event_authority="automatic"),
+                recording=RecordingConfig(enabled=True, autocapture=True),
+            ),
+            MockRoasterDriver(),
+            False,
+        ),
+        (
+            _manual_authority_config(),
+            HottopRoasterDriver(port="/dev/fake-capture-bootstrap"),
+            False,
+        ),
+    ],
+)
+def test_capture_bootstrap_capability_is_closed_to_manual_mock_composition(
+    config: AppConfig, driver: object, expected: bool
+) -> None:
+    """Automatic and Hottop compositions cannot advertise manual mock capture."""
+    assert (
+        mcp_server._manual_mock_capture_configured(  # pyright: ignore[reportPrivateUsage]
+            config, cast(Any, driver)
+        )
+        is expected
+    )
 
 
 def test_manual_start_refuses_spoofed_capability_family_before_reservation(

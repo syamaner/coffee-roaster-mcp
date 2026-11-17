@@ -190,6 +190,40 @@ def test_disabled_and_manual_modes_do_not_prepare_audio_or_detector() -> None:
     assert calls == []
 
 
+def test_automatic_audio_capture_never_calls_an_injected_evidence_publisher() -> None:
+    """Automatic capture starts normally without reporting into the manual evidence path."""
+    from coffee_roaster_mcp.capture_evidence import CaptureEvidencePublisher
+
+    class ReporterSpy(CaptureEvidencePublisher):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[str] = []
+
+        def publish_setup(self, **kwargs: object) -> bool:
+            self.calls.append("publish_setup")
+            return super().publish_setup(**kwargs)  # type: ignore[arg-type]
+
+    store = RoastSessionStore()
+    session = store.start_session()
+    pipeline = FakeAudioPipeline()
+    reporter = ReporterSpy()
+    backend = MockDetectorBackend(())
+    runtime = FirstCrackSessionRuntime(
+        config=AppConfig(first_crack=FirstCrackConfig(mode="audio", event_authority="automatic")),
+        audio_pipeline_factory=lambda _: pipeline,
+        detector_adapter_factory=lambda config: build_first_crack_detector_adapter(
+            config, _resolved_detector_artifacts(), backend
+        ),
+        capture_evidence=reporter,
+    )
+
+    started = runtime.start_for_session(session)
+
+    assert started.status == "pending"
+    assert pipeline.started
+    assert reporter.calls == []
+
+
 def test_audio_runtime_processes_after_beans_added_and_records_once() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
@@ -5133,3 +5167,32 @@ def test_successor_setup_failure_exposes_only_its_allocated_resources(
     finally:
         runtime.close_observation(third, reason="beans_dropped")
         assert third_owner.reaped.wait(2)
+
+
+def test_manual_capture_evidence_marks_failed_recorder_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An admitted manual owner reports setup failure even without a recorder wrapper."""
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+    from coffee_roaster_mcp.capture_evidence import CaptureEvidencePublisher
+
+    runtime, _captures, _config = _manual_runtime_fixture(tmp_path)
+    publisher = CaptureEvidencePublisher()
+    runtime.set_capture_evidence_publisher(publisher)
+    store = RoastSessionStore(default_log_dir=tmp_path / "setup-failure")
+    session = store.start_session()
+
+    def fail_recorder(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("synthetic recorder construction failure")
+
+    monkeypatch.setattr(runtime_module, "build_session_recorder", fail_recorder)
+    failed = runtime.start_for_session(session)
+    snapshot = publisher.try_snapshot()
+
+    assert failed.status == "unavailable"
+    assert snapshot is not False and snapshot is not None
+    assert (
+        snapshot.session_id,
+        snapshot.ownership_sequence,
+        snapshot.setup_failed,
+    ) == (session.id, session.capture_ownership_sequence, True)
