@@ -1538,6 +1538,7 @@ class _IndependentCaptureStream:
         self._slot: int | None = None
         self._input_observed = False
         self._input_frame_total = 0
+        self._input_close_confirmed: bool | None = None
 
     @property
     def writer(self) -> _WavStreamWriter:
@@ -1553,6 +1554,11 @@ class _IndependentCaptureStream:
     def input_frame_total(self) -> int:
         """Return this input owner's cumulative attributable read total."""
         return self._input_frame_total
+
+    @property
+    def input_close_confirmed(self) -> bool | None:
+        """Return this input owner's close result when evidence observes it."""
+        return self._input_close_confirmed
 
     def set_capture_evidence_observer(self, observer: EvidenceRoastRecorder, *, slot: int) -> None:
         """Attach the bounded observer to this existing capture owner."""
@@ -1659,7 +1665,20 @@ class _IndependentCaptureStream:
             # Close the audio input on the same thread that owns its reads, so its
             # native PortAudio ring buffer is never freed mid-read (the same
             # discipline the detector capture loop uses).
-            _close_audio_input_if_supported(self._audio_input)
+            observer = self._capture_evidence_observer
+            if observer is None:
+                # Preserve the legacy automatic/non-evidence cleanup exactly.
+                _close_audio_input_if_supported(self._audio_input)
+            else:
+                close = getattr(self._audio_input, "close", None)
+                confirmed = False
+                if callable(close):
+                    try:
+                        close()
+                        confirmed = True
+                    except Exception as exc:  # noqa: BLE001 - close diagnostics vary.
+                        _LOGGER.warning("Independent audio input close failed: %s", exc)
+                self._input_close_confirmed = confirmed
 
 
 class RoastAudioRecorder:
@@ -2173,7 +2192,11 @@ class MultiDeviceRoastRecorder:
                             input_frames=stream.input_frame_total,
                             accepted_frames=accepted_frames,
                             flushed_frames=flushed_frames,
-                            confirmed=stream.shutdown_confirmed and stream.writer.close_confirmed,
+                            confirmed=(
+                                stream.shutdown_confirmed
+                                and stream.writer.close_confirmed
+                                and stream.input_close_confirmed is True
+                            ),
                             wav_header_rate_hz=header_rate_hz,
                         )
             streams = [self._detector_writer, *(s.writer for s in self._additional_streams)]
@@ -2868,18 +2891,23 @@ class AudioCapturePipeline:
             # Close the audio input on the same thread that owns its reads —
             # see the docstring above; this is the load-bearing invariant
             # #190 must not disturb.
-            input_close_confirmed = False
-            try:
+            recorder = self._recorder
+            if not isinstance(recorder, EvidenceRoastRecorder):
+                # Preserve the pre-evidence reader cleanup path, including its
+                # diagnostics and stop/drain behavior.
                 _close_audio_input_if_supported(self._audio_input)
-                input_close_confirmed = True
-            except Exception as exc:  # noqa: BLE001 - backend close errors vary.
-                with self._state_lock:
-                    self._latest_error = str(exc)
-                _LOGGER.warning("Audio input close failed: %s", exc)
-            finally:
-                recorder = self._recorder
-                if isinstance(recorder, EvidenceRoastRecorder):
-                    recorder.confirm_detector_input_closed(confirmed=input_close_confirmed)
+            else:
+                input_close_confirmed = False
+                close = getattr(self._audio_input, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                        input_close_confirmed = True
+                    except Exception as exc:  # noqa: BLE001 - backend close errors vary.
+                        # A cleanup fault is evidence uncertainty, not a later
+                        # replacement for a causal read failure.
+                        _LOGGER.warning("Audio input close failed: %s", exc)
+                recorder.confirm_detector_input_closed(confirmed=input_close_confirmed)
             # Sentinel: wake a processing thread that is blocked waiting for
             # the next chunk so it notices shutdown promptly even if
             # _stop_requested was set for a reason other than the caller's

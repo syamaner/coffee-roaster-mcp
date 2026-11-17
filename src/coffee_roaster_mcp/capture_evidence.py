@@ -22,6 +22,18 @@ CaptureFailure = Literal[
 
 
 @dataclass(frozen=True)
+class _PendingFinalReceipt:
+    """Private writer receipt retained until an input-open claim can prove it."""
+
+    input_frames: int | None
+    accepted_frames: int | None
+    flushed_frames: int | None
+    confirmed: bool
+    failure: CaptureFailure | None
+    wav_header_rate_hz: float | None
+
+
+@dataclass(frozen=True)
 class CaptureInputEvidence:
     """One bounded recorder-input projection, with no raw device identity."""
 
@@ -33,6 +45,11 @@ class CaptureInputEvidence:
     # attempt must fence a late callback without inventing an opened public
     # generation in the wire row.
     attempted_input_generation: int | None = None
+    # These receipts are intentionally private while there is no attributable
+    # input-open observation.  The wire contract keeps an unopened row fully
+    # null, but a same-attempt first open can later attach the writer truth.
+    pending_final_receipt: _PendingFinalReceipt | None = None
+    attempted_input_close_confirmed: bool | None = None
     opened_input_token: str | None = None
     identity: CaptureIdentity = "unopened"
     reported_rate_hz: float | None = None
@@ -303,26 +320,86 @@ class CaptureEvidencePublisher:
             if input_generation < known_generation:
                 return None
             if input_generation == known_generation:
-                if row.state == "failed":
+                # A definitive terminal disposition without an attributable
+                # open is a fence, not an invitation for a delayed callback
+                # to manufacture an opened generation.
+                if row.state in {"closed", "failed"}:
                     return None
                 if row.state == "closing":
                     # Writer finalisation can win before the reader's first
                     # observation. Record the late actual input proof, but do
                     # not let it reopen a finalised attempt as capturing.
+                    receipt = row.pending_final_receipt
+                    if (
+                        valid_id
+                        and row.backend_input_id is not None
+                        and row.backend_input_id != backend_input_id
+                    ):
+                        return None
+                    state: CaptureState = "closing"
+                    failure: CaptureFailure | None = row.failure or "close_unconfirmed"
+                    if receipt is not None:
+                        if receipt.failure not in {None, "close_unconfirmed"}:
+                            state = "failed"
+                            failure = receipt.failure
+                        elif receipt.confirmed and row.attempted_input_close_confirmed is not False:
+                            state = "closed"
+                            failure = None
+                    # A late observation may fill only evidence that this
+                    # owned attempt has not already proved.  In particular,
+                    # an absent or contradictory backend observation cannot
+                    # erase a resolved identity or its collision fence.
+                    has_proved_identity = row.backend_input_id is not None
                     return replace(
                         row,
                         input_generation=input_generation,
-                        opened_input_token=candidate_token if valid_id else None,
-                        identity="unresolved" if not valid_id else "resolved",
-                        reported_rate_hz=reported_rate_hz if valid_rate else None,
-                        wav_header_rate_hz=(
-                            wav_header_rate_hz if valid_header else row.wav_header_rate_hz
+                        opened_input_token=(
+                            row.opened_input_token
+                            if has_proved_identity
+                            else (candidate_token if valid_id else None)
                         ),
-                        input_frames=0,
-                        accepted_frames=0,
-                        flushed_frames=0,
-                        backend_input_id=backend_input_id if valid_id else None,
-                        identity_collision=False,
+                        identity=(
+                            row.identity
+                            if has_proved_identity
+                            else ("unresolved" if not valid_id else "resolved")
+                        ),
+                        reported_rate_hz=(
+                            row.reported_rate_hz
+                            if row.reported_rate_hz is not None or not valid_rate
+                            else reported_rate_hz
+                        ),
+                        wav_header_rate_hz=(
+                            row.wav_header_rate_hz
+                            if row.wav_header_rate_hz is not None
+                            else (
+                                wav_header_rate_hz
+                                if valid_header
+                                else (
+                                    receipt.wav_header_rate_hz
+                                    if receipt is not None
+                                    else row.wav_header_rate_hz
+                                )
+                            )
+                        ),
+                        input_frames=(
+                            receipt.input_frames if receipt is not None else row.input_frames
+                        ),
+                        accepted_frames=(
+                            receipt.accepted_frames if receipt is not None else row.accepted_frames
+                        ),
+                        flushed_frames=(
+                            receipt.flushed_frames if receipt is not None else row.flushed_frames
+                        ),
+                        state=state,
+                        failure=failure,
+                        backend_input_id=(
+                            row.backend_input_id
+                            if has_proved_identity
+                            else backend_input_id
+                            if valid_id
+                            else None
+                        ),
+                        identity_collision=row.identity_collision,
                     )
                 # A generic processor may have published an unresolved row
                 # before the actual PortAudio owner reports its proved input.
@@ -350,6 +427,12 @@ class CaptureEvidencePublisher:
                 row,
                 input_generation=input_generation,
                 attempted_input_generation=input_generation,
+                # Private receipts and close confirmation belong only to the
+                # exact input generation that produced them.  A successful
+                # reopen starts a new attempt, so it must not inherit an
+                # earlier attempt's terminal disposition.
+                pending_final_receipt=None,
+                attempted_input_close_confirmed=None,
                 opened_input_token=candidate_token if valid_id else None,
                 identity="unresolved" if not valid_id else "resolved",
                 reported_rate_hz=reported_rate_hz if valid_rate else None,
@@ -426,9 +509,30 @@ class CaptureEvidencePublisher:
         """Publish owner-observed input close, preserving partial finalisation."""
 
         def update(row: CaptureInputEvidence) -> CaptureInputEvidence | None:
-            if row.state not in {"capturing", "closing"} or (
-                row.input_generation != input_generation
-            ):
+            if row.state in {"closed", "failed"}:
+                return None
+            if row.state == "pending":
+                return replace(
+                    row,
+                    attempted_input_generation=input_generation,
+                    attempted_input_close_confirmed=confirmed,
+                    state="closing",
+                    failure=None if confirmed else "close_unconfirmed",
+                )
+            if row.input_generation is None:
+                if row.attempted_input_generation != input_generation:
+                    return None
+                receipt = row.pending_final_receipt
+                settled = confirmed and receipt is not None and receipt.confirmed
+                return replace(
+                    row,
+                    attempted_input_close_confirmed=confirmed,
+                    state="closed" if settled else "closing",
+                    failure=None if settled else row.failure or "close_unconfirmed",
+                )
+            if row.input_generation != input_generation:
+                return None
+            if row.state not in {"capturing", "closing"}:
                 return None
             return replace(
                 row,
@@ -473,16 +577,43 @@ class CaptureEvidencePublisher:
             return False
 
         def update(row: CaptureInputEvidence) -> CaptureInputEvidence | None:
-            if row.state == "pending":
+            if row.state == "pending" or (
+                row.state == "closing"
+                and row.input_generation is None
+                and row.attempted_input_generation == input_generation
+            ):
                 # The writer can complete while the owning reader is still
                 # blocked in its first read. Fence that exact attempt before
-                # it returns: a later reader callback must not resurrect this
-                # finalised recorder as a healthy capturing row.
+                # it returns, retaining its private receipt so a later exact
+                # input-open proof can expose it without resurrecting capture.
+                receipt = _PendingFinalReceipt(
+                    input_frames=input_frames,
+                    accepted_frames=accepted_frames,
+                    flushed_frames=flushed_frames,
+                    confirmed=confirmed,
+                    failure=failure,
+                    wav_header_rate_hz=(
+                        float(wav_header_rate_hz)
+                        if wav_header_rate_hz is not None and _positive_finite(wav_header_rate_hz)
+                        else None
+                    ),
+                )
+                definite_failure = failure not in {None, "close_unconfirmed"}
+                settled = (
+                    not definite_failure
+                    and confirmed
+                    and row.attempted_input_close_confirmed is True
+                )
                 return replace(
                     row,
                     attempted_input_generation=input_generation,
-                    state="closing",
-                    failure="close_unconfirmed",
+                    pending_final_receipt=receipt,
+                    state="failed" if definite_failure else ("closed" if settled else "closing"),
+                    failure=(
+                        failure
+                        if definite_failure
+                        else (None if settled else failure or "close_unconfirmed")
+                    ),
                 )
             if row.input_generation != input_generation or row.state not in {"capturing", "failed"}:
                 return None
