@@ -61,6 +61,16 @@ TimingEvidenceIdentityRejection = Literal[
     "session_purpose_not_eligible",
 ]
 TimingEvidenceBusyRejection = Literal["finalisation_in_progress", "drop_in_progress"]
+TimingEvidenceAssemblyReason = Literal[
+    "session_changed_during_read",
+    "finalisation_in_progress",
+    "drop_in_progress",
+    "clock_invalid",
+    "clock_regression",
+    "out_of_order_read",
+    "sequence_exhausted",
+    "record_invalid",
+]
 
 _SINGLETON_EVENT_KINDS: frozenset[RoastEventKind] = frozenset(
     {
@@ -512,7 +522,7 @@ class TimingEvidenceAssembly:
     """Closed store-side outcome for a timing-evidence assembly attempt."""
 
     outcome: Literal["evidence", "refused_identity", "refused_busy", "unavailable"]
-    reason_code: str | None
+    reason_code: TimingEvidenceAssemblyReason | None
     result: object | None = None
 
 

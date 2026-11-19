@@ -659,6 +659,13 @@ class EventEvidence(BaseModel):
 
     @model_validator(mode="after")
     def _validate_source_time_basis(self) -> EventEvidence:
+        allowed_sources = {
+            "beans_added": frozenset({"manual_mark", "auto_t0", "unattributed"}),
+            "first_crack_detected": frozenset({"manual_mark", "model_detection", "unattributed"}),
+            "beans_dropped": frozenset({"unattributed"}),
+        }
+        if self.source not in allowed_sources[self.kind]:
+            raise ValueError("Event source must match event kind.")
         expected = (
             "detector_clock_rebased"
             if self.source == "model_detection"
@@ -2968,7 +2975,7 @@ def _run_timing_evidence(
     return _timing_evidence_result(
         outcome=assembled.outcome,
         requested_session_id=expected_session_id,
-        reason_code=cast(TimingEvidenceReason, assembled.reason_code),
+        reason_code=assembled.reason_code,
         driver_read="invoked",
     )
 

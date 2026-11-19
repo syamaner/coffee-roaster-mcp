@@ -2631,5 +2631,12 @@ atomic, versioned mock records with canonical producer events and synthetic
 software-only temperature brackets. Hottop and every non-exact mock composition
 are refused. The record does not qualify physical timing, hardware, recipe
 decisions, or roast readiness; reads advance only the existing mock simulation
-step and do not run auto-T0 or first-crack processing. No release is claimed.
-Issue #244 remains open, and its exact-Drop P2 work is separate and unstarted.
+step and do not run auto-T0 or first-crack processing. Consequently, polling
+cadence can affect later mock auto-T0 charge timing; this is a software-only
+simulation limitation, not a timing or recipe claim. Replay or future-dated
+model first-crack remains diagnostic (`detector_clock_rebased`); later
+non-fault canonical events, including a subsequent Drop, are normalised to no
+earlier than the preceding event time. The recorded offline gate environment
+was Python 3.11.14, MCP 1.30.0, Pydantic 2.14.4, and pydantic-core 2.50.5.
+No release is claimed. Issue #244 remains open, and its exact-Drop P2 work is
+separate and unstarted.

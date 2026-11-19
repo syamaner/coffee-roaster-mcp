@@ -253,8 +253,49 @@ def test_timing_evidence_capability_version_refuses_without_reading(
     assert reads == 0
 
 
-def test_timing_evidence_models_reject_inexact_and_inconsistent_rows() -> None:
-    """Wire models reject coercion and source/time-basis mismatches before output."""
+@pytest.mark.parametrize(
+    ("kind", "source", "time_basis", "accepted"),
+    (
+        ("beans_added", "manual_mark", "producer_canonical_record", True),
+        ("beans_added", "auto_t0", "producer_canonical_record", True),
+        ("beans_added", "model_detection", "detector_clock_rebased", False),
+        ("beans_added", "unattributed", "producer_canonical_record", True),
+        ("first_crack_detected", "manual_mark", "producer_canonical_record", True),
+        ("first_crack_detected", "auto_t0", "producer_canonical_record", False),
+        ("first_crack_detected", "model_detection", "detector_clock_rebased", True),
+        ("first_crack_detected", "unattributed", "producer_canonical_record", True),
+        ("beans_dropped", "manual_mark", "producer_canonical_record", False),
+        ("beans_dropped", "auto_t0", "producer_canonical_record", False),
+        ("beans_dropped", "model_detection", "detector_clock_rebased", False),
+        ("beans_dropped", "unattributed", "producer_canonical_record", True),
+    ),
+)
+def test_event_evidence_enforces_the_closed_kind_source_matrix(
+    kind: str, source: str, time_basis: str, accepted: bool
+) -> None:
+    """Each source/kind pairing is accepted only when §4.5 permits it.
+
+    This is the causal witness for the kind/source guard: removing that guard
+    admits each rejected pairing.
+    """
+    row = {
+        "kind": kind,
+        "event_index": 1,
+        "canonical_seconds": 1.0,
+        "clock_epoch_id": "0" * 32,
+        "source": source,
+        "time_basis": time_basis,
+        "physical_time_bound": "not_provided",
+    }
+    if accepted:
+        assert mcp_server.EventEvidence.model_validate(row).source == source
+    else:
+        with pytest.raises((TypeError, ValueError)):
+            mcp_server.EventEvidence.model_validate(row)
+
+
+def test_event_evidence_rejects_inconsistent_source_time_basis() -> None:
+    """The §18.1 source/time-basis guard remains independently causal."""
     with pytest.raises((TypeError, ValueError)):
         mcp_server.EventEvidence.model_validate(
             {
@@ -267,6 +308,10 @@ def test_timing_evidence_models_reject_inexact_and_inconsistent_rows() -> None:
                 "physical_time_bound": "not_provided",
             }
         )
+
+
+def test_timing_evidence_models_reject_inexact_rows() -> None:
+    """Wire models reject inexact values before output."""
     with pytest.raises((TypeError, ValueError)):
         mcp_server.TimingEvidenceResult.model_validate(
             {
@@ -537,15 +582,36 @@ def test_timing_evidence_capability_property_and_config_are_closed(
 def test_timing_evidence_epoch_is_store_lifetime_and_validated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The epoch generator runs once per store, not per session or read."""
+    """The frozen returned clock exposes one immutable store-lifetime epoch."""
     values = iter(("a" * 32, "b" * 32))
     monkeypatch.setattr(session_module, "_generate_clock_epoch_id", lambda: next(values))
-    one = RoastSessionStore(monotonic_now=lambda: 1.0, session_id_factory=lambda: "one")
+    one = RoastSessionStore(
+        monotonic_now=lambda: 1.0,
+        session_id_factory=iter(("one", "one-next")).__next__,
+    )
     first = one.start_session()
+    one.record_event(first, "beans_added", provenance="manual_mark")
+    driver = MockRoasterDriver()
+    driver.connect()
+    context = cast(
+        mcp_server.ServerContext,
+        SimpleNamespace(
+            session_store=one,
+            roaster_driver=driver,
+            config=SimpleNamespace(roaster=SimpleNamespace(driver="mock")),
+        ),
+    )
+    first_result = _run(context, first.id)
+    assert first_result.record is not None
     one.stop_session()
-    one.start_session()
+    second = one.start_session()
+    one.record_event(second, "beans_added", provenance="manual_mark")
+    second_result = _run(context, second.id)
+    assert second_result.record is not None
     two = RoastSessionStore(monotonic_now=lambda: 1.0, session_id_factory=lambda: "two")
-    assert one._clock_epoch_id == "a" * 32  # pyright: ignore[reportPrivateUsage]
+    assert first_result.record.clock.epoch_id == "a" * 32
+    assert second_result.record.clock.epoch_id == first_result.record.clock.epoch_id
+    assert second_result.record.clock.epoch_id != "b" * 32
     assert two._clock_epoch_id == "b" * 32  # pyright: ignore[reportPrivateUsage]
     assert first.id == "one"
     monkeypatch.setattr(session_module, "_generate_clock_epoch_id", lambda: "INVALID")
