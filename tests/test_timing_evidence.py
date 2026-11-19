@@ -467,8 +467,10 @@ def test_session_timing_ownership_does_not_depend_on_mcp_or_drivers() -> None:
         ("bean", "7.0", "invalid", "not_exact_float"),
         ("environment", "7.0", "invalid", "not_exact_float"),
         ("bean", math.nan, "invalid", "non_finite"),
+        ("bean", math.inf, "invalid", "non_finite"),
         ("environment", math.inf, "invalid", "non_finite"),
         ("bean", -math.inf, "invalid", "non_finite"),
+        ("environment", -math.inf, "invalid", "non_finite"),
         ("environment", math.nan, "invalid", "non_finite"),
     ],
 )
@@ -1314,9 +1316,11 @@ def test_timing_evidence_bare_cooling_stop_active_complete_is_record_invalid(
         ((1, 101.0), "not_invoked"),
         ((math.nan, 101.0), "not_invoked"),
         ((math.inf, 101.0), "not_invoked"),
+        ((-math.inf, 101.0), "not_invoked"),
         ((100.0, 1), "invoked"),
         ((100.0, math.nan), "invoked"),
         ((100.0, math.inf), "invoked"),
+        ((100.0, -math.inf), "invoked"),
     ],
 )
 def test_timing_evidence_rejects_exact_invalid_t0_and_t1_values(
@@ -1334,6 +1338,32 @@ def test_timing_evidence_rejects_exact_invalid_t0_and_t1_values(
 
     _assert_refusal(result, outcome="unavailable", reason="clock_invalid", driver_read=driver_read)
     assert reads == [0 if driver_read == "not_invoked" else 1]
+
+
+@pytest.mark.parametrize("position", ["t0", "t1"])
+def test_timing_evidence_rejects_clock_exceptions_at_both_positions(
+    monkeypatch: pytest.MonkeyPatch, position: str
+) -> None:
+    """Clock exceptions are closed before or after exactly one driver read."""
+    context, driver, session_id = _context()
+    reads = _count_reads(monkeypatch, driver)
+    calls = [0]
+
+    def clock() -> float:
+        calls[0] += 1
+        if calls[0] == (1 if position == "t0" else 2):
+            raise RuntimeError("test clock failure")
+        return 101.0
+
+    monkeypatch.setattr(context.session_store, "read_timing_evidence_clock", clock)
+    result = _run(context, session_id)
+    _assert_refusal(
+        result,
+        outcome="unavailable",
+        reason="clock_invalid",
+        driver_read="not_invoked" if position == "t0" else "invoked",
+    )
+    assert reads == [0 if position == "t0" else 1]
 
 
 def test_timing_evidence_rejects_nonfinite_derived_bracket_without_commit(
@@ -1907,3 +1937,350 @@ def test_timing_evidence_real_stdio_schema_and_malformed_requests(
     assert imported_module.read_text(encoding="utf-8").endswith("coffee_roaster_mcp/mcp_server.py")
     if mutated_source is not None:
         assert Path(imported_module.read_text(encoding="utf-8")).is_relative_to(mutated_source)
+
+
+def _context_without_fc(
+    clock_values: tuple[float, ...],
+) -> tuple[mcp_server.ServerContext, MockRoasterDriver, str]:
+    """Create a roast with charge only and a fully test-owned clock stream."""
+    clock = iter(clock_values).__next__
+    store = RoastSessionStore(monotonic_now=clock, session_id_factory=lambda: "boundary-session")
+    session = store.start_session()
+    store.record_event(session, "beans_added", provenance="manual_mark")
+    driver = MockRoasterDriver()
+    driver.connect()
+    return (
+        cast(
+            mcp_server.ServerContext,
+            SimpleNamespace(
+                session_store=store,
+                roaster_driver=driver,
+                config=SimpleNamespace(roaster=SimpleNamespace(driver="mock")),
+            ),
+        ),
+        driver,
+        session.id,
+    )
+
+
+def test_timing_evidence_keeps_fc_at_its_actual_read_or_assembly_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G13a/G14: FC written in-read differs from FC written after t1, bit-for-bit.
+
+    A disposable ``round(event.monotonic_seconds, 6)`` mutation in the event
+    evidence builder makes the first raw-hex assertion fail.
+    """
+    in_read, in_driver, in_id = _context_without_fc(
+        (100.0, 100.1, 100.30000000000004, 100.6000000000001, 100.8000000000001)
+    )
+    in_store = in_read.session_store
+    in_session = in_store.get_latest_session()
+    assert in_session is not None
+    original_read = in_driver.read_state
+
+    def record_inside_read() -> RoasterState:
+        event = in_store.record_event(in_session, "first_crack_detected", provenance="manual_mark")
+        assert event.monotonic_seconds.hex() == (100.6000000000001 - 100.0).hex()
+        return original_read()
+
+    monkeypatch.setattr(in_driver, "read_state", record_inside_read)
+    inside = _run(in_read, in_id)
+    assert inside.record is not None and inside.record.first_crack is not None
+    inside_fc = inside.record.first_crack.canonical_seconds
+    inside_lo = inside.record.bean.acquisition_lo_seconds  # type: ignore[union-attr]
+    inside_hi = inside.record.bean.acquisition_hi_seconds  # type: ignore[union-attr]
+    assert inside_fc.hex() == (100.6000000000001 - 100.0).hex()
+    assert inside_lo <= inside_fc <= inside_hi
+
+    after, _, after_id = _context_without_fc(
+        (100.0, 100.1, 100.30000000000004, 100.8000000000001, 100.9000000000001)
+    )
+    after_store = after.session_store
+    after_session = after_store.get_latest_session()
+    assert after_session is not None
+    original_assemble = after_store.assemble_timing_evidence
+
+    def assemble_after_t1(*args: object, **kwargs: object) -> object:
+        event = after_store.record_event(
+            after_session, "first_crack_detected", provenance="manual_mark"
+        )
+        assert event.monotonic_seconds.hex() == (100.9000000000001 - 100.0).hex()
+        return original_assemble(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(after_store, "assemble_timing_evidence", assemble_after_t1)
+    later = _run(after, after_id)
+    assert later.record is not None and later.record.first_crack is not None
+    assert later.record.first_crack.canonical_seconds.hex() == (100.9000000000001 - 100.0).hex()
+    assert later.record.first_crack.canonical_seconds > later.record.bean.acquisition_hi_seconds  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("pending_kind", ["control", "heat_containment"])
+def test_timing_evidence_non_drop_reservations_remain_pending_and_visible_at_assembly(
+    monkeypatch: pytest.MonkeyPatch, pending_kind: str
+) -> None:
+    """Only Drop is busy: other exact reservations survive an evidence read."""
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    before_phase = session.phase
+    original = driver.read_state
+    reservation: list[object] = []
+
+    def reserve_other() -> RoasterState:
+        reservation.append(store.reserve_driver_command(session, kind=cast(Any, pending_kind)))
+        return original()
+
+    monkeypatch.setattr(driver, "read_state", reserve_other)
+    result = _run(context, session_id)
+    assert result.record is not None
+    assert result.record.drop is None
+    assert result.record.evidence_sequence == 1
+    assert len(reservation) == 1
+    assert session.pending_driver_command_kind == pending_kind
+    assert session.pending_driver_command_token == reservation[0].token  # type: ignore[union-attr]
+    assert session.phase == before_phase
+
+
+def test_timing_evidence_cleared_drop_reservation_has_no_drop_event_or_public_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Drop reservation cleared during read is not mistaken for a completed Drop."""
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    original = driver.read_state
+    reservation: list[object] = []
+    before = (session.phase, list(session.event_timeline), session.pending_driver_command_token)
+
+    def reserve_then_clear() -> RoasterState:
+        item = store.reserve_driver_command(session, kind="drop")
+        reservation.append(item)
+        with store._lock:  # pyright: ignore[reportPrivateUsage]
+            store._clear_driver_command_reservation_locked(session, item)  # pyright: ignore[reportPrivateUsage]
+        return original()
+
+    monkeypatch.setattr(driver, "read_state", reserve_then_clear)
+    result = _run(context, session_id)
+    assert result.record is not None and result.record.drop is None
+    assert result.record.evidence_sequence == 1
+    assert len(reservation) == 1
+    assert session.pending_driver_command_token is None
+    assert session.pending_driver_command_kind is None
+    assert (session.phase, list(session.event_timeline), before[2]) == before
+
+
+def test_timing_evidence_provenance_first_writer_and_payload_are_store_owned() -> None:
+    """Writer ordering, not an arbitrary payload key, determines evidence provenance."""
+    manual, _, manual_id = _context_without_fc((10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0))
+    manual_store = manual.session_store
+    manual_session = manual_store.get_latest_session()
+    assert manual_session is not None
+    manual_store.process_auto_t0_reading_snapshot(
+        manual_session, bean_temp_c=200.0, drop_threshold_c=5.0
+    )
+    auto_attempt, _ = manual_store.process_auto_t0_reading_snapshot(
+        manual_session, bean_temp_c=194.0, drop_threshold_c=5.0
+    )
+    assert auto_attempt is not None
+    manual_store.record_event(manual_session, "first_crack_detected", provenance="manual_mark")
+    model_attempt, copied = manual_store.record_first_crack_detection_snapshot(
+        manual_session, detected_at_monotonic_seconds=13.0, max_future_seconds=None
+    )
+    result = _run(manual, manual_id)
+    assert result.record is not None
+    assert result.record.charge is not None and result.record.charge.source == "manual_mark"
+    assert (
+        result.record.first_crack is not None and result.record.first_crack.source == "manual_mark"
+    )
+    assert model_attempt is manual_session.event_timeline[-1]
+    assert copied.first_crack_source == "manual_mark"
+
+    for payload_source in ("operator", "auto_t0"):
+        bare, _, bare_id = _context_without_fc((10.0, 11.0, 12.0, 13.0, 14.0))
+        bare_store = bare.session_store
+        bare_session = bare_store.get_latest_session()
+        assert bare_session is not None
+        bare_store.record_event(
+            bare_session, "first_crack_detected", payload={"source": payload_source}
+        )
+        bare_result = _run(bare, bare_id)
+        assert bare_result.record is not None and bare_result.record.first_crack is not None
+        assert bare_result.record.first_crack.source == "unattributed"
+        assert bare_result.record.first_crack.canonical_seconds.hex() == (
+            bare_session.first_crack_monotonic_seconds.hex()  # type: ignore[union-attr]
+        )
+
+
+@pytest.mark.parametrize(
+    ("purpose", "faulted", "stopped", "reason"),
+    [
+        ("cold_characterisation", False, False, "session_purpose_not_eligible"),
+        ("roast", True, True, "session_faulted"),
+        ("roast", False, True, "session_not_active"),
+    ],
+)
+def test_timing_evidence_identity_rows_have_exact_reason_and_zero_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    purpose: str,
+    faulted: bool,
+    stopped: bool,
+    reason: str,
+) -> None:
+    """Eligible purpose and stopped/faulted identity rows are pre-read refusals."""
+    context, driver, _ = _context()
+    store = context.session_store
+    store.stop_session()
+    session = store.start_session(purpose=cast(Any, purpose))
+    if faulted:
+        with store._lock:  # pyright: ignore[reportPrivateUsage]
+            session.faulted_at_utc = datetime(2026, 1, 1, tzinfo=UTC)
+            session.phase = "fault"
+    if stopped:
+        with store._lock:  # pyright: ignore[reportPrivateUsage]
+            session.stopped_at_utc = datetime(2026, 1, 1, tzinfo=UTC)
+            session.monotonic_stop = 1.0
+    reads = _count_reads(monkeypatch, driver)
+    result = _run(context, session.id)
+    _assert_refusal(result, outcome="refused_identity", reason=reason, driver_read="not_invoked")
+    assert reads == [0]
+
+
+def test_timing_evidence_invalid_assembly_keeps_both_endpoints_then_advances_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed validation commits neither endpoint; valid records remain consecutive."""
+    context, _, session_id = _context()
+    session = context.session_store.get_latest_session()
+    assert session is not None
+    first = _run(context, session_id)
+    assert first.record is not None
+    committed = (
+        session.timing_evidence_sequence,
+        session.timing_evidence_last_lo,
+        session.timing_evidence_last_hi,
+    )
+    original = mcp_server._timing_evidence_result  # pyright: ignore[reportPrivateUsage]
+
+    def reject_evidence(**kwargs: object) -> mcp_server.TimingEvidenceResult:
+        if kwargs["outcome"] == "evidence":
+            raise ValueError("test invalid assembly")
+        return original(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(mcp_server, "_timing_evidence_result", reject_evidence)
+    failed = _run(context, session_id)
+    _assert_refusal(failed, outcome="unavailable", reason="record_invalid", driver_read="invoked")
+    assert (
+        session.timing_evidence_sequence,
+        session.timing_evidence_last_lo,
+        session.timing_evidence_last_hi,
+    ) == committed
+    monkeypatch.undo()
+    second = _run(context, session_id)
+    assert second.record is not None
+    assert (first.record.evidence_sequence, second.record.evidence_sequence) == (1, 2)
+
+
+@pytest.mark.parametrize("mutation", ["slot", "phase", "wire_integer", "epoch"])
+def test_timing_evidence_record_model_rejects_direct_cross_boundary_mutations(
+    mutation: str,
+) -> None:
+    """Direct model validation closes slot, phase, safe-integer and epoch rows."""
+    context, _, session_id = _context()
+    result = _run(context, session_id)
+    assert result.record is not None
+    row = result.record.model_dump()
+    if mutation == "slot":
+        charge = cast(dict[str, object], row["charge"])
+        charge["kind"] = "first_crack_detected"
+    elif mutation == "phase":
+        row["phase"] = "pre_roast"
+    elif mutation == "wire_integer":
+        row["evidence_sequence"] = 2**53
+    else:
+        clock = cast(dict[str, object], row["clock"])
+        clock["epoch_id"] = "f" * 32
+    with pytest.raises((TypeError, ValueError)):
+        mcp_server.TimingEvidenceRecord.model_validate(row)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_read"),
+    [("pre_read", "not_invoked"), ("post_read", "invoked"), ("evidence", "invoked")],
+)
+def test_timing_evidence_outcomes_do_not_run_controls_or_append_test_owned_jsonl(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    outcome: str,
+    expected_read: str,
+) -> None:
+    """§10.8: refusal and evidence leave non-bracket session machinery untouched."""
+    ticks = iter((10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0)).__next__
+    store = RoastSessionStore(
+        monotonic_now=ticks,
+        session_id_factory=lambda: "side-effects",
+        default_log_dir=tmp_path,
+    )
+    session = store.start_session()
+    store.record_event(session, "beans_added", provenance="manual_mark")
+    driver = MockRoasterDriver()
+    driver.connect()
+    context = cast(
+        mcp_server.ServerContext,
+        SimpleNamespace(
+            session_store=store,
+            roaster_driver=driver,
+            config=SimpleNamespace(roaster=SimpleNamespace(driver="mock")),
+        ),
+    )
+    log_path = session.log_writer.log_dir / "roast.jsonl"  # type: ignore[union-attr]
+    before = (
+        log_path.read_bytes(),
+        list(session.telemetry_buffer),
+        list(session.event_timeline),
+        session.heat_level_percent,
+        session.fan_level_percent,
+        session.cooling_on,
+        session.phase,
+        session.pending_driver_command_token,
+        session.auto_t0_charge_temperature_c,
+        session.first_crack_source,
+    )
+    actuator_calls = [0]
+
+    def forbidden_control(*_: object, **__: object) -> RoasterState:
+        actuator_calls[0] += 1
+        raise AssertionError("timing evidence must not actuate")
+
+    for method in ("set_heat", "set_fan", "drop_beans", "start_cooling", "stop_cooling"):
+        monkeypatch.setattr(driver, method, forbidden_control)
+    if outcome == "post_read":
+        original_read = driver.read_state
+
+        def finalise_during_read() -> RoasterState:
+            with store._lock:  # pyright: ignore[reportPrivateUsage]
+                store._nonterminal_finalisations.add(session.id)  # pyright: ignore[reportPrivateUsage]
+            return original_read()
+
+        monkeypatch.setattr(driver, "read_state", finalise_during_read)
+    result = _run(context, "missing" if outcome == "pre_read" else session.id)
+    assert result.driver_read == expected_read
+    assert actuator_calls == [0]
+    assert (
+        log_path.read_bytes(),
+        list(session.telemetry_buffer),
+        list(session.event_timeline),
+        session.heat_level_percent,
+        session.fan_level_percent,
+        session.cooling_on,
+        session.phase,
+        session.pending_driver_command_token,
+        session.auto_t0_charge_temperature_c,
+        session.first_crack_source,
+    ) == before
+    if outcome == "evidence":
+        assert result.record is not None and result.record.evidence_sequence == 1
+    else:
+        assert result.record is None
