@@ -375,6 +375,7 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
             "export_roast_log",
             "finalise_cold_characterisation_session",
             "get_capture_evidence",
+            "get_timing_evidence",
             "get_roast_state",
             "get_runtime_config",
             "get_server_info",

@@ -1226,6 +1226,89 @@ def test_auto_t0_records_beans_added_from_drop_against_preheat_max() -> None:
     assert snapshot.auto_t0_current_drop_c == 26.5
 
 
+def test_timing_evidence_provenance_is_append_only_and_payload_independent() -> None:
+    """Store-side timing provenance follows the first successful event writer."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+
+    bare = store.record_event(session, "beans_added", payload={"source": "operator"})
+    assert bare.payload["source"] == "operator"
+    assert session.beans_added_source is None
+    assert store.record_event(session, "beans_added", provenance="manual_mark") is bare
+    assert session.beans_added_source is None
+
+    clock.monotonic_value = 101.0
+    model, _ = store.record_first_crack_detection_snapshot(
+        session,
+        detected_at_monotonic_seconds=101.0000004,
+        max_future_seconds=None,
+    )
+    assert session.first_crack_source == "model_detection"
+    assert store.record_event(session, "first_crack_detected", provenance="manual_mark") is model
+    assert session.first_crack_source == "model_detection"
+
+
+def test_timing_evidence_provenance_rejects_invalid_append_and_copies_all_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invalid or failed appends cannot create source authority in live or copied state."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    before = list(session.event_timeline)
+
+    with pytest.raises(SessionLifecycleError):
+        store.record_event(session, "beans_dropped", provenance="manual_mark")
+    with pytest.raises(SessionLifecycleError):
+        store.record_event(session, "beans_added", provenance=cast(object, True))  # type: ignore[arg-type]
+    assert session.event_timeline == before
+    assert session.beans_added_source is None
+
+    def fail_append(_session: RoastSession, _event: session_module.RoastEvent) -> None:
+        raise OSError("synthetic append failure")
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_append)
+    with pytest.raises(OSError, match="synthetic append failure"):
+        store.record_event(session, "beans_added", provenance="manual_mark")
+    assert session.event_timeline == before
+    assert session.beans_added_source is None
+
+    monkeypatch.undo()
+    store.record_event(session, "beans_added", provenance="manual_mark")
+    session.timing_evidence_sequence = 7
+    session.timing_evidence_last_lo = 1.25
+    session.timing_evidence_last_hi = 2.5
+    snapshot = store.get_session_snapshot(session_id=session.id)
+    assert (
+        snapshot.beans_added_source,
+        snapshot.first_crack_source,
+        snapshot.timing_evidence_sequence,
+        snapshot.timing_evidence_last_lo,
+        snapshot.timing_evidence_last_hi,
+    ) == ("manual_mark", None, 7, 1.25, 2.5)
+
+
+def test_future_model_first_crack_lifts_later_bare_drop_to_canonical_order() -> None:
+    """Replay FC may be future-dated, so a later Drop is normalized to its time."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+    store.record_event(session, "beans_added", provenance="manual_mark")
+    future_fc, _ = store.record_first_crack_detection_snapshot(
+        session,
+        detected_at_monotonic_seconds=150.0000004,
+        max_future_seconds=None,
+    )
+
+    clock.monotonic_value = 110.0
+    dropped = store.record_event(session, "beans_dropped")
+
+    assert session.first_crack_source == "model_detection"
+    assert future_fc.monotonic_seconds == 50.0
+    assert dropped.monotonic_seconds == future_fc.monotonic_seconds
+
+
 def test_auto_t0_uses_max_preheat_for_gradual_drop() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(

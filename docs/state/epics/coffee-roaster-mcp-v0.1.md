@@ -51,6 +51,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
   describe latest or physical state. A matching unresolved reservation blocks
   ordinary fan, cooling, and drop commands; an independent emergency retains
   its existing admission rules.
+- MCP244 P1 adds source-only `timing_evidence/v1` software evidence for the
+  exact mock driver. Its brackets are synthetic, Hottop is refused, and it
+  grants no physical or recipe qualification. This is not a release; #244
+  remains open and P2 is separate and unstarted.
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -2619,3 +2623,25 @@ transport settlement, automatic retry, or Agent-global uncertainty handling.
 Unknown driver/completion outcomes retain only a still-matching reservation;
 newer ownership is never restored or modified. Emergency and stopped-fault
 recovery semantics remain independent.
+
+### MCP244 P1 — timing evidence software boundary
+
+This source-only slice adds the read-only `timing_evidence/v1` tool. It emits
+atomic, versioned mock records with canonical producer events and synthetic
+software-only temperature brackets. Hottop and every non-exact mock composition
+are refused. The record does not qualify physical timing, hardware, recipe
+decisions, or roast readiness; reads advance only the existing mock simulation
+step and do not run auto-T0 or first-crack processing. Consequently, polling
+cadence can affect later mock auto-T0 charge timing; this is a software-only
+simulation limitation, not a timing or recipe claim. Replay or future-dated
+model first-crack remains diagnostic (`detector_clock_rebased`); later
+non-fault canonical events, including a subsequent Drop, are normalised to no
+earlier than the preceding event time. The recorded offline gate environment
+was Python 3.11.14, MCP 1.30.0, Pydantic 2.14.4, and pydantic-core 2.50.5.
+`emergency_stop` takes the store lock before issuing its driver command, so
+mock-only assembly under that lock can delay mock dispatch; its callback performs
+pure validation only and no I/O. Hottop timing requests refuse before record
+assembly, no latency bound is established, and future hardware qualification
+needs a separate check.
+No release is claimed. Issue #244 remains open, and its exact-Drop P2 work is
+separate and unstarted.
