@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, Never, cast
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
@@ -55,6 +55,8 @@ from coffee_roaster_mcp.config import (
 from coffee_roaster_mcp.drivers import (
     DriverLifecycleEvidence,
     FixedZeroCommandedState,
+    HottopRoasterDriver,
+    HottopStartSettlement,
     LifecycleEvidenceDriver,
     MockRoasterDriver,
     RoasterCapabilities,
@@ -81,6 +83,7 @@ from coffee_roaster_mcp.session import (
     SessionLifecycleError,
     SessionPresence,
     SessionPurpose,
+    SessionStartReservation,
     compute_roast_metrics,
     default_emergency_safety_payload,
     has_verified_emergency_containment,
@@ -1527,6 +1530,8 @@ def create_mcp_server(
         )
         with server_context.lifecycle_barrier:
             reservation = server_context.session_store.reserve_session_start()
+        if manual and isinstance(server_context.roaster_driver, HottopRoasterDriver):
+            _abort_future_manual_hottop_start(server_context, reservation)
         try:
             server_context.roaster_driver.connect()
             with server_context.lifecycle_barrier:
@@ -2556,6 +2561,35 @@ def _run_fixed_zero_heat_containment(
         session_projection="recorded_in_memory",
         reason_code=None,
     )
+
+
+def _abort_future_manual_hottop_start(
+    server_context: ServerContext, reservation: SessionStartReservation
+) -> Never:
+    """Stage and abort a future manual start without publishing a session.
+
+    Production policy rejects this path before reservation. Only exact positive
+    non-entry or closure releases the server owner; uncertain entry stays blocked.
+    """
+    driver = server_context.roaster_driver
+    assert isinstance(driver, HottopRoasterDriver)
+    owner = None
+    try:
+        owner = driver.reserve_inhibited_start(reservation.token)
+        driver.open_inhibited_start(owner)
+    finally:
+        settlement = (
+            HottopStartSettlement.NOT_ENTERED
+            if owner is None
+            else driver.abort_inhibited_start(owner)
+        )
+        if settlement in (
+            HottopStartSettlement.NOT_ENTERED,
+            HottopStartSettlement.CLEAN_CLOSED,
+        ):
+            with server_context.lifecycle_barrier:
+                server_context.session_store.clear_session_start_reservation(reservation)
+    raise RuntimeError("Manual Hottop start remains inhibited; no session was published.")
 
 
 def _run_reserved_driver_control(

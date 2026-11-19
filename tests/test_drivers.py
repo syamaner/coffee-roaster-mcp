@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from threading import Event, Lock, Thread
 from time import monotonic, sleep
-from typing import Any, cast
+from typing import Any, Never, cast
 
 import pytest
 
@@ -15,6 +15,9 @@ from coffee_roaster_mcp.drivers import (
     DriverLifecycleEvidence,
     FixedZeroCommandedState,
     HottopRoasterDriver,
+    HottopStartOwner,
+    HottopStartPhase,
+    HottopStartSettlement,
     HottopTemperatureUnit,
     MockRoasterDriver,
     RoasterCapabilities,
@@ -2274,3 +2277,136 @@ def test_fixed_zero_commanded_state_rejects_each_closed_field(
     values[field] = invalid_value
     with pytest.raises(exception):
         FixedZeroCommandedState(**cast(dict[str, Any], values))
+
+
+@pytest.mark.parametrize("outcome", ["clean", "raise", "open", "unverifiable"])
+def test_inhibited_start_exact_disposal_and_legacy_isolation(outcome: str) -> None:
+    """Only exact verified closure releases authority, without frames or projections."""
+
+    class Transport(FakeSerialTransport):
+        def close(self) -> None:
+            self.close_calls += 1
+            if outcome == "raise":
+                raise OSError("uncertain close")
+            if outcome == "clean":
+                self.is_open = False
+            if outcome == "unverifiable":
+                del self.is_open
+
+    transport = Transport()
+    calls: list[str] = []
+
+    def factory(port: str, **_kwargs: Any) -> Transport:
+        calls.append(port)
+        return transport
+
+    driver = HottopRoasterDriver(port="fake", serial_factory=factory)
+    baseline = driver.read_state(), driver.read_lifecycle_evidence()
+    owner = driver.reserve_inhibited_start("server")
+    assert owner.generation == 1
+    with pytest.raises(RuntimeError, match="staged"):
+        driver.connect()
+    driver.open_inhibited_start(owner)
+    assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.OPEN_INHIBITED)
+    assert (driver.read_state(), driver.read_lifecycle_evidence()) == baseline
+    impostor = HottopStartOwner(owner.server_token, owner.generation)
+    assert driver.abort_inhibited_start(impostor) is HottopStartSettlement.UNRESOLVED
+    assert transport.close_calls == 0
+    driver.disconnect()
+    assert transport.close_calls == 0
+    settlement = driver.abort_inhibited_start(owner)
+    assert transport.close_calls == 1
+    assert transport.writes == []
+    assert (driver.read_state(), driver.read_lifecycle_evidence()) == baseline
+    if outcome == "clean":
+        assert settlement is HottopStartSettlement.CLEAN_CLOSED
+        newer = driver.reserve_inhibited_start("newer")
+        assert newer.generation == 2
+        assert driver.abort_inhibited_start(owner) is HottopStartSettlement.UNRESOLVED
+        assert driver.inspect_inhibited_start()[0] is newer
+        assert driver.abort_inhibited_start(newer) is HottopStartSettlement.NOT_ENTERED
+    else:
+        assert settlement is HottopStartSettlement.UNRESOLVED
+        assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.UNRESOLVED)
+        with pytest.raises(RuntimeError, match="staged"):
+            driver.connect()
+        with pytest.raises(RuntimeError, match="staged"):
+            driver.reserve_inhibited_start("replacement")
+        assert driver.abort_inhibited_start(owner) is HottopStartSettlement.UNRESOLVED
+        assert transport.close_calls == 1
+    assert calls == ["fake"]
+
+
+def test_inhibited_factory_exception_retains_owner_without_handle() -> None:
+    """Factory entry is irreversible uncertainty even when no handle is returned."""
+    calls: list[str] = []
+
+    def factory(port: str, **_kwargs: Any) -> Never:
+        calls.append(port)
+        raise OSError("entered factory")
+
+    driver = HottopRoasterDriver(port="fake", serial_factory=factory)
+    owner = driver.reserve_inhibited_start("server")
+    with pytest.raises(OSError, match="entered"):
+        driver.open_inhibited_start(owner)
+    assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.UNRESOLVED)
+    assert driver.abort_inhibited_start(owner) is HottopStartSettlement.UNRESOLVED
+    with pytest.raises(RuntimeError, match="staged"):
+        driver.connect()
+    assert calls == ["fake"]
+
+
+def test_inhibited_missing_port_is_proven_nonentry() -> None:
+    """Known refusal before OPENING can clear only its exact reservation."""
+    driver = HottopRoasterDriver()
+    owner = driver.reserve_inhibited_start("server")
+    with pytest.raises(ValueError, match="port"):
+        driver.open_inhibited_start(owner)
+    assert driver.abort_inhibited_start(owner) is HottopStartSettlement.NOT_ENTERED
+    assert driver.inspect_inhibited_start() == (None, None)
+
+
+def test_inhibited_reservation_refuses_legacy_lifecycle() -> None:
+    """Staging cannot borrow a legacy handle or command thread."""
+    driver = HottopRoasterDriver(port="fake", serial_factory=FakeSerialFactory())
+    driver.connect()
+    try:
+        with pytest.raises(RuntimeError, match="Legacy"):
+            driver.reserve_inhibited_start("server")
+    finally:
+        driver.disconnect()
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_inhibited_close_interruption_propagates_and_retains_exact_handle(
+    interruption: type[BaseException],
+) -> None:
+    """Process interruption must not suppress cancellation or discard uncertain identity."""
+
+    class Transport(FakeSerialTransport):
+        def close(self) -> None:
+            self.close_calls += 1
+            raise interruption()
+
+    transport = Transport()
+    driver = HottopRoasterDriver(port="fake", serial_factory=FakeSerialFactory(transport=transport))
+    owner = driver.reserve_inhibited_start("server")
+    driver.open_inhibited_start(owner)
+    with pytest.raises(interruption):
+        driver.abort_inhibited_start(owner)
+    assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.UNRESOLVED)
+    assert driver._start_handle is transport  # pyright: ignore[reportPrivateUsage]
+    assert driver.abort_inhibited_start(owner) is HottopStartSettlement.UNRESOLVED
+    assert transport.close_calls == 1
+    assert transport.writes == []
+
+
+def test_inhibited_foreign_open_cannot_enter_factory() -> None:
+    """Caller text and a copied generation never reconstruct the minted capability."""
+    factory = FakeSerialFactory()
+    driver = HottopRoasterDriver(port="fake", serial_factory=factory)
+    owner = driver.reserve_inhibited_start("server")
+    with pytest.raises(RuntimeError, match="not reserved"):
+        driver.open_inhibited_start(HottopStartOwner(owner.server_token, owner.generation))
+    assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.RESERVED)
+    assert driver.abort_inhibited_start(owner) is HottopStartSettlement.NOT_ENTERED

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import Enum
 from importlib import import_module
 from math import isfinite
 from threading import Event, Lock, Thread
@@ -876,6 +877,32 @@ class MockRoasterDriver:
         return (heat_effect - fan_effect - cooling_effect) * self._SAMPLE_INTERVAL_SECONDS
 
 
+class HottopStartPhase(Enum):
+    """Private staged-start lifecycle; no phase permits command streaming."""
+
+    RESERVED = "reserved"
+    OPENING = "opening"
+    OPEN_INHIBITED = "open_inhibited"
+    CLOSING = "closing"
+    UNRESOLVED = "unresolved"
+
+
+class HottopStartSettlement(Enum):
+    """Evidence of whether one exact staged attempt has been disposed."""
+
+    NOT_ENTERED = "not_entered"
+    CLEAN_CLOSED = "clean_closed"
+    UNRESOLVED = "unresolved"
+
+
+@dataclass(frozen=True, eq=False)
+class HottopStartOwner:
+    """Driver-minted identity bound to one server reservation and generation."""
+
+    server_token: str
+    generation: int
+
+
 class HottopRoasterDriver:
     """Hottop KN-8828B-2K+ driver lifecycle and command-state owner.
 
@@ -924,6 +951,10 @@ class HottopRoasterDriver:
         self._join_timeout_seconds = join_timeout_seconds
         self._serial: SerialTransport | None = None
         self._connected = False
+        self._start_owner: HottopStartOwner | None = None
+        self._start_phase: HottopStartPhase | None = None
+        self._start_handle: SerialTransport | None = None
+        self._start_generation = 0
         self._stop_event = Event()
         self._disconnect_requested = Event()
         self._command_thread: Thread | None = None
@@ -980,9 +1011,105 @@ class HottopRoasterDriver:
             heat_containment_version=1,
         )
 
+    def inspect_inhibited_start(
+        self,
+    ) -> tuple[HottopStartOwner | None, HottopStartPhase | None]:
+        """Read ownership without waiting for native open or close."""
+        with self._state_lock:
+            return self._start_owner, self._start_phase
+
+    def reserve_inhibited_start(self, server_token: str) -> HottopStartOwner:
+        """Allocate exact ownership before any native factory entry."""
+        self._refuse_staged_connect()
+        with self._lifecycle_lock, self._state_lock:
+            if self._start_owner is not None:
+                raise RuntimeError("A staged Hottop start already owns this driver.")
+            if self._connected or self._serial is not None or self._command_thread is not None:
+                raise RuntimeError("Legacy Hottop lifecycle must be absent before staging.")
+            self._start_generation += 1
+            owner = HottopStartOwner(server_token, self._start_generation)
+            self._start_owner = owner
+            self._start_phase = HottopStartPhase.RESERVED
+            self._stop_event.set()
+            return owner
+
+    def open_inhibited_start(self, owner: HottopStartOwner) -> None:
+        """Open one owned transport without starting a command loop or writing."""
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if (
+                    self._start_owner is not owner
+                    or self._start_phase is not HottopStartPhase.RESERVED
+                ):
+                    raise RuntimeError("Staged Hottop owner is not reserved.")
+                if self._port is None:
+                    raise ValueError("Hottop serial port is required before connect.")
+                port = self._port
+                self._start_phase = HottopStartPhase.OPENING
+            try:
+                handle = self._serial_factory(
+                    port,
+                    baudrate=self._baudrate,
+                    bytesize=8,
+                    parity="N",
+                    stopbits=1,
+                    timeout=0.5,
+                    write_timeout=self._write_timeout_seconds,
+                )
+            except BaseException:
+                with self._state_lock:
+                    self._start_phase = HottopStartPhase.UNRESOLVED
+                raise
+            with self._state_lock:
+                self._start_handle = handle
+                self._start_phase = HottopStartPhase.OPEN_INHIBITED
+
+    def abort_inhibited_start(self, owner: HottopStartOwner) -> HottopStartSettlement:
+        """Dispose one exact attempt once; retain identity on uncertain native outcomes."""
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if self._start_owner is not owner:
+                    return HottopStartSettlement.UNRESOLVED
+                if self._start_phase is HottopStartPhase.RESERVED:
+                    self._start_owner = None
+                    self._start_phase = None
+                    return HottopStartSettlement.NOT_ENTERED
+                if self._start_phase is not HottopStartPhase.OPEN_INHIBITED:
+                    return HottopStartSettlement.UNRESOLVED
+                handle = self._start_handle
+                self._start_phase = HottopStartPhase.CLOSING
+            closed = False
+            try:
+                if handle is not None:
+                    handle.close()
+                    closed = handle.is_open is False
+            except Exception:
+                # Native failure provides no exact positive disposal evidence.
+                pass
+            except BaseException:
+                with self._state_lock:
+                    self._start_phase = HottopStartPhase.UNRESOLVED
+                raise
+            with self._state_lock:
+                if self._start_owner is owner and self._start_handle is handle and closed:
+                    self._start_owner = None
+                    self._start_phase = None
+                    self._start_handle = None
+                    return HottopStartSettlement.CLEAN_CLOSED
+                self._start_phase = HottopStartPhase.UNRESOLVED
+                return HottopStartSettlement.UNRESOLVED
+
+    def _refuse_staged_connect(self) -> None:
+        """Refuse unrelated legacy reuse before waiting on native lifecycle work."""
+        with self._state_lock:
+            if self._start_owner is not None:
+                raise RuntimeError("A staged Hottop start retains transport authority.")
+
     def connect(self) -> None:
         """Open serial transport and start the Hottop command-loop lifecycle."""
+        self._refuse_staged_connect()
         with self._lifecycle_lock:
+            self._refuse_staged_connect()
             with self._state_lock:
                 if self._connected:
                     return

@@ -2635,3 +2635,30 @@ def test_fixed_zero_completion_rejects_matching_normal_control_token_without_cle
     assert snapshot.heat_level_percent == 55
     assert snapshot.pending_driver_command_token == control.token
     assert snapshot.pending_driver_command_kind == "control"
+
+
+@pytest.mark.parametrize("emergency", [False, True])
+def test_exact_start_revoke_retains_inflight_until_settlement(emergency: bool) -> None:
+    """Revocation affects pending only, never clears foreign or newer owners."""
+    store = RoastSessionStore()
+    owner = store.reserve_session_start()
+    foreign = type(owner)(token="foreign")
+    assert not store.revoke_session_start(foreign)
+    if emergency:
+        store.cancel_session_start_for_emergency_stop()
+        assert not store.revoke_session_start(owner)
+    else:
+        assert store.revoke_session_start(owner)
+        assert not store.revoke_session_start(owner)
+    with pytest.raises(SessionLifecycleError, match="progress"):
+        store.reserve_session_start()
+    with pytest.raises(SessionLifecycleError, match="no longer active"):
+        store.complete_session_start_snapshot(owner)
+    store.clear_session_start_reservation(foreign)
+    with pytest.raises(SessionLifecycleError, match="progress"):
+        store.reserve_session_start()
+    store.clear_session_start_reservation(owner)
+    newer = store.reserve_session_start()
+    assert not store.revoke_session_start(owner)
+    store.clear_session_start_reservation(owner)
+    assert store.complete_session_start_snapshot(newer).active
