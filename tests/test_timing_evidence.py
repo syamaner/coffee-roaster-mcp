@@ -14,9 +14,10 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, Literal, cast
 
 import pytest
+from jsonschema import Draft202012Validator, ValidationError
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
@@ -765,7 +766,7 @@ def test_timing_evidence_real_stdio_schema_and_malformed_requests(
                 output_schema, sort_keys=True, separators=(",", ":")
             ).encode()
             assert hashlib.sha256(canonical_schema).hexdigest() == (
-                "9f032a0022a8d948a7f2ede0c5c1c4f4a683c1f1612a38046d0688ad193d5370"
+                "aa7543a7d5644e18753cea66e26e26137b86aba17b5be646df226c3c688e7cf6"
             )
             assert output_schema["additionalProperties"] is False
             assert output_schema["properties"]["evidence_protocol"]["const"] == "timing_evidence/v1"
@@ -795,6 +796,146 @@ def test_timing_evidence_real_stdio_schema_and_malformed_requests(
                 "producer_canonical_record",
                 "detector_clock_rebased",
             ]
+            assert event["allOf"] == [
+                {
+                    "if": {"properties": {"source": {"const": "model_detection"}}},
+                    "then": {"properties": {"time_basis": {"const": "detector_clock_rebased"}}},
+                    "else": {"properties": {"time_basis": {"const": "producer_canonical_record"}}},
+                },
+                {
+                    "if": {"properties": {"kind": {"const": "beans_added"}}},
+                    "then": {
+                        "properties": {
+                            "source": {"enum": ["manual_mark", "auto_t0", "unattributed"]}
+                        }
+                    },
+                },
+                {
+                    "if": {"properties": {"kind": {"const": "first_crack_detected"}}},
+                    "then": {
+                        "properties": {
+                            "source": {"enum": ["manual_mark", "model_detection", "unattributed"]}
+                        }
+                    },
+                },
+                {
+                    "if": {"properties": {"kind": {"const": "beans_dropped"}}},
+                    "then": {"properties": {"source": {"const": "unattributed"}}},
+                },
+            ]
+            schema_validator: Any = Draft202012Validator(output_schema)
+            schema_record: dict[str, object] = {
+                "session_id": "schema-session",
+                "session_ownership_sequence": 1,
+                "driver": "mock",
+                "clock": {
+                    "epoch_id": "0" * 32,
+                    "domain": "session_relative_store_monotonic",
+                    "suspend_behaviour": "unqualified",
+                },
+                "evidence_sequence": 1,
+                "phase": "development",
+                "charge": {
+                    "kind": "beans_added",
+                    "event_index": 0,
+                    "canonical_seconds": 1.0,
+                    "clock_epoch_id": "0" * 32,
+                    "source": "manual_mark",
+                    "time_basis": "producer_canonical_record",
+                    "physical_time_bound": "not_provided",
+                },
+                "first_crack": {
+                    "kind": "first_crack_detected",
+                    "event_index": 1,
+                    "canonical_seconds": 2.0,
+                    "clock_epoch_id": "0" * 32,
+                    "source": "model_detection",
+                    "time_basis": "detector_clock_rebased",
+                    "physical_time_bound": "not_provided",
+                },
+                "drop": None,
+                "bean": {
+                    "status": "unavailable",
+                    "reason": "reported_none",
+                },
+                "environment": {
+                    "status": "unavailable",
+                    "reason": "reported_none",
+                },
+                "time_basis": "canonical_operational_session_relative",
+                "physical_qualification": "none_synthetic_mock_only",
+            }
+            schema_result: dict[str, object] = {
+                "evidence_protocol": "timing_evidence/v1",
+                "evidence_version": 1,
+                "outcome": "evidence",
+                "reason_code": None,
+                "driver_read": "invoked",
+                "requested_session_id": "schema-session",
+                "record": schema_record,
+            }
+            schema_validator.validate(schema_result)
+            schema_charge = cast(dict[str, object], schema_record["charge"])
+            schema_first_crack = cast(dict[str, object], schema_record["first_crack"])
+            invalid_schema_cases: list[
+                tuple[Literal["charge", "first_crack", "drop"], dict[str, object], str]
+            ] = [
+                (
+                    "first_crack",
+                    schema_first_crack | {"time_basis": "producer_canonical_record"},
+                    "development",
+                ),
+                (
+                    "charge",
+                    {
+                        **schema_charge,
+                        "source": "model_detection",
+                        "time_basis": "detector_clock_rebased",
+                    },
+                    "development",
+                ),
+                (
+                    "first_crack",
+                    {
+                        **schema_first_crack,
+                        "source": "auto_t0",
+                        "time_basis": "producer_canonical_record",
+                    },
+                    "development",
+                ),
+                (
+                    "drop",
+                    {
+                        "kind": "beans_dropped",
+                        "event_index": 2,
+                        "canonical_seconds": 3.0,
+                        "clock_epoch_id": "0" * 32,
+                        "source": "manual_mark",
+                        "time_basis": "producer_canonical_record",
+                        "physical_time_bound": "not_provided",
+                    },
+                    "dropped",
+                ),
+            ]
+            for index, (slot, invalid_event, phase) in enumerate(invalid_schema_cases):
+                invalid_record = dict(schema_record)
+                invalid_record[slot] = invalid_event
+                invalid_record["phase"] = phase
+                invalid_result = {**schema_result, "record": invalid_record}
+                with pytest.raises(ValidationError):
+                    schema_validator.validate(invalid_result)
+                mutated_event_schema = dict(event)
+                mutated_event_schema["allOf"] = [
+                    condition
+                    for conditional_index, condition in enumerate(event["allOf"])
+                    if conditional_index != index
+                ]
+                mutated_output_schema = dict(output_schema)
+                mutated_definitions = dict(output_schema["$defs"])
+                mutated_definitions["EventEvidence"] = mutated_event_schema
+                mutated_output_schema["$defs"] = mutated_definitions
+                mutated_schema_validator: Any = Draft202012Validator(mutated_output_schema)
+                mutated_schema_validator.validate(invalid_result)
             malformed = [
                 {"expected_session_id": "x", "evidence_protocol": "wrong"},
                 {"expected_session_id": 1, "evidence_protocol": "timing_evidence/v1"},

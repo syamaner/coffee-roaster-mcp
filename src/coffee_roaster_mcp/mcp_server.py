@@ -516,6 +516,33 @@ TimingEpochId = Annotated[str, Strict(), StringConstraints(pattern=_TIMING_EPOCH
 TimingExactInt = Annotated[int, Strict(), Field(ge=0, le=2**53 - 1)]
 TimingPositiveInt = Annotated[int, Strict(), Field(ge=1, le=2**53 - 1)]
 TimingFiniteFloat = Annotated[float, Strict(), Field(allow_inf_nan=False)]
+_EVENT_EVIDENCE_SCHEMA_CONDITIONALS: dict[str, Any] = {
+    "allOf": [
+        {
+            "if": {"properties": {"source": {"const": "model_detection"}}},
+            "then": {"properties": {"time_basis": {"const": "detector_clock_rebased"}}},
+            "else": {"properties": {"time_basis": {"const": "producer_canonical_record"}}},
+        },
+        {
+            "if": {"properties": {"kind": {"const": "beans_added"}}},
+            "then": {
+                "properties": {"source": {"enum": ["manual_mark", "auto_t0", "unattributed"]}}
+            },
+        },
+        {
+            "if": {"properties": {"kind": {"const": "first_crack_detected"}}},
+            "then": {
+                "properties": {
+                    "source": {"enum": ["manual_mark", "model_detection", "unattributed"]}
+                }
+            },
+        },
+        {
+            "if": {"properties": {"kind": {"const": "beans_dropped"}}},
+            "then": {"properties": {"source": {"const": "unattributed"}}},
+        },
+    ]
+}
 
 
 def _timing_mapping(
@@ -631,7 +658,12 @@ ChannelEvidence = Annotated[
 class EventEvidence(BaseModel):
     """Canonical producer event operand with store-side provenance."""
 
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        frozen=True,
+        json_schema_extra=_EVENT_EVIDENCE_SCHEMA_CONDITIONALS,
+    )
 
     kind: Literal["beans_added", "first_crack_detected", "beans_dropped"]
     event_index: TimingExactInt
