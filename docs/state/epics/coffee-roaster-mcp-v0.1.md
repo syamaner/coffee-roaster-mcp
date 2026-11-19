@@ -2638,5 +2638,10 @@ model first-crack remains diagnostic (`detector_clock_rebased`); later
 non-fault canonical events, including a subsequent Drop, are normalised to no
 earlier than the preceding event time. The recorded offline gate environment
 was Python 3.11.14, MCP 1.30.0, Pydantic 2.14.4, and pydantic-core 2.50.5.
+`emergency_stop` takes the store lock before issuing its driver command, so
+mock-only assembly under that lock can delay mock dispatch; its callback performs
+pure validation only and no I/O. Hottop timing requests refuse before record
+assembly, no latency bound is established, and future hardware qualification
+needs a separate check.
 No release is claimed. Issue #244 remains open, and its exact-Drop P2 work is
 separate and unstarted.

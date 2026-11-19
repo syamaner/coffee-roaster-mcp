@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import inspect
@@ -395,12 +396,58 @@ def test_timing_evidence_schema_is_closed_at_the_sdk_boundary() -> None:
     }
 
 
+_FORBIDDEN_SESSION_IMPORTS = frozenset(
+    {"coffee_roaster_mcp.drivers", "coffee_roaster_mcp.mcp_server"}
+)
+
+
+def _static_imported_modules(source: str) -> set[str]:
+    """Return closed-package modules directly bound by static import statements."""
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 1 and node.module in {"drivers", "mcp_server"}:
+                imported.add(f"coffee_roaster_mcp.{node.module}")
+            elif (node.level, node.module) in {(1, None), (0, "coffee_roaster_mcp")}:
+                imported.update(
+                    f"coffee_roaster_mcp.{alias.name}"
+                    for alias in node.names
+                    if alias.name in {"drivers", "mcp_server"}
+                )
+            elif node.level == 0 and node.module in _FORBIDDEN_SESSION_IMPORTS:
+                imported.add(node.module)
+    return imported
+
+
+@pytest.mark.parametrize(
+    ("source", "is_forbidden"),
+    [
+        ("from .drivers import MockRoasterDriver", True),
+        ("from . import drivers", True),
+        ("from coffee_roaster_mcp import drivers", True),
+        ("import coffee_roaster_mcp.drivers", True),
+        ("from .mcp_server import ServerContext", True),
+        ("from . import mcp_server", True),
+        ("from coffee_roaster_mcp import mcp_server", True),
+        ("import coffee_roaster_mcp.mcp_server", True),
+        ("from . import controls", False),
+        ("from coffee_roaster_mcp.config import RoastConfig", False),
+    ],
+)
+def test_session_dependency_import_guard_discriminates_static_import_forms(
+    source: str, is_forbidden: bool
+) -> None:
+    """The AST guard rejects driver/server imports without banning allowed modules."""
+    assert bool(_static_imported_modules(source) & _FORBIDDEN_SESSION_IMPORTS) is is_forbidden
+
+
 def test_session_timing_ownership_does_not_depend_on_mcp_or_drivers() -> None:
     """The store keeps its closed direction while accepting plain evidence values."""
-    source = inspect.getsource(session_module)
+    imported = _static_imported_modules(inspect.getsource(session_module))
 
-    assert "coffee_roaster_mcp.mcp_server" not in source
-    assert "coffee_roaster_mcp.drivers" not in source
+    assert not imported & _FORBIDDEN_SESSION_IMPORTS
 
 
 @pytest.mark.parametrize(
