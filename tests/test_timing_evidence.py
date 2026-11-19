@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import math
 import os
 import sys
@@ -17,6 +19,7 @@ from typing import cast
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.types import TextContent
 
 import coffee_roaster_mcp.mcp_server as mcp_server
 import coffee_roaster_mcp.session as session_module
@@ -608,10 +611,58 @@ def test_timing_evidence_does_not_hold_store_or_lifecycle_lock_during_read(
 def test_timing_evidence_real_stdio_schema_and_malformed_requests(
     tmp_path: Path,
 ) -> None:
-    """The installed child exposes closed input/output and rejects malformed calls."""
+    """A patched child preserves strict parsing and exact values on the stdio wire."""
+    injection_root = tmp_path / "child_injection"
+    injection_root.mkdir()
+    read_counter = tmp_path / "child-read-count.txt"
+    imported_module = tmp_path / "child-mcp-server-path.txt"
+    injection_root.joinpath("sitecustomize.py").write_text(
+        "\n".join(
+            (
+                "import functools",
+                "import os",
+                "from pathlib import Path",
+                "import coffee_roaster_mcp.mcp_server as mcp_server",
+                "from coffee_roaster_mcp.drivers import MockRoasterDriver",
+                "from coffee_roaster_mcp.session import RoastSessionStore",
+                "Path(os.environ['P1_WIRE_IMPORTED_MODULE']).write_text(mcp_server.__file__)",
+                "Path(os.environ['P1_WIRE_READ_COUNTER']).write_text('0')",
+                "clock_values = iter((100.0, 100.30000000000004, 100.6000000000001, 100.7, 100.8))",
+                "mcp_server.RoastSessionStore = functools.partial(",
+                "    RoastSessionStore, monotonic_now=lambda: next(clock_values)",
+                ")",
+                "driver = MockRoasterDriver()",
+                "driver.connect()",
+                "original_read = driver.read_state",
+                "read_count = 0",
+                "def counted_read():",
+                "    global read_count",
+                "    read_count += 1",
+                "    Path(os.environ['P1_WIRE_READ_COUNTER']).write_text(str(read_count))",
+                "    if read_count == 2:",
+                "        raise RuntimeError('P1-STDIO-SENTINEL-DO-NOT-LEAK')",
+                "    state = original_read()",
+                "    object.__setattr__(state, 'bean_temp_c', 196.00000000000003)",
+                "    object.__setattr__(state, 'env_temp_c', 0.30000000000000004)",
+                "    return state",
+                "driver.read_state = counted_read",
+                "mcp_server.create_roaster_driver = lambda *args, **kwargs: driver",
+            )
+        ),
+        encoding="utf-8",
+    )
+    mutated_source = os.environ.get("P1_WIRE_MUTANT_SOURCE")
+    python_path = os.pathsep.join(
+        path for path in (str(injection_root), mutated_source) if path is not None
+    )
 
     async def exercise() -> None:
-        environment = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": ""}
+        environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": python_path,
+            "P1_WIRE_IMPORTED_MODULE": str(imported_module),
+            "P1_WIRE_READ_COUNTER": str(read_counter),
+        }
         parameters = StdioServerParameters(
             command=sys.executable,
             args=["-m", "coffee_roaster_mcp.cli", "serve"],
@@ -642,6 +693,42 @@ def test_timing_evidence_real_stdio_schema_and_malformed_requests(
                 "title": "_TimingEvidenceArguments",
                 "type": "object",
             }
+            assert tool.outputSchema is not None
+            output_schema = tool.outputSchema
+            canonical_schema = json.dumps(
+                output_schema, sort_keys=True, separators=(",", ":")
+            ).encode()
+            assert hashlib.sha256(canonical_schema).hexdigest() == (
+                "9f032a0022a8d948a7f2ede0c5c1c4f4a683c1f1612a38046d0688ad193d5370"
+            )
+            assert output_schema["additionalProperties"] is False
+            assert output_schema["properties"]["evidence_protocol"]["const"] == "timing_evidence/v1"
+            assert output_schema["properties"]["evidence_version"]["const"] == 1
+            assert output_schema["$defs"]["TimingEvidenceRecord"]["additionalProperties"] is False
+            assert output_schema["$defs"]["TimingClock"]["properties"]["domain"]["const"] == (
+                "session_relative_store_monotonic"
+            )
+            valid_channel = output_schema["$defs"]["ValidChannelEvidence"]
+            assert valid_channel["additionalProperties"] is False
+            assert valid_channel["properties"]["status"]["const"] == "valid"
+            assert (
+                valid_channel["properties"]["qualification"]["const"] == "synthetic_software_only"
+            )
+            record = output_schema["$defs"]["TimingEvidenceRecord"]
+            assert record["properties"]["bean"]["discriminator"] == {
+                "propertyName": "status",
+                "mapping": {
+                    "invalid": "#/$defs/InvalidChannelEvidence",
+                    "unavailable": "#/$defs/UnavailableChannelEvidence",
+                    "valid": "#/$defs/ValidChannelEvidence",
+                },
+            }
+            event = output_schema["$defs"]["EventEvidence"]
+            assert event["properties"]["physical_time_bound"]["const"] == "not_provided"
+            assert event["properties"]["time_basis"]["enum"] == [
+                "producer_canonical_record",
+                "detector_clock_rebased",
+            ]
             malformed = [
                 {"expected_session_id": "x", "evidence_protocol": "wrong"},
                 {"expected_session_id": 1, "evidence_protocol": "timing_evidence/v1"},
@@ -656,6 +743,7 @@ def test_timing_evidence_real_stdio_schema_and_malformed_requests(
             for arguments in malformed:
                 reply = await client.call_tool("get_timing_evidence", arguments)
                 assert reply.isError is True
+                assert read_counter.read_text(encoding="utf-8") == "0"
 
             started = await client.call_tool("start_roast_session", {})
             assert started.structuredContent is not None
@@ -678,7 +766,8 @@ def test_timing_evidence_real_stdio_schema_and_malformed_requests(
                 "record",
             }
             assert reply.structuredContent["record"] is not None
-            assert set(reply.structuredContent["record"]) == {
+            record_content = cast(Mapping[str, object], reply.structuredContent["record"])
+            assert set(record_content) == {
                 "session_id",
                 "session_ownership_sequence",
                 "driver",
@@ -693,5 +782,53 @@ def test_timing_evidence_real_stdio_schema_and_malformed_requests(
                 "time_basis",
                 "physical_qualification",
             }
+            assert read_counter.read_text(encoding="utf-8") == "1"
+            bean = cast(Mapping[str, object], record_content["bean"])
+            environment_channel = cast(Mapping[str, object], record_content["environment"])
+            assert cast(float, bean["celsius"]).hex() == (196.00000000000003).hex()
+            assert cast(float, environment_channel["celsius"]).hex() == (0.30000000000000004).hex()
+            assert (
+                cast(float, bean["acquisition_lo_seconds"]).hex()
+                == (100.30000000000004 - 100.0).hex()
+            )
+            assert (
+                cast(float, bean["acquisition_hi_seconds"]).hex()
+                == (100.6000000000001 - 100.0).hex()
+            )
+            text_content = next(
+                content.text for content in reply.content if isinstance(content, TextContent)
+            )
+            text_record = cast(Mapping[str, object], json.loads(text_content)["record"])
+            text_bean = cast(Mapping[str, object], text_record["bean"])
+            text_environment = cast(Mapping[str, object], text_record["environment"])
+            assert cast(float, text_bean["celsius"]).hex() == cast(float, bean["celsius"]).hex()
+            assert (
+                cast(float, text_environment["celsius"]).hex()
+                == cast(float, environment_channel["celsius"]).hex()
+            )
+            assert (
+                cast(float, text_bean["acquisition_lo_seconds"]).hex()
+                == cast(float, bean["acquisition_lo_seconds"]).hex()
+            )
+            assert (
+                cast(float, text_bean["acquisition_hi_seconds"]).hex()
+                == cast(float, bean["acquisition_hi_seconds"]).hex()
+            )
+
+            sentinel_reply = await client.call_tool(
+                "get_timing_evidence",
+                {"expected_session_id": session_id, "evidence_protocol": "timing_evidence/v1"},
+            )
+            assert sentinel_reply.isError is False
+            sentinel_text = "".join(
+                content.text
+                for content in sentinel_reply.content
+                if isinstance(content, TextContent)
+            )
+            assert "P1-STDIO-SENTINEL-DO-NOT-LEAK" not in sentinel_text
+            assert read_counter.read_text(encoding="utf-8") == "2"
 
     asyncio.run(exercise())
+    assert imported_module.read_text(encoding="utf-8").endswith("coffee_roaster_mcp/mcp_server.py")
+    if mutated_source is not None:
+        assert Path(imported_module.read_text(encoding="utf-8")).is_relative_to(mutated_source)
