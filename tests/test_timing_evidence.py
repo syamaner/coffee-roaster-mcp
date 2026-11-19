@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import math
+import os
+import sys
+import threading
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 import coffee_roaster_mcp.mcp_server as mcp_server
 import coffee_roaster_mcp.session as session_module
@@ -19,7 +28,7 @@ class _Clock:
     """Deterministic exact-float clock for one timing-evidence test."""
 
     def __init__(self) -> None:
-        self.values = iter((100.0, 100.1, 100.2, 101.25, 102.5))
+        self.values = iter((100.0, 100.1, 100.2, 101.25, 102.5, 103.0, 104.0, 105.0, 106.0))
 
     def now(self) -> float:
         """Return the next injected clock value."""
@@ -32,7 +41,7 @@ def _context() -> tuple[mcp_server.ServerContext, MockRoasterDriver, str]:
     store = RoastSessionStore(
         utc_now=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         monotonic_now=clock.now,
-        session_id_factory=lambda: "timing-session",
+        session_id_factory=iter(("timing-session", "replacement-session")).__next__,
     )
     session = store.start_session()
     store.record_event(session, "beans_added", provenance="manual_mark")
@@ -45,6 +54,56 @@ def _context() -> tuple[mcp_server.ServerContext, MockRoasterDriver, str]:
         config=SimpleNamespace(roaster=SimpleNamespace(driver="mock")),
     )
     return cast(mcp_server.ServerContext, context), driver, session.id
+
+
+def _run(context: mcp_server.ServerContext, session_id: str) -> mcp_server.TimingEvidenceResult:
+    """Call the private orchestration seam through its public-tool implementation."""
+    return mcp_server._run_timing_evidence(  # pyright: ignore[reportPrivateUsage]
+        context, expected_session_id=session_id
+    )
+
+
+def _assert_refusal(
+    result: mcp_server.TimingEvidenceResult,
+    *,
+    outcome: str,
+    reason: str,
+    driver_read: str,
+) -> None:
+    """Assert the complete closed refusal row shared by negative witnesses."""
+    assert result.outcome == outcome
+    assert result.reason_code == reason
+    assert result.driver_read == driver_read
+    assert result.record is None
+
+
+def _count_reads(monkeypatch: pytest.MonkeyPatch, driver: MockRoasterDriver) -> list[int]:
+    """Install a counting mock read wrapper and return its mutable counter."""
+    reads = [0]
+    original = driver.read_state
+
+    def counted() -> RoasterState:
+        reads[0] += 1
+        return original()
+
+    monkeypatch.setattr(driver, "read_state", counted)
+    return reads
+
+
+def _state(*, bean: object = 20.0, environment: object = 21.0) -> RoasterState:
+    """Build an otherwise-valid state while allowing raw channel corruption."""
+    result = RoasterState(
+        driver="mock",
+        connected=True,
+        bean_temp_c=20.0,
+        env_temp_c=21.0,
+        heat_level_percent=0,
+        fan_level_percent=0,
+        cooling_on=False,
+    )
+    object.__setattr__(result, "bean_temp_c", bean)
+    object.__setattr__(result, "env_temp_c", environment)
+    return result
 
 
 def test_timing_evidence_returns_atomic_mock_record() -> None:
@@ -253,3 +312,386 @@ def test_session_timing_ownership_does_not_depend_on_mcp_or_drivers() -> None:
 
     assert "coffee_roaster_mcp.mcp_server" not in source
     assert "coffee_roaster_mcp.drivers" not in source
+
+
+@pytest.mark.parametrize(
+    ("channel", "value", "status", "reason"),
+    [
+        ("bean", None, "unavailable", "reported_none"),
+        ("environment", None, "unavailable", "reported_none"),
+        ("bean", 7, "invalid", "not_exact_float"),
+        ("environment", 7, "invalid", "not_exact_float"),
+        ("bean", True, "invalid", "not_exact_float"),
+        ("environment", True, "invalid", "not_exact_float"),
+        ("bean", "7.0", "invalid", "not_exact_float"),
+        ("environment", "7.0", "invalid", "not_exact_float"),
+        ("bean", math.nan, "invalid", "non_finite"),
+        ("environment", math.inf, "invalid", "non_finite"),
+        ("bean", -math.inf, "invalid", "non_finite"),
+        ("environment", math.nan, "invalid", "non_finite"),
+    ],
+)
+def test_timing_evidence_channel_matrix_is_local_and_non_coercing(
+    monkeypatch: pytest.MonkeyPatch,
+    channel: str,
+    value: object,
+    status: str,
+    reason: str,
+) -> None:
+    """Every malformed channel remains local while the peer stays valid."""
+    context, driver, session_id = _context()
+    monkeypatch.setattr(
+        driver,
+        "read_state",
+        lambda: _state(
+            bean=value if channel == "bean" else 20.0,
+            environment=value if channel == "environment" else 21.0,
+        ),
+    )
+
+    result = _run(context, session_id)
+
+    assert result.outcome == "evidence"
+    assert result.record is not None
+    tested = getattr(result.record, channel)
+    peer = result.record.environment if channel == "bean" else result.record.bean
+    assert tested.status == status
+    assert tested.reason == reason  # type: ignore[union-attr]
+    assert peer.status == "valid"
+
+
+@pytest.mark.parametrize(
+    ("replacement", "reason"),
+    [
+        (None, "driver_result_invalid"),
+        (object(), "driver_result_invalid"),
+        (_state(), "driver_result_invalid"),
+    ],
+)
+def test_timing_evidence_rejects_non_exact_driver_state(
+    monkeypatch: pytest.MonkeyPatch, replacement: object, reason: str
+) -> None:
+    """Only an exact connected mock state can begin channel classification."""
+    context, driver, session_id = _context()
+    if isinstance(replacement, RoasterState):
+        object.__setattr__(replacement, "driver", "hottop")
+    monkeypatch.setattr(driver, "read_state", lambda: replacement)
+    result = _run(context, session_id)
+    _assert_refusal(result, outcome="unavailable", reason=reason, driver_read="invoked")
+
+
+@pytest.mark.parametrize("connected", [False, 1, "yes"])
+def test_timing_evidence_rejects_disconnected_or_non_bool_state(
+    monkeypatch: pytest.MonkeyPatch, connected: object
+) -> None:
+    """Connection is an exact boolean whole-read guard."""
+    context, driver, session_id = _context()
+    state = _state()
+    object.__setattr__(state, "connected", connected)
+    monkeypatch.setattr(driver, "read_state", lambda: state)
+    result = _run(context, session_id)
+    _assert_refusal(
+        result,
+        outcome="unavailable",
+        reason="driver_not_connected" if connected is False else "driver_result_invalid",
+        driver_read="invoked",
+    )
+
+
+def test_timing_evidence_does_not_leak_driver_exception_or_mutate_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Driver faults are closed results with no exception-text disclosure."""
+    context, driver, session_id = _context()
+    session = context.session_store.get_latest_session()
+    assert session is not None
+    before = (list(session.event_timeline), list(session.telemetry_buffer), session.phase)
+
+    def explode() -> RoasterState:
+        raise RuntimeError("P1-SENTINEL-DO-NOT-LEAK")
+
+    monkeypatch.setattr(driver, "read_state", explode)
+    result = _run(context, session_id)
+    _assert_refusal(result, outcome="unavailable", reason="driver_raised", driver_read="invoked")
+    assert "P1-SENTINEL-DO-NOT-LEAK" not in result.model_dump_json()
+    assert (list(session.event_timeline), list(session.telemetry_buffer), session.phase) == before
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected_reason"),
+    [("missing", "unknown_session"), ("old", "not_latest_session")],
+)
+def test_timing_evidence_identity_rows_precede_capability(
+    monkeypatch: pytest.MonkeyPatch, requested: str, expected_reason: str
+) -> None:
+    """Identity rejects before an incapable driver can be inspected or read."""
+    context, driver, session_id = _context()
+    if requested == "old":
+        context.session_store.stop_session()
+        replacement = context.session_store.start_session()
+        session_id = replacement.id
+    reads = _count_reads(monkeypatch, driver)
+    monkeypatch.setattr(MockRoasterDriver, "capabilities", property(lambda _: object()))
+    result = _run(context, requested if requested == "missing" else "timing-session")
+    _assert_refusal(
+        result, outcome="refused_identity", reason=expected_reason, driver_read="not_invoked"
+    )
+    assert reads == [0]
+    assert session_id
+
+
+def test_timing_evidence_post_capability_identity_revalidation_has_no_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A capability hook replacing the session is caught by admission before t0."""
+    context, driver, session_id = _context()
+    reads = _count_reads(monkeypatch, driver)
+    original = MockRoasterDriver.capabilities
+
+    def replace(_: MockRoasterDriver) -> RoasterCapabilities:
+        context.session_store.stop_session()
+        context.session_store.start_session()
+        return original.__get__(driver, MockRoasterDriver)
+
+    monkeypatch.setattr(MockRoasterDriver, "capabilities", property(replace))
+    result = _run(context, session_id)
+    _assert_refusal(
+        result, outcome="refused_identity", reason="not_latest_session", driver_read="not_invoked"
+    )
+    assert reads == [0]
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "reason"),
+    [
+        ("timing_evidence_version", None, "capability_absent"),
+        ("timing_evidence_version", True, "capability_malformed"),
+        ("timing_evidence_version", 2, "capability_version_unsupported"),
+        ("driver", "other", "composition_not_qualified"),
+    ],
+)
+def test_timing_evidence_capability_rows_have_zero_reads(
+    monkeypatch: pytest.MonkeyPatch, attribute: str, value: object, reason: str
+) -> None:
+    """Each malformed capability row fails closed independently."""
+    context, driver, session_id = _context()
+    reads = _count_reads(monkeypatch, driver)
+    caps = driver.capabilities
+
+    def mutated(_: MockRoasterDriver) -> RoasterCapabilities:
+        return RoasterCapabilities(
+            driver=cast(str, value) if attribute == "driver" else caps.driver,
+            heat=caps.heat,
+            fan=caps.fan,
+            actions=caps.actions,
+            sensor_units=caps.sensor_units,
+            command_streaming=caps.command_streaming,
+            heat_containment_version=caps.heat_containment_version,
+            manual_first_crack_version=caps.manual_first_crack_version,
+            timing_evidence_version=cast(int | None, value)
+            if attribute == "timing_evidence_version"
+            else caps.timing_evidence_version,
+        )
+
+    monkeypatch.setattr(MockRoasterDriver, "capabilities", property(mutated))
+    result = _run(context, session_id)
+    _assert_refusal(result, outcome="refused_capability", reason=reason, driver_read="not_invoked")
+    assert reads == [0]
+
+
+def test_timing_evidence_capability_property_and_config_are_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable declarations and configured composition never invoke reads."""
+    context, driver, session_id = _context()
+    reads = _count_reads(monkeypatch, driver)
+    monkeypatch.setattr(
+        MockRoasterDriver, "capabilities", property(lambda _: (_ for _ in ()).throw(RuntimeError()))
+    )
+    result = _run(context, session_id)
+    _assert_refusal(
+        result,
+        outcome="refused_capability",
+        reason="capability_unreadable",
+        driver_read="not_invoked",
+    )
+    assert reads == [0]
+
+    monkeypatch.undo()
+    context, driver, session_id = _context()
+    reads = _count_reads(monkeypatch, driver)
+    object.__setattr__(context.config.roaster, "driver", "hottop")
+    result = _run(context, session_id)
+    _assert_refusal(
+        result,
+        outcome="refused_capability",
+        reason="composition_not_qualified",
+        driver_read="not_invoked",
+    )
+    assert reads == [0]
+
+
+def test_timing_evidence_epoch_is_store_lifetime_and_validated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The epoch generator runs once per store, not per session or read."""
+    values = iter(("a" * 32, "b" * 32))
+    monkeypatch.setattr(session_module, "_generate_clock_epoch_id", lambda: next(values))
+    one = RoastSessionStore(monotonic_now=lambda: 1.0, session_id_factory=lambda: "one")
+    first = one.start_session()
+    one.stop_session()
+    one.start_session()
+    two = RoastSessionStore(monotonic_now=lambda: 1.0, session_id_factory=lambda: "two")
+    assert one._clock_epoch_id == "a" * 32  # pyright: ignore[reportPrivateUsage]
+    assert two._clock_epoch_id == "b" * 32  # pyright: ignore[reportPrivateUsage]
+    assert first.id == "one"
+    monkeypatch.setattr(session_module, "_generate_clock_epoch_id", lambda: "INVALID")
+    with pytest.raises(ValueError):
+        RoastSessionStore(monotonic_now=lambda: 1.0)
+
+
+def test_timing_evidence_sequence_rollover_and_invalid_assembly_do_not_commit() -> None:
+    """Wire bounds and failed finalization leave the session sequence untouched."""
+    context, _, session_id = _context()
+    session = context.session_store.get_latest_session()
+    assert session is not None
+    session.timing_evidence_sequence = 2**53 - 2
+    final = _run(context, session_id)
+    assert final.record is not None and final.record.evidence_sequence == 2**53 - 1
+    exhausted = _run(context, session_id)
+    _assert_refusal(
+        exhausted, outcome="unavailable", reason="sequence_exhausted", driver_read="invoked"
+    )
+    assert session.timing_evidence_sequence == 2**53 - 1
+
+    session.timing_evidence_sequence = 0
+    session.beans_added_source = "manual_mark"
+    session.event_timeline.clear()
+    invalid = _run(context, session_id)
+    _assert_refusal(invalid, outcome="unavailable", reason="record_invalid", driver_read="invoked")
+    assert session.timing_evidence_sequence == 0
+
+
+def test_timing_evidence_does_not_hold_store_or_lifecycle_lock_during_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second thread can acquire both unrelated locks while the driver is blocked."""
+    context, driver, session_id = _context()
+    object.__setattr__(context, "lifecycle_barrier", threading.Lock())
+    entered = threading.Event()
+    release = threading.Event()
+    acquired = threading.Event()
+    original = driver.read_state
+
+    def blocked() -> RoasterState:
+        entered.set()
+        assert release.wait(2)
+        return original()
+
+    def probe() -> None:
+        assert entered.wait(2)
+        with context.session_store._lock:  # pyright: ignore[reportPrivateUsage]
+            assert context.lifecycle_barrier.acquire(timeout=1)
+            context.lifecycle_barrier.release()
+        acquired.set()
+        release.set()
+
+    monkeypatch.setattr(driver, "read_state", blocked)
+    worker = threading.Thread(target=probe)
+    worker.start()
+    result = _run(context, session_id)
+    worker.join(2)
+    assert acquired.is_set()
+    assert result.outcome == "evidence"
+
+
+def test_timing_evidence_real_stdio_schema_and_malformed_requests(
+    tmp_path: Path,
+) -> None:
+    """The installed child exposes closed input/output and rejects malformed calls."""
+
+    async def exercise() -> None:
+        environment = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": ""}
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "coffee_roaster_mcp.cli", "serve"],
+            cwd=tmp_path,
+            env=environment,
+        )
+        async with stdio_client(parameters) as (read, write), ClientSession(read, write) as client:
+            await client.initialize()
+            tools = await client.list_tools()
+            tool = next(item for item in tools.tools if item.name == "get_timing_evidence")
+            assert tool.inputSchema == {
+                "additionalProperties": False,
+                "description": "Strict raw SDK-boundary arguments for synthetic timing evidence.",
+                "properties": {
+                    "expected_session_id": {
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "title": "Expected Session Id",
+                        "type": "string",
+                    },
+                    "evidence_protocol": {
+                        "const": "timing_evidence/v1",
+                        "title": "Evidence Protocol",
+                        "type": "string",
+                    },
+                },
+                "required": ["expected_session_id", "evidence_protocol"],
+                "title": "_TimingEvidenceArguments",
+                "type": "object",
+            }
+            malformed = [
+                {"expected_session_id": "x", "evidence_protocol": "wrong"},
+                {"expected_session_id": 1, "evidence_protocol": "timing_evidence/v1"},
+                {"expected_session_id": "", "evidence_protocol": "timing_evidence/v1"},
+                {"expected_session_id": "x" * 129, "evidence_protocol": "timing_evidence/v1"},
+                {
+                    "expected_session_id": "x",
+                    "evidence_protocol": "timing_evidence/v1",
+                    "extra": "blocked",
+                },
+            ]
+            for arguments in malformed:
+                reply = await client.call_tool("get_timing_evidence", arguments)
+                assert reply.isError is True
+
+            started = await client.call_tool("start_roast_session", {})
+            assert started.structuredContent is not None
+            started_content = cast(Mapping[str, object], started.structuredContent)
+            session = cast(Mapping[str, object], started_content["session"])
+            session_id = cast(str, session["session_id"])
+            reply = await client.call_tool(
+                "get_timing_evidence",
+                {"expected_session_id": session_id, "evidence_protocol": "timing_evidence/v1"},
+            )
+            assert reply.isError is False
+            assert reply.structuredContent is not None
+            assert set(reply.structuredContent) == {
+                "evidence_protocol",
+                "evidence_version",
+                "outcome",
+                "reason_code",
+                "driver_read",
+                "requested_session_id",
+                "record",
+            }
+            assert reply.structuredContent["record"] is not None
+            assert set(reply.structuredContent["record"]) == {
+                "session_id",
+                "session_ownership_sequence",
+                "driver",
+                "clock",
+                "evidence_sequence",
+                "phase",
+                "charge",
+                "first_crack",
+                "drop",
+                "bean",
+                "environment",
+                "time_basis",
+                "physical_qualification",
+            }
+
+    asyncio.run(exercise())
