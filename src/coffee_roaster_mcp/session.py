@@ -977,6 +977,21 @@ class RoastSessionStore:
             if self._session_start_in_flight_token == reservation.token:
                 self._session_start_in_flight_token = None
 
+    def revoke_session_start(self, reservation: SessionStartReservation) -> bool:
+        """Invalidate exact pending admission while retaining its in-flight owner.
+
+        The server caller holds the lifecycle barrier before entering the store.
+        This operation performs no transport work and claims no physical stop.
+        """
+        with self._lock:
+            if (
+                self._pending_session_start_token != reservation.token
+                or self._session_start_in_flight_token != reservation.token
+            ):
+                return False
+            self._pending_session_start_token = None
+            return True
+
     def cancel_session_start_for_emergency_stop(self) -> None:
         """Invalidate pending start admission while its driver connect remains in flight."""
         with self._lock:

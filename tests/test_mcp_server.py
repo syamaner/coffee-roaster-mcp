@@ -45,6 +45,7 @@ from coffee_roaster_mcp.drivers import (
     EmergencyStopResult,
     FixedZeroCommandedState,
     HottopRoasterDriver,
+    HottopStartPhase,
     MockRoasterDriver,
     RoasterCapabilities,
     RoasterState,
@@ -8571,3 +8572,220 @@ def test_sampler_failed_event_keeps_original_early_return_cleanup_behaviour(
     )
     assert trace == ["driver", "failed_event"]
     assert context.session_store.get_session_snapshot(session_id=session.id).active
+
+
+@pytest.mark.parametrize("held_site", ["factory", "close"])
+@pytest.mark.parametrize("outcome", ["clean", "factory_raise", "close_raise", "still_open"])
+def test_future_manual_registered_start_inhibited_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held_site: str, outcome: str
+) -> None:
+    """Exact revoke is prompt during native work and uncertain starts stay owned."""
+    entered = Event()
+    release = Event()
+    opened = Event()
+    calls: list[str] = []
+    failures: list[BaseException] = []
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+
+    class Transport(_ObservationFakeSerialTransport):
+        def close(self) -> None:
+            calls.append("close")
+            if held_site == "close":
+                entered.set()
+                assert release.wait(3)
+            if outcome == "close_raise":
+                raise OSError("uncertain close")
+            if outcome != "still_open":
+                self.is_open = False
+
+        def write(self, data: bytes) -> int:
+            calls.append("write")
+            raise AssertionError("inhibited transport wrote a frame")
+
+    transport = Transport()
+
+    def factory(_port: str, **_kwargs: Any) -> Transport:
+        calls.append("factory")
+        assert context.session_store.get_active_session() is None
+        assert driver.read_state() == baseline[0]
+        assert driver.read_lifecycle_evidence() == baseline[1]
+        if held_site == "factory":
+            entered.set()
+            assert release.wait(3)
+        if outcome == "factory_raise":
+            raise OSError("uncertain native entry")
+        opened.set()
+        return transport
+
+    driver = HottopRoasterDriver(port="fake-only", serial_factory=factory)
+    baseline = driver.read_state(), driver.read_lifecycle_evidence()
+    object.__setattr__(context, "roaster_driver", driver)
+
+    # Only existing policy predicates are replaced on this deliberately fake context.
+    def accept_policy(*_args: object) -> None:
+        pass
+
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", accept_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", accept_policy
+    )
+    server = create_mcp_server()
+
+    def start() -> None:
+        try:
+            _call_tool(
+                server, "start_roast_session", _ctx(context), first_crack_observer_ack="manual/v1"
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = Thread(target=start)
+    worker.start()
+    try:
+        if held_site == "close" and outcome == "factory_raise":
+            worker.join(3)
+            assert not worker.is_alive()
+        else:
+            assert entered.wait(3)
+        owner, phase = driver.inspect_inhibited_start()
+        assert owner is not None
+        assert owner.generation == 1
+        reservation = session_module.SessionStartReservation(owner.server_token)
+        if worker.is_alive():
+            assert phase is (
+                HottopStartPhase.OPENING if held_site == "factory" else HottopStartPhase.CLOSING
+            )
+            assert driver.read_state() == baseline[0]
+            assert driver.read_lifecycle_evidence() == baseline[1]
+        revoked = Event()
+        revoke_results: list[bool] = []
+
+        def revoke() -> None:
+            with context.lifecycle_barrier:
+                revoke_results.append(context.session_store.revoke_session_start(reservation))
+            revoked.set()
+
+        revoker = Thread(target=revoke)
+        revoker.start()
+        assert revoked.wait(1), "exact revoke waited on native lifecycle work"
+        revoker.join(1)
+        assert revoke_results == [True]
+        with context.lifecycle_barrier:
+            assert not context.session_store.revoke_session_start(reservation)
+            assert not context.session_store.revoke_session_start(
+                session_module.SessionStartReservation("foreign")
+            )
+        with pytest.raises(SessionLifecycleError, match="progress"):
+            context.session_store.reserve_session_start()
+        with pytest.raises(RuntimeError, match="staged"):
+            driver.connect()
+        assert "write" not in calls
+        assert context.session_store.get_active_session() is None
+        for expected_session_id, error in (
+            (None, r"^No active roast session exists\.$"),
+            ("missing-session", r"^Expected session is not the latest roast session\.$"),
+        ):
+            with pytest.raises(ValueError, match=error):
+                _call_tool(
+                    server, "emergency_stop", _ctx(context), expected_session_id=expected_session_id
+                )
+        assert driver.inspect_inhibited_start()[0] is owner
+    finally:
+        release.set()
+        worker.join(3)
+    assert not worker.is_alive()
+    assert len(failures) == 1
+    assert calls.count("factory") == 1
+    assert calls.count("close") == (0 if outcome == "factory_raise" else 1)
+    assert "write" not in calls
+    assert context.session_store.get_active_session() is None
+    if outcome == "clean":
+        assert opened.is_set()
+        assert driver.inspect_inhibited_start() == (None, None)
+        with context.lifecycle_barrier:
+            newer = context.session_store.reserve_session_start()
+            assert not context.session_store.revoke_session_start(reservation)
+            context.session_store.clear_session_start_reservation(reservation)
+            newer_session = context.session_store.complete_session_start_snapshot(newer)
+            assert newer_session.active
+        # Staging is fully settled. Use the established fake containment adapter to
+        # exercise existing session authority, without claiming staged Hottop writes.
+        contained_driver = RecordingRoasterDriver()
+        object.__setattr__(context, "roaster_driver", contained_driver)
+        automatic = dataclasses.replace(
+            context.config,
+            first_crack=dataclasses.replace(
+                context.config.first_crack, event_authority="automatic"
+            ),
+        )
+        object.__setattr__(context, "config", automatic)
+        initial_stop = _call_tool(
+            server, "emergency_stop", _ctx(context), reason="after-settlement"
+        )
+        guarded_stop = _call_tool(
+            server,
+            "emergency_stop",
+            _ctx(context),
+            expected_session_id=newer_session.id,
+            reason="exact-settled-session",
+        )
+        assert initial_stop.session_id == guarded_stop.session_id == newer_session.id
+        assert guarded_stop.phase == "fault"
+        assert guarded_stop.event.kind == "fault"
+        assert guarded_stop.event.payload["reason"] == "exact-settled-session"
+        assert contained_driver.actions == [
+            "emergency_stop:after-settlement",
+            "emergency_stop:exact-settled-session",
+        ]
+        assert contained_driver.heat_level_percent == 0
+        assert contained_driver.fan_level_percent == 100
+        assert contained_driver.cooling_on is True
+        assert calls.count("close") == 1
+        assert "write" not in calls
+    else:
+        assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.UNRESOLVED)
+        with pytest.raises(SessionLifecycleError, match="progress"):
+            _call_tool(
+                server, "start_roast_session", _ctx(context), first_crack_observer_ack="manual/v1"
+            )
+        # An ordinary automatic Start on this same unresolved candidate also refuses.
+        automatic = dataclasses.replace(
+            context.config,
+            first_crack=dataclasses.replace(
+                context.config.first_crack, event_authority="automatic"
+            ),
+        )
+        object.__setattr__(context, "config", automatic)
+        with pytest.raises(SessionLifecycleError, match="progress"):
+            _call_tool(server, "start_roast_session", _ctx(context))
+        assert calls.count("factory") == 1
+        assert calls.count("close") == (0 if outcome == "factory_raise" else 1)
+
+
+def test_future_manual_early_driver_refusal_releases_server_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A port refusal before native entry disposes exactly the server reservation."""
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    driver = HottopRoasterDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+
+    def accept_policy(*_args: object) -> None:
+        pass
+
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", accept_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", accept_policy
+    )
+    with pytest.raises(ValueError, match="port"):
+        _call_tool(
+            create_mcp_server(),
+            "start_roast_session",
+            _ctx(context),
+            first_crack_observer_ack="manual/v1",
+        )
+    assert driver.inspect_inhibited_start() == (None, None)
+    assert context.session_store.get_active_session() is None
+    assert context.session_store.reserve_session_start().token
