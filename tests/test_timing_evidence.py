@@ -642,6 +642,411 @@ def test_timing_evidence_sequence_rollover_and_invalid_assembly_do_not_commit() 
     assert session.timing_evidence_sequence == 0
 
 
+def test_timing_evidence_finalizer_failure_is_observed_before_any_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G18: a failed final validation reaches finalization and cannot advance state."""
+    context, _, session_id = _context()
+    session = context.session_store.get_latest_session()
+    assert session is not None
+    before = (
+        session.timing_evidence_sequence,
+        session.timing_evidence_last_lo,
+        session.timing_evidence_last_hi,
+    )
+    called = False
+    original = mcp_server._timing_evidence_result  # pyright: ignore[reportPrivateUsage]
+
+    def reject_candidate(**kwargs: object) -> mcp_server.TimingEvidenceResult:
+        nonlocal called
+        if kwargs["outcome"] == "evidence":
+            called = True
+            raise ValueError("test finalizer rejection")
+        return original(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(mcp_server, "_timing_evidence_result", reject_candidate)
+    result = _run(context, session_id)
+    _assert_refusal(result, outcome="unavailable", reason="record_invalid", driver_read="invoked")
+    assert called is True
+    assert (
+        session.timing_evidence_sequence,
+        session.timing_evidence_last_lo,
+        session.timing_evidence_last_hi,
+    ) == before
+
+
+def test_timing_evidence_wire_ownership_bound_is_enforced_by_its_model() -> None:
+    """G19: direct model validation exercises the wire bound without store masking."""
+    context, _, session_id = _context()
+    result = _run(context, session_id)
+    assert result.record is not None
+    row = result.record.model_dump()
+    row["session_ownership_sequence"] = 2**53
+
+    try:
+        mcp_server.TimingEvidenceRecord.model_validate(row)
+    except (TypeError, ValueError):
+        return
+    raise AssertionError("ownership sequence above the exact wire bound was accepted")
+
+
+def test_timing_evidence_revalidates_same_id_replacement_and_ownership_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G5: object and ownership identity both survive an identical textual id."""
+    clock = iter((0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)).__next__
+    store = RoastSessionStore(monotonic_now=clock, session_id_factory=lambda: "same-id")
+    original_session = store.start_session()
+    driver = MockRoasterDriver()
+    driver.connect()
+    context = cast(
+        mcp_server.ServerContext,
+        SimpleNamespace(
+            session_store=store,
+            roaster_driver=driver,
+            config=SimpleNamespace(roaster=SimpleNamespace(driver="mock")),
+        ),
+    )
+    reads = _count_reads(monkeypatch, driver)
+    original_read = driver.read_state
+
+    def replace_same_id() -> RoasterState:
+        store.stop_session()
+        store.start_session()
+        return original_read()
+
+    monkeypatch.setattr(driver, "read_state", replace_same_id)
+    replaced = _run(context, original_session.id)
+    _assert_refusal(
+        replaced,
+        outcome="refused_identity",
+        reason="session_changed_during_read",
+        driver_read="invoked",
+    )
+    assert reads == [1]
+
+    current = store.get_latest_session()
+    assert current is not None
+
+    def change_ownership() -> RoasterState:
+        with store._lock:  # pyright: ignore[reportPrivateUsage]
+            current.capture_ownership_sequence += 1
+        return original_read()
+
+    monkeypatch.setattr(driver, "read_state", change_ownership)
+    changed = _run(context, current.id)
+    _assert_refusal(
+        changed,
+        outcome="refused_identity",
+        reason="session_changed_during_read",
+        driver_read="invoked",
+    )
+    assert reads == [2]
+
+
+def test_timing_evidence_fault_and_inactive_drop_win_over_busy_during_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G6: post-read fault or inactivity wins even while a Drop reservation remains."""
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    with store._lock:  # pyright: ignore[reportPrivateUsage]
+        session.event_timeline = [
+            event for event in session.event_timeline if event.kind != "first_crack_detected"
+        ]
+        session.first_crack_at_utc = None
+        session.first_crack_monotonic_seconds = None
+        session.first_crack_source = None
+        session.phase = "roasting"
+    reads = _count_reads(monkeypatch, driver)
+    original = driver.read_state
+
+    def fault_with_pending_drop() -> RoasterState:
+        reservation = store.reserve_driver_command(session, kind="drop")
+        with store._lock:  # pyright: ignore[reportPrivateUsage]
+            session.faulted_at_utc = datetime(2026, 1, 1, tzinfo=UTC)
+            assert session.active is True
+            assert session.pending_driver_command_token == reservation.token
+            assert session.pending_driver_command_kind == "drop"
+        return original()
+
+    monkeypatch.setattr(driver, "read_state", fault_with_pending_drop)
+    result = _run(context, session_id)
+    _assert_refusal(
+        result,
+        outcome="refused_identity",
+        reason="session_changed_during_read",
+        driver_read="invoked",
+    )
+    assert reads == [1]
+    assert session.timing_evidence_sequence == 0
+
+
+def test_timing_evidence_handles_pending_and_completed_drop_at_the_right_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G6/G14: pending Drop refuses; a completed active Drop is assembled live."""
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    reads = _count_reads(monkeypatch, driver)
+    pending = store.reserve_driver_command(session, kind="drop")
+    precheck = _run(context, session_id)
+    _assert_refusal(
+        precheck, outcome="refused_busy", reason="drop_in_progress", driver_read="not_invoked"
+    )
+    assert reads == [0]
+    with store._lock:  # pyright: ignore[reportPrivateUsage]
+        store._clear_driver_command_reservation_locked(session, pending)  # pyright: ignore[reportPrivateUsage]
+    original = driver.read_state
+
+    def complete_drop() -> RoasterState:
+        reservation = store.reserve_driver_drop(session).reservation
+        assert reservation is not None
+        store.complete_reserved_driver_drop_snapshot(
+            session,
+            reservation=reservation,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=True,
+        )
+        return original()
+
+    monkeypatch.setattr(driver, "read_state", complete_drop)
+    completed = _run(context, session_id)
+    assert completed.outcome == "evidence"
+    assert completed.record is not None
+    assert completed.record.drop is not None
+    assert completed.record.phase in {"dropped", "cooling"}
+    assert reads == [1]
+
+
+def test_timing_evidence_rechecks_pending_drop_and_first_crack_during_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G6/G14: live assembly sees a new reservation or a new canonical FC event."""
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    with store._lock:  # pyright: ignore[reportPrivateUsage]
+        session.event_timeline = [
+            event for event in session.event_timeline if event.kind != "first_crack_detected"
+        ]
+        session.first_crack_at_utc = None
+        session.first_crack_monotonic_seconds = None
+        session.first_crack_source = None
+        session.phase = "roasting"
+    reads = _count_reads(monkeypatch, driver)
+    original = driver.read_state
+
+    def reserve_drop() -> RoasterState:
+        assert session is not None
+        store.reserve_driver_command(session, kind="drop")
+        return original()
+
+    monkeypatch.setattr(driver, "read_state", reserve_drop)
+    pending = _run(context, session_id)
+    _assert_refusal(
+        pending, outcome="refused_busy", reason="drop_in_progress", driver_read="invoked"
+    )
+    assert reads == [1]
+
+    with store._lock:  # pyright: ignore[reportPrivateUsage]
+        session.pending_driver_command_kind = None
+        session.pending_driver_command_token = None
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    with store._lock:  # pyright: ignore[reportPrivateUsage]
+        session.event_timeline = [
+            event for event in session.event_timeline if event.kind != "first_crack_detected"
+        ]
+        session.first_crack_at_utc = None
+        session.first_crack_monotonic_seconds = None
+        session.first_crack_source = None
+        session.phase = "roasting"
+    reads = _count_reads(monkeypatch, driver)
+    original = driver.read_state
+
+    def record_fc() -> RoasterState:
+        store.record_event(session, "first_crack_detected", provenance="manual_mark")
+        return original()
+
+    monkeypatch.setattr(driver, "read_state", record_fc)
+    evidence = _run(context, session_id)
+    assert evidence.outcome == "evidence"
+    assert evidence.record is not None
+    assert evidence.record.first_crack is not None
+    assert evidence.record.first_crack.source == "manual_mark"
+    assert reads == [1]
+
+
+def test_timing_evidence_refuses_drop_then_stop_during_read_without_committing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G6: a completed Drop followed by a stop is identity refusal, never evidence."""
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    reads = _count_reads(monkeypatch, driver)
+    original = driver.read_state
+
+    def complete_and_stop() -> RoasterState:
+        reservation = store.reserve_driver_drop(session).reservation
+        assert reservation is not None
+        store.complete_reserved_driver_drop_snapshot(
+            session,
+            reservation=reservation,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=True,
+        )
+        store.stop_cooling(session)
+        return original()
+
+    monkeypatch.setattr(driver, "read_state", complete_and_stop)
+    result = _run(context, session_id)
+    _assert_refusal(
+        result,
+        outcome="refused_identity",
+        reason="session_changed_during_read",
+        driver_read="invoked",
+    )
+    assert reads == [1]
+    assert session.timing_evidence_sequence == 0
+
+
+def test_timing_evidence_finalisation_and_active_complete_state_are_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finalisation is pre-read busy; an impossible active complete state cannot leak a record."""
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    reads = _count_reads(monkeypatch, driver)
+    with store._lock:  # pyright: ignore[reportPrivateUsage]
+        store._nonterminal_finalisations.add(session.id)  # pyright: ignore[reportPrivateUsage]
+    busy = _run(context, session_id)
+    _assert_refusal(
+        busy,
+        outcome="refused_busy",
+        reason="finalisation_in_progress",
+        driver_read="not_invoked",
+    )
+    assert reads == [0]
+    with store._lock:  # pyright: ignore[reportPrivateUsage]
+        store._nonterminal_finalisations.clear()  # pyright: ignore[reportPrivateUsage]
+        session.phase = "complete"  # type: ignore[assignment]
+    invalid = _run(context, session_id)
+    _assert_refusal(invalid, outcome="unavailable", reason="record_invalid", driver_read="invoked")
+    assert reads == [1]
+    assert session.timing_evidence_sequence == 0
+
+
+@pytest.mark.parametrize(
+    ("clock_values", "reason"),
+    [((100.0, 99.0), "clock_regression"), ((100.0, 101.0), "clock_regression")],
+)
+def test_timing_evidence_rejects_reversed_or_lower_than_start_clock(
+    monkeypatch: pytest.MonkeyPatch,
+    clock_values: tuple[float, float],
+    reason: str,
+) -> None:
+    """G7: raw clocks are checked before clamping or assembly."""
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    if clock_values[1] > clock_values[0]:
+        session.monotonic_start = 200.0
+    values = iter(clock_values)
+    monkeypatch.setattr(store, "read_timing_evidence_clock", lambda: next(values))
+    reads = _count_reads(monkeypatch, driver)
+    result = _run(context, session_id)
+    _assert_refusal(result, outcome="unavailable", reason=reason, driver_read="invoked")
+    assert reads == [1]
+
+
+def _reverse_assembly_results(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    first_bracket: tuple[float, float],
+    second_bracket: tuple[float, float],
+) -> tuple[mcp_server.TimingEvidenceResult, mcp_server.TimingEvidenceResult]:
+    """Run two calls with a controlled reverse assembly order and no sleeps."""
+    initial_clock = iter((0.0,)).__next__
+    store = RoastSessionStore(monotonic_now=initial_clock, session_id_factory=lambda: "race")
+    session = store.start_session()
+    driver = MockRoasterDriver()
+    driver.connect()
+    context = cast(
+        mcp_server.ServerContext,
+        SimpleNamespace(
+            session_store=store,
+            roaster_driver=driver,
+            config=SimpleNamespace(roaster=SimpleNamespace(driver="mock")),
+        ),
+    )
+    first_clock = iter(first_bracket)
+    second_clock = iter(second_bracket)
+    monkeypatch.setattr(
+        store,
+        "read_timing_evidence_clock",
+        lambda: (
+            next(first_clock)
+            if threading.current_thread().name == "timing-first"
+            else next(second_clock)
+        ),
+    )
+    first_read_entered = threading.Event()
+    release_first = threading.Event()
+    original = driver.read_state
+
+    def ordered_read() -> RoasterState:
+        if threading.current_thread().name == "timing-first":
+            first_read_entered.set()
+            assert release_first.wait(2)
+        return original()
+
+    monkeypatch.setattr(driver, "read_state", ordered_read)
+    first_result: list[mcp_server.TimingEvidenceResult] = []
+    thread = threading.Thread(
+        target=lambda: first_result.append(_run(context, session.id)), name="timing-first"
+    )
+    thread.start()
+    assert first_read_entered.wait(2)
+    second_result = _run(context, session.id)
+    release_first.set()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert len(first_result) == 1
+    return first_result[0], second_result
+
+
+@pytest.mark.parametrize(
+    ("first_bracket", "second_bracket"),
+    [((10.0, 40.0), (20.0, 30.0)), ((30.0, 35.0), (20.0, 40.0))],
+)
+def test_timing_evidence_rejects_distinct_reverse_assembly_endpoint_regressions(
+    monkeypatch: pytest.MonkeyPatch,
+    first_bracket: tuple[float, float],
+    second_bracket: tuple[float, float],
+) -> None:
+    """G11: lo-only and hi-only regressions have separate threaded witnesses."""
+    first, second = _reverse_assembly_results(
+        monkeypatch, first_bracket=first_bracket, second_bracket=second_bracket
+    )
+    assert second.outcome == "evidence"
+    _assert_refusal(first, outcome="unavailable", reason="out_of_order_read", driver_read="invoked")
+
+
 def test_timing_evidence_does_not_hold_store_or_lifecycle_lock_during_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -936,13 +1341,22 @@ def test_timing_evidence_real_stdio_schema_and_malformed_requests(
                 mutated_output_schema["$defs"] = mutated_definitions
                 mutated_schema_validator: Any = Draft202012Validator(mutated_output_schema)
                 mutated_schema_validator.validate(invalid_result)
+            started = await client.call_tool("start_roast_session", {})
+            assert started.structuredContent is not None
+            started_content = cast(Mapping[str, object], started.structuredContent)
+            session = cast(Mapping[str, object], started_content["session"])
+            session_id = cast(str, session["session_id"])
+            read_baseline = read_counter.read_text(encoding="utf-8")
             malformed = [
-                {"expected_session_id": "x", "evidence_protocol": "wrong"},
+                {"expected_session_id": session_id, "evidence_protocol": "wrong"},
                 {"expected_session_id": 1, "evidence_protocol": "timing_evidence/v1"},
                 {"expected_session_id": "", "evidence_protocol": "timing_evidence/v1"},
-                {"expected_session_id": "x" * 129, "evidence_protocol": "timing_evidence/v1"},
                 {
-                    "expected_session_id": "x",
+                    "expected_session_id": "x" * 129,
+                    "evidence_protocol": "timing_evidence/v1",
+                },
+                {
+                    "expected_session_id": session_id,
                     "evidence_protocol": "timing_evidence/v1",
                     "extra": "blocked",
                 },
@@ -950,13 +1364,8 @@ def test_timing_evidence_real_stdio_schema_and_malformed_requests(
             for arguments in malformed:
                 reply = await client.call_tool("get_timing_evidence", arguments)
                 assert reply.isError is True
-                assert read_counter.read_text(encoding="utf-8") == "0"
+                assert read_counter.read_text(encoding="utf-8") == read_baseline
 
-            started = await client.call_tool("start_roast_session", {})
-            assert started.structuredContent is not None
-            started_content = cast(Mapping[str, object], started.structuredContent)
-            session = cast(Mapping[str, object], started_content["session"])
-            session_id = cast(str, session["session_id"])
             reply = await client.call_tool(
                 "get_timing_evidence",
                 {"expected_session_id": session_id, "evidence_protocol": "timing_evidence/v1"},
