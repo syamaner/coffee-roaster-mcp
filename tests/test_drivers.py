@@ -2337,6 +2337,40 @@ def test_inhibited_start_exact_disposal_and_legacy_isolation(outcome: str) -> No
     assert calls == ["fake"]
 
 
+def test_inhibited_close_retains_replaced_handle_after_injected_corruption() -> None:
+    """An injected, normally unreachable handle swap cannot falsely settle cleanup."""
+    replacement = FakeSerialTransport()
+
+    class ReplacingTransport(FakeSerialTransport):
+        def close(self) -> None:
+            super().close()
+            # Deliberately violate lifecycle serialization to exercise the defensive guard.
+            with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+                driver._start_handle = replacement  # pyright: ignore[reportPrivateUsage]
+
+    transport = ReplacingTransport()
+    factory = FakeSerialFactory(transport)
+    driver = HottopRoasterDriver(port="fake-only", serial_factory=factory)
+    owner = driver.reserve_inhibited_start("server")
+    driver.open_inhibited_start(owner)
+
+    assert driver.abort_inhibited_start(owner) is HottopStartSettlement.UNRESOLVED
+    assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.UNRESOLVED)
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        assert driver._start_handle is replacement  # pyright: ignore[reportPrivateUsage]
+    assert transport.is_open is False
+    assert replacement.is_open is True
+    assert driver.abort_inhibited_start(owner) is HottopStartSettlement.UNRESOLVED
+    with pytest.raises(RuntimeError, match="staged"):
+        driver.connect()
+    with pytest.raises(RuntimeError, match="staged"):
+        driver.reserve_inhibited_start("newer")
+    assert len(factory.calls) == 1
+    assert transport.close_calls == 1
+    assert replacement.close_calls == 0
+    assert transport.writes == replacement.writes == []
+
+
 def test_inhibited_factory_exception_retains_owner_without_handle() -> None:
     """Factory entry is irreversible uncertainty even when no handle is returned."""
     calls: list[str] = []

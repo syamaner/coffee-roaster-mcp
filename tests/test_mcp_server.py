@@ -8682,8 +8682,11 @@ def test_future_manual_registered_start_inhibited_abort(
             driver.connect()
         assert "write" not in calls
         assert context.session_store.get_active_session() is None
-        for expected_session_id in (None, "missing-session"):
-            with pytest.raises(ValueError):
+        for expected_session_id, error in (
+            (None, r"^No active roast session exists\.$"),
+            ("missing-session", r"^Expected session is not the latest roast session\.$"),
+        ):
+            with pytest.raises(ValueError, match=error):
                 _call_tool(
                     server, "emergency_stop", _ctx(context), expected_session_id=expected_session_id
                 )
@@ -8704,7 +8707,42 @@ def test_future_manual_registered_start_inhibited_abort(
             newer = context.session_store.reserve_session_start()
             assert not context.session_store.revoke_session_start(reservation)
             context.session_store.clear_session_start_reservation(reservation)
-            assert context.session_store.complete_session_start_snapshot(newer).active
+            newer_session = context.session_store.complete_session_start_snapshot(newer)
+            assert newer_session.active
+        # Staging is fully settled. Use the established fake containment adapter to
+        # exercise existing session authority, without claiming staged Hottop writes.
+        contained_driver = RecordingRoasterDriver()
+        object.__setattr__(context, "roaster_driver", contained_driver)
+        automatic = dataclasses.replace(
+            context.config,
+            first_crack=dataclasses.replace(
+                context.config.first_crack, event_authority="automatic"
+            ),
+        )
+        object.__setattr__(context, "config", automatic)
+        initial_stop = _call_tool(
+            server, "emergency_stop", _ctx(context), reason="after-settlement"
+        )
+        guarded_stop = _call_tool(
+            server,
+            "emergency_stop",
+            _ctx(context),
+            expected_session_id=newer_session.id,
+            reason="exact-settled-session",
+        )
+        assert initial_stop.session_id == guarded_stop.session_id == newer_session.id
+        assert guarded_stop.phase == "fault"
+        assert guarded_stop.event.kind == "fault"
+        assert guarded_stop.event.payload["reason"] == "exact-settled-session"
+        assert contained_driver.actions == [
+            "emergency_stop:after-settlement",
+            "emergency_stop:exact-settled-session",
+        ]
+        assert contained_driver.heat_level_percent == 0
+        assert contained_driver.fan_level_percent == 100
+        assert contained_driver.cooling_on is True
+        assert calls.count("close") == 1
+        assert "write" not in calls
     else:
         assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.UNRESOLVED)
         with pytest.raises(SessionLifecycleError, match="progress"):
