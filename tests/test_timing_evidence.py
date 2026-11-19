@@ -25,7 +25,12 @@ from mcp.types import TextContent
 
 import coffee_roaster_mcp.mcp_server as mcp_server
 import coffee_roaster_mcp.session as session_module
-from coffee_roaster_mcp.drivers import MockRoasterDriver, RoasterCapabilities, RoasterState
+from coffee_roaster_mcp.drivers import (
+    HottopRoasterDriver,
+    MockRoasterDriver,
+    RoasterCapabilities,
+    RoasterState,
+)
 from coffee_roaster_mcp.session import RoastSessionStore
 
 
@@ -773,6 +778,77 @@ def test_timing_evidence_composition_subguards_are_independent(
     assert reads == [0]
 
 
+def test_timing_evidence_real_hottop_capability_never_opens_or_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual Hottop class is refused before its transport can be touched."""
+    context, _, session_id = _context()
+    opened = [0]
+
+    def unopened_transport(*_: object, **__: object) -> object:
+        opened[0] += 1
+        raise AssertionError("timing evidence must not open a Hottop transport")
+
+    driver = HottopRoasterDriver(serial_factory=unopened_transport)  # type: ignore[arg-type]
+    reads = [0]
+    original_read = driver.read_state
+
+    def counted_read() -> RoasterState:
+        reads[0] += 1
+        return original_read()
+
+    monkeypatch.setattr(driver, "read_state", counted_read)
+    object.__setattr__(context, "roaster_driver", driver)
+
+    absent = _run(context, session_id)
+    _assert_refusal(
+        absent,
+        outcome="refused_capability",
+        reason="capability_absent",
+        driver_read="not_invoked",
+    )
+    assert opened == [0]
+    assert reads == [0]
+
+    original_capabilities = HottopRoasterDriver.capabilities
+
+    def version_one(_: HottopRoasterDriver) -> RoasterCapabilities:
+        caps = original_capabilities.__get__(driver, HottopRoasterDriver)
+        return RoasterCapabilities(
+            driver=caps.driver,
+            heat=caps.heat,
+            fan=caps.fan,
+            actions=caps.actions,
+            sensor_units=caps.sensor_units,
+            command_streaming=caps.command_streaming,
+            heat_containment_version=caps.heat_containment_version,
+            manual_first_crack_version=caps.manual_first_crack_version,
+            timing_evidence_version=1,
+        )
+
+    monkeypatch.setattr(HottopRoasterDriver, "capabilities", property(version_one))
+    versioned = _run(context, session_id)
+    _assert_refusal(
+        versioned,
+        outcome="refused_capability",
+        reason="composition_not_qualified",
+        driver_read="not_invoked",
+    )
+    assert opened == [0]
+    assert reads == [0]
+
+    monkeypatch.setattr(HottopRoasterDriver, "capabilities", property(lambda _: object()))
+    malformed = _run(context, session_id)
+    _assert_refusal(
+        malformed,
+        outcome="refused_capability",
+        reason="capability_malformed",
+        driver_read="not_invoked",
+    )
+    assert opened == [0]
+    assert reads == [0]
+
+
 def test_timing_evidence_epoch_is_store_lifetime_and_validated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1154,6 +1230,181 @@ def test_timing_evidence_finalisation_and_active_complete_state_are_invalid(
         session.phase = "complete"  # type: ignore[assignment]
     invalid = _run(context, session_id)
     _assert_refusal(invalid, outcome="unavailable", reason="record_invalid", driver_read="invoked")
+    assert reads == [1]
+    assert session.timing_evidence_sequence == 0
+
+
+def test_timing_evidence_exposes_auto_t0_and_model_fc_writer_provenance() -> None:
+    """Real auto-T0 and model writers preserve their sources and canonical bases."""
+    clock = iter((10.0, 11.0, 12.0, 13.0, 14.0, 15.0)).__next__
+    store = RoastSessionStore(monotonic_now=clock, session_id_factory=lambda: "writer-session")
+    session = store.start_session()
+    first_t0, first_snapshot = store.process_auto_t0_reading_snapshot(
+        session, bean_temp_c=200.0, drop_threshold_c=5.0
+    )
+    auto_t0, auto_snapshot = store.process_auto_t0_reading_snapshot(
+        session, bean_temp_c=194.0, drop_threshold_c=5.0
+    )
+    assert first_t0 is None
+    assert first_snapshot.beans_added_source is None
+    assert auto_t0 is not None
+    assert auto_snapshot.beans_added_source == "auto_t0"
+    assert auto_snapshot.beans_added_at_utc is not None
+    model_fc, model_snapshot = store.record_first_crack_detection_snapshot(
+        session,
+        detected_at_monotonic_seconds=12.25,
+        max_future_seconds=None,
+    )
+    manual_fc = store.record_event(session, "first_crack_detected", provenance="manual_mark")
+    assert manual_fc is model_fc
+    assert model_snapshot.first_crack_source == "model_detection"
+    assert model_snapshot.first_crack_at_utc is not None
+    driver = MockRoasterDriver()
+    driver.connect()
+    context = cast(
+        mcp_server.ServerContext,
+        SimpleNamespace(
+            session_store=store,
+            roaster_driver=driver,
+            config=SimpleNamespace(roaster=SimpleNamespace(driver="mock")),
+        ),
+    )
+
+    result = _run(context, session.id)
+
+    assert result.record is not None
+    assert result.record.charge is not None
+    assert result.record.first_crack is not None
+    assert result.record.charge.source == "auto_t0"
+    assert result.record.charge.time_basis == "producer_canonical_record"
+    assert result.record.charge.canonical_seconds.hex() == (1.0).hex()
+    assert result.record.first_crack.source == "model_detection"
+    assert result.record.first_crack.time_basis == "detector_clock_rebased"
+    assert result.record.first_crack.canonical_seconds.hex() == (2.25).hex()
+    snapshot = store.get_session_snapshot(session_id=session.id)
+    assert snapshot.beans_added_source == "auto_t0"
+    assert snapshot.first_crack_source == "model_detection"
+
+
+def test_timing_evidence_bare_cooling_stop_active_complete_is_record_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare lifecycle event can make active complete and cannot yield evidence."""
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    store.record_event(session, "beans_dropped")
+    store.record_event(session, "cooling_started")
+    store.record_event(session, "cooling_stopped")
+    assert session.active is True
+    assert session.phase == "complete"
+    reads = _count_reads(monkeypatch, driver)
+
+    result = _run(context, session_id)
+
+    _assert_refusal(result, outcome="unavailable", reason="record_invalid", driver_read="invoked")
+    assert reads == [1]
+    assert session.timing_evidence_sequence == 0
+
+
+@pytest.mark.parametrize(
+    ("clock_values", "driver_read"),
+    [
+        ((1, 101.0), "not_invoked"),
+        ((math.nan, 101.0), "not_invoked"),
+        ((math.inf, 101.0), "not_invoked"),
+        ((100.0, 1), "invoked"),
+        ((100.0, math.nan), "invoked"),
+        ((100.0, math.inf), "invoked"),
+    ],
+)
+def test_timing_evidence_rejects_exact_invalid_t0_and_t1_values(
+    monkeypatch: pytest.MonkeyPatch,
+    clock_values: tuple[object, object],
+    driver_read: str,
+) -> None:
+    """Raw clock typing and finiteness are checked at both causal positions."""
+    context, driver, session_id = _context()
+    values = iter(clock_values)
+    monkeypatch.setattr(context.session_store, "read_timing_evidence_clock", lambda: next(values))
+    reads = _count_reads(monkeypatch, driver)
+
+    result = _run(context, session_id)
+
+    _assert_refusal(result, outcome="unavailable", reason="clock_invalid", driver_read=driver_read)
+    assert reads == [0 if driver_read == "not_invoked" else 1]
+
+
+def test_timing_evidence_rejects_nonfinite_derived_bracket_without_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finite raw clocks cannot make a non-finite session-relative bracket valid."""
+    context, driver, session_id = _context()
+    session = context.session_store.get_latest_session()
+    assert session is not None
+    session.monotonic_start = math.inf
+    monkeypatch.setattr(
+        context.session_store, "read_timing_evidence_clock", iter((100.0, 101.0)).__next__
+    )
+    reads = _count_reads(monkeypatch, driver)
+
+    result = _run(context, session_id)
+
+    _assert_refusal(result, outcome="unavailable", reason="clock_invalid", driver_read="invoked")
+    assert reads == [1]
+    assert session.timing_evidence_sequence == 0
+
+
+def test_timing_evidence_driver_exception_precedes_post_read_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raised driver result wins over replacement that happened during that read."""
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    reads = [0]
+
+    def replace_then_raise() -> RoasterState:
+        reads[0] += 1
+        store.stop_session()
+        store.start_session()
+        raise RuntimeError("replacement happened before driver failure")
+
+    monkeypatch.setattr(driver, "read_state", replace_then_raise)
+    result = _run(context, session_id)
+
+    _assert_refusal(result, outcome="unavailable", reason="driver_raised", driver_read="invoked")
+    assert reads == [1]
+    assert session.timing_evidence_sequence == 0
+
+
+def test_timing_evidence_post_read_finalisation_refuses_without_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finalisation created during a read is a post-read busy refusal."""
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    reads = _count_reads(monkeypatch, driver)
+    original_read = driver.read_state
+
+    def finalise_during_read() -> RoasterState:
+        with store._lock:  # pyright: ignore[reportPrivateUsage]
+            store._nonterminal_finalisations.add(session.id)  # pyright: ignore[reportPrivateUsage]
+        return original_read()
+
+    monkeypatch.setattr(driver, "read_state", finalise_during_read)
+    result = _run(context, session_id)
+
+    _assert_refusal(
+        result,
+        outcome="refused_busy",
+        reason="finalisation_in_progress",
+        driver_read="invoked",
+    )
     assert reads == [1]
     assert session.timing_evidence_sequence == 0
 
