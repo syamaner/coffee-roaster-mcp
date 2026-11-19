@@ -133,6 +133,46 @@ def test_timing_evidence_returns_atomic_mock_record() -> None:
     assert result.record.environment.clock_epoch_id == result.record.clock.epoch_id
 
 
+def test_timing_evidence_preserves_exact_bracket_and_has_no_session_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A synthetic read neither rounds values nor processes session machinery."""
+    context, driver, session_id = _context()
+    store = context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    values = iter((100.0, 100.30000000000004))
+    monkeypatch.setattr(store, "read_timing_evidence_clock", lambda: next(values))
+    state = _state(bean=196.00000000000003, environment=0.30000000000000004)
+    monkeypatch.setattr(driver, "read_state", lambda: state)
+    before = (
+        list(session.telemetry_buffer),
+        list(session.event_timeline),
+        session.phase,
+        session.auto_t0_charge_temperature_c,
+        session.first_crack_source,
+        session.pending_driver_command_token,
+    )
+
+    result = _run(context, session_id)
+
+    assert result.record is not None
+    assert result.record.bean.status == "valid"
+    assert result.record.environment.status == "valid"
+    assert result.record.bean.celsius.hex() == (196.00000000000003).hex()
+    assert result.record.environment.celsius.hex() == (0.30000000000000004).hex()
+    assert result.record.bean.acquisition_lo_seconds.hex() == (0.0).hex()
+    assert result.record.bean.acquisition_hi_seconds.hex() == (100.30000000000004 - 100.0).hex()
+    assert (
+        list(session.telemetry_buffer),
+        list(session.event_timeline),
+        session.phase,
+        session.auto_t0_charge_temperature_c,
+        session.first_crack_source,
+        session.pending_driver_command_token,
+    ) == before
+
+
 def test_timing_evidence_classifies_one_bad_channel_without_losing_the_other(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -429,6 +469,39 @@ def test_timing_evidence_rejects_non_exact_driver_state(
     _assert_refusal(result, outcome="unavailable", reason=reason, driver_read="invoked")
 
 
+def test_timing_evidence_rejects_state_subclass_and_string_subclass_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whole-state checks reject lookalikes before channel-local classification."""
+    context, driver, session_id = _context()
+
+    class _StateSubclass(RoasterState):
+        pass
+
+    subclass_state = _state()
+    object.__setattr__(subclass_state, "__class__", _StateSubclass)
+    monkeypatch.setattr(driver, "read_state", lambda: subclass_state)
+    _assert_refusal(
+        _run(context, session_id),
+        outcome="unavailable",
+        reason="driver_result_invalid",
+        driver_read="invoked",
+    )
+
+    class _MockString(str):
+        pass
+
+    string_subclass_state = _state()
+    object.__setattr__(string_subclass_state, "driver", _MockString("mock"))
+    monkeypatch.setattr(driver, "read_state", lambda: string_subclass_state)
+    _assert_refusal(
+        _run(context, session_id),
+        outcome="unavailable",
+        reason="driver_result_invalid",
+        driver_read="invoked",
+    )
+
+
 @pytest.mark.parametrize("connected", [False, 1, "yes"])
 def test_timing_evidence_rejects_disconnected_or_non_bool_state(
     monkeypatch: pytest.MonkeyPatch, connected: object
@@ -580,6 +653,79 @@ def test_timing_evidence_capability_property_and_config_are_closed(
     assert reads == [0]
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("name", "composition_not_qualified"),
+        ("capabilities_driver", "composition_not_qualified"),
+        ("configured_driver", "composition_not_qualified"),
+        ("hottop_absent", "capability_absent"),
+        ("hottop_version_one", "composition_not_qualified"),
+    ],
+)
+def test_timing_evidence_composition_subguards_are_independent(
+    monkeypatch: pytest.MonkeyPatch, mutation: str, expected_reason: str
+) -> None:
+    """Every capability/composition component refuses before a synthetic read."""
+    context, driver, session_id = _context()
+    reads = _count_reads(monkeypatch, driver)
+    caps = driver.capabilities
+    if mutation == "name":
+        monkeypatch.setattr(MockRoasterDriver, "name", "not-mock")
+        monkeypatch.setattr(MockRoasterDriver, "capabilities", property(lambda _: caps))
+    elif mutation == "capabilities_driver":
+        monkeypatch.setattr(
+            MockRoasterDriver,
+            "capabilities",
+            property(
+                lambda _: RoasterCapabilities(
+                    driver="hottop",
+                    heat=caps.heat,
+                    fan=caps.fan,
+                    actions=caps.actions,
+                    sensor_units=caps.sensor_units,
+                    command_streaming=caps.command_streaming,
+                    heat_containment_version=caps.heat_containment_version,
+                    manual_first_crack_version=caps.manual_first_crack_version,
+                    timing_evidence_version=1,
+                )
+            ),
+        )
+    elif mutation == "configured_driver":
+        object.__setattr__(context.config.roaster, "driver", "hottop")
+    else:
+
+        class _HottopNamedDriver:
+            name = "hottop"
+
+            @property
+            def capabilities(self) -> RoasterCapabilities:
+                return RoasterCapabilities(
+                    driver="hottop",
+                    heat=caps.heat,
+                    fan=caps.fan,
+                    actions=caps.actions,
+                    sensor_units=caps.sensor_units,
+                    command_streaming=caps.command_streaming,
+                    heat_containment_version=caps.heat_containment_version,
+                    manual_first_crack_version=caps.manual_first_crack_version,
+                    timing_evidence_version=None if mutation == "hottop_absent" else 1,
+                )
+
+            def read_state(self) -> RoasterState:
+                raise AssertionError("capability refusal must not read")
+
+        object.__setattr__(context, "roaster_driver", _HottopNamedDriver())
+    result = _run(context, session_id)
+    _assert_refusal(
+        result,
+        outcome="refused_capability",
+        reason=expected_reason,
+        driver_read="not_invoked",
+    )
+    assert reads == [0]
+
+
 def test_timing_evidence_epoch_is_store_lifetime_and_validated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -618,6 +764,21 @@ def test_timing_evidence_epoch_is_store_lifetime_and_validated(
     monkeypatch.setattr(session_module, "_generate_clock_epoch_id", lambda: "INVALID")
     with pytest.raises(ValueError):
         RoastSessionStore(monotonic_now=lambda: 1.0)
+
+
+def test_timing_evidence_record_rejects_mismatched_event_epoch() -> None:
+    """A record epoch tag cannot be substituted for a canonical event epoch."""
+    context, _, session_id = _context()
+    result = _run(context, session_id)
+    assert result.record is not None and result.record.charge is not None
+    row = result.record.model_dump()
+    charge = cast(dict[str, object], row["charge"])
+    charge["clock_epoch_id"] = "f" * 32
+    try:
+        mcp_server.TimingEvidenceRecord.model_validate(row)
+    except (TypeError, ValueError):
+        return
+    raise AssertionError("mismatched event epoch was accepted")
 
 
 def test_timing_evidence_sequence_rollover_and_invalid_assembly_do_not_commit() -> None:
