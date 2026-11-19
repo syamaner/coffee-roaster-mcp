@@ -51,6 +51,10 @@ The first implementation milestone is a mock vertical slice that requires no roa
   describe latest or physical state. A matching unresolved reservation blocks
   ordinary fan, cooling, and drop commands; an independent emergency retains
   its existing admission rules.
+- MCP244 P1 adds source-only `timing_evidence/v1` software evidence for the
+  exact mock driver. Its brackets are synthetic, Hottop is refused, and it
+  grants no physical or recipe qualification. This is not a release; #244
+  remains open and P2 is separate and unstarted.
 - Product/display name: `RoastPilot`
 - GitHub repo: `syamaner/coffee-roaster-mcp`
 - PyPI package: `coffee-roaster-mcp`
@@ -2619,3 +2623,13 @@ transport settlement, automatic retry, or Agent-global uncertainty handling.
 Unknown driver/completion outcomes retain only a still-matching reservation;
 newer ownership is never restored or modified. Emergency and stopped-fault
 recovery semantics remain independent.
+
+### MCP244 P1 — timing evidence software boundary
+
+This source-only slice adds the read-only `timing_evidence/v1` tool. It emits
+atomic, versioned mock records with canonical producer events and synthetic
+software-only temperature brackets. Hottop and every non-exact mock composition
+are refused. The record does not qualify physical timing, hardware, recipe
+decisions, or roast readiness; reads advance only the existing mock simulation
+step and do not run auto-T0 or first-crack processing. No release is claimed.
+Issue #244 remains open, and its exact-Drop P2 work is separate and unstarted.

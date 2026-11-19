@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections import deque
 from collections.abc import Callable, Mapping
 from copy import deepcopy
@@ -52,6 +53,14 @@ FixedZeroIdentityRejection = Literal[
     "session_faulted",
 ]
 FixedZeroBusyRejection = Literal["finalisation_in_progress", "command_in_progress"]
+TimingEvidenceIdentityRejection = Literal[
+    "unknown_session",
+    "not_latest_session",
+    "session_faulted",
+    "session_not_active",
+    "session_purpose_not_eligible",
+]
+TimingEvidenceBusyRejection = Literal["finalisation_in_progress", "drop_in_progress"]
 
 _SINGLETON_EVENT_KINDS: frozenset[RoastEventKind] = frozenset(
     {
@@ -101,6 +110,11 @@ def _event_payload_default() -> dict[str, EventPayloadValue]:
 def _event_timeline_default() -> list[RoastEvent]:
     """Return an empty typed event timeline."""
     return []
+
+
+def _generate_clock_epoch_id() -> str:
+    """Return one opaque store-lifetime timing clock epoch identifier."""
+    return uuid4().hex
 
 
 def _telemetry_buffer_default() -> deque[TelemetrySample]:
@@ -390,6 +404,19 @@ class RoastSession:
     created_at_utc: datetime
     monotonic_start: float
     capture_ownership_sequence: int = field(default=0, kw_only=True, compare=False, repr=False)
+    beans_added_source: Literal["manual_mark", "auto_t0"] | None = field(
+        default=None, kw_only=True, compare=False, repr=False
+    )
+    first_crack_source: Literal["manual_mark", "model_detection"] | None = field(
+        default=None, kw_only=True, compare=False, repr=False
+    )
+    timing_evidence_sequence: int = field(default=0, kw_only=True, compare=False, repr=False)
+    timing_evidence_last_lo: float | None = field(
+        default=None, kw_only=True, compare=False, repr=False
+    )
+    timing_evidence_last_hi: float | None = field(
+        default=None, kw_only=True, compare=False, repr=False
+    )
     purpose: SessionPurpose = "roast"
     phase: RoastPhase = "pre_roast"
     beans_added_at_utc: datetime | None = None
@@ -467,6 +494,26 @@ class RoastSession:
         self.stopped_at_utc = utc_now()
         self.monotonic_stop = monotonic_now()
         self.phase = phase
+
+
+@dataclass(frozen=True)
+class TimingEvidenceAdmission:
+    """Opaque live-session admission for one read-only timing-evidence read."""
+
+    session: RoastSession | None
+    ownership_sequence: int | None
+    session_id: str | None
+    identity_rejection: TimingEvidenceIdentityRejection | None = None
+    busy_rejection: TimingEvidenceBusyRejection | None = None
+
+
+@dataclass(frozen=True)
+class TimingEvidenceAssembly:
+    """Closed store-side outcome for a timing-evidence assembly attempt."""
+
+    outcome: Literal["evidence", "refused_identity", "refused_busy", "unavailable"]
+    reason_code: str | None
+    result: object | None = None
 
 
 def compute_roast_metrics(
@@ -829,6 +876,14 @@ class RoastSessionStore:
         self._session_id_factory = session_id_factory or _generate_session_id
         self._default_log_dir = default_log_dir
         self._lock = RLock()
+        self._clock_epoch_id = _generate_clock_epoch_id()
+        if (
+            type(self._clock_epoch_id) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", self._clock_epoch_id, flags=re.ASCII) is None
+        ):
+            raise ValueError(
+                "Timing clock epoch identifier must be 32 lowercase hexadecimal characters."
+            )
         self._latest_session: RoastSession | None = None
         self._capture_ownership_sequence = 0
         self._sessions_by_id: dict[str, RoastSession] = {}
@@ -1170,6 +1225,183 @@ class RoastSessionStore:
         """Classify exact-session containment identity without reserving work."""
         with self._lock:
             return self._fixed_zero_identity_rejection_locked(expected_session_id)
+
+    def inspect_timing_evidence_identity(
+        self, expected_session_id: str
+    ) -> TimingEvidenceIdentityRejection | None:
+        """Classify timing-evidence identity before any driver read."""
+        with self._lock:
+            return self._timing_evidence_identity_rejection_locked(expected_session_id)
+
+    def admit_timing_evidence(self, expected_session_id: str) -> TimingEvidenceAdmission:
+        """Revalidate an exact roast session without reserving or mutating it."""
+        with self._lock:
+            identity_rejection = self._timing_evidence_identity_rejection_locked(
+                expected_session_id
+            )
+            if identity_rejection is not None:
+                return TimingEvidenceAdmission(
+                    None, None, None, identity_rejection=identity_rejection
+                )
+            session = self._latest_session
+            assert session is not None
+            if self._finalisation_blocks_mutation(session):
+                return TimingEvidenceAdmission(
+                    session,
+                    session.capture_ownership_sequence,
+                    session.id,
+                    busy_rejection="finalisation_in_progress",
+                )
+            if session.pending_driver_command_kind == "drop":
+                return TimingEvidenceAdmission(
+                    session,
+                    session.capture_ownership_sequence,
+                    session.id,
+                    busy_rejection="drop_in_progress",
+                )
+            return TimingEvidenceAdmission(
+                session,
+                session.capture_ownership_sequence,
+                session.id,
+            )
+
+    def read_timing_evidence_clock(self) -> float:
+        """Read the injected store clock without taking the store lock."""
+        return self._monotonic_now()
+
+    def assemble_timing_evidence(
+        self,
+        admission: TimingEvidenceAdmission,
+        *,
+        t0: float,
+        t1: float,
+        channels: Mapping[str, Mapping[str, object]],
+        finalize: Callable[[dict[str, object]], object],
+    ) -> TimingEvidenceAssembly:
+        """Atomically assemble and commit one validated synthetic timing record.
+
+        The supplied finalizer is intentionally pure validation owned by the
+        presentation boundary. It is invoked while the store lock is held and
+        must not perform I/O or call back into the store.
+        """
+        with self._lock:
+            session = admission.session
+            if (
+                session is None
+                or self._latest_session is not session
+                or admission.ownership_sequence is None
+                or session.capture_ownership_sequence != admission.ownership_sequence
+                or admission.session_id is None
+                or session.id != admission.session_id
+            ):
+                return TimingEvidenceAssembly("refused_identity", "session_changed_during_read")
+            if session.faulted_at_utc is not None or session.phase == "fault" or not session.active:
+                return TimingEvidenceAssembly("refused_identity", "session_changed_during_read")
+            if self._finalisation_blocks_mutation(session):
+                return TimingEvidenceAssembly("refused_busy", "finalisation_in_progress")
+            if session.pending_driver_command_kind == "drop":
+                return TimingEvidenceAssembly("refused_busy", "drop_in_progress")
+
+            lo = t0 - session.monotonic_start
+            hi = t1 - session.monotonic_start
+            if not math.isfinite(lo) or not math.isfinite(hi):
+                return TimingEvidenceAssembly("unavailable", "clock_invalid")
+            if lo < 0:
+                return TimingEvidenceAssembly("unavailable", "clock_regression")
+            if (
+                session.timing_evidence_last_lo is not None and lo < session.timing_evidence_last_lo
+            ) or (
+                session.timing_evidence_last_hi is not None and hi < session.timing_evidence_last_hi
+            ):
+                return TimingEvidenceAssembly("unavailable", "out_of_order_read")
+            maximum = 2**53 - 1
+            if session.timing_evidence_sequence >= maximum:
+                return TimingEvidenceAssembly("unavailable", "sequence_exhausted")
+            if not 1 <= session.capture_ownership_sequence <= maximum:
+                return TimingEvidenceAssembly("unavailable", "record_invalid")
+
+            event_by_kind: dict[str, tuple[int, RoastEvent]] = {}
+            for index, event in enumerate(session.event_timeline):
+                if event.kind in {"beans_added", "first_crack_detected", "beans_dropped"}:
+                    event_by_kind.setdefault(event.kind, (index, event))
+            if (session.beans_added_source is not None and "beans_added" not in event_by_kind) or (
+                session.first_crack_source is not None
+                and "first_crack_detected" not in event_by_kind
+            ):
+                return TimingEvidenceAssembly("unavailable", "record_invalid")
+
+            def event_evidence(kind: str, source: str) -> dict[str, object] | None:
+                indexed_event = event_by_kind.get(kind)
+                if indexed_event is None:
+                    return None
+                index, event = indexed_event
+                if (
+                    type(index) is not int
+                    or not 0 <= index <= maximum
+                    or type(event.monotonic_seconds) is not float
+                    or not math.isfinite(event.monotonic_seconds)
+                    or event.monotonic_seconds < 0
+                ):
+                    raise ValueError("Invalid canonical timing event.")
+                return {
+                    "kind": kind,
+                    "event_index": index,
+                    "canonical_seconds": event.monotonic_seconds,
+                    "clock_epoch_id": self._clock_epoch_id,
+                    "source": source,
+                    "time_basis": (
+                        "detector_clock_rebased"
+                        if source == "model_detection"
+                        else "producer_canonical_record"
+                    ),
+                    "physical_time_bound": "not_provided",
+                }
+
+            def channel_evidence(channel: Mapping[str, object]) -> Mapping[str, object]:
+                if channel.get("status") != "valid":
+                    return channel
+                return {
+                    "status": "valid",
+                    "celsius": channel["celsius"],
+                    "acquisition_lo_seconds": lo,
+                    "acquisition_hi_seconds": hi,
+                    "clock_epoch_id": self._clock_epoch_id,
+                    "basis": "in_call_synthesis",
+                    "qualification": "synthetic_software_only",
+                }
+
+            try:
+                record: dict[str, object] = {
+                    "session_id": session.id,
+                    "session_ownership_sequence": session.capture_ownership_sequence,
+                    "driver": "mock",
+                    "clock": {
+                        "epoch_id": self._clock_epoch_id,
+                        "domain": "session_relative_store_monotonic",
+                        "suspend_behaviour": "unqualified",
+                    },
+                    "evidence_sequence": session.timing_evidence_sequence + 1,
+                    "phase": session.phase,
+                    "charge": event_evidence(
+                        "beans_added", session.beans_added_source or "unattributed"
+                    ),
+                    "first_crack": event_evidence(
+                        "first_crack_detected",
+                        session.first_crack_source or "unattributed",
+                    ),
+                    "drop": event_evidence("beans_dropped", "unattributed"),
+                    "bean": channel_evidence(channels["bean"]),
+                    "environment": channel_evidence(channels["environment"]),
+                    "time_basis": "canonical_operational_session_relative",
+                    "physical_qualification": "none_synthetic_mock_only",
+                }
+                result = finalize(record)
+            except Exception:  # noqa: BLE001 - validation is an unavailable business outcome.
+                return TimingEvidenceAssembly("unavailable", "record_invalid")
+            session.timing_evidence_sequence += 1
+            session.timing_evidence_last_lo = lo
+            session.timing_evidence_last_hi = hi
+            return TimingEvidenceAssembly("evidence", None, result)
 
     def reserve_fixed_zero_containment(
         self, expected_session_id: str
@@ -1933,6 +2165,7 @@ class RoastSessionStore:
         kind: RoastEventKind,
         *,
         payload: dict[str, EventPayloadValue] | None = None,
+        provenance: Literal["manual_mark"] | None = None,
     ) -> RoastEvent:
         """Record one authoritative session event under store-owned locking.
 
@@ -1949,6 +2182,14 @@ class RoastSessionStore:
             SessionLifecycleError: If the session is not the latest active
                 session in this store.
         """
+        if provenance is not None and (
+            type(provenance) is not str
+            or provenance != "manual_mark"
+            or kind not in {"beans_added", "first_crack_detected"}
+        ):
+            raise SessionLifecycleError(
+                "Manual provenance is valid only for charge or first crack."
+            )
         with self._lock:
             self._assert_latest_active_session(session)
             if kind != "fault":
@@ -1985,6 +2226,11 @@ class RoastSessionStore:
             _append_event_log_row(session, event)
             session.event_timeline.append(event)
             _apply_event_timestamp(session, event)
+            if provenance is not None:
+                if kind == "beans_added":
+                    session.beans_added_source = provenance
+                else:
+                    session.first_crack_source = provenance
             return event
 
     def record_event_snapshot(
@@ -1993,10 +2239,11 @@ class RoastSessionStore:
         kind: RoastEventKind,
         *,
         payload: dict[str, EventPayloadValue] | None = None,
+        provenance: Literal["manual_mark"] | None = None,
     ) -> tuple[RoastEvent, RoastSession]:
         """Record one event and return the event plus an atomic lightweight snapshot."""
         with self._lock:
-            event = self.record_event(session, kind, payload=payload)
+            event = self.record_event(session, kind, payload=payload, provenance=provenance)
             return event, _copy_session_for_read(session)
 
     def process_auto_t0_reading_snapshot(
@@ -2145,6 +2392,7 @@ class RoastSessionStore:
         _append_event_log_row(session, event)
         session.event_timeline.append(event)
         _apply_event_timestamp(session, event)
+        session.beans_added_source = "auto_t0"
         return event
 
     def record_first_crack_window_observation(
@@ -2292,6 +2540,7 @@ class RoastSessionStore:
             _append_event_log_row(session, event)
             session.event_timeline.append(event)
             _apply_event_timestamp(session, event)
+            session.first_crack_source = "model_detection"
             return event, _copy_session_for_read(session)
 
     def emergency_stop(
@@ -2622,6 +2871,19 @@ class RoastSessionStore:
             return "session_faulted"
         if not latest.active:
             return "session_not_active"
+        return None
+
+    def _timing_evidence_identity_rejection_locked(
+        self, expected_session_id: str
+    ) -> TimingEvidenceIdentityRejection | None:
+        """Return the closed timing-evidence identity rejection under the lock."""
+        rejection = self._fixed_zero_identity_rejection_locked(expected_session_id)
+        if rejection is not None:
+            return rejection
+        latest = self._latest_session
+        assert latest is not None
+        if latest.purpose != "roast":
+            return "session_purpose_not_eligible"
         return None
 
     def _finalisation_blocks_mutation(self, session: RoastSession) -> bool:
@@ -3201,6 +3463,11 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         created_at_utc=session.created_at_utc,
         monotonic_start=session.monotonic_start,
         capture_ownership_sequence=session.capture_ownership_sequence,
+        beans_added_source=session.beans_added_source,
+        first_crack_source=session.first_crack_source,
+        timing_evidence_sequence=session.timing_evidence_sequence,
+        timing_evidence_last_lo=session.timing_evidence_last_lo,
+        timing_evidence_last_hi=session.timing_evidence_last_hi,
         purpose=session.purpose,
         phase=session.phase,
         beans_added_at_utc=session.beans_added_at_utc,

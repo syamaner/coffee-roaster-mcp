@@ -485,6 +485,377 @@ class FixedZeroContainmentResult(BaseModel):
         return self
 
 
+TimingEvidenceOutcome = Literal[
+    "evidence", "refused_identity", "refused_capability", "refused_busy", "unavailable"
+]
+TimingEvidenceReason = Literal[
+    "unknown_session",
+    "not_latest_session",
+    "session_faulted",
+    "session_not_active",
+    "session_purpose_not_eligible",
+    "session_changed_during_read",
+    "capability_unreadable",
+    "capability_malformed",
+    "capability_absent",
+    "capability_version_unsupported",
+    "composition_not_qualified",
+    "finalisation_in_progress",
+    "drop_in_progress",
+    "clock_invalid",
+    "driver_raised",
+    "driver_result_invalid",
+    "driver_not_connected",
+    "clock_regression",
+    "out_of_order_read",
+    "sequence_exhausted",
+    "record_invalid",
+]
+_TIMING_EPOCH_PATTERN = r"^[0-9a-f]{32}$"
+TimingEpochId = Annotated[str, Strict(), StringConstraints(pattern=_TIMING_EPOCH_PATTERN)]
+TimingExactInt = Annotated[int, Strict(), Field(ge=0, le=2**53 - 1)]
+TimingPositiveInt = Annotated[int, Strict(), Field(ge=1, le=2**53 - 1)]
+TimingFiniteFloat = Annotated[float, Strict(), Field(allow_inf_nan=False)]
+
+
+def _timing_mapping(
+    value: object,
+    *,
+    string_fields: tuple[str, ...] = (),
+    integer_fields: tuple[str, ...] = (),
+    float_fields: tuple[str, ...] = (),
+) -> Mapping[str, object]:
+    """Reject coercible primitive values before Pydantic validates timing evidence."""
+    if not isinstance(value, Mapping):
+        raise TypeError("Timing evidence values must be mappings.")
+    raw = cast(Mapping[str, object], value)
+    for field_name in string_fields:
+        if type(raw.get(field_name)) is not str:
+            raise TypeError(f"{field_name} must be an exact string.")
+    for field_name in integer_fields:
+        if type(raw.get(field_name)) is not int:
+            raise TypeError(f"{field_name} must be an exact integer.")
+    for field_name in float_fields:
+        if type(raw.get(field_name)) is not float:
+            raise TypeError(f"{field_name} must be an exact float.")
+    return raw
+
+
+class _TimingEvidenceArguments(ArgModelBase):
+    """Strict raw SDK-boundary arguments for synthetic timing evidence."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_session_id: FixedZeroSessionId
+    evidence_protocol: Literal["timing_evidence/v1"]
+
+
+class TimingClock(BaseModel):
+    """Closed identifier for the store-relative synthetic clock."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    epoch_id: TimingEpochId
+    domain: Literal["session_relative_store_monotonic"]
+    suspend_behaviour: Literal["unqualified"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw(cls, value: object) -> object:
+        return _timing_mapping(value, string_fields=("epoch_id", "domain", "suspend_behaviour"))
+
+
+class ValidChannelEvidence(BaseModel):
+    """One synthetic mock channel with an in-call clock bracket."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    status: Literal["valid"]
+    celsius: TimingFiniteFloat
+    acquisition_lo_seconds: Annotated[float, Strict(), Field(ge=0, allow_inf_nan=False)]
+    acquisition_hi_seconds: Annotated[float, Strict(), Field(ge=0, allow_inf_nan=False)]
+    clock_epoch_id: TimingEpochId
+    basis: Literal["in_call_synthesis"]
+    qualification: Literal["synthetic_software_only"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw(cls, value: object) -> object:
+        return _timing_mapping(
+            value,
+            string_fields=("status", "clock_epoch_id", "basis", "qualification"),
+            float_fields=("celsius", "acquisition_lo_seconds", "acquisition_hi_seconds"),
+        )
+
+    @model_validator(mode="after")
+    def _validate_bracket(self) -> ValidChannelEvidence:
+        if self.acquisition_lo_seconds > self.acquisition_hi_seconds:
+            raise ValueError("Channel acquisition bracket must be ordered.")
+        return self
+
+
+class UnavailableChannelEvidence(BaseModel):
+    """One channel explicitly reported absent by the driver."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    status: Literal["unavailable"]
+    reason: Literal["reported_none"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw(cls, value: object) -> object:
+        return _timing_mapping(value, string_fields=("status", "reason"))
+
+
+class InvalidChannelEvidence(BaseModel):
+    """One non-coercible malformed channel reported by the driver."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    status: Literal["invalid"]
+    reason: Literal["not_exact_float", "non_finite"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw(cls, value: object) -> object:
+        return _timing_mapping(value, string_fields=("status", "reason"))
+
+
+ChannelEvidence = Annotated[
+    ValidChannelEvidence | UnavailableChannelEvidence | InvalidChannelEvidence,
+    Field(discriminator="status"),
+]
+
+
+class EventEvidence(BaseModel):
+    """Canonical producer event operand with store-side provenance."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    kind: Literal["beans_added", "first_crack_detected", "beans_dropped"]
+    event_index: TimingExactInt
+    canonical_seconds: Annotated[float, Strict(), Field(ge=0, allow_inf_nan=False)]
+    clock_epoch_id: TimingEpochId
+    source: Literal["manual_mark", "auto_t0", "model_detection", "unattributed"]
+    time_basis: Literal["producer_canonical_record", "detector_clock_rebased"]
+    physical_time_bound: Literal["not_provided"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw(cls, value: object) -> object:
+        return _timing_mapping(
+            value,
+            string_fields=(
+                "kind",
+                "clock_epoch_id",
+                "source",
+                "time_basis",
+                "physical_time_bound",
+            ),
+            integer_fields=("event_index",),
+            float_fields=("canonical_seconds",),
+        )
+
+    @model_validator(mode="after")
+    def _validate_source_time_basis(self) -> EventEvidence:
+        expected = (
+            "detector_clock_rebased"
+            if self.source == "model_detection"
+            else "producer_canonical_record"
+        )
+        if self.time_basis != expected:
+            raise ValueError("Event time basis must match provenance.")
+        return self
+
+
+class TimingEvidenceRecord(BaseModel):
+    """Closed atomic synthetic timing evidence record for one roast session."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    session_id: FixedZeroSessionId
+    session_ownership_sequence: TimingPositiveInt
+    driver: Literal["mock"]
+    clock: TimingClock
+    evidence_sequence: TimingPositiveInt
+    phase: Literal["pre_roast", "roasting", "development", "dropped", "cooling"]
+    charge: EventEvidence | None
+    first_crack: EventEvidence | None
+    drop: EventEvidence | None
+    bean: ChannelEvidence
+    environment: ChannelEvidence
+    time_basis: Literal["canonical_operational_session_relative"]
+    physical_qualification: Literal["none_synthetic_mock_only"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw(cls, value: object) -> object:
+        return _timing_mapping(
+            value,
+            string_fields=("session_id", "driver", "phase", "time_basis", "physical_qualification"),
+            integer_fields=("session_ownership_sequence", "evidence_sequence"),
+        )
+
+    @model_validator(mode="after")
+    def _validate_record(self) -> TimingEvidenceRecord:
+        events = (
+            ("charge", self.charge, "beans_added"),
+            ("first_crack", self.first_crack, "first_crack_detected"),
+            ("drop", self.drop, "beans_dropped"),
+        )
+        if any(event is not None and event.kind != kind for _, event, kind in events):
+            raise ValueError("Event kind must match its record slot.")
+        if any(
+            event is not None and event.clock_epoch_id != self.clock.epoch_id
+            for _, event, _ in events
+        ):
+            raise ValueError("Event epoch must match the record clock.")
+        for channel in (self.bean, self.environment):
+            if (
+                isinstance(channel, ValidChannelEvidence)
+                and channel.clock_epoch_id != self.clock.epoch_id
+            ):
+                raise ValueError("Channel epoch must match the record clock.")
+        phase_events = (
+            self.charge is not None,
+            self.first_crack is not None,
+            self.drop is not None,
+        )
+        allowed = {
+            "pre_roast": (False, False, False),
+            "roasting": (True, False, False),
+            "development": (True, True, False),
+        }
+        if self.phase in allowed and phase_events != allowed[self.phase]:
+            raise ValueError("Phase and event slots are inconsistent.")
+        if self.phase in {"dropped", "cooling"} and (not phase_events[0] or not phase_events[2]):
+            raise ValueError("Dropped or cooling phase requires charge and drop.")
+        present = [event for _, event, _ in events if event is not None]
+        if any(
+            later.event_index <= earlier.event_index
+            or later.canonical_seconds < earlier.canonical_seconds
+            for earlier, later in zip(present, present[1:], strict=False)
+        ):
+            raise ValueError("Present timing events must preserve canonical timeline order.")
+        if (
+            isinstance(self.bean, ValidChannelEvidence)
+            and isinstance(self.environment, ValidChannelEvidence)
+            and (
+                self.bean.acquisition_lo_seconds != self.environment.acquisition_lo_seconds
+                or self.bean.acquisition_hi_seconds != self.environment.acquisition_hi_seconds
+            )
+        ):
+            raise ValueError("Valid channels must share the in-call bracket.")
+        return self
+
+
+class TimingEvidenceResult(BaseModel):
+    """Closed result for one read-only timing-evidence request."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    evidence_protocol: Literal["timing_evidence/v1"]
+    evidence_version: Literal[1]
+    outcome: TimingEvidenceOutcome
+    reason_code: TimingEvidenceReason | None
+    driver_read: Literal["not_invoked", "invoked"]
+    requested_session_id: FixedZeroSessionId
+    record: TimingEvidenceRecord | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw(cls, value: object) -> object:
+        raw = _timing_mapping(
+            value,
+            string_fields=("evidence_protocol", "outcome", "driver_read", "requested_session_id"),
+            integer_fields=("evidence_version",),
+        )
+        reason = raw.get("reason_code")
+        if reason is not None and type(reason) is not str:
+            raise TypeError("reason_code must be an exact string or null.")
+        return raw
+
+    @model_validator(mode="after")
+    def _validate_outcome(self) -> TimingEvidenceResult:
+        rows: dict[TimingEvidenceOutcome, tuple[frozenset[str] | None, frozenset[str]]] = {
+            "evidence": (None, frozenset({"invoked"})),
+            "refused_identity": (
+                frozenset(
+                    {
+                        "unknown_session",
+                        "not_latest_session",
+                        "session_faulted",
+                        "session_not_active",
+                        "session_purpose_not_eligible",
+                        "session_changed_during_read",
+                    }
+                ),
+                frozenset({"not_invoked", "invoked"}),
+            ),
+            "refused_capability": (
+                frozenset(
+                    {
+                        "capability_unreadable",
+                        "capability_malformed",
+                        "capability_absent",
+                        "capability_version_unsupported",
+                        "composition_not_qualified",
+                    }
+                ),
+                frozenset({"not_invoked"}),
+            ),
+            "refused_busy": (
+                frozenset({"finalisation_in_progress", "drop_in_progress"}),
+                frozenset({"not_invoked", "invoked"}),
+            ),
+            "unavailable": (
+                frozenset(
+                    {
+                        "clock_invalid",
+                        "driver_raised",
+                        "driver_result_invalid",
+                        "driver_not_connected",
+                        "clock_regression",
+                        "out_of_order_read",
+                        "sequence_exhausted",
+                        "record_invalid",
+                    }
+                ),
+                frozenset({"not_invoked", "invoked"}),
+            ),
+        }
+        reasons, reads = rows[self.outcome]
+        if self.driver_read not in reads or (reasons is None) != (self.reason_code is None):
+            raise ValueError("Timing evidence result has an invalid outcome row.")
+        if reasons is not None and self.reason_code not in reasons:
+            raise ValueError("Timing evidence result has an invalid reason code.")
+        if (
+            self.outcome == "refused_identity"
+            and self.reason_code != "session_changed_during_read"
+            and self.driver_read != "not_invoked"
+        ):
+            raise ValueError("Pre-read identity refusals must not invoke the driver.")
+        if (
+            self.outcome == "refused_identity"
+            and self.reason_code == "session_changed_during_read"
+            and self.driver_read != "invoked"
+        ):
+            raise ValueError("Post-read identity changes require an invoked read.")
+        if (
+            self.outcome == "unavailable"
+            and self.reason_code != "clock_invalid"
+            and self.driver_read != "invoked"
+        ):
+            raise ValueError("Non-clock unavailable rows require an invoked driver read.")
+        requires_record = self.outcome == "evidence"
+        if requires_record != (self.record is not None):
+            raise ValueError("Timing evidence record must exactly follow evidence outcome.")
+        if self.record is not None and self.record.session_id != self.requested_session_id:
+            raise ValueError("Timing evidence record must match the requested session.")
+        return self
+
+
 def _install_fixed_zero_argument_adapter(mcp: FastMCP) -> None:
     """Bind strict raw argument validation to only the new fixed-zero tool."""
     tool = mcp._tool_manager.get_tool("contain_heat_fixed_zero")  # pyright: ignore[reportPrivateUsage]
@@ -508,6 +879,31 @@ def _install_fixed_zero_argument_adapter(mcp: FastMCP) -> None:
         raise RuntimeError("Fixed-zero containment argument adapter is unsupported.")
     tool.fn_metadata = adapted_metadata
     tool.parameters = _FixedZeroContainmentArguments.model_json_schema(by_alias=True)
+
+
+def _install_timing_evidence_argument_adapter(mcp: FastMCP) -> None:
+    """Bind strict raw argument validation to only the timing-evidence tool."""
+    tool = mcp._tool_manager.get_tool("get_timing_evidence")  # pyright: ignore[reportPrivateUsage]
+    if tool is None:
+        raise RuntimeError("Timing evidence tool was not registered.")
+    existing_metadata = tool.fn_metadata
+    declared_metadata_fields = getattr(type(existing_metadata), "model_fields", None)
+    if (
+        not isinstance(declared_metadata_fields, Mapping)
+        or "arg_model" not in declared_metadata_fields
+    ):
+        raise RuntimeError("Timing evidence argument adapter is unsupported.")
+    try:
+        adapted_metadata = existing_metadata.model_copy(
+            update={"arg_model": _TimingEvidenceArguments}
+        )
+        binds_timing_arguments = adapted_metadata.arg_model is _TimingEvidenceArguments
+    except Exception as exc:
+        raise RuntimeError("Timing evidence argument adapter is unsupported.") from exc
+    if not binds_timing_arguments:
+        raise RuntimeError("Timing evidence argument adapter is unsupported.")
+    tool.fn_metadata = adapted_metadata
+    tool.parameters = _TimingEvidenceArguments.model_json_schema(by_alias=True)
 
 
 def _install_capture_evidence_argument_adapter(mcp: FastMCP) -> None:
@@ -1664,6 +2060,23 @@ def create_mcp_server(
         )
 
     @mcp.tool()
+    def get_timing_evidence(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+        expected_session_id: str,
+        evidence_protocol: Literal["timing_evidence/v1"],
+    ) -> TimingEvidenceResult:
+        """Return one mock-only, read-only timing-evidence record.
+
+        The response is synthetic software evidence and does not qualify live
+        hardware, physical timing, recipe decisions, or roast readiness.
+        """
+        _ = evidence_protocol
+        return _run_timing_evidence(
+            ctx.request_context.lifespan_context,
+            expected_session_id=expected_session_id,
+        )
+
+    @mcp.tool()
     def set_fan(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
         fan_level_percent: int,
@@ -2017,6 +2430,7 @@ def create_mcp_server(
 
     _install_fixed_zero_argument_adapter(mcp)
     _install_capture_evidence_argument_adapter(mcp)
+    _install_timing_evidence_argument_adapter(mcp)
     return mcp
 
 
@@ -2147,7 +2561,11 @@ def _record_session_event(
     """Record one core event against the active session."""
     server_context = ctx.request_context.lifespan_context
     session = _require_active_session(server_context)
-    event, snapshot = server_context.session_store.record_event_snapshot(session, kind)
+    event, snapshot = server_context.session_store.record_event_snapshot(
+        session,
+        kind,
+        provenance="manual_mark",
+    )
     return _serialize_event_result(snapshot=snapshot, event=event)
 
 
@@ -2349,6 +2767,210 @@ def _process_auto_t0_for_active_session(
         drop_threshold_c=server_context.config.session.auto_t0_drop_threshold_c,
     )
     return event is not None
+
+
+def _timing_evidence_result(
+    *,
+    outcome: TimingEvidenceOutcome,
+    requested_session_id: str,
+    reason_code: TimingEvidenceReason | None,
+    driver_read: Literal["not_invoked", "invoked"],
+    record: object | None = None,
+) -> TimingEvidenceResult:
+    """Build and validate one closed timing-evidence result without leakage."""
+    return TimingEvidenceResult.model_validate(
+        {
+            "evidence_protocol": "timing_evidence/v1",
+            "evidence_version": 1,
+            "outcome": outcome,
+            "reason_code": reason_code,
+            "driver_read": driver_read,
+            "requested_session_id": requested_session_id,
+            "record": record,
+        }
+    )
+
+
+def _timing_evidence_capability(
+    server_context: ServerContext,
+) -> TimingEvidenceReason | None:
+    """Check the mock-only timing-evidence composition without driver I/O."""
+    driver: Any = server_context.roaster_driver
+    try:
+        capabilities: Any = driver.capabilities
+    except Exception:  # noqa: BLE001 - untrusted adapter declarations fail closed.
+        return "capability_unreadable"
+    if type(capabilities) is not RoasterCapabilities:
+        return "capability_malformed"
+    try:
+        version: Any = capabilities.timing_evidence_version
+    except Exception:  # noqa: BLE001 - malformed declarations fail closed.
+        return "capability_malformed"
+    if version is None:
+        return "capability_absent"
+    if type(version) is not int:
+        return "capability_malformed"
+    if version != 1:
+        return "capability_version_unsupported"
+    try:
+        driver_name: Any = driver.name
+        capability_driver: Any = capabilities.driver
+        configured_driver: Any = server_context.config.roaster.driver
+    except Exception:  # noqa: BLE001 - composition inspection is not driver I/O.
+        return "composition_not_qualified"
+    if (
+        type(driver) is not MockRoasterDriver
+        or type(driver_name) is not str
+        or driver_name != "mock"
+        or type(capability_driver) is not str
+        or capability_driver != "mock"
+        or type(configured_driver) is not str
+        or configured_driver != "mock"
+    ):
+        return "composition_not_qualified"
+    return None
+
+
+def _timing_clock_value(store: RoastSessionStore) -> float | None:
+    """Read one exact finite store clock value without exposing exceptions."""
+    try:
+        value: object = store.read_timing_evidence_clock()
+    except Exception:  # noqa: BLE001 - clock failures are a closed unavailable result.
+        return None
+    if type(value) is not float or not math.isfinite(value):
+        return None
+    return value
+
+
+def _classify_timing_channel(value: object) -> Mapping[str, object]:
+    """Classify one driver channel without coercion or shared-channel failure."""
+    if value is None:
+        return {"status": "unavailable", "reason": "reported_none"}
+    if type(value) is not float:
+        return {"status": "invalid", "reason": "not_exact_float"}
+    if not math.isfinite(value):
+        return {"status": "invalid", "reason": "non_finite"}
+    return {"status": "valid", "celsius": value}
+
+
+def _run_timing_evidence(
+    server_context: ServerContext,
+    *,
+    expected_session_id: str,
+) -> TimingEvidenceResult:
+    """Run one atomic mock-only timing-evidence read without lifecycle barriers."""
+    store = server_context.session_store
+    identity_rejection = store.inspect_timing_evidence_identity(expected_session_id)
+    if identity_rejection is not None:
+        return _timing_evidence_result(
+            outcome="refused_identity",
+            requested_session_id=expected_session_id,
+            reason_code=identity_rejection,
+            driver_read="not_invoked",
+        )
+    capability_rejection = _timing_evidence_capability(server_context)
+    if capability_rejection is not None:
+        return _timing_evidence_result(
+            outcome="refused_capability",
+            requested_session_id=expected_session_id,
+            reason_code=capability_rejection,
+            driver_read="not_invoked",
+        )
+    admission = store.admit_timing_evidence(expected_session_id)
+    if admission.identity_rejection is not None:
+        return _timing_evidence_result(
+            outcome="refused_identity",
+            requested_session_id=expected_session_id,
+            reason_code=admission.identity_rejection,
+            driver_read="not_invoked",
+        )
+    if admission.busy_rejection is not None:
+        return _timing_evidence_result(
+            outcome="refused_busy",
+            requested_session_id=expected_session_id,
+            reason_code=admission.busy_rejection,
+            driver_read="not_invoked",
+        )
+    t0 = _timing_clock_value(store)
+    if t0 is None:
+        return _timing_evidence_result(
+            outcome="unavailable",
+            requested_session_id=expected_session_id,
+            reason_code="clock_invalid",
+            driver_read="not_invoked",
+        )
+    try:
+        state: object = server_context.roaster_driver.read_state()
+    except Exception:  # noqa: BLE001 - never expose adapter exception text.
+        return _timing_evidence_result(
+            outcome="unavailable",
+            requested_session_id=expected_session_id,
+            reason_code="driver_raised",
+            driver_read="invoked",
+        )
+    t1 = _timing_clock_value(store)
+    if t1 is None:
+        return _timing_evidence_result(
+            outcome="unavailable",
+            requested_session_id=expected_session_id,
+            reason_code="clock_invalid",
+            driver_read="invoked",
+        )
+    if t1 < t0:
+        return _timing_evidence_result(
+            outcome="unavailable",
+            requested_session_id=expected_session_id,
+            reason_code="clock_regression",
+            driver_read="invoked",
+        )
+    try:
+        if (
+            type(state) is not RoasterState
+            or type(state.driver) is not str
+            or state.driver != "mock"
+            or type(state.connected) is not bool
+        ):
+            raise ValueError("Invalid timing driver state.")
+        if state.connected is not True:
+            return _timing_evidence_result(
+                outcome="unavailable",
+                requested_session_id=expected_session_id,
+                reason_code="driver_not_connected",
+                driver_read="invoked",
+            )
+        channels = {
+            "bean": _classify_timing_channel(state.bean_temp_c),
+            "environment": _classify_timing_channel(state.env_temp_c),
+        }
+    except Exception:  # noqa: BLE001 - malformed state attribute access is closed.
+        return _timing_evidence_result(
+            outcome="unavailable",
+            requested_session_id=expected_session_id,
+            reason_code="driver_result_invalid",
+            driver_read="invoked",
+        )
+    assembled = store.assemble_timing_evidence(
+        admission,
+        t0=t0,
+        t1=t1,
+        channels=channels,
+        finalize=lambda record: _timing_evidence_result(
+            outcome="evidence",
+            requested_session_id=expected_session_id,
+            reason_code=None,
+            driver_read="invoked",
+            record=record,
+        ),
+    )
+    if assembled.outcome == "evidence":
+        assert isinstance(assembled.result, TimingEvidenceResult)
+        return assembled.result
+    return _timing_evidence_result(
+        outcome=assembled.outcome,
+        requested_session_id=expected_session_id,
+        reason_code=cast(TimingEvidenceReason, assembled.reason_code),
+        driver_read="invoked",
+    )
 
 
 def _fixed_zero_result(
