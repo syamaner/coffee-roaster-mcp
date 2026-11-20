@@ -79,6 +79,7 @@ NormalDropAdmissionOutcome = Literal[
     "refused",
 ]
 NormalDropSettlementOutcome = Literal["success", "cancelled", "unknown", "stale"]
+NormalDropFenceState = Literal["pending", "unknown"]
 NormalDropRejection = Literal[
     "invalid_identity",
     "unknown_session",
@@ -969,6 +970,9 @@ class RoastSessionStore:
         # cancellation until the exact operation is settled. It prevents a
         # later call from treating a cleared token as evidence of non-dispatch.
         self._normal_drop_in_flight: NormalDropReservation | None = None
+        # UNKNOWN is terminal for one retained reservation.  A later duplicate
+        # driver completion cannot reinterpret that operation as cancellation.
+        self._normal_drop_fence_state: NormalDropFenceState | None = None
         self._fault_recovery_in_flight_tokens: dict[str, str] = {}
         self._fault_recovery_admission_blocks: set[str] = set()
         self._fault_drop_cooling_cycle_required: set[str] = set()
@@ -1657,6 +1661,7 @@ class RoastSessionStore:
             session.pending_driver_command_token = reservation.token
             session.pending_driver_command_kind = "drop"
             self._normal_drop_in_flight = reservation
+            self._normal_drop_fence_state = "pending"
             return NormalDropAdmission("dispatch", reservation=reservation)
 
     def settle_normal_drop_cancelled(
@@ -1671,8 +1676,15 @@ class RoastSessionStore:
                 return NormalDropSettlement("stale")
             if not self._normal_drop_reservation_matches_locked(session, reservation):
                 return NormalDropSettlement("stale")
+            if (
+                self._normal_drop_fence_state != "pending"
+                or session.pending_driver_command_token != reservation.token
+                or session.pending_driver_command_kind != "drop"
+            ):
+                return NormalDropSettlement("stale")
             self._clear_normal_drop_token_locked(session, reservation)
             self._normal_drop_in_flight = None
+            self._normal_drop_fence_state = None
             return NormalDropSettlement("cancelled", snapshot=_copy_session_for_read(session))
 
     def retain_normal_drop_unknown(
@@ -1687,7 +1699,7 @@ class RoastSessionStore:
                 return NormalDropSettlement("stale")
             if not self._normal_drop_reservation_matches_locked(session, reservation):
                 return NormalDropSettlement("stale")
-            self._clear_normal_drop_token_locked(session, reservation)
+            self._retain_normal_drop_unknown_locked(session, reservation)
             return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
 
     def complete_normal_drop_success(
@@ -1710,8 +1722,10 @@ class RoastSessionStore:
                 return NormalDropSettlement("stale")
             if not self._normal_drop_reservation_matches_locked(session, reservation):
                 return NormalDropSettlement("stale")
+            if self._normal_drop_fence_state == "unknown":
+                return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
             if not session.active or session.faulted_at_utc is not None or session.phase == "fault":
-                self._clear_normal_drop_token_locked(session, reservation)
+                self._retain_normal_drop_unknown_locked(session, reservation)
                 return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
             if (
                 session.pending_driver_command_token != reservation.token
@@ -1747,11 +1761,12 @@ class RoastSessionStore:
                         session.fan_level_percent,
                         session.cooling_on,
                     ) = previous_control_state
-                self._clear_normal_drop_token_locked(session, reservation)
+                self._retain_normal_drop_unknown_locked(session, reservation)
                 return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
 
             self._clear_normal_drop_token_locked(session, reservation)
             self._normal_drop_in_flight = None
+            self._normal_drop_fence_state = None
             return NormalDropSettlement(
                 "success",
                 event=event,
@@ -3451,12 +3466,26 @@ class RoastSessionStore:
         """Distinguish an owned pending dispatch from retained uncertainty."""
         operation = self._normal_drop_in_flight
         assert operation is not None
-        if (
+        if self._normal_drop_fence_state == "pending" and (
             session.pending_driver_command_token == operation.token
             and session.pending_driver_command_kind == "drop"
         ):
             return "in_progress"
         return "ambiguous"
+
+    def _retain_normal_drop_unknown_locked(
+        self,
+        session: RoastSession,
+        reservation: NormalDropReservation,
+    ) -> None:
+        """Make one owned normal-drop fence terminally UNKNOWN.
+
+        This is deliberately one-way.  Only an exact, still-pending operation
+        can settle as proved cancellation; any driver or persistence ambiguity
+        retains the reservation after its ordinary token is cleared.
+        """
+        self._clear_normal_drop_token_locked(session, reservation)
+        self._normal_drop_fence_state = "unknown"
 
     def _clear_normal_drop_token_locked(
         self,

@@ -74,6 +74,33 @@ def test_known_cancellation_releases_only_its_exact_admission() -> None:
     assert duplicate.outcome == "stale"
 
 
+def test_driver_uncertainty_makes_same_operation_unknown_terminal() -> None:
+    """A later cancellation or success cannot reverse retained uncertainty."""
+    store = RoastSessionStore()
+    session, identity = _ready_drop(store)
+    admission = store.admit_normal_drop(identity)
+    assert admission.reservation is not None
+
+    uncertain = store.retain_normal_drop_unknown(session, reservation=admission.reservation)
+
+    assert uncertain.outcome == "unknown"
+    assert (
+        store.settle_normal_drop_cancelled(session, reservation=admission.reservation).outcome
+        == "stale"
+    )
+    assert (
+        store.complete_normal_drop_success(
+            session,
+            reservation=admission.reservation,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
+        ).outcome
+        == "unknown"
+    )
+    assert store.admit_normal_drop(identity).outcome == "ambiguous"
+
+
 def test_recorded_event_precedes_evidence_freshness_but_partial_endpoint_is_ambiguous(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -114,6 +141,21 @@ def test_recorded_event_precedes_evidence_freshness_but_partial_endpoint_is_ambi
     assert retry.outcome == "ambiguous"
     assert retry.existing_event is not None
     assert retry.existing_event.kind == "beans_dropped"
+    assert (
+        store.settle_normal_drop_cancelled(session, reservation=admission.reservation).outcome
+        == "stale"
+    )
+    assert (
+        store.complete_normal_drop_success(
+            session,
+            reservation=admission.reservation,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
+        ).outcome
+        == "unknown"
+    )
+    assert store.admit_normal_drop(identity).outcome == "ambiguous"
 
 
 def test_first_endpoint_append_failure_retains_unknown_fence_without_event(
@@ -140,8 +182,55 @@ def test_first_endpoint_append_failure_retains_unknown_fence_without_event(
     assert settled.outcome == "unknown"
     assert session.beans_dropped_at_utc is None
     assert store.admit_normal_drop(identity).outcome == "ambiguous"
+    assert (
+        store.settle_normal_drop_cancelled(session, reservation=admission.reservation).outcome
+        == "stale"
+    )
+    assert (
+        store.complete_normal_drop_success(
+            session,
+            reservation=admission.reservation,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
+        ).outcome
+        == "unknown"
+    )
+    assert store.admit_normal_drop(identity).outcome == "ambiguous"
     with pytest.raises(SessionLifecycleError, match="ambiguous bean drop"):
         store.stop_session()
+        store.start_session()
+
+
+def test_emergency_cannot_make_terminal_unknown_cancellable() -> None:
+    """Emergency cancellation of the token leaves an uncertain drop fenced."""
+    store = RoastSessionStore()
+    session, identity = _ready_drop(store)
+    admission = store.admit_normal_drop(identity)
+    assert admission.reservation is not None
+
+    assert (
+        store.retain_normal_drop_unknown(session, reservation=admission.reservation).outcome
+        == "unknown"
+    )
+    store.emergency_stop(session, reason="test")
+    store.cancel_nonfinalisation_driver_command(session)
+
+    assert (
+        store.settle_normal_drop_cancelled(session, reservation=admission.reservation).outcome
+        == "stale"
+    )
+    assert (
+        store.complete_normal_drop_success(
+            session,
+            reservation=admission.reservation,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=True,
+        ).outcome
+        == "unknown"
+    )
+    with pytest.raises(SessionLifecycleError, match="ambiguous bean drop"):
         store.start_session()
 
 
