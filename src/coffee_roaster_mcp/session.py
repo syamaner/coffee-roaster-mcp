@@ -3487,6 +3487,12 @@ class RoastSessionStore:
             raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
         if session.pending_driver_command_token is not None:
             raise SessionLifecycleError("Another driver command is already in progress.")
+        if (
+            kind == "control"
+            and self._normal_drop_in_flight is not None
+            and self._normal_drop_reservation_matches_locked(session, self._normal_drop_in_flight)
+        ):
+            raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
         reservation = DriverCommandReservation(
             session_id=session.id,
             token=_generate_session_id(),

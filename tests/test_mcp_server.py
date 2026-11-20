@@ -4764,6 +4764,138 @@ def test_blocked_drop_command_does_not_block_emergency_stop(tmp_path: Path) -> N
     ]
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    (
+        ("set_heat", {"heat_level_percent": 0}),
+        ("set_heat", {"heat_level_percent": 65}),
+        ("set_fan", {"fan_level_percent": 0}),
+        ("set_fan", {"fan_level_percent": 45}),
+    ),
+)
+@pytest.mark.parametrize(
+    ("fence_state", "refusal"),
+    (
+        ("pending", "Another driver command is already in progress."),
+        ("unknown", "A normal bean-drop operation is unresolved."),
+    ),
+)
+def test_mcp_ordinary_controls_do_not_dispatch_during_exact_unresolved_normal_drop(
+    tmp_path: Path,
+    tool_name: str,
+    arguments: dict[str, int],
+    fence_state: str,
+    refusal: str,
+) -> None:
+    """Ordinary controls retain normal-Drop and pending-token fences before dispatch."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.timing_evidence_sequence = 1
+    admission = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert admission.reservation is not None
+    if fence_state == "unknown":
+        assert (
+            context.session_store.retain_normal_drop_unknown(
+                session, reservation=admission.reservation
+            ).outcome
+            == "unknown"
+        )
+
+    with pytest.raises(SessionLifecycleError, match=refusal):
+        _call_tool(server, tool_name, ctx, **arguments)
+
+    assert driver.actions == ["connect"]
+
+
+def test_mcp_control_succeeds_after_exact_normal_drop_cancellation_and_in_new_session(
+    tmp_path: Path,
+) -> None:
+    """A proved cancellation clears only its exact fence and leaves later sessions unaffected."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.timing_evidence_sequence = 1
+    admission = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert admission.reservation is not None
+    proof = session_module.NormalDropNonDispatchProof(
+        reservation=admission.reservation,
+        zero_actuation=True,
+    )
+    assert (
+        context.session_store.settle_normal_drop_cancelled(
+            session, reservation=admission.reservation, proof=proof
+        ).outcome
+        == "cancelled"
+    )
+
+    _call_tool(server, "set_heat", ctx, heat_level_percent=0)
+    context.session_store.stop_session()
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "set_fan", ctx, fan_level_percent=0)
+
+    assert driver.actions == ["connect", "set_heat:0", "connect", "set_fan:0"]
+
+
+def test_mcp_fixed_zero_and_emergency_remain_eligible_after_unknown_normal_drop(
+    tmp_path: Path,
+) -> None:
+    """The ordinary-control fence does not replace dedicated containment or emergency paths."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = _CountingFixedZeroDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+
+    started = _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.timing_evidence_sequence = 1
+    admission = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert admission.reservation is not None
+    assert (
+        context.session_store.retain_normal_drop_unknown(
+            session, reservation=admission.reservation
+        ).outcome
+        == "unknown"
+    )
+
+    containment = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        ctx,
+        expected_session_id=started.session.session_id,
+        containment_protocol="fixed_zero/v1",
+    )
+    emergency = _call_tool(server, "emergency_stop", ctx, reason="unit-test")
+
+    assert containment.outcome == "command_state_returned"
+    assert driver.fixed_zero_calls == 1
+    assert emergency.event.kind == "fault"
+    assert driver.emergency_stop_calls == 1
+
+
 class _QueuedWindowAudioPipeline:
     """Fake audio pipeline exposing detector windows queued after construction.
 
