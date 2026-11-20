@@ -86,6 +86,7 @@ NormalDropRejection = Literal[
     "not_latest_session",
     "session_not_active",
     "session_faulted",
+    "session_purpose_not_eligible",
     "clock_epoch_mismatch",
     "ownership_sequence_mismatch",
     "timing_evidence_missing",
@@ -378,6 +379,21 @@ class NormalDropReservation:
 
     identity: NormalDropIdentity
     token: str
+
+
+@dataclass(frozen=True)
+class NormalDropNonDispatchProof:
+    """Positive mock-driver proof that one exact Drop did not actuate.
+
+    This is intentionally narrower than an emergency, a cleared ordinary
+    token, a timeout, or a driver exception.  The mock driver's atomic
+    emergency-before-actuation transition is the only producer of this proof;
+    it binds its zero-actuation observation to the exact store reservation.
+    The store validates that binding again before releasing admission.
+    """
+
+    reservation: NormalDropReservation
+    zero_actuation: Literal[True]
 
 
 @dataclass(frozen=True)
@@ -1334,6 +1350,21 @@ class RoastSessionStore:
     def admit_timing_evidence(self, expected_session_id: str) -> TimingEvidenceAdmission:
         """Revalidate an exact roast session without reserving or mutating it."""
         with self._lock:
+            latest = self._latest_session
+            if (
+                latest is not None
+                and latest.id == expected_session_id
+                and (
+                    self._normal_drop_in_flight is not None
+                    or latest.pending_driver_command_kind == "drop"
+                )
+            ):
+                return TimingEvidenceAdmission(
+                    latest,
+                    latest.capture_ownership_sequence,
+                    latest.id,
+                    busy_rejection="drop_in_progress",
+                )
             identity_rejection = self._timing_evidence_identity_rejection_locked(
                 expected_session_id
             )
@@ -1350,7 +1381,7 @@ class RoastSessionStore:
                     session.id,
                     busy_rejection="finalisation_in_progress",
                 )
-            if session.pending_driver_command_kind == "drop":
+            if self._normal_drop_in_flight is not None:
                 return TimingEvidenceAdmission(
                     session,
                     session.capture_ownership_sequence,
@@ -1393,12 +1424,14 @@ class RoastSessionStore:
                 or session.id != admission.session_id
             ):
                 return TimingEvidenceAssembly("refused_identity", "session_changed_during_read")
+            if self._normal_drop_in_flight is not None:
+                return TimingEvidenceAssembly("refused_busy", "drop_in_progress")
             if session.faulted_at_utc is not None or session.phase == "fault" or not session.active:
                 return TimingEvidenceAssembly("refused_identity", "session_changed_during_read")
-            if self._finalisation_blocks_mutation(session):
-                return TimingEvidenceAssembly("refused_busy", "finalisation_in_progress")
             if session.pending_driver_command_kind == "drop":
                 return TimingEvidenceAssembly("refused_busy", "drop_in_progress")
+            if self._finalisation_blocks_mutation(session):
+                return TimingEvidenceAssembly("refused_busy", "finalisation_in_progress")
 
             lo = t0 - session.monotonic_start
             hi = t1 - session.monotonic_start
@@ -1620,29 +1653,26 @@ class RoastSessionStore:
         with self._lock:
             if not isinstance(identity, NormalDropIdentity):
                 return NormalDropAdmission("refused", rejection="invalid_identity")
-            rejection = self._normal_drop_identity_rejection_locked(identity)
+            rejection = self._normal_drop_exact_identity_rejection_locked(identity)
             if rejection is not None:
                 return NormalDropAdmission("refused", rejection=rejection)
             session = self._latest_session
             assert session is not None
 
             existing_event = self._get_existing_singleton_event(session, "beans_dropped")
-            if existing_event is not None:
-                if self._normal_drop_in_flight is not None:
-                    return NormalDropAdmission(
-                        self._normal_drop_admission_outcome_for_in_flight_locked(session),
-                        existing_event=existing_event,
-                        snapshot=_copy_session_for_read(session),
-                    )
-                return NormalDropAdmission(
-                    "recorded",
-                    existing_event=existing_event,
-                    snapshot=_copy_session_for_read(session),
-                )
-
             if self._normal_drop_in_flight is not None:
                 return NormalDropAdmission(
                     self._normal_drop_admission_outcome_for_in_flight_locked(session),
+                    existing_event=existing_event,
+                    snapshot=_copy_session_for_read(session),
+                )
+            rejection = self._normal_drop_lifecycle_rejection_locked(session)
+            if rejection is not None:
+                return NormalDropAdmission("refused", rejection=rejection)
+            if existing_event is not None:
+                return NormalDropAdmission(
+                    "recorded",
+                    existing_event=existing_event,
                     snapshot=_copy_session_for_read(session),
                 )
             evidence_rejection = self._normal_drop_evidence_rejection_locked(session, identity)
@@ -1669,18 +1699,27 @@ class RoastSessionStore:
         session: RoastSession,
         *,
         reservation: object,
+        proof: object,
     ) -> NormalDropSettlement:
-        """Release one proved pre-actuation cancellation and no other operation."""
+        """Release one exact operation only with positive zero-actuation proof.
+
+        An emergency may already have cleared the ordinary command token and
+        faulted the session.  Neither fact is proof of non-dispatch, so this
+        settlement accepts only the matching atomic mock-driver proof while
+        the retained operation is still pending.
+        """
         with self._lock:
             if not isinstance(reservation, NormalDropReservation):
                 return NormalDropSettlement("stale")
+            if (
+                not isinstance(proof, NormalDropNonDispatchProof)
+                or proof.zero_actuation is not True
+                or proof.reservation != reservation
+            ):
+                return NormalDropSettlement("stale")
             if not self._normal_drop_reservation_matches_locked(session, reservation):
                 return NormalDropSettlement("stale")
-            if (
-                self._normal_drop_fence_state != "pending"
-                or session.pending_driver_command_token != reservation.token
-                or session.pending_driver_command_kind != "drop"
-            ):
+            if self._normal_drop_fence_state != "pending":
                 return NormalDropSettlement("stale")
             self._clear_normal_drop_token_locked(session, reservation)
             self._normal_drop_in_flight = None
@@ -1731,6 +1770,14 @@ class RoastSessionStore:
                 session.pending_driver_command_token != reservation.token
                 or session.pending_driver_command_kind != "drop"
             ):
+                self._retain_normal_drop_unknown_locked(session, reservation)
+                return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
+            if not _is_valid_mock_drop_projection(
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=fan_level_percent,
+                cooling_on=cooling_on,
+            ):
+                self._retain_normal_drop_unknown_locked(session, reservation)
                 return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
 
             previous_control_state = (
@@ -1751,9 +1798,14 @@ class RoastSessionStore:
                     "fan_level_percent": fan_level_percent,
                     "cooling_on": cooling_on,
                 }
-                event = self.record_event(session, "beans_dropped", payload=payload)
+                event = self._record_event_locked(
+                    session,
+                    "beans_dropped",
+                    payload=payload,
+                    owned_normal_drop_reservation=reservation,
+                )
                 if cooling_on:
-                    self.record_event(session, "cooling_started", payload=payload)
+                    self._record_event_locked(session, "cooling_started", payload=payload)
             except Exception:  # noqa: BLE001 - caller receives the closed unknown outcome.
                 if len(session.event_timeline) == event_count:
                     (
@@ -2473,47 +2525,84 @@ class RoastSessionStore:
                 "Manual provenance is valid only for charge or first crack."
             )
         with self._lock:
-            self._assert_latest_active_session(session)
-            if kind != "fault":
-                self._assert_finalisation_allows_mutation(session)
-            if session.faulted_at_utc is not None and kind != "fault":
-                raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
+            return self._record_event_locked(
+                session,
+                kind,
+                payload=payload,
+                provenance=provenance,
+            )
 
-            existing_event = self._get_existing_singleton_event(session, kind)
-            if existing_event is not None:
-                return existing_event
-            _validate_event_transition(session, kind)
+    def _record_event_locked(
+        self,
+        session: RoastSession,
+        kind: RoastEventKind,
+        *,
+        payload: dict[str, EventPayloadValue] | None = None,
+        provenance: Literal["manual_mark"] | None = None,
+        owned_normal_drop_reservation: NormalDropReservation | None = None,
+    ) -> RoastEvent:
+        """Record one event while holding the store lock.
 
-            recorded_at_utc = self._utc_now()
-            monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
-            monotonic_seconds = _normalize_event_monotonic_seconds(
-                session,
-                monotonic_seconds=monotonic_seconds,
+        A P2 fence closes the ordinary ``beans_dropped`` writer.  The normal
+        Drop settlement is the sole caller allowed to supply its exact owned
+        reservation, preventing a foreign event writer from turning a pending
+        or ambiguous operation into a claimed endpoint.
+        """
+        self._assert_latest_active_session(session)
+        if kind != "fault":
+            self._assert_finalisation_allows_mutation(session)
+        if session.faulted_at_utc is not None and kind != "fault":
+            raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
+        if (
+            kind == "beans_dropped"
+            and self._normal_drop_in_flight is not None
+            and (
+                owned_normal_drop_reservation is None
+                or self._normal_drop_fence_state != "pending"
+                or not self._normal_drop_reservation_matches_locked(
+                    session, owned_normal_drop_reservation
+                )
             )
-            recorded_at_utc = _normalize_event_recorded_at_utc(
-                session,
-                recorded_at_utc=recorded_at_utc,
+        ):
+            raise SessionLifecycleError(
+                "Beans dropped can only be recorded by the owned normal-drop settlement."
             )
-            _validate_event_monotonic_order(
-                session,
-                kind=kind,
-                monotonic_seconds=monotonic_seconds,
-            )
-            event = RoastEvent(
-                kind=kind,
-                recorded_at_utc=recorded_at_utc,
-                monotonic_seconds=monotonic_seconds,
-                payload={} if payload is None else dict(payload),
-            )
-            _append_event_log_row(session, event)
-            session.event_timeline.append(event)
-            _apply_event_timestamp(session, event)
-            if provenance is not None:
-                if kind == "beans_added":
-                    session.beans_added_source = provenance
-                else:
-                    session.first_crack_source = provenance
-            return event
+
+        existing_event = self._get_existing_singleton_event(session, kind)
+        if existing_event is not None:
+            return existing_event
+        _validate_event_transition(session, kind)
+
+        recorded_at_utc = self._utc_now()
+        monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+        monotonic_seconds = _normalize_event_monotonic_seconds(
+            session,
+            monotonic_seconds=monotonic_seconds,
+        )
+        recorded_at_utc = _normalize_event_recorded_at_utc(
+            session,
+            recorded_at_utc=recorded_at_utc,
+        )
+        _validate_event_monotonic_order(
+            session,
+            kind=kind,
+            monotonic_seconds=monotonic_seconds,
+        )
+        event = RoastEvent(
+            kind=kind,
+            recorded_at_utc=recorded_at_utc,
+            monotonic_seconds=monotonic_seconds,
+            payload={} if payload is None else dict(payload),
+        )
+        _append_event_log_row(session, event)
+        session.event_timeline.append(event)
+        _apply_event_timestamp(session, event)
+        if provenance is not None:
+            if kind == "beans_added":
+                session.beans_added_source = provenance
+            else:
+                session.first_crack_source = provenance
+        return event
 
     def record_event_snapshot(
         self,
@@ -3407,10 +3496,10 @@ class RoastSessionStore:
         session.pending_driver_command_kind = reservation.kind
         return reservation
 
-    def _normal_drop_identity_rejection_locked(
+    def _normal_drop_exact_identity_rejection_locked(
         self, identity: NormalDropIdentity
     ) -> NormalDropRejection | None:
-        """Validate exact normal-drop identity excluding evidence freshness."""
+        """Validate store ownership before phase, evidence, or fence inspection."""
         if (
             type(identity.session_id) is not str
             or type(identity.clock_epoch_id) is not str
@@ -3423,14 +3512,22 @@ class RoastSessionStore:
             return "unknown_session"
         if latest.id != identity.session_id:
             return "not_latest_session"
-        if latest.faulted_at_utc is not None or latest.phase == "fault":
-            return "session_faulted"
-        if not latest.active:
-            return "session_not_active"
         if identity.clock_epoch_id != self._clock_epoch_id:
             return "clock_epoch_mismatch"
         if identity.ownership_sequence != latest.capture_ownership_sequence:
             return "ownership_sequence_mismatch"
+        return None
+
+    def _normal_drop_lifecycle_rejection_locked(
+        self, session: RoastSession
+    ) -> NormalDropRejection | None:
+        """Return phase-independent exact-owner admission refusal, when any."""
+        if session.purpose != "roast":
+            return "session_purpose_not_eligible"
+        if session.faulted_at_utc is not None or session.phase == "fault":
+            return "session_faulted"
+        if not session.active:
+            return "session_not_active"
         return None
 
     def _normal_drop_evidence_rejection_locked(
@@ -3669,6 +3766,26 @@ def _validate_event_transition(session: RoastSession, kind: RoastEventKind) -> N
             f"{kind} cannot be recorded while phase is {session.phase}; "
             f"allowed phases: {allowed_phase_list}."
         )
+
+
+def _is_valid_mock_drop_projection(
+    *,
+    heat_level_percent: object,
+    fan_level_percent: object,
+    cooling_on: object,
+) -> bool:
+    """Return whether a mock Drop report is the complete expected endpoint.
+
+    P2 stores only the mock driver's internally consistent command projection:
+    zero heat, full fan, and cooling enabled.  This validates a reported
+    software state; it does not make a physical-actuation or durability claim.
+    """
+    try:
+        heat = validate_control_percent(heat_level_percent, label="heat_level_percent")
+        fan = validate_control_percent(fan_level_percent, label="fan_level_percent")
+    except (TypeError, ValueError):
+        return False
+    return heat == 0 and fan == 100 and cooling_on is True
 
 
 def _validate_event_monotonic_order(

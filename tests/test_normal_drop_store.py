@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from threading import Barrier, Thread
 
 import pytest
 
 import coffee_roaster_mcp.session as session_module
 from coffee_roaster_mcp.session import (
     NormalDropIdentity,
+    NormalDropNonDispatchProof,
+    NormalDropReservation,
     RoastSession,
     RoastSessionStore,
     SessionLifecycleError,
+    TimingEvidenceAdmission,
 )
 
 
@@ -40,6 +44,11 @@ def _ready_drop(store: RoastSessionStore) -> tuple[RoastSession, NormalDropIdent
     return session, store.normal_drop_identity(session)
 
 
+def _non_dispatch_proof(reservation: NormalDropReservation) -> NormalDropNonDispatchProof:
+    """Return the test-double's positive atomic mock non-dispatch evidence."""
+    return NormalDropNonDispatchProof(reservation=reservation, zero_actuation=True)
+
+
 def test_exact_admission_reserves_once_and_blocks_legacy_and_recovery_drop() -> None:
     store = RoastSessionStore()
     session, identity = _ready_drop(store)
@@ -55,9 +64,55 @@ def test_exact_admission_reserves_once_and_blocks_legacy_and_recovery_drop() -> 
 
     store.emergency_stop(session, reason="test")
     store.cancel_nonfinalisation_driver_command(session)
-    assert store.admit_normal_drop(identity).outcome == "refused"
+    assert store.admit_normal_drop(identity).outcome == "ambiguous"
     with pytest.raises(SessionLifecycleError, match="unresolved"):
         store.reserve_driver_fault_recovery(session, kind="drop")
+
+
+def test_unresolved_drop_blocks_p1_timing_after_token_cancellation() -> None:
+    """P1 admission and assembly use the retained P2 fence, not the token."""
+    store = RoastSessionStore()
+    session, identity = _ready_drop(store)
+    prior_admission = TimingEvidenceAdmission(
+        session,
+        session.capture_ownership_sequence,
+        session.id,
+    )
+    normal_admission = store.admit_normal_drop(identity)
+    assert normal_admission.reservation is not None
+    store.emergency_stop(session, reason="test")
+    store.cancel_nonfinalisation_driver_command(session)
+
+    assert store.admit_timing_evidence(session.id).busy_rejection == "drop_in_progress"
+    assembled = store.assemble_timing_evidence(
+        prior_admission,
+        t0=100.0,
+        t1=100.0,
+        channels={},
+        finalize=lambda record: record,
+    )
+    assert (assembled.outcome, assembled.reason_code) == ("refused_busy", "drop_in_progress")
+
+
+def test_simultaneous_normal_drop_admission_has_one_owner() -> None:
+    """Two real threads receive one reservation and one non-dispatch result."""
+    store = RoastSessionStore()
+    _, identity = _ready_drop(store)
+    barrier = Barrier(3)
+    outcomes: list[str] = []
+
+    def admit() -> None:
+        barrier.wait()
+        outcomes.append(store.admit_normal_drop(identity).outcome)
+
+    threads = [Thread(target=admit), Thread(target=admit)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["dispatch", "in_progress"]
 
 
 def test_known_cancellation_releases_only_its_exact_admission() -> None:
@@ -66,12 +121,99 @@ def test_known_cancellation_releases_only_its_exact_admission() -> None:
     admission = store.admit_normal_drop(identity)
     assert admission.reservation is not None
 
-    cancelled = store.settle_normal_drop_cancelled(session, reservation=admission.reservation)
+    cancelled = store.settle_normal_drop_cancelled(
+        session,
+        reservation=admission.reservation,
+        proof=_non_dispatch_proof(admission.reservation),
+    )
 
     assert cancelled.outcome == "cancelled"
     assert store.admit_normal_drop(identity).outcome == "dispatch"
-    duplicate = store.settle_normal_drop_cancelled(session, reservation=admission.reservation)
+    duplicate = store.settle_normal_drop_cancelled(
+        session,
+        reservation=admission.reservation,
+        proof=_non_dispatch_proof(admission.reservation),
+    )
     assert duplicate.outcome == "stale"
+
+
+def test_emergency_cleared_token_can_settle_only_with_exact_positive_proof() -> None:
+    """A faulted exact owner reports pending ambiguity until mock proof arrives."""
+    store = RoastSessionStore()
+    session, identity = _ready_drop(store)
+    admission = store.admit_normal_drop(identity)
+    assert admission.reservation is not None
+
+    store.emergency_stop(session, reason="test")
+    store.cancel_nonfinalisation_driver_command(session)
+
+    assert store.admit_normal_drop(identity).outcome == "ambiguous"
+    assert (
+        store.settle_normal_drop_cancelled(
+            session,
+            reservation=admission.reservation,
+            proof=None,
+        ).outcome
+        == "stale"
+    )
+    cancelled = store.settle_normal_drop_cancelled(
+        session,
+        reservation=admission.reservation,
+        proof=_non_dispatch_proof(admission.reservation),
+    )
+    assert cancelled.outcome == "cancelled"
+    assert store.admit_normal_drop(identity).rejection == "session_faulted"
+
+
+def test_foreign_event_cannot_claim_pending_normal_drop_completion() -> None:
+    """Only the exact P2 settlement can append the protected endpoint marker."""
+    store = RoastSessionStore()
+    session, identity = _ready_drop(store)
+    admission = store.admit_normal_drop(identity)
+    assert admission.reservation is not None
+
+    with pytest.raises(SessionLifecycleError, match="owned normal-drop settlement"):
+        store.record_event(session, "beans_dropped")
+
+    assert session.beans_dropped_at_utc is None
+    assert store.admit_normal_drop(identity).outcome == "in_progress"
+
+
+@pytest.mark.parametrize(
+    ("heat_level_percent", "fan_level_percent", "cooling_on"),
+    [
+        (1, 100, True),
+        (0, 99, True),
+        (0, 100, False),
+        (True, 100, True),
+        (0, "100", True),
+        (0, 100, 1),
+    ],
+)
+def test_contradictory_or_malformed_mock_drop_projection_is_unknown(
+    heat_level_percent: object,
+    fan_level_percent: object,
+    cooling_on: object,
+) -> None:
+    """Bad mock reports cannot write a confirmed endpoint or mutate controls."""
+    store = RoastSessionStore()
+    session, identity = _ready_drop(store)
+    admission = store.admit_normal_drop(identity)
+    assert admission.reservation is not None
+    before = (session.heat_level_percent, session.fan_level_percent, session.cooling_on)
+
+    settled = store.complete_normal_drop_success(
+        session,
+        reservation=admission.reservation,
+        heat_level_percent=heat_level_percent,  # type: ignore[arg-type]
+        fan_level_percent=fan_level_percent,  # type: ignore[arg-type]
+        cooling_on=cooling_on,  # type: ignore[arg-type]
+    )
+
+    assert settled.outcome == "unknown"
+    assert session.beans_dropped_at_utc is None
+    assert (session.heat_level_percent, session.fan_level_percent, session.cooling_on) == before
+    assert store.admit_normal_drop(identity).outcome == "ambiguous"
 
 
 def test_driver_uncertainty_makes_same_operation_unknown_terminal() -> None:
@@ -85,7 +227,11 @@ def test_driver_uncertainty_makes_same_operation_unknown_terminal() -> None:
 
     assert uncertain.outcome == "unknown"
     assert (
-        store.settle_normal_drop_cancelled(session, reservation=admission.reservation).outcome
+        store.settle_normal_drop_cancelled(
+            session,
+            reservation=admission.reservation,
+            proof=_non_dispatch_proof(admission.reservation),
+        ).outcome
         == "stale"
     )
     assert (
@@ -142,7 +288,11 @@ def test_recorded_event_precedes_evidence_freshness_but_partial_endpoint_is_ambi
     assert retry.existing_event is not None
     assert retry.existing_event.kind == "beans_dropped"
     assert (
-        store.settle_normal_drop_cancelled(session, reservation=admission.reservation).outcome
+        store.settle_normal_drop_cancelled(
+            session,
+            reservation=admission.reservation,
+            proof=_non_dispatch_proof(admission.reservation),
+        ).outcome
         == "stale"
     )
     assert (
@@ -183,7 +333,11 @@ def test_first_endpoint_append_failure_retains_unknown_fence_without_event(
     assert session.beans_dropped_at_utc is None
     assert store.admit_normal_drop(identity).outcome == "ambiguous"
     assert (
-        store.settle_normal_drop_cancelled(session, reservation=admission.reservation).outcome
+        store.settle_normal_drop_cancelled(
+            session,
+            reservation=admission.reservation,
+            proof=_non_dispatch_proof(admission.reservation),
+        ).outcome
         == "stale"
     )
     assert (
@@ -217,7 +371,11 @@ def test_emergency_cannot_make_terminal_unknown_cancellable() -> None:
     store.cancel_nonfinalisation_driver_command(session)
 
     assert (
-        store.settle_normal_drop_cancelled(session, reservation=admission.reservation).outcome
+        store.settle_normal_drop_cancelled(
+            session,
+            reservation=admission.reservation,
+            proof=_non_dispatch_proof(admission.reservation),
+        ).outcome
         == "stale"
     )
     assert (
@@ -241,7 +399,9 @@ def test_stale_settlement_cannot_clear_a_replacement_or_restart_fence() -> None:
     first = first_store.admit_normal_drop(first_identity)
     assert first.reservation is not None
     first_cancel = first_store.settle_normal_drop_cancelled(
-        first_session, reservation=first.reservation
+        first_session,
+        reservation=first.reservation,
+        proof=_non_dispatch_proof(first.reservation),
     )
     assert first_cancel.outcome == "cancelled"
     first_store.stop_session()
@@ -249,7 +409,9 @@ def test_stale_settlement_cannot_clear_a_replacement_or_restart_fence() -> None:
     replacement = first_store.start_session()
     first_session.timing_evidence_sequence = 1
     stale_cancel = first_store.settle_normal_drop_cancelled(
-        first_session, reservation=first.reservation
+        first_session,
+        reservation=first.reservation,
+        proof=_non_dispatch_proof(first.reservation),
     )
     assert stale_cancel.outcome == "stale"
     assert replacement.id == "same-id"
@@ -284,7 +446,7 @@ def test_identity_and_phase_fail_closed_and_success_is_idempotent() -> None:
         reservation=admission.reservation,
         heat_level_percent=0,
         fan_level_percent=100,
-        cooling_on=False,
+        cooling_on=True,
     )
 
     assert success.outcome == "success"
@@ -298,3 +460,14 @@ def test_identity_and_phase_fail_closed_and_success_is_idempotent() -> None:
     retry = store.admit_normal_drop(stale_evidence)
     assert retry.outcome == "recorded"
     assert retry.existing_event == success.event
+
+
+def test_cold_characterisation_normal_drop_is_refused() -> None:
+    """The P2 normal Drop path is unavailable outside roast sessions."""
+    store = RoastSessionStore()
+    session = store.start_session(purpose="cold_characterisation")
+    session.log_writer = None
+    session.timing_evidence_sequence = 1
+    identity = store.normal_drop_identity(session)
+
+    assert store.admit_normal_drop(identity).rejection == "session_purpose_not_eligible"
