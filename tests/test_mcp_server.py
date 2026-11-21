@@ -9607,6 +9607,8 @@ def test_exact_normal_drop_old_timing_identity_is_superseded_but_fresh_identity_
     """E1: fresh timing does not refresh the session-start emergency baseline."""
     context, server, ctx, session = _exact_normal_drop_context(tmp_path)
     old_identity = context.session_store.normal_drop_identity(session)
+    driver = cast(MockRoasterDriver, context.roaster_driver)
+    driver.emergency_stop(reason="intervening exact-drop test emergency")
     fresh_evidence = _call_tool(
         server,
         "get_timing_evidence",
@@ -9615,8 +9617,6 @@ def test_exact_normal_drop_old_timing_identity_is_superseded_but_fresh_identity_
         evidence_protocol="timing_evidence/v1",
     )
     assert fresh_evidence.outcome == "evidence"
-    driver = cast(MockRoasterDriver, context.roaster_driver)
-    driver.emergency_stop(reason="intervening exact-drop test emergency")
 
     old = _run_normal_drop_exact_session(
         context,
@@ -9632,6 +9632,7 @@ def test_exact_normal_drop_old_timing_identity_is_superseded_but_fresh_identity_
     assert fresh.outcome == "cancelled"
     assert fresh.reason == "emergency_since_session_baseline"
     assert driver.drop_transition_count == 0
+    assert driver.emergency_count == 1
 
 
 def test_exact_normal_drop_after_registered_emergency_is_faulted_before_dispatch(
@@ -9754,13 +9755,18 @@ def test_exact_normal_drop_success_does_not_weaken_a_later_registered_emergency(
 
 
 def test_exact_normal_drop_after_recorded_legacy_drop_never_repeats_transition(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """P1: the registered legacy producer's saved endpoint wins before exact dispatch."""
     context, server, ctx, session = _exact_normal_drop_context(tmp_path)
     identity = context.session_store.normal_drop_identity(session)
     legacy = _call_tool(server, "drop_beans", ctx)
     driver = cast(MockRoasterDriver, context.roaster_driver)
+
+    def fail_repeat_cleanup(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("a repeated exact Drop must not run post-Drop cleanup")
+
+    monkeypatch.setattr(mcp_server, "_stop_runtimes_after_drop", fail_repeat_cleanup)
 
     result = _run_normal_drop_exact_session(
         context,
@@ -10024,7 +10030,7 @@ def test_exact_normal_drop_endpoint_append_interruption_freezes_without_cleanup(
 
     assert not exact_thread.is_alive() and not emergency_thread.is_alive()
     assert exact_results[0].history == "unknown"
-    assert exact_results[0].fence in {"retained", "not_established"}
+    assert exact_results[0].fence == "retained"
     assert observation_tickets[0] is not None
     assert observation_tickets[0] in freezes
     assert cleanup_calls == []
@@ -10170,6 +10176,7 @@ def test_exact_normal_drop_retains_unknown_when_the_mock_driver_raises(
     context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
     driver = context.roaster_driver
     runtime = context.first_crack_runtime
+    cleanup_calls: list[None] = []
     assert type(driver) is MockRoasterDriver
     assert isinstance(runtime, FakeFirstCrackRuntime)
 
@@ -10177,7 +10184,11 @@ def test_exact_normal_drop_retains_unknown_when_the_mock_driver_raises(
         del exact_drop
         raise RuntimeError("synthetic mock driver failure")
 
+    def record_cleanup(*_args: object, **_kwargs: object) -> None:
+        cleanup_calls.append(None)
+
     monkeypatch.setattr(driver, "drop_beans", fail_drop)
+    monkeypatch.setattr(mcp_server, "_stop_runtimes_after_drop", record_cleanup)
     result = _exact_normal_drop(context, session)
 
     assert result.outcome == "unknown"
@@ -10186,6 +10197,7 @@ def test_exact_normal_drop_retains_unknown_when_the_mock_driver_raises(
     assert result.fence == "retained"
     assert driver.drop_transition_count == 0
     assert driver.emergency_count == 0
+    assert cleanup_calls == []
     assert runtime.stopped_sessions == []
 
 
