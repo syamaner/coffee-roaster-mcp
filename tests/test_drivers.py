@@ -1,7 +1,7 @@
 """Roaster driver contract, capability, and safety behavior coverage."""
 
 from collections.abc import Callable
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, get_ident
 from time import monotonic, sleep
 from typing import Any, Never, cast
 
@@ -1632,6 +1632,119 @@ def test_mock_driver_control_commands_do_not_advance_telemetry() -> None:
     assert drop_state.raw_vendor_data["sample_index"] == 1
     assert drop_state.bean_temp_c == sampled_state.bean_temp_c
     assert drop_state.env_temp_c == sampled_state.env_temp_c
+
+
+def test_mock_driver_initial_sample_is_private_and_instance_local() -> None:
+    """New mock instances expose the unchanged index-zero telemetry grammar."""
+    first = MockRoasterDriver()
+    second = MockRoasterDriver()
+
+    first_state = first.set_heat(heat_level_percent=0)
+    second_state = second.set_fan(fan_level_percent=0)
+
+    for state in (first_state, second_state):
+        assert type(state) is RoasterState
+        assert state.bean_temp_c == state.env_temp_c == 20.0
+        assert state.raw_vendor_data == {
+            "beans_dropped": False,
+            "sample_index": 0,
+            "telemetry_model": "fixed_step_thermal_v1",
+        }
+
+
+def test_mock_driver_serializes_completed_samples_and_keeps_commands_nonblocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read owns one completed sample while commands only copy the prior publication.
+
+    This is a causal concurrency witness: removing writer serialization gives
+    both readers index one, reloading during assembly gives the first reader
+    the second pair, and taking the writer lock from a command blocks its copy.
+    """
+    driver = MockRoasterDriver()
+    driver.set_heat(heat_level_percent=100)
+    first_computation_entered = Event()
+    release_first_computation = Event()
+    first_assembly_entered = Event()
+    release_first_assembly = Event()
+    command_completed = Event()
+    second_completed = Event()
+    first_result: list[RoasterState] = []
+    second_result: list[RoasterState] = []
+    command_result: list[RoasterState] = []
+    errors: list[BaseException] = []
+    first_reader_ident: list[int] = []
+    original_delta = driver._environment_delta_c  # pyright: ignore[reportPrivateUsage]
+    original_snapshot = driver._state_snapshot  # pyright: ignore[reportPrivateUsage]
+
+    def hold_first_computation() -> float:
+        if not first_computation_entered.is_set():
+            first_computation_entered.set()
+            assert release_first_computation.wait(timeout=1.0)
+        return original_delta()
+
+    def hold_first_assembly(thermal_sample: object = None) -> RoasterState:
+        if first_reader_ident == [get_ident()]:
+            first_assembly_entered.set()
+            assert release_first_assembly.wait(timeout=1.0)
+        return original_snapshot(thermal_sample)  # type: ignore[arg-type]
+
+    def read_into(destination: list[RoasterState], completed: Event | None = None) -> None:
+        try:
+            if destination is first_result:
+                first_reader_ident.append(get_ident())
+            destination.append(driver.read_state())
+        except BaseException as exc:  # noqa: BLE001 - surface worker failures in the test thread.
+            errors.append(exc)
+        finally:
+            if completed is not None:
+                completed.set()
+
+    def copy_command_snapshot() -> None:
+        try:
+            command_result.append(driver.set_heat(heat_level_percent=100))
+        except BaseException as exc:  # noqa: BLE001 - surface worker failures in the test thread.
+            errors.append(exc)
+        finally:
+            command_completed.set()
+
+    monkeypatch.setattr(driver, "_environment_delta_c", hold_first_computation)
+    monkeypatch.setattr(driver, "_state_snapshot", hold_first_assembly)
+    first_reader = Thread(target=read_into, args=(first_result,))
+    second_reader = Thread(target=read_into, args=(second_result, second_completed))
+    command = Thread(target=copy_command_snapshot)
+    second_reader_started = False
+    command_started = False
+    first_reader.start()
+    try:
+        assert first_computation_entered.wait(timeout=1.0)
+        command.start()
+        command_started = True
+        assert command_completed.wait(timeout=1.0)
+        second_reader.start()
+        second_reader_started = True
+        release_first_computation.set()
+        assert first_assembly_entered.wait(timeout=1.0)
+        assert second_completed.wait(timeout=1.0)
+    finally:
+        release_first_computation.set()
+        release_first_assembly.set()
+        first_reader.join(timeout=1.0)
+        if second_reader_started:
+            second_reader.join(timeout=1.0)
+        if command_started:
+            command.join(timeout=1.0)
+
+    assert not errors
+    assert not first_reader.is_alive()
+    assert second_reader_started and not second_reader.is_alive()
+    assert command_started and not command.is_alive()
+    assert command_result[0].raw_vendor_data["sample_index"] == 0
+    assert command_result[0].bean_temp_c == command_result[0].env_temp_c == 20.0
+    assert first_result[0].raw_vendor_data["sample_index"] == 1
+    assert (first_result[0].bean_temp_c, first_result[0].env_temp_c) == (20.2, 22.0)
+    assert second_result[0].raw_vendor_data["sample_index"] == 2
+    assert (second_result[0].bean_temp_c, second_result[0].env_temp_c) == (20.6, 24.0)
 
 
 def test_command_streaming_allows_required_positive_interval() -> None:
