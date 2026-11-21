@@ -11525,16 +11525,22 @@ def test_registered_hottop_start_partial_sampler_failure_keeps_replacement(
     context.telemetry_sampler.shutdown()
 
 
-def test_telemetry_sampler_stale_worker_cannot_clear_replacement() -> None:
-    """A displaced worker returning false leaves its replacement authoritative."""
+@pytest.mark.parametrize("outcome", ["false", "error"])
+def test_telemetry_sampler_stale_worker_cannot_affect_replacement(outcome: str) -> None:
+    """A displaced worker cannot clear or fault a same-id replacement."""
     entered = Event()
     release_first = Event()
     replacement_started = Event()
+    first_callback = True
 
     def sample(_session_id: str) -> bool:
-        if not entered.is_set():
+        nonlocal first_callback
+        if first_callback:
+            first_callback = False
             entered.set()
             assert release_first.wait(timeout=4.0)
+            if outcome == "error":
+                raise RuntimeError("stale worker failure")
             return False
         replacement_started.set()
         return True
@@ -11542,17 +11548,121 @@ def test_telemetry_sampler_stale_worker_cannot_clear_replacement() -> None:
     sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=sample)
     sampler.start_for_session("same-session")
     assert entered.wait(timeout=1.0)
-    replacement_worker = Thread(target=lambda: sampler.start_for_session("same-session"))
+    superseded = sampler._thread  # pyright: ignore[reportPrivateUsage]
+    assert superseded is not None
+    replacement_receipt = mcp_server._TelemetrySamplerStartReceipt()  # pyright: ignore[reportPrivateUsage]
+
+    def start_replacement() -> None:
+        sampler._start_for_session("same-session", receipt=replacement_receipt)  # pyright: ignore[reportPrivateUsage]
+
+    replacement_worker = Thread(target=start_replacement)
     replacement_worker.start()
-    assert replacement_started.wait(timeout=2.0)
-    replacement = sampler._thread  # pyright: ignore[reportPrivateUsage]
-    assert replacement is not None and replacement is not replacement_worker
-    release_first.set()
-    replacement_worker.join(timeout=1.0)
-    assert not replacement_worker.is_alive()
-    assert sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
-    assert sampler.active_session_id == "same-session"
-    sampler.shutdown()
+    try:
+        release_first.set()
+        superseded.join(timeout=2.0)
+        assert not superseded.is_alive()
+        replacement_worker.join(timeout=2.0)
+        assert not replacement_worker.is_alive()
+        replacement = replacement_receipt.thread
+        replacement_stop_event = replacement_receipt.stop_event
+        assert replacement is not None and replacement is not superseded
+        assert replacement_stop_event is not None and not replacement_stop_event.is_set()
+        assert replacement_started.wait(timeout=1.0)
+        assert sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
+        assert sampler.active_session_id == "same-session"
+        assert sampler.last_error is None
+    finally:
+        release_first.set()
+        replacement_worker.join(timeout=2.0)
+        sampler.shutdown()
+
+
+def test_telemetry_sampler_active_callback_error_is_reported() -> None:
+    """An active sampler callback still records its error before stopping."""
+    entered = Event()
+    release = Event()
+
+    def failing_callback(_session_id: str) -> bool:
+        entered.set()
+        assert release.wait(timeout=4.0)
+        raise RuntimeError("active sampler failure")
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=failing_callback)
+    sampler.start_for_session("active")
+    worker = sampler._thread  # pyright: ignore[reportPrivateUsage]
+    assert worker is not None
+    try:
+        assert entered.wait(timeout=1.0)
+        release.set()
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+        assert sampler.last_error == "RuntimeError: active sampler failure"
+        assert sampler.active_session_id is None
+    finally:
+        release.set()
+        sampler.shutdown()
+
+
+def test_telemetry_sampler_stopped_callback_error_is_not_reported() -> None:
+    """A deliberately stopped held callback cannot update finalisation error evidence."""
+    entered = Event()
+    release = Event()
+    stop_finished = Event()
+
+    def failing_callback(_session_id: str) -> bool:
+        entered.set()
+        assert release.wait(timeout=4.0)
+        raise RuntimeError("stopped sampler failure")
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=failing_callback)
+    receipt = mcp_server._TelemetrySamplerStartReceipt()  # pyright: ignore[reportPrivateUsage]
+    sampler._start_for_session("stopped", receipt=receipt)  # pyright: ignore[reportPrivateUsage]
+    worker = receipt.thread
+    assert worker is not None
+
+    def stop_generation() -> None:
+        sampler.stop_started_generation(receipt, reason="synthetic stop")
+        stop_finished.set()
+
+    stopper = Thread(target=stop_generation)
+    try:
+        assert entered.wait(timeout=1.0)
+        stopper.start()
+        assert receipt.stop_event is not None and receipt.stop_event.wait(timeout=1.0)
+        assert sampler.active_session_id is None
+        release.set()
+        stopper.join(timeout=2.0)
+        worker.join(timeout=2.0)
+        assert stop_finished.is_set()
+        assert not worker.is_alive()
+        assert sampler.last_error is None
+    finally:
+        release.set()
+        stopper.join(timeout=2.0)
+        sampler.shutdown()
+
+
+def test_telemetry_sampler_start_failure_does_not_advertise_supervision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staged worker start failure leaves no active sampler generation."""
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=lambda _session_id: True)
+    receipt = mcp_server._TelemetrySamplerStartReceipt()  # pyright: ignore[reportPrivateUsage]
+    original_start = Thread.start
+
+    def fail_sampler_start(worker: Thread) -> None:
+        if worker.name.startswith("roast-telemetry-sampler-"):
+            raise RuntimeError("synthetic thread start failure")
+        original_start(worker)
+
+    monkeypatch.setattr(Thread, "start", fail_sampler_start)
+    with pytest.raises(RuntimeError, match="synthetic thread start failure"):
+        sampler._start_for_session("staged", receipt=receipt)  # pyright: ignore[reportPrivateUsage]
+    assert receipt.thread is not None
+    assert receipt.stop_event is not None and receipt.stop_event.is_set()
+    assert sampler.active_session_id is None
+    assert sampler._thread is None  # pyright: ignore[reportPrivateUsage]
+    assert sampler._thread_session_id is None  # pyright: ignore[reportPrivateUsage]
 
 
 def test_telemetry_sampler_stopping_generation_clears_active_before_held_callback_exits() -> None:

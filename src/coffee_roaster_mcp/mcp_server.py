@@ -1082,7 +1082,15 @@ class _TelemetrySampler:
             self._thread = worker
             generation.stop_event = stop_event
             generation.thread = worker
-            worker.start()
+            try:
+                worker.start()
+            except BaseException:
+                if self._owns_active_generation(session_id, stop_event, generation):
+                    self._active_session_id = None
+                    self._thread = None
+                    self._thread_session_id = None
+                stop_event.set()
+                raise
 
     def stop_started_generation(
         self, receipt: _TelemetrySamplerStartReceipt, *, reason: str
@@ -1094,9 +1102,10 @@ class _TelemetrySampler:
         if stop_event is None or thread is None:
             return
         with self._lock:
-            if self._thread is thread and self._stop_event is stop_event:
-                self._active_session_id = None
-            stop_event.set()
+            if not self._owns_active_generation(self._thread_session_id, stop_event, receipt):
+                return
+            self._active_session_id = None
+        stop_event.set()
         self._join_thread(thread)
         if thread.is_alive():
             return
@@ -1166,20 +1175,31 @@ class _TelemetrySampler:
                 keep_sampling = self._sample_callback(session_id)
             except Exception as exc:  # noqa: BLE001 - background worker must not escape.
                 with self._lock:
-                    if self._owns_generation(stop_event, receipt):
+                    if self._owns_active_generation(session_id, stop_event, receipt):
                         self._last_error = f"{type(exc).__name__}: {exc}"
                 keep_sampling = False
             if not keep_sampling:
                 with self._lock:
-                    if self._owns_generation(stop_event, receipt):
+                    if self._owns_active_generation(session_id, stop_event, receipt):
                         self._active_session_id = None
                         self._thread = None
                         self._thread_session_id = None
                 return
 
-    def _owns_generation(self, stop_event: Event, receipt: _TelemetrySamplerStartReceipt) -> bool:
-        """Return whether the calling worker is still the current generation."""
-        return self._stop_event is stop_event and self._thread is receipt.thread
+    def _owns_active_generation(
+        self,
+        session_id: str | None,
+        stop_event: Event,
+        receipt: _TelemetrySamplerStartReceipt,
+    ) -> bool:
+        """Return whether the calling worker still owns active supervision."""
+        return (
+            session_id is not None
+            and self._active_session_id == session_id
+            and self._thread_session_id == session_id
+            and self._stop_event is stop_event
+            and self._thread is receipt.thread
+        )
 
     def _stop_locked(self) -> Thread | None:
         thread = self._thread
