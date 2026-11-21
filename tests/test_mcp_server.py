@@ -11642,12 +11642,20 @@ def test_telemetry_sampler_stopped_callback_error_is_not_reported() -> None:
         sampler.shutdown()
 
 
-def test_telemetry_sampler_start_failure_does_not_advertise_supervision(
-    monkeypatch: pytest.MonkeyPatch,
+def test_registered_hottop_start_pre_entry_sampler_failure_compensates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A staged worker start failure leaves no active sampler generation."""
-    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=lambda _session_id: True)
-    receipt = mcp_server._TelemetrySamplerStartReceipt()  # pyright: ignore[reportPrivateUsage]
+    """A pre-entry sampler start failure is compensated by the staged Start lifecycle."""
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    object.__setattr__(
+        context,
+        "roaster_driver",
+        HottopRoasterDriver(
+            port="fake-only",
+            serial_factory=lambda *_args, **_kwargs: _ObservationFakeSerialTransport(),
+        ),
+    )
     original_start = Thread.start
 
     def fail_sampler_start(worker: Thread) -> None:
@@ -11656,13 +11664,90 @@ def test_telemetry_sampler_start_failure_does_not_advertise_supervision(
         original_start(worker)
 
     monkeypatch.setattr(Thread, "start", fail_sampler_start)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
     with pytest.raises(RuntimeError, match="synthetic thread start failure"):
-        sampler._start_for_session("staged", receipt=receipt)  # pyright: ignore[reportPrivateUsage]
-    assert receipt.thread is not None
-    assert receipt.stop_event is not None and receipt.stop_event.is_set()
-    assert sampler.active_session_id is None
-    assert sampler._thread is None  # pyright: ignore[reportPrivateUsage]
-    assert sampler._thread_session_id is None  # pyright: ignore[reportPrivateUsage]
+        _call_tool(
+            create_mcp_server(),
+            "start_roast_session",
+            _ctx(context),
+            purpose="cold_characterisation",
+            first_crack_observer_ack="manual/v1",
+        )
+    assert context.session_store.get_active_session() is not None
+    assert context.telemetry_sampler.active_session_id is None
+    assert context.telemetry_sampler._thread is None  # pyright: ignore[reportPrivateUsage]
+    assert context.telemetry_sampler._thread_session_id is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_registered_hottop_start_post_entry_sampler_interrupt_retains_finalisation_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-entry interrupt retains the stopped sampler for finalisation."""
+    entered = Event()
+    release = Event()
+    errors: list[BaseException] = []
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    object.__setattr__(
+        context,
+        "roaster_driver",
+        HottopRoasterDriver(
+            port="fake-only",
+            serial_factory=lambda *_args, **_kwargs: _ObservationFakeSerialTransport(),
+        ),
+    )
+
+    def held_callback(_session_id: str) -> bool:
+        entered.set()
+        assert release.wait(timeout=4.0)
+        return True
+
+    monkeypatch.setattr(context.telemetry_sampler, "_interval_seconds", 0.01)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(context.telemetry_sampler, "_sample_callback", held_callback)  # pyright: ignore[reportPrivateUsage]
+    original_start = Thread.start
+
+    def start_then_interrupt(worker: Thread) -> None:
+        if worker.name.startswith("roast-telemetry-sampler-"):
+            original_start(worker)
+            assert entered.wait(timeout=4.0)
+            raise KeyboardInterrupt("synthetic post-entry interrupt")
+        original_start(worker)
+
+    monkeypatch.setattr(Thread, "start", start_then_interrupt)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    worker = Thread(
+        target=_record_tool_error,
+        args=(errors, create_mcp_server(), "start_roast_session", _ctx(context)),
+        kwargs={"purpose": "cold_characterisation", "first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    try:
+        assert entered.wait(timeout=4.0)
+        sampler_thread = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+        assert sampler_thread is not None
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], KeyboardInterrupt)
+        assert context.telemetry_sampler.active_session_id is None
+        assert context.telemetry_sampler._thread is sampler_thread  # pyright: ignore[reportPrivateUsage]
+        assert sampler_thread.is_alive()
+    finally:
+        release.set()
+        worker.join(timeout=2.0)
+
+    sampler_thread.join(timeout=2.0)
+    assert not sampler_thread.is_alive()
+    session = context.session_store.get_active_session()
+    assert session is not None
+    finalisation = context.telemetry_sampler.stop_and_join_for_finalisation(session.id)
+    assert finalisation.owned_by_session_before_stop
+    assert not finalisation.thread_alive_after_join
 
 
 def test_telemetry_sampler_stopping_generation_clears_active_before_held_callback_exits() -> None:

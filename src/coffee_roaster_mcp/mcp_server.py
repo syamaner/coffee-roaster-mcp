@@ -1085,7 +1085,9 @@ class _TelemetrySampler:
             try:
                 worker.start()
             except BaseException:
-                if self._owns_active_generation(session_id, stop_event, generation):
+                if not worker.is_alive() and self._owns_active_generation(
+                    session_id, stop_event, generation
+                ):
                     self._active_session_id = None
                     self._thread = None
                     self._thread_session_id = None
@@ -1102,9 +1104,8 @@ class _TelemetrySampler:
         if stop_event is None or thread is None:
             return
         with self._lock:
-            if not self._owns_active_generation(self._thread_session_id, stop_event, receipt):
-                return
-            self._active_session_id = None
+            if self._thread is thread and self._stop_event is stop_event:
+                self._active_session_id = None
         stop_event.set()
         self._join_thread(thread)
         if thread.is_alive():
