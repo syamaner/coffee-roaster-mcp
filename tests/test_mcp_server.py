@@ -9710,6 +9710,197 @@ def test_export_uses_one_atomic_runtime_observation_snapshot(
     context.telemetry_sampler.stop_for_session(session_id, reason="test_cleanup")
 
 
+@pytest.mark.parametrize("explicit_session_id", [False, True])
+def test_manual_mock_active_roast_export_is_unready_without_artifact_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit_session_id: bool
+) -> None:
+    """The registered manual/mock route refuses active exports before observation or writing."""
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    runtime = FakeFirstCrackRuntime()
+    _set_first_crack_runtime(context, runtime)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    started = _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+    session_id = started.session.session_id
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None and session.log_writer is not None
+    log_dir = session.log_writer.log_dir
+    jsonl_path = log_dir / "roast.jsonl"
+    jsonl_before = jsonl_path.read_bytes()
+    controls_before = (session.heat_level_percent, session.fan_level_percent, session.cooling_on)
+    events_before = tuple(session.event_timeline)
+
+    def forbidden_observation(_: str) -> None:
+        raise AssertionError("active manual/mock refusal must not read the observation")
+
+    def forbidden_export(*_args: object, **_kwargs: object) -> Never:
+        raise AssertionError("active manual/mock refusal must not build export artefacts")
+
+    monkeypatch.setattr(runtime, "observation_for_session", forbidden_observation)
+    monkeypatch.setattr(mcp_server, "export_roast_snapshot", forbidden_export)
+
+    exported = _call_tool(
+        server, "export_roast_log", ctx, session_id=session_id if explicit_session_id else None
+    )
+
+    assert exported.session_id == session_id
+    assert exported.log_dir == str(log_dir)
+    assert exported.jsonl_path == str(jsonl_path)
+    assert exported.csv_path == str(log_dir / "roast.csv")
+    assert exported.summary_path == str(log_dir / "summary.json")
+    assert exported.ready is False
+    assert exported.note == "Roast log export is unavailable while this roast session is active."
+    assert jsonl_path.read_bytes() == jsonl_before
+    assert not (log_dir / "roast.csv").exists()
+    assert not (log_dir / "summary.json").exists()
+    assert context.telemetry_sampler.active_session_id == session_id
+    assert runtime.started_sessions == [session_id]
+    assert runtime.stopped_sessions == []
+    assert (
+        session.heat_level_percent,
+        session.fan_level_percent,
+        session.cooling_on,
+    ) == controls_before
+    assert tuple(session.event_timeline) == events_before
+    context.telemetry_sampler.stop_for_session(session_id, reason="test_cleanup")
+
+
+def test_manual_mock_export_uses_selected_session_activity(tmp_path: Path) -> None:
+    """A retained completed manual/mock session remains exportable beside an active successor."""
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    _set_first_crack_runtime(context, FakeFirstCrackRuntime())
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    first = _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+    first_id = first.session.session_id
+    _call_tool(server, "mark_beans_added", ctx)
+    _call_tool(server, "drop_beans", ctx)
+    _call_tool(server, "stop_cooling", ctx)
+    second = _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+    second_id = second.session.session_id
+
+    active_export = _call_tool(server, "export_roast_log", ctx, session_id=second_id)
+    completed_export = _call_tool(server, "export_roast_log", ctx, session_id=first_id)
+
+    assert active_export.session_id == second_id
+    assert active_export.ready is False
+    assert (
+        active_export.note == "Roast log export is unavailable while this roast session is active."
+    )
+    assert not Path(active_export.summary_path).exists()
+    assert completed_export.session_id == first_id
+    assert completed_export.ready is True
+    assert Path(completed_export.summary_path).is_file()
+    context.telemetry_sampler.stop_for_session(second_id, reason="test_cleanup")
+
+
+def test_manual_mock_active_export_preserves_incomplete_and_missing_target_precedence(
+    tmp_path: Path,
+) -> None:
+    """The pre-existing incomplete-persistence result stays ahead of the active refusal."""
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    _set_first_crack_runtime(context, FakeFirstCrackRuntime())
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    started = _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.mock_log_torn = True
+
+    incomplete = _call_tool(server, "export_roast_log", ctx, session_id=started.session.session_id)
+
+    assert incomplete.ready is False
+    assert incomplete.note == "Roast log recording is unavailable: JSONL persistence is incomplete."
+    session.log_writer = None
+    with pytest.raises(ValueError, match="^Session log target is unavailable\\.$"):
+        _call_tool(server, "export_roast_log", ctx, session_id=started.session.session_id)
+    session.mock_log_torn = False
+    with pytest.raises(ValueError, match="^Session log target is unavailable\\.$"):
+        _call_tool(server, "export_roast_log", ctx, session_id=started.session.session_id)
+    context.telemetry_sampler.stop_for_session(started.session.session_id, reason="test_cleanup")
+
+
+def test_export_guard_preserves_nonmatching_scope_and_captured_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a captured active manual/mock roast snapshot takes the new refusal path."""
+    automatic_dir = tmp_path / "automatic"
+    automatic_dir.mkdir()
+    automatic = _cold_finalisation_context(automatic_dir)
+    automatic_server = create_mcp_server()
+    automatic_ctx = _ctx(automatic)
+    automatic_started = _call_tool(automatic_server, "start_roast_session", automatic_ctx)
+    automatic_export = _call_tool(
+        automatic_server,
+        "export_roast_log",
+        automatic_ctx,
+        session_id=automatic_started.session.session_id,
+    )
+    assert automatic_export.ready is True
+    automatic.telemetry_sampler.stop_for_session(
+        automatic_started.session.session_id, reason="test_cleanup"
+    )
+
+    cold_dir = tmp_path / "cold"
+    cold_dir.mkdir()
+    cold = _cold_finalisation_context(cold_dir)
+    object.__setattr__(cold, "config", _manual_authority_config())
+    _set_first_crack_runtime(cold, FakeFirstCrackRuntime())
+    cold_server = create_mcp_server()
+    cold_ctx = _ctx(cold)
+    cold_started = _call_tool(
+        cold_server,
+        "start_roast_session",
+        cold_ctx,
+        purpose="cold_characterisation",
+        first_crack_observer_ack="manual/v1",
+    )
+    cold_export = _call_tool(
+        cold_server, "export_roast_log", cold_ctx, session_id=cold_started.session.session_id
+    )
+    assert cold_export.ready is True
+    cold.telemetry_sampler.stop_for_session(cold_started.session.session_id, reason="test_cleanup")
+
+    raced_dir = tmp_path / "raced"
+    raced_dir.mkdir()
+    raced = _cold_finalisation_context(raced_dir)
+    object.__setattr__(raced, "config", _manual_authority_config())
+    _set_first_crack_runtime(raced, FakeFirstCrackRuntime())
+    raced_server = create_mcp_server()
+    raced_ctx = _ctx(raced)
+    raced_started = _call_tool(
+        raced_server, "start_roast_session", raced_ctx, first_crack_observer_ack="manual/v1"
+    )
+    observe = raced.session_store.observe_export_readiness
+    observations = 0
+
+    def observe_then_stop(*, session_id: str | None = None) -> tuple[RoastSession, bool]:
+        nonlocal observations
+        observations += 1
+        snapshot, incomplete = observe(session_id=session_id)
+        raced.session_store.stop_session()
+        return snapshot, incomplete
+
+    monkeypatch.setattr(raced.session_store, "observe_export_readiness", observe_then_stop)
+    raced_export = _call_tool(
+        raced_server, "export_roast_log", raced_ctx, session_id=raced_started.session.session_id
+    )
+
+    assert observations == 1
+    assert raced_export.ready is False
+    assert (
+        raced_export.note == "Roast log export is unavailable while this roast session is active."
+    )
+    assert not Path(raced_export.summary_path).exists()
+    raced.telemetry_sampler.stop_for_session(
+        raced_started.session.session_id, reason="test_cleanup"
+    )
+
+
 def test_export_rejects_a_fault_pending_between_legacy_snapshot_and_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -9893,18 +10084,21 @@ async def _manual_shadow_stdio_successor(tmp_path: Path, *, seed_projection: boo
             assert not observation["worker_reaped"]
             assert observation["first_confirmation"]["value"] is None
             assert observation["frozen_summary"]["value"] is None
+            exported_while_active = await call(
+                "export_roast_log", {"session_id": second["session"]["session_id"]}
+            )
+            assert exported_while_active["ready"] is False
+            assert (
+                exported_while_active["note"]
+                == "Roast log export is unavailable while this roast session is active."
+            )
+            assert not Path(exported_while_active["summary_path"]).exists()
             if seed_projection:
                 capture = refused["first_crack_status"]
                 assert not capture["audio_running"]
                 assert capture["queued_window_count"] == capture["emitted_window_count"] == 0
                 assert capture["dropped_window_count"] == capture["total_overflow_count"] == 0
                 assert capture["mic_peak_dbfs"] is None and capture["mic_rms_dbfs"] is None
-                exported = await call(
-                    "export_roast_log", {"session_id": second["session"]["session_id"]}
-                )
-                summary = json.loads(Path(exported["summary_path"]).read_text())
-                assert summary["first_crack_observation"] == observation
-                assert summary["first_crack_detection"]["window_count"] == 0
             assert (tmp_path / "capture-starts").read_text().splitlines() == ["start"]
             assert (tmp_path / "loader-starts").read_text().splitlines() == ["load"]
         finally:
@@ -9916,6 +10110,15 @@ async def _manual_shadow_stdio_successor(tmp_path: Path, *, seed_projection: boo
         assert after["first_crack_observation"] == observation
         assert (tmp_path / "capture-starts").read_text().splitlines() == ["start"]
         assert (tmp_path / "loader-starts").read_text().splitlines() == ["load"]
+        await call("mark_beans_added", {})
+        await call("drop_beans", {})
+        await call("stop_cooling", {})
+        completed_export = await call(
+            "export_roast_log", {"session_id": second["session"]["session_id"]}
+        )
+        summary = json.loads(Path(completed_export["summary_path"]).read_text())
+        assert summary["first_crack_observation"] == observation
+        assert summary["first_crack_detection"]["window_count"] == 0
 
 
 def test_retained_roast_observation_survives_successor_state_and_reexport(tmp_path: Path) -> None:

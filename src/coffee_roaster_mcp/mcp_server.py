@@ -2300,7 +2300,13 @@ def create_mcp_server(
             )
         except SessionLifecycleError as error:
             raise ValueError(str(error)) from error
-        if persistence_incomplete:
+        if persistence_incomplete or (
+            session.active
+            and session.purpose == "roast"
+            and server_context.config.first_crack.event_authority == "manual"
+            and server_context.config.roaster.driver == "mock"
+            and isinstance(server_context.roaster_driver, MockRoasterDriver)
+        ):
             if session.log_writer is None:
                 raise ValueError("Session log target is unavailable.")
             log_dir = session.log_writer.log_dir
@@ -2311,7 +2317,11 @@ def create_mcp_server(
                 csv_path=str(log_dir / "roast.csv"),
                 summary_path=str(log_dir / "summary.json"),
                 ready=False,
-                note="Roast log recording is unavailable: JSONL persistence is incomplete.",
+                note=(
+                    "Roast log recording is unavailable: JSONL persistence is incomplete."
+                    if persistence_incomplete
+                    else "Roast log export is unavailable while this roast session is active."
+                ),
             )
         observation = server_context.first_crack_runtime.observation_for_session(session.id)
         export = export_roast_snapshot(

@@ -641,8 +641,11 @@ start audio capture or detector runtime.
 
 ## Log Export
 
-RoastPilot currently supports snapshot export through `export_roast_log` for
-the active in-process session.
+RoastPilot supports snapshot export through `export_roast_log` for selected
+in-process sessions. While a roast-purpose session is active on the configured
+manual-authority mock composition, the tool returns `ready=false` without
+writing export artefacts; normally completed inactive selections follow the
+normal export path. An inactive selection does not by itself prove closure.
 
 Current export files:
 
