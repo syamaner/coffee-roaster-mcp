@@ -11707,6 +11707,47 @@ def test_registered_hottop_start_pre_entry_sampler_failure_compensates(
     assert context.telemetry_sampler._thread_session_id is None  # pyright: ignore[reportPrivateUsage]
 
 
+def test_telemetry_sampler_public_start_interrupt_after_worker_entry_retains_finalisation_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-entry public start failure withdraws supervision but retains the worker."""
+    entered = Event()
+    release = Event()
+
+    def held_callback(_session_id: str) -> bool:
+        entered.set()
+        assert release.wait(timeout=1.0)
+        return True
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=held_callback)
+    original_start = Thread.start
+
+    def start_then_raise(worker: Thread) -> None:
+        original_start(worker)
+        assert entered.wait(timeout=1.0)
+        raise RuntimeError("synthetic post-entry start failure")
+
+    monkeypatch.setattr(Thread, "start", start_then_raise)
+    try:
+        with pytest.raises(RuntimeError, match="synthetic post-entry start failure"):
+            sampler.start_for_session("interrupted")
+        worker = sampler._thread  # pyright: ignore[reportPrivateUsage]
+        assert worker is not None and worker.is_alive()
+        assert sampler.active_session_id is None
+
+        release.set()
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert sampler.active_session_id is None
+
+        finalisation = sampler.stop_and_join_for_finalisation("interrupted")
+        assert finalisation.owned_by_session_before_stop
+        assert not finalisation.thread_alive_after_join
+    finally:
+        release.set()
+        sampler.shutdown()
+
+
 def test_registered_hottop_start_post_entry_sampler_interrupt_retains_finalisation_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1085,12 +1085,11 @@ class _TelemetrySampler:
             try:
                 worker.start()
             except BaseException:
-                if not worker.is_alive() and self._owns_active_generation(
-                    session_id, stop_event, generation
-                ):
+                if self._owns_active_generation(session_id, stop_event, generation):
                     self._active_session_id = None
-                    self._thread = None
-                    self._thread_session_id = None
+                    if not worker.is_alive():
+                        self._thread = None
+                        self._thread_session_id = None
                 stop_event.set()
                 raise
 
