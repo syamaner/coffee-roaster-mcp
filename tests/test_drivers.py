@@ -14,6 +14,7 @@ from coffee_roaster_mcp.drivers import (
     CommandStreaming,
     DriverLifecycleEvidence,
     FixedZeroCommandedState,
+    HottopFirstWriteDisposition,
     HottopRoasterDriver,
     HottopStartOwner,
     HottopStartPhase,
@@ -2522,6 +2523,62 @@ def test_inhibited_reservation_refuses_legacy_lifecycle() -> None:
             driver.reserve_inhibited_start("server")
     finally:
         driver.disconnect()
+
+
+@pytest.mark.parametrize(
+    ("receipt", "expected_disposition", "expected_phase"),
+    [
+        (HOTTOP_PACKET_LENGTH, HottopFirstWriteDisposition.WRITTEN, HottopStartPhase.WRITTEN),
+        (True, HottopFirstWriteDisposition.UNKNOWN, HottopStartPhase.UNRESOLVED),
+    ],
+)
+def test_claimed_first_write_consumes_entry_before_native_write(
+    receipt: object,
+    expected_disposition: HottopFirstWriteDisposition,
+    expected_phase: HottopStartPhase,
+) -> None:
+    """One exact claim admits only one native entry, including an unknown receipt."""
+
+    class Transport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            self.entered.set()
+            assert self.release.wait(timeout=1.0)
+            return cast(int, receipt)
+
+    transport = Transport()
+    driver = HottopRoasterDriver(port="fake", serial_factory=FakeSerialFactory(transport))
+    owner = driver.reserve_inhibited_start("server")
+    driver.open_inhibited_start(owner)
+    driver.begin_inhibited_start_promotion(owner)
+    session = object()
+    driver.bind_promoted_inhibited_start(owner, session)
+    claim = driver.claim_prepared_first_write(driver.prepare_promoted_first_write(owner, session))
+    outcomes: list[HottopFirstWriteDisposition] = []
+
+    worker = Thread(target=lambda: outcomes.append(driver.dispatch_claimed_first_write(claim)))
+    worker.start()
+    assert transport.entered.wait(timeout=1.0)
+    assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.ENTERING)
+    with pytest.raises(RuntimeError, match="claim"):
+        driver.dispatch_claimed_first_write(claim)
+    assert transport.writes == [claim.frame]
+    transport.release.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert outcomes == [expected_disposition]
+    assert driver.inspect_inhibited_start() == (owner, expected_phase)
+    assert driver._start_write_disposition is expected_disposition  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RuntimeError, match="claim"):
+        driver.dispatch_claimed_first_write(claim)
+    assert driver._start_write_disposition is expected_disposition  # pyright: ignore[reportPrivateUsage]
+    assert transport.writes == [claim.frame]
 
 
 @pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])

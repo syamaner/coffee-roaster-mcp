@@ -1028,6 +1028,7 @@ class HottopStartPhase(Enum):
     PROMOTING = "promoting"
     PROMOTED = "promoted"
     CLAIMED = "claimed"
+    ENTERING = "entering"
     WRITTEN = "written"
     CLOSING = "closing"
     UNRESOLVED = "unresolved"
@@ -1370,17 +1371,20 @@ class HottopRoasterDriver:
                 or self._start_handle is not claim.handle
             ):
                 raise RuntimeError("Staged Hottop first-write claim is no longer current.")
+            # CLAIMED proves a frame may be considered for entry; ENTERING consumes
+            # that right before releasing this lock for an unbounded native write.
+            self._start_phase = HottopStartPhase.ENTERING
         try:
             receipt = claim.handle.write(claim.frame)
         except BaseException:
             with self._state_lock:
-                if self._start_claim is claim:
+                if self._start_claim is claim and self._start_phase is HottopStartPhase.ENTERING:
                     self._start_write_disposition = HottopFirstWriteDisposition.UNKNOWN
                     self._start_phase = HottopStartPhase.UNRESOLVED
             raise
         with self._state_lock:
-            if self._start_claim is not claim:
-                return HottopFirstWriteDisposition.UNKNOWN
+            if self._start_claim is not claim or self._start_phase is not HottopStartPhase.ENTERING:
+                raise RuntimeError("Staged Hottop first-write entry is no longer current.")
             if type(receipt) is int and receipt == len(claim.frame):
                 self._start_write_disposition = HottopFirstWriteDisposition.WRITTEN
                 self._start_phase = HottopStartPhase.WRITTEN
@@ -1397,6 +1401,8 @@ class HottopRoasterDriver:
                 and self._start_session is session
                 and self._start_phase is HottopStartPhase.WRITTEN
                 and self._start_write_disposition is HottopFirstWriteDisposition.WRITTEN
+                and self._start_claim is not None
+                and self._command_state_revision == self._start_claim.revision
             )
 
     def _refuse_staged_connect(self) -> None:

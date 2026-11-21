@@ -1970,7 +1970,12 @@ def create_mcp_server(
             reservation = server_context.session_store.reserve_session_start()
         driver = server_context.roaster_driver
         if manual and isinstance(driver, HottopRoasterDriver):
-            owner = driver.reserve_inhibited_start(reservation.token)
+            try:
+                owner = driver.reserve_inhibited_start(reservation.token)
+            except BaseException:
+                with server_context.lifecycle_barrier:
+                    server_context.session_store.clear_session_start_reservation(reservation)
+                raise
             publication = StagedSessionStartPublication(session=None)
             try:
                 driver.open_inhibited_start(owner)
