@@ -16,6 +16,8 @@ from coffee_roaster_mcp.session import (
     RoastSession,
     RoastSessionStore,
     SessionLifecycleError,
+    SessionStartReservation,
+    StagedSessionStartPublication,
     TelemetrySample,
     compute_bean_ror_c_per_min,
     compute_bean_temp_delta_60s_c,
@@ -123,6 +125,74 @@ def test_read_snapshot_retains_store_owned_mock_drop_facts() -> None:
     assert snapshot.unconfirmed_torn_start_cooling_attempted is True
     assert store.get_latest_session() is session
     assert store.get_session_snapshot(session_id=snapshot.id).id == snapshot.id
+
+
+def test_staged_completion_foreign_token_preserves_legitimate_reservation() -> None:
+    """A foreign staged completion cannot consume the current reservation."""
+    store = RoastSessionStore(session_id_factory=lambda: "published")
+    reservation = store.reserve_session_start()
+    foreign_publication = StagedSessionStartPublication(session=None)
+
+    with pytest.raises(SessionLifecycleError, match="no longer active"):
+        store.complete_staged_session_start_snapshot(
+            SessionStartReservation("foreign"), publication=foreign_publication
+        )
+
+    with pytest.raises(SessionLifecycleError, match="in progress"):
+        store.reserve_session_start()
+    publication = StagedSessionStartPublication(session=None)
+    snapshot = store.complete_staged_session_start_snapshot(reservation, publication=publication)
+    assert publication.session is store.get_active_session()
+    assert publication.session is not None
+    assert snapshot.id == publication.session.id == "published"
+
+
+@pytest.mark.parametrize("failure_site", ["id", "prune", "snapshot"])
+def test_staged_completion_binds_published_identity_before_handoff_failure(
+    monkeypatch: pytest.MonkeyPatch, failure_site: str
+) -> None:
+    """Publication identity survives failures after the normal store assignment."""
+    if failure_site == "id":
+
+        def failing_id() -> str:
+            raise RuntimeError("id")
+
+        store = RoastSessionStore(session_id_factory=failing_id)
+    else:
+        store = RoastSessionStore(session_id_factory=lambda: "published")
+    reservation = store.reserve_session_start()
+    publication = StagedSessionStartPublication(session=None)
+    if failure_site == "prune":
+        monkeypatch.setattr(
+            store,
+            "_prune_session_history_locked",
+            lambda: (_ for _ in ()).throw(RuntimeError("prune")),
+        )
+    if failure_site == "snapshot":
+
+        def fail_snapshot(_session: RoastSession) -> RoastSession:
+            raise RuntimeError("snapshot")
+
+        monkeypatch.setattr(
+            session_module,
+            "_copy_session_for_read",
+            fail_snapshot,
+        )
+
+    with pytest.raises(RuntimeError, match=failure_site):
+        store.complete_staged_session_start_snapshot(reservation, publication=publication)
+
+    if failure_site == "id":
+        assert publication.session is None
+        assert store.get_active_session() is None
+        with pytest.raises(SessionLifecycleError, match="in progress"):
+            store.reserve_session_start()
+        store.clear_session_start_reservation(reservation)
+        assert store.reserve_session_start()
+    else:
+        assert publication.session is store.get_active_session()
+        assert publication.session is not None
+        assert publication.session.id == "published"
 
 
 def test_start_session_rejects_second_active_session() -> None:

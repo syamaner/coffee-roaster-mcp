@@ -50,6 +50,7 @@ from coffee_roaster_mcp.drivers import (
     MockRoasterDriver,
     RoasterCapabilities,
     RoasterState,
+    build_hottop_command_packet,
 )
 from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackRuntimeSnapshot,
@@ -2662,7 +2663,7 @@ def test_nonterminal_finalisation_blocks_registered_start_session(
 
 
 def test_real_sampler_retains_thread_owner_until_timeout_retry_joins() -> None:
-    """A timed-out finalisation retry joins the same stopped sampler thread."""
+    """A stopped callback returning false clears its own retained dead handle."""
     entered = Event()
     release = Event()
 
@@ -2674,13 +2675,190 @@ def test_real_sampler_retains_thread_owner_until_timeout_retry_joins() -> None:
     sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=block_sample)
     sampler.start_for_session("cold-session")
     assert entered.wait(timeout=1.0)
+    worker = sampler._thread  # pyright: ignore[reportPrivateUsage]
+    assert worker is not None
     first = sampler.stop_and_join_for_finalisation("cold-session")
     assert first.owned_by_session_before_stop is True
     assert first.thread_alive_after_join is True
     release.set()
+    worker.join(timeout=4.0)
+    assert not worker.is_alive()
     second = sampler.stop_and_join_for_finalisation("cold-session")
-    assert second.owned_by_session_before_stop is True
+    assert second.owned_by_session_before_stop is False
     assert second.thread_alive_after_join is False
+
+
+def test_registered_finalisation_keeps_replacement_sampler_until_its_callback_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disconnected refusal cannot let its displaced sampler clear a replacement."""
+    first_entered = Event()
+    replacement_entered = Event()
+    release_first = Event()
+    release_replacement = Event()
+    callback_lock = Lock()
+    callback_count = 0
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver(initially_connected=False)
+    object.__setattr__(context, "roaster_driver", driver)
+    monkeypatch.setattr(context.telemetry_sampler, "_interval_seconds", 0.01)
+
+    def held_callback(_session_id: str) -> bool:
+        nonlocal callback_count
+        with callback_lock:
+            callback_count += 1
+            callback_number = callback_count
+        if callback_number == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=4.0)
+            return False
+        assert callback_number == 2
+        replacement_entered.set()
+        assert release_replacement.wait(timeout=4.0)
+        return False
+
+    monkeypatch.setattr(context.telemetry_sampler, "_sample_callback", held_callback)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.telemetry_sampler.start_for_session(session.id)
+    first = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+    assert first is not None and first_entered.wait(timeout=4.0)
+    server = create_mcp_server()
+    try:
+        refusal = asyncio.run(
+            _call_tool(
+                server,
+                "finalise_cold_characterisation_session",
+                _ctx(context),
+                session_id=session.id,
+            )
+        )
+        assert refusal.rejection_reason == "driver_not_connected"
+        assert replacement_entered.wait(timeout=4.0)
+        replacement = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+        assert replacement is not None and replacement is not first
+
+        release_first.set()
+        first.join(timeout=4.0)
+        assert not first.is_alive()
+        assert context.telemetry_sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
+
+        driver.connect()
+        driver.actions.clear()
+        partial = asyncio.run(
+            _call_tool(
+                server,
+                "finalise_cold_characterisation_session",
+                _ctx(context),
+                session_id=session.id,
+            )
+        )
+        assert partial.status == "partial"
+        assert partial.stages[0].status == "incomplete"
+        assert partial.sampler.owned_by_session_before_stop is True
+        assert partial.sampler.thread_alive_after_join is True
+        assert driver.actions == []
+
+        release_replacement.set()
+        replacement.join(timeout=4.0)
+        assert not replacement.is_alive()
+        completed = asyncio.run(
+            _call_tool(
+                server,
+                "finalise_cold_characterisation_session",
+                _ctx(context),
+                session_id=session.id,
+            )
+        )
+        assert completed.status == "clean"
+        assert completed.clean is True
+        assert driver.actions == ["disconnect"]
+    finally:
+        release_first.set()
+        release_replacement.set()
+        first.join(timeout=4.0)
+        context.telemetry_sampler.shutdown()
+
+
+def test_registered_finalisation_retry_reports_owned_dead_sampler_after_callback_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry retains its pre-join ownership observation when the callback then exits."""
+    callback_entered = Event()
+    release_callback = Event()
+    join_entered = Event()
+    release_join = Event()
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    monkeypatch.setattr(context.telemetry_sampler, "_interval_seconds", 0.01)
+
+    def held_callback(_session_id: str) -> bool:
+        callback_entered.set()
+        assert release_callback.wait(timeout=4.0)
+        return False
+
+    monkeypatch.setattr(context.telemetry_sampler, "_sample_callback", held_callback)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.telemetry_sampler.start_for_session(session.id)
+    sampler_thread = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+    assert sampler_thread is not None and callback_entered.wait(timeout=4.0)
+    server = create_mcp_server()
+    original_join = context.telemetry_sampler._join_thread  # pyright: ignore[reportPrivateUsage]
+    try:
+        partial = asyncio.run(
+            _call_tool(
+                server,
+                "finalise_cold_characterisation_session",
+                _ctx(context),
+                session_id=session.id,
+            )
+        )
+        assert partial.status == "partial"
+
+        def hold_retry_join(thread: Thread | None) -> None:
+            assert thread is sampler_thread
+            join_entered.set()
+            assert release_join.wait(timeout=4.0)
+            original_join(thread)
+
+        monkeypatch.setattr(context.telemetry_sampler, "_join_thread", hold_retry_join)
+        results: list[object] = []
+        errors: list[BaseException] = []
+
+        def retry() -> None:
+            try:
+                results.append(
+                    asyncio.run(
+                        _call_tool(
+                            server,
+                            "finalise_cold_characterisation_session",
+                            _ctx(context),
+                            session_id=session.id,
+                        )
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - report thread failure exactly.
+                errors.append(exc)
+
+        retry_thread = Thread(target=retry)
+        retry_thread.start()
+        assert join_entered.wait(timeout=4.0)
+        release_callback.set()
+        sampler_thread.join(timeout=4.0)
+        assert not sampler_thread.is_alive()
+        release_join.set()
+        retry_thread.join(timeout=4.0)
+        assert not retry_thread.is_alive() and errors == []
+        retry_result = cast(Any, results[0])
+        assert retry_result.sampler.owned_by_session_before_stop is True
+        assert retry_result.sampler.thread_alive_after_join is False
+        assert retry_result.status == "clean"
+    finally:
+        release_callback.set()
+        release_join.set()
+        sampler_thread.join(timeout=4.0)
+        monkeypatch.setattr(context.telemetry_sampler, "_join_thread", original_join)
+        context.telemetry_sampler.shutdown()
 
 
 def test_first_crack_stop_failure_resumes_without_rerunning_sampler(tmp_path: Path) -> None:
@@ -8081,6 +8259,7 @@ class FakeFirstCrackRuntime:
         self.inference_overrun_count = inference_overrun_count
         self.active_session_id: str | None = None
         self.started_sessions: list[str] = []
+        self.started_session_objects: list[RoastSession] = []
         self.processed_sessions: list[str] = []
         self.processed_after_drop_sessions: list[bool] = []
         self.stopped_sessions: list[str] = []
@@ -8089,6 +8268,7 @@ class FakeFirstCrackRuntime:
     def start_for_session(self, session: RoastSession) -> FirstCrackRuntimeSnapshot:
         self.active_session_id = session.id
         self.started_sessions.append(session.id)
+        self.started_session_objects.append(session)
         return self.snapshot()
 
     def process_available_windows(
@@ -8153,6 +8333,10 @@ class FakeFirstCrackRuntime:
         self.stopped_sessions.append(session_id)
         self.reason = reason
         return self.snapshot()
+
+    def stop_after_failed_start(self, session_id: str, *, reason: str) -> None:
+        """Model the staged failed-Start cleanup port."""
+        self.stop_for_session(session_id, reason=reason)
 
     def finalise_for_session(self, session_id: str) -> tuple[str, str | None, bool]:
         """Report the default fake as inactive with no capture to stop."""
@@ -8225,11 +8409,13 @@ class FakeAmbientRuntime:
         self.last_reading_monotonic_seconds = last_reading_monotonic_seconds
         self.active_session_id: str | None = None
         self.started_sessions: list[str] = []
+        self.started_session_objects: list[RoastSession] = []
         self.stopped_sessions: list[str] = []
 
     def start_for_session(self, session: RoastSession) -> AmbientRuntimeSnapshot:
         self.active_session_id = session.id
         self.started_sessions.append(session.id)
+        self.started_session_objects.append(session)
         return self.snapshot()
 
     def poll(self) -> AmbientRuntimeSnapshot:
@@ -8263,7 +8449,7 @@ def _ctx(server_context: ServerContext) -> Any:
 
 def _set_first_crack_runtime(
     server_context: ServerContext,
-    runtime: FakeFirstCrackRuntime,
+    runtime: FakeFirstCrackRuntime | FirstCrackSessionRuntime,
 ) -> None:
     object.__setattr__(server_context, "first_crack_runtime", runtime)
 
@@ -11327,7 +11513,7 @@ def test_manual_start_refuses_hottop_before_reservation_or_transport_open(
     monkeypatch.setattr(driver, "connect", forbid("connect"))
     monkeypatch.setattr(context.first_crack_runtime, "start_for_session", forbid("runtime"))
     monkeypatch.setattr(context.ambient_runtime, "start_for_session", forbid("ambient"))
-    monkeypatch.setattr(context.telemetry_sampler, "start_for_session", forbid("capture"))
+    monkeypatch.setattr(context.telemetry_sampler, "_start_for_session", forbid("capture"))  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(
         ConfigError,
         match="Composed driver does not support configured manual first-crack authority.",
@@ -12483,16 +12669,18 @@ def test_sampler_fault_commit_releases_lifecycle_barrier_while_drop_append_stall
     ]
 
 
-@pytest.mark.parametrize("held_site", ["factory", "close"])
 @pytest.mark.parametrize("outcome", ["clean", "factory_raise", "close_raise", "still_open"])
 def test_future_manual_registered_start_inhibited_abort(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held_site: str, outcome: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
     """Exact revoke is prompt during native work and uncertain starts stay owned."""
     entered = Event()
     release = Event()
     opened = Event()
+    close_started = Event()
+    finish_close = Event()
     calls: list[str] = []
+    close_owners: list[tuple[object | None, object | None]] = []
     failures: list[BaseException] = []
     context = _cold_finalisation_context(tmp_path)
     object.__setattr__(context, "config", _manual_authority_config())
@@ -12500,9 +12688,9 @@ def test_future_manual_registered_start_inhibited_abort(
     class Transport(_ObservationFakeSerialTransport):
         def close(self) -> None:
             calls.append("close")
-            if held_site == "close":
-                entered.set()
-                assert release.wait(3)
+            close_owners.append(driver.inspect_inhibited_start())
+            close_started.set()
+            assert finish_close.wait(3)
             if outcome == "close_raise":
                 raise OSError("uncertain close")
             if outcome != "still_open":
@@ -12519,9 +12707,8 @@ def test_future_manual_registered_start_inhibited_abort(
         assert context.session_store.get_active_session() is None
         assert driver.read_state() == baseline[0]
         assert driver.read_lifecycle_evidence() == baseline[1]
-        if held_site == "factory":
-            entered.set()
-            assert release.wait(3)
+        entered.set()
+        assert release.wait(3)
         if outcome == "factory_raise":
             raise OSError("uncertain native entry")
         opened.set()
@@ -12552,19 +12739,13 @@ def test_future_manual_registered_start_inhibited_abort(
     worker = Thread(target=start)
     worker.start()
     try:
-        if held_site == "close" and outcome == "factory_raise":
-            worker.join(3)
-            assert not worker.is_alive()
-        else:
-            assert entered.wait(3)
+        assert entered.wait(3)
         owner, phase = driver.inspect_inhibited_start()
         assert owner is not None
         assert owner.generation == 1
         reservation = session_module.SessionStartReservation(owner.server_token)
         if worker.is_alive():
-            assert phase is (
-                HottopStartPhase.OPENING if held_site == "factory" else HottopStartPhase.CLOSING
-            )
+            assert phase is HottopStartPhase.OPENING
             assert driver.read_state() == baseline[0]
             assert driver.read_lifecycle_evidence() == baseline[1]
         revoked = Event()
@@ -12600,13 +12781,23 @@ def test_future_manual_registered_start_inhibited_abort(
                     server, "emergency_stop", _ctx(context), expected_session_id=expected_session_id
                 )
         assert driver.inspect_inhibited_start()[0] is owner
+        release.set()
+        if outcome != "factory_raise":
+            assert close_started.wait(3)
+            with context.lifecycle_barrier:
+                assert not context.session_store.revoke_session_start(reservation)
+                with pytest.raises(SessionLifecycleError, match="progress"):
+                    context.session_store.reserve_session_start()
     finally:
         release.set()
+        finish_close.set()
         worker.join(3)
     assert not worker.is_alive()
     assert len(failures) == 1
     assert calls.count("factory") == 1
     assert calls.count("close") == (0 if outcome == "factory_raise" else 1)
+    if outcome != "factory_raise":
+        assert close_owners == [(owner, HottopStartPhase.CLOSING)]
     assert "write" not in calls
     assert context.session_store.get_active_session() is None
     if outcome == "clean":
@@ -12654,7 +12845,11 @@ def test_future_manual_registered_start_inhibited_abort(
         assert "write" not in calls
     else:
         assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.UNRESOLVED)
-        with pytest.raises(SessionLifecycleError, match="progress"):
+        with context.lifecycle_barrier, pytest.raises(SessionLifecycleError, match="progress"):
+            context.session_store.reserve_session_start()
+        expected_error = SessionLifecycleError
+        expected_message = "progress"
+        with pytest.raises(expected_error, match=expected_message):
             _call_tool(
                 server, "start_roast_session", _ctx(context), first_crack_observer_ack="manual/v1"
             )
@@ -12666,7 +12861,7 @@ def test_future_manual_registered_start_inhibited_abort(
             ),
         )
         object.__setattr__(context, "config", automatic)
-        with pytest.raises(SessionLifecycleError, match="progress"):
+        with pytest.raises(expected_error, match=expected_message):
             _call_tool(server, "start_roast_session", _ctx(context))
         assert calls.count("factory") == 1
         assert calls.count("close") == (0 if outcome == "factory_raise" else 1)
@@ -12698,3 +12893,1314 @@ def test_future_manual_early_driver_refusal_releases_server_only(
     assert driver.inspect_inhibited_start() == (None, None)
     assert context.session_store.get_active_session() is None
     assert context.session_store.reserve_session_start().token
+
+
+def test_future_manual_driver_reservation_refusal_releases_only_new_server_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retained driver owner cannot leak a later server-only reservation."""
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    transport_calls: list[object] = []
+
+    def forbidden_transport(*_args: object, **_kwargs: object) -> Never:
+        transport_calls.append(None)
+        raise AssertionError("driver reservation refusal entered transport")
+
+    driver = HottopRoasterDriver(
+        port="fake-only",
+        serial_factory=forbidden_transport,
+    )
+    old_owner = driver.reserve_inhibited_start("old-owner")
+    object.__setattr__(context, "roaster_driver", driver)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+
+    with pytest.raises(RuntimeError, match="staged"):
+        _call_tool(
+            create_mcp_server(),
+            "start_roast_session",
+            _ctx(context),
+            first_crack_observer_ack="manual/v1",
+        )
+
+    assert driver.inspect_inhibited_start() == (old_owner, HottopStartPhase.RESERVED)
+    assert transport_calls == []
+    replacement = context.session_store.reserve_session_start()
+    context.session_store.clear_session_start_reservation(replacement)
+
+
+@pytest.mark.parametrize("mutation_point", ["during_write", "after_setup"])
+def test_registered_hottop_start_rejects_revision_changed_after_write_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation_point: str
+) -> None:
+    """A same-value command revision invalidates setup or success after exact receipt."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.write_entered = Event()
+            self.release_write = Event()
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            self.write_entered.set()
+            assert self.release_write.wait(timeout=1.0)
+            return len(data)
+
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    first_crack = FakeFirstCrackRuntime()
+    ambient = FakeAmbientRuntime()
+    _set_first_crack_runtime(context, first_crack)
+    _set_ambient_runtime(context, ambient)
+    transport = Transport()
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+    setup_entered = Event()
+    release_setup = Event()
+    if mutation_point == "after_setup":
+        original_start = context.telemetry_sampler._start_for_session  # pyright: ignore[reportPrivateUsage]
+
+        def hold_after_setup(
+            session_id: str,
+            *,
+            receipt: mcp_server._TelemetrySamplerStartReceipt | None,  # pyright: ignore[reportPrivateUsage]
+        ) -> None:
+            original_start(session_id, receipt=receipt)
+            setup_entered.set()
+            assert release_setup.wait(timeout=1.0)
+
+        monkeypatch.setattr(context.telemetry_sampler, "_start_for_session", hold_after_setup)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    errors: list[BaseException] = []
+    worker = Thread(
+        target=_record_tool_error,
+        args=(errors, create_mcp_server(), "start_roast_session", _ctx(context)),
+        kwargs={"first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    assert transport.write_entered.wait(timeout=1.0)
+    if mutation_point == "during_write":
+        driver.set_heat(heat_level_percent=0)
+        transport.release_write.set()
+    else:
+        transport.release_write.set()
+        assert setup_entered.wait(timeout=1.0)
+        driver.set_heat(heat_level_percent=0)
+        release_setup.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], SessionLifecycleError)
+    assert transport.writes == [build_hottop_command_packet()]
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None and phase is HottopStartPhase.WRITTEN
+    assert context.telemetry_sampler.active_session_id is None
+    if mutation_point == "during_write":
+        assert first_crack.started_sessions == []
+        assert ambient.started_sessions == []
+    else:
+        assert first_crack.started_sessions
+        assert ambient.started_sessions
+        assert first_crack.stopped_sessions
+        assert ambient.stopped_sessions
+
+
+def test_registered_hottop_start_claims_one_immutable_fake_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The staged route writes exactly its captured command frame once."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data)
+
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    transport = Transport()
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+
+    def accept_policy(*_args: object) -> None:
+        pass
+
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", accept_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", accept_policy
+    )
+
+    result = _call_tool(
+        create_mcp_server(),
+        "start_roast_session",
+        _ctx(context),
+        first_crack_observer_ack="manual/v1",
+    )
+
+    assert result.session.phase == "pre_roast"
+    assert transport.writes == [build_hottop_command_packet()]
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None
+    assert phase is HottopStartPhase.WRITTEN
+
+
+def test_registered_hottop_start_reply_and_runtimes_use_isolated_promotion_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final Start snapshot linearizes before a later emergency mutation."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def write(self, data: bytes) -> int:
+            return len(data)
+
+    serialized = Event()
+    release_serialization = Event()
+    results: list[object] = []
+    errors: list[BaseException] = []
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    first_crack = FakeFirstCrackRuntime()
+    ambient = FakeAmbientRuntime()
+    _set_first_crack_runtime(context, first_crack)
+    _set_ambient_runtime(context, ambient)
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: Transport()
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+    original_serialize = mcp_server._serialize_session_state  # pyright: ignore[reportPrivateUsage]
+
+    def hold_serialization(session: RoastSession, **kwargs: Any) -> Any:
+        serialized.set()
+        assert release_serialization.wait(timeout=1.0)
+        return original_serialize(session, **kwargs)
+
+    monkeypatch.setattr(mcp_server, "_serialize_session_state", hold_serialization)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    server = create_mcp_server()
+    worker = Thread(
+        target=_record_tool_result,
+        args=(results, errors, server, "start_roast_session", _ctx(context)),
+        kwargs={"first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    assert serialized.wait(timeout=1.0)
+    canonical = context.session_store.get_active_session()
+    assert canonical is not None
+    emergency = _call_tool(server, "emergency_stop", _ctx(context), reason="after-copy")
+    release_serialization.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive() and errors == []
+    result = cast(Any, results[0])
+    assert result.session.session_id == canonical.id
+    assert result.session.active and result.session.phase == "pre_roast"
+    assert emergency.session_id == canonical.id and emergency.phase == "fault"
+    assert context.session_store.get_session_snapshot(session_id=canonical.id).phase == "fault"
+    assert len(first_crack.started_session_objects) == 1
+    assert len(ambient.started_session_objects) == 1
+    assert first_crack.started_session_objects[0].id == canonical.id
+    assert ambient.started_session_objects[0].id == canonical.id
+    assert first_crack.started_session_objects[0] is not canonical
+    assert ambient.started_session_objects[0] is not canonical
+
+
+@pytest.mark.parametrize("receipt", [True, 0, 25, -1, None])
+def test_registered_hottop_start_retains_unknown_first_write_receipt(
+    tmp_path: Path, receipt: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-exact native receipt cannot be reported as a normal Start success."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return cast(int, receipt)
+
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    transport = Transport()
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+
+    def accept_policy(*_args: object) -> None:
+        pass
+
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", accept_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", accept_policy
+    )
+
+    with pytest.raises(SessionLifecycleError, match="unknown receipt"):
+        _call_tool(
+            create_mcp_server(),
+            "start_roast_session",
+            _ctx(context),
+            first_crack_observer_ack="manual/v1",
+        )
+
+    assert len(transport.writes) == 1
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None
+    assert phase is HottopStartPhase.UNRESOLVED
+    assert context.session_store.get_active_session() is not None
+
+
+def test_automatic_hottop_start_uses_legacy_connect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Automatic authority never enters the staged manual-Hottop route."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = HottopRoasterDriver(port="fake-only")
+    calls: list[str] = []
+
+    def legacy_connect() -> None:
+        calls.append("connect")
+
+    def forbidden_reservation(_token: str) -> object:
+        raise AssertionError("automatic Start entered manual staging")
+
+    monkeypatch.setattr(driver, "connect", legacy_connect)
+    monkeypatch.setattr(driver, "reserve_inhibited_start", forbidden_reservation)
+    object.__setattr__(context, "roaster_driver", driver)
+
+    result = _call_tool(create_mcp_server(), "start_roast_session", _ctx(context))
+
+    assert result.session.phase == "pre_roast"
+    assert calls == ["connect"]
+
+
+def _accept_manual_hottop_policy(*_args: object) -> None:
+    """Provide the existing policy seam for staged in-memory transport schedules."""
+
+
+def test_registered_hottop_start_emergency_after_preparation_refuses_without_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An admitted emergency invalidates a prepared, but unclaimed, first frame."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data)
+
+    prepared = Event()
+    release = Event()
+    errors: list[BaseException] = []
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    transport = Transport()
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+    original_prepare = driver.prepare_promoted_first_write
+
+    def hold_after_prepare(owner: object, session: object) -> object:
+        claim = original_prepare(cast(Any, owner), session)
+        prepared.set()
+        assert release.wait(timeout=1.0)
+        return claim
+
+    monkeypatch.setattr(driver, "prepare_promoted_first_write", hold_after_prepare)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    server = create_mcp_server()
+    worker = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "start_roast_session", _ctx(context)),
+        kwargs={"first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    assert prepared.wait(timeout=1.0)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    emergency = _call_tool(server, "emergency_stop", _ctx(context), reason="prepared")
+    release.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive() and len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "Stopped sessions cannot be mutated" in str(errors[0])
+    assert emergency.session_id == session.id and emergency.event.kind == "fault"
+    assert transport.writes == []
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None and phase is HottopStartPhase.PROMOTED
+    assert context.session_store.get_latest_session() is session
+    assert context.telemetry_sampler.active_session_id is None
+
+
+def test_registered_hottop_start_held_write_allows_emergency_without_retry_or_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claimed fake write does not delay the registered emergency handler."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[bytes] = []
+            self.write_entered = Event()
+            self.release_write = Event()
+            self.close_count = 0
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            self.write_entered.set()
+            assert self.release_write.wait(timeout=1.0)
+            return len(data)
+
+        def close(self) -> None:
+            self.close_count += 1
+            super().close()
+
+    transport = Transport()
+    errors: list[BaseException] = []
+    emergency_results: list[object] = []
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    server = create_mcp_server()
+    start_thread = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "start_roast_session", _ctx(context)),
+        kwargs={"first_crack_observer_ack": "manual/v1"},
+    )
+    start_thread.start()
+    assert transport.write_entered.wait(timeout=1.0)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    emergency_thread = Thread(
+        target=_record_tool_result,
+        args=(emergency_results, errors, server, "emergency_stop", _ctx(context)),
+        kwargs={"reason": "held write"},
+    )
+    emergency_thread.start()
+    emergency_thread.join(timeout=1.0)
+    assert not emergency_thread.is_alive() and errors == []
+    assert len(transport.writes) == 1 and transport.close_count == 0
+    transport.release_write.set()
+    start_thread.join(timeout=1.0)
+
+    assert not start_thread.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], SessionLifecycleError)
+    assert "Stopped sessions cannot be mutated" in str(errors[0])
+    assert len(emergency_results) == 1
+    assert cast(Any, emergency_results[0]).event.kind == "fault"
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None and phase is HottopStartPhase.WRITTEN
+    assert transport.close_count == 0
+    assert context.telemetry_sampler.active_session_id is None
+
+
+def test_registered_hottop_start_emergency_after_runtime_setup_reaps_started_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-write emergency suppresses stale Start success and reaps setup work."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data)
+
+    setup_entered = Event()
+    release_setup = Event()
+    errors: list[BaseException] = []
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    first_crack = FakeFirstCrackRuntime()
+    ambient = FakeAmbientRuntime()
+    _set_first_crack_runtime(context, first_crack)
+    _set_ambient_runtime(context, ambient)
+    transport = Transport()
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+    original_start = context.telemetry_sampler._start_for_session  # pyright: ignore[reportPrivateUsage]
+
+    def hold_before_sampler(
+        session_id: str,
+        *,
+        receipt: mcp_server._TelemetrySamplerStartReceipt | None,  # pyright: ignore[reportPrivateUsage]
+    ) -> None:
+        setup_entered.set()
+        assert release_setup.wait(timeout=1.0)
+        original_start(session_id, receipt=receipt)
+
+    monkeypatch.setattr(context.telemetry_sampler, "_start_for_session", hold_before_sampler)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    server = create_mcp_server()
+    worker = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "start_roast_session", _ctx(context)),
+        kwargs={"first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    assert setup_entered.wait(timeout=1.0)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    emergency = _call_tool(server, "emergency_stop", _ctx(context), reason="setup")
+    release_setup.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive() and len(errors) == 1
+    assert isinstance(errors[0], SessionLifecycleError)
+    assert "Stopped sessions cannot be mutated" in str(errors[0])
+    assert emergency.event.kind == "fault" and emergency.session_id == session.id
+    assert transport.writes == [build_hottop_command_packet()]
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None and phase is HottopStartPhase.WRITTEN
+    assert first_crack.started_sessions == [session.id]
+    assert first_crack.stopped_sessions == [session.id]
+    assert ambient.started_sessions == [session.id]
+    assert ambient.stopped_sessions == [session.id, session.id]
+    assert context.telemetry_sampler.active_session_id is None
+
+
+@pytest.mark.parametrize(
+    ("schedule", "retain_fails"),
+    [
+        ("start_first", False),
+        ("saved", False),
+        ("expired", False),
+        ("failed_save", False),
+        ("failed_save", True),
+    ],
+)
+def test_registered_hottop_start_failure_preserves_first_closer_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schedule: str, retain_fails: bool
+) -> None:
+    """A held registered emergency cannot be replaced by staged-Start cleanup."""
+    from coffee_roaster_mcp.first_crack_observer import load_observation_model
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data)
+
+    class Pipeline:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def start(self) -> AudioCaptureSnapshot:
+            return self.snapshot()
+
+        def stop(self, *, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
+            del timeout_seconds
+            self.stopped = True
+            return self.snapshot()
+
+        def drain_windows(self, *, max_windows: int | None = None) -> tuple[AudioWindow, ...]:
+            del max_windows
+            return ()
+
+        def discard_pending_audio(self, *, timeout_seconds: float = 1.0) -> None:
+            del timeout_seconds
+
+        def snapshot(self) -> AudioCaptureSnapshot:
+            return AudioCaptureSnapshot(
+                running=not self.stopped,
+                queued_window_count=0,
+                emitted_window_count=0,
+                dropped_window_count=0,
+                latest_error=None,
+                peak_dbfs=None,
+                rms_dbfs=None,
+            )
+
+        @property
+        def shutdown_confirmed(self) -> bool:
+            return self.stopped
+
+    entered, release_ambient, boundary_open, release_boundary = Event(), Event(), Event(), Event()
+    release_save = Event()
+    errors: list[BaseException] = []
+    emergency_results: list[object] = []
+    context = _cold_finalisation_context(tmp_path)
+    config = _manual_authority_config()
+    object.__setattr__(context, "config", config)
+    pipeline = Pipeline()
+    model = tmp_path / "model.onnx"
+    prep = tmp_path / "preprocessor.json"
+    model.write_bytes(b"model")
+    prep.write_text("{}", encoding="utf-8")
+    artifacts = ResolvedDetectorArtifacts(
+        ResolvedArtifact("synthetic", "v1", "model.onnx", model),
+        ResolvedArtifact("synthetic", "v1", "preprocessor.json", prep),
+    )
+
+    class Backend:
+        def detect(self, window: AudioWindow) -> FirstCrackDetectorOutput:
+            del window
+            return FirstCrackDetectorOutput(confirmed=False, confidence=0.0)
+
+    clock = [500.0]
+    runtime = FirstCrackSessionRuntime(
+        config=config,
+        audio_pipeline_factory=lambda _config: pipeline,
+        observation_model_loader=lambda fc: load_observation_model(
+            fc, resolver=lambda _fc: artifacts, backend_factory=lambda _fc, _artifacts: Backend()
+        ),
+        monotonic_now=lambda: clock[0],
+    )
+    _set_first_crack_runtime(context, runtime)
+    ambient = FakeAmbientRuntime()
+
+    def fail_after_admission(session: RoastSession) -> AmbientRuntimeSnapshot:
+        ambient.started_sessions.append(session.id)
+        entered.set()
+        assert release_ambient.wait(1)
+        raise RuntimeError("synthetic ambient setup failure")
+
+    monkeypatch.setattr(ambient, "start_for_session", fail_after_admission)
+    _set_ambient_runtime(context, ambient)
+    transport = Transport()
+    object.__setattr__(
+        context,
+        "roaster_driver",
+        HottopRoasterDriver(port="fake-only", serial_factory=lambda *_a, **_k: transport),
+    )
+    original_begin = runtime.begin_observation_boundary
+
+    def hold_open_boundary(session: RoastSession, *, reason: str) -> object | None:
+        if schedule == "start_first":
+            boundary_open.set()
+            assert release_boundary.wait(1)
+        ticket = original_begin(session, reason=reason)
+        if schedule != "start_first":
+            boundary_open.set()
+            assert release_boundary.wait(1)
+        return ticket
+
+    monkeypatch.setattr(runtime, "begin_observation_boundary", hold_open_boundary)
+    original_save = context.session_store.emergency_stop_snapshot
+
+    def hold_save(
+        saved_session: RoastSession,
+        *,
+        reason: str,
+        safety_payload: Mapping[str, EventPayloadValue] | None = None,
+        allow_stopped_latest: bool = False,
+    ) -> tuple[RoastEvent, RoastSession]:
+        assert release_save.wait(1)
+        if schedule == "failed_save":
+            raise OSError("synthetic fault persistence failure")
+        return original_save(
+            saved_session,
+            reason=reason,
+            safety_payload=safety_payload,
+            allow_stopped_latest=allow_stopped_latest,
+        )
+
+    monkeypatch.setattr(context.session_store, "emergency_stop_snapshot", hold_save)
+    if retain_fails:
+
+        def fail_retain_active_fault_block(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("synthetic fault-block retention failure")
+
+        monkeypatch.setattr(
+            context.session_store,
+            "retain_active_fault_block",
+            fail_retain_active_fault_block,
+        )
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    server = create_mcp_server()
+    start = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "start_roast_session", _ctx(context)),
+        kwargs={"first_crack_observer_ack": "manual/v1"},
+    )
+    start.start()
+    assert entered.wait(1)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    emergency = Thread(
+        target=_record_tool_result,
+        args=(emergency_results, errors, server, "emergency_stop", _ctx(context)),
+        kwargs={"reason": "race"},
+    )
+    emergency.start()
+    assert boundary_open.wait(1)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - deadline witness
+    original_deadline = observer.deadline if observer is not None else None
+    if schedule != "start_first":
+        assert observer is not None and original_deadline is not None
+    release_ambient.set()
+    if schedule == "start_first":
+        start.join(timeout=1)
+        assert not start.is_alive()
+    else:
+        # Start cleanup has completed while the emergency save remains held.
+        start.join(timeout=1)
+        assert not start.is_alive()
+        assert observer is not None
+        assert observer.summary is None
+        assert observer.reason == "emergency_stop"
+        assert observer.deadline == original_deadline
+        assert observer.cutoff is None
+    if schedule == "expired":
+        assert observer is not None and original_deadline is not None
+        clock[0] = original_deadline
+        observer.check_deadline()
+        assert observer.summary is not None
+        assert observer.summary.reason.value == "emergency_stop"
+        assert observer.summary.drop_cutoff.value is None
+        assert observer.deadline == original_deadline
+    release_boundary.set()
+    release_save.set()
+    start.join(timeout=1)
+    emergency.join(timeout=1)
+    assert not start.is_alive() and not emergency.is_alive()
+    assert isinstance(errors[0], RuntimeError)
+    if schedule == "failed_save":
+        assert not emergency_results and len(errors) == 2
+        if retain_fails:
+            assert isinstance(errors[1], RuntimeError)
+            assert str(errors[1]) == "synthetic fault-block retention failure"
+        else:
+            assert isinstance(errors[1], SessionLifecycleError)
+            assert "fault recording failed" in str(errors[1])
+    else:
+        assert len(errors) == 1 and len(emergency_results) == 1
+    assert observer is not None and observer.reaped.wait(1) and pipeline.stopped
+    summary = runtime.observation_for_session(session.id)
+    assert summary is not None and summary.frozen_summary.value is not None
+    frozen = summary.frozen_summary.value
+    if schedule == "start_first":
+        assert frozen.reason.value == "staged_start_failed"
+        assert frozen.drop_cutoff.value is None
+    else:
+        assert frozen.reason.value == "emergency_stop"
+    if schedule == "expired":
+        assert frozen.drop_cutoff.value is None
+        assert frozen.drop_cutoff.null_reason == "not_yet_observed"
+    elif schedule == "saved":
+        reply = cast(Any, emergency_results[0])
+        assert frozen.drop_cutoff.value is not None
+        assert (
+            frozen.drop_cutoff.value.session_relative_seconds.value == reply.event.monotonic_seconds
+        )
+    assert session.log_writer is not None
+    log_path = session.log_writer.log_dir / "roast.jsonl"
+    if schedule == "failed_save":
+        assert not log_path.exists()
+        assert [event.kind for event in session.event_timeline].count("fault") == 0
+    else:
+        rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+        fault_rows = [row for row in rows if row.get("kind") == "fault"]
+        assert len(fault_rows) == 1
+        assert [event.kind for event in session.event_timeline].count("fault") == 1
+        if schedule == "saved":
+            reply = cast(Any, emergency_results[0])
+            assert fault_rows[0]["monotonic_seconds"] == reply.event.monotonic_seconds
+    assert transport.writes == [build_hottop_command_packet()]
+
+
+def test_registered_hottop_start_sampler_tick_and_unknown_cold_refusals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The composed sampler and cold refusals retain the exact staged owner."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self, receipt: object) -> None:
+            super().__init__()
+            self.receipt = receipt
+            self.writes: list[bytes] = []
+            self.close_count = 0
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return cast(int, self.receipt)
+
+        def close(self) -> None:
+            self.close_count += 1
+            super().close()
+
+    def configured_context(receipt: object) -> tuple[ServerContext, HottopRoasterDriver, Transport]:
+        context_dir = tmp_path / str(id(receipt))
+        context_dir.mkdir()
+        context = _cold_finalisation_context(context_dir)
+        object.__setattr__(context, "config", _manual_authority_config())
+        transport = Transport(receipt)
+        driver = HottopRoasterDriver(
+            port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+        )
+        object.__setattr__(context, "roaster_driver", driver)
+        return context, driver, transport
+
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    success, _, successful_transport = configured_context(len(build_hottop_command_packet()))
+    started = _call_tool(
+        create_mcp_server(),
+        "start_roast_session",
+        _ctx(success),
+        first_crack_observer_ack="manual/v1",
+    )
+    assert _sample_active_session_telemetry(success, session_id=started.session.session_id)
+    assert success.session_store.get_session_snapshot(session_id=started.session.session_id).active
+    assert successful_transport.writes == [build_hottop_command_packet()]
+    success.telemetry_sampler.stop_for_session(started.session.session_id, reason="test_cleanup")
+
+    uncertain, driver, transport = configured_context(True)
+    server = create_mcp_server()
+    with pytest.raises(SessionLifecycleError, match="unknown receipt"):
+        _call_tool(
+            server,
+            "start_roast_session",
+            _ctx(uncertain),
+            purpose="cold_characterisation",
+            first_crack_observer_ack="manual/v1",
+        )
+    session = uncertain.session_store.get_active_session()
+    assert session is not None
+    uncertain.telemetry_sampler.start_for_session(session.id)
+    first = _finalise_cold_characterisation_session(uncertain, session.id)
+    second = _finalise_cold_characterisation_session(uncertain, session.id)
+    assert (first.rejection_reason, second.rejection_reason) == (
+        "driver_not_connected",
+        "driver_not_connected",
+    )
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None and phase is HottopStartPhase.UNRESOLVED
+    assert len(transport.writes) == 1 and transport.close_count == 0
+
+    def fail_read() -> RoasterState:
+        raise RuntimeError("synthetic read failure")
+
+    monkeypatch.setattr(driver, "read_state", fail_read)
+    assert not _sample_active_session_telemetry(uncertain, session_id=session.id)
+    next_refusal = _finalise_cold_characterisation_session(uncertain, session.id)
+    assert next_refusal.rejection_reason == "session_not_active"
+    assert len(transport.writes) == 1 and transport.close_count == 0
+    uncertain.telemetry_sampler.stop_for_session(session.id, reason="test_cleanup")
+
+
+def test_registered_hottop_start_failure_does_not_stop_cold_refusal_sampler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-sampler Start failure cannot clean up a finalisation restart."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.write_entered = Event()
+            self.release_write = Event()
+
+        def write(self, data: bytes) -> int:
+            self.write_entered.set()
+            assert self.release_write.wait(timeout=4.0)
+            return len(data)
+
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    transport = Transport()
+    object.__setattr__(
+        context,
+        "roaster_driver",
+        HottopRoasterDriver(port="fake-only", serial_factory=lambda *_args, **_kwargs: transport),
+    )
+    errors: list[BaseException] = []
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+
+    def fail_first_crack_runtime(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("synthetic setup failure")
+
+    monkeypatch.setattr(mcp_server, "_start_first_crack_runtime", fail_first_crack_runtime)
+    worker = Thread(
+        target=_record_tool_error,
+        args=(errors, create_mcp_server(), "start_roast_session", _ctx(context)),
+        kwargs={"purpose": "cold_characterisation", "first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    try:
+        assert transport.write_entered.wait(timeout=4.0)
+        session = context.session_store.get_active_session()
+        assert session is not None
+        refusal = _finalise_cold_characterisation_session(context, session.id)
+        assert refusal.rejection_reason == "driver_not_connected"
+        assert context.telemetry_sampler.active_session_id == session.id
+        sampler_thread = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+        sampler_stop_event = context.telemetry_sampler._stop_event  # pyright: ignore[reportPrivateUsage]
+        assert sampler_thread is not None and sampler_thread.is_alive()
+        assert not sampler_stop_event.is_set()
+    finally:
+        transport.release_write.set()
+        worker.join(timeout=4.0)
+    assert not worker.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    assert context.telemetry_sampler.active_session_id == session.id
+    assert context.telemetry_sampler._thread is sampler_thread  # pyright: ignore[reportPrivateUsage]
+    assert sampler_thread.is_alive()
+    assert context.telemetry_sampler._stop_event is sampler_stop_event  # pyright: ignore[reportPrivateUsage]
+    assert not sampler_stop_event.is_set()
+    context.telemetry_sampler.shutdown()
+
+
+def test_registered_hottop_start_partial_sampler_failure_keeps_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Start compensation can stop only its published sampler generation."""
+
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    object.__setattr__(
+        context,
+        "roaster_driver",
+        HottopRoasterDriver(
+            port="fake-only",
+            serial_factory=lambda *_args, **_kwargs: _ObservationFakeSerialTransport(),
+        ),
+    )
+    entered = Event()
+    release_setup = Event()
+    errors: list[BaseException] = []
+    original_start = context.telemetry_sampler._start_for_session  # pyright: ignore[reportPrivateUsage]
+
+    def start_then_fail(
+        session_id: str,
+        *,
+        receipt: mcp_server._TelemetrySamplerStartReceipt | None,  # pyright: ignore[reportPrivateUsage]
+    ) -> None:
+        original_start(session_id, receipt=receipt)
+        if receipt is None:
+            return
+        entered.set()
+        assert release_setup.wait(timeout=4.0)
+        raise RuntimeError("synthetic partial sampler setup")
+
+    monkeypatch.setattr(context.telemetry_sampler, "_start_for_session", start_then_fail)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    worker = Thread(
+        target=_record_tool_error,
+        args=(errors, create_mcp_server(), "start_roast_session", _ctx(context)),
+        kwargs={"purpose": "cold_characterisation", "first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    try:
+        assert entered.wait(timeout=4.0)
+        session_id = context.telemetry_sampler.active_session_id
+        assert session_id is not None
+        first_thread = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+        refusal = _finalise_cold_characterisation_session(context, session_id)
+        replacement = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+        assert refusal.rejection_reason == "driver_not_connected"
+        assert replacement is not None and replacement is not first_thread
+        assert context.telemetry_sampler.active_session_id == session_id
+    finally:
+        release_setup.set()
+        worker.join(timeout=4.0)
+    assert not worker.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    assert context.telemetry_sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
+    assert context.telemetry_sampler.active_session_id == session_id
+    context.telemetry_sampler.shutdown()
+
+
+@pytest.mark.parametrize("outcome", ["false", "error"])
+def test_telemetry_sampler_stale_worker_cannot_affect_replacement(outcome: str) -> None:
+    """A displaced worker cannot clear or fault a same-id replacement."""
+    entered = Event()
+    release_first = Event()
+    replacement_started = Event()
+    callback_failures: list[str] = []
+    first_callback = True
+
+    def sample(_session_id: str) -> bool:
+        nonlocal first_callback
+        if first_callback:
+            first_callback = False
+            entered.set()
+            if not release_first.wait(timeout=10.0):
+                callback_failures.append("superseded callback release timed out")
+                raise TimeoutError("superseded callback release timed out")
+            if outcome == "error":
+                raise RuntimeError("stale worker failure")
+            return False
+        replacement_started.set()
+        return True
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=sample)
+    sampler.start_for_session("same-session")
+    assert entered.wait(timeout=1.0)
+    superseded = sampler._thread  # pyright: ignore[reportPrivateUsage]
+    assert superseded is not None
+    superseded_stop_event = sampler._stop_event  # pyright: ignore[reportPrivateUsage]
+    replacement_receipt = mcp_server._TelemetrySamplerStartReceipt()  # pyright: ignore[reportPrivateUsage]
+
+    def start_replacement() -> None:
+        sampler._start_for_session("same-session", receipt=replacement_receipt)  # pyright: ignore[reportPrivateUsage]
+
+    replacement_worker = Thread(target=start_replacement)
+    replacement_worker.start()
+    try:
+        assert superseded_stop_event.wait(timeout=5.0)
+        assert replacement_started.wait(timeout=5.0)
+        replacement_worker.join(timeout=5.0)
+        assert not replacement_worker.is_alive()
+        replacement = replacement_receipt.thread
+        replacement_stop_event = replacement_receipt.stop_event
+        assert replacement is not None and replacement is not superseded
+        assert replacement.is_alive()
+        assert replacement_stop_event is not None and not replacement_stop_event.is_set()
+        assert sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
+        assert sampler.active_session_id == "same-session"
+        assert sampler.last_error is None
+
+        release_first.set()
+        superseded.join(timeout=5.0)
+        assert not superseded.is_alive()
+        assert not callback_failures
+        assert replacement.is_alive()
+        assert not replacement_stop_event.is_set()
+        assert sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
+        assert sampler.active_session_id == "same-session"
+        assert sampler.last_error is None
+    finally:
+        release_first.set()
+        replacement_worker.join(timeout=5.0)
+        sampler.shutdown()
+
+
+def test_telemetry_sampler_active_callback_error_is_reported() -> None:
+    """An active sampler callback still records its error before stopping."""
+    entered = Event()
+    release = Event()
+
+    def failing_callback(_session_id: str) -> bool:
+        entered.set()
+        assert release.wait(timeout=4.0)
+        raise RuntimeError("active sampler failure")
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=failing_callback)
+    sampler.start_for_session("active")
+    worker = sampler._thread  # pyright: ignore[reportPrivateUsage]
+    assert worker is not None
+    try:
+        assert entered.wait(timeout=1.0)
+        release.set()
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+        assert sampler.last_error == "RuntimeError: active sampler failure"
+        assert sampler.active_session_id is None
+    finally:
+        release.set()
+        sampler.shutdown()
+
+
+def test_telemetry_sampler_stopped_callback_error_is_not_reported() -> None:
+    """A deliberately stopped held callback cannot update finalisation error evidence."""
+    entered = Event()
+    release = Event()
+    stop_finished = Event()
+
+    def failing_callback(_session_id: str) -> bool:
+        entered.set()
+        assert release.wait(timeout=4.0)
+        raise RuntimeError("stopped sampler failure")
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=failing_callback)
+    receipt = mcp_server._TelemetrySamplerStartReceipt()  # pyright: ignore[reportPrivateUsage]
+    sampler._start_for_session("stopped", receipt=receipt)  # pyright: ignore[reportPrivateUsage]
+    worker = receipt.thread
+    assert worker is not None
+
+    def stop_generation() -> None:
+        sampler.stop_started_generation(receipt, reason="synthetic stop")
+        stop_finished.set()
+
+    stopper = Thread(target=stop_generation)
+    try:
+        assert entered.wait(timeout=1.0)
+        stopper.start()
+        assert receipt.stop_event is not None and receipt.stop_event.wait(timeout=1.0)
+        assert sampler.active_session_id is None
+        release.set()
+        stopper.join(timeout=2.0)
+        worker.join(timeout=2.0)
+        assert stop_finished.is_set()
+        assert not worker.is_alive()
+        assert sampler.last_error is None
+    finally:
+        release.set()
+        stopper.join(timeout=2.0)
+        sampler.shutdown()
+
+
+def test_registered_hottop_start_pre_entry_sampler_failure_compensates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-entry sampler start failure is compensated by the staged Start lifecycle."""
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    object.__setattr__(
+        context,
+        "roaster_driver",
+        HottopRoasterDriver(
+            port="fake-only",
+            serial_factory=lambda *_args, **_kwargs: _ObservationFakeSerialTransport(),
+        ),
+    )
+    original_start = Thread.start
+
+    def fail_sampler_start(worker: Thread) -> None:
+        if worker.name.startswith("roast-telemetry-sampler-"):
+            raise RuntimeError("synthetic thread start failure")
+        original_start(worker)
+
+    monkeypatch.setattr(Thread, "start", fail_sampler_start)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    with pytest.raises(RuntimeError, match="synthetic thread start failure"):
+        _call_tool(
+            create_mcp_server(),
+            "start_roast_session",
+            _ctx(context),
+            purpose="cold_characterisation",
+            first_crack_observer_ack="manual/v1",
+        )
+    assert context.session_store.get_active_session() is not None
+    assert context.telemetry_sampler.active_session_id is None
+    assert context.telemetry_sampler._thread is None  # pyright: ignore[reportPrivateUsage]
+    assert context.telemetry_sampler._thread_session_id is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_telemetry_sampler_public_start_interrupt_after_worker_entry_retains_finalisation_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-entry public start failure withdraws supervision but retains the worker."""
+    entered = Event()
+    release = Event()
+
+    def held_callback(_session_id: str) -> bool:
+        entered.set()
+        assert release.wait(timeout=1.0)
+        return True
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=held_callback)
+    original_start = Thread.start
+
+    def start_then_raise(worker: Thread) -> None:
+        original_start(worker)
+        assert entered.wait(timeout=1.0)
+        raise RuntimeError("synthetic post-entry start failure")
+
+    monkeypatch.setattr(Thread, "start", start_then_raise)
+    try:
+        with pytest.raises(RuntimeError, match="synthetic post-entry start failure"):
+            sampler.start_for_session("interrupted")
+        worker = sampler._thread  # pyright: ignore[reportPrivateUsage]
+        assert worker is not None and worker.is_alive()
+        assert sampler.active_session_id is None
+
+        release.set()
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert sampler.active_session_id is None
+
+        finalisation = sampler.stop_and_join_for_finalisation("interrupted")
+        assert finalisation.owned_by_session_before_stop
+        assert not finalisation.thread_alive_after_join
+    finally:
+        release.set()
+        sampler.shutdown()
+
+
+def test_registered_hottop_start_post_entry_sampler_interrupt_retains_finalisation_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-entry interrupt retains the stopped sampler for finalisation."""
+    entered = Event()
+    release = Event()
+    errors: list[BaseException] = []
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    object.__setattr__(
+        context,
+        "roaster_driver",
+        HottopRoasterDriver(
+            port="fake-only",
+            serial_factory=lambda *_args, **_kwargs: _ObservationFakeSerialTransport(),
+        ),
+    )
+
+    def held_callback(_session_id: str) -> bool:
+        entered.set()
+        assert release.wait(timeout=4.0)
+        return True
+
+    monkeypatch.setattr(context.telemetry_sampler, "_interval_seconds", 0.01)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(context.telemetry_sampler, "_sample_callback", held_callback)  # pyright: ignore[reportPrivateUsage]
+    original_start = Thread.start
+
+    def start_then_interrupt(worker: Thread) -> None:
+        if worker.name.startswith("roast-telemetry-sampler-"):
+            original_start(worker)
+            assert entered.wait(timeout=4.0)
+            raise KeyboardInterrupt("synthetic post-entry interrupt")
+        original_start(worker)
+
+    monkeypatch.setattr(Thread, "start", start_then_interrupt)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    worker = Thread(
+        target=_record_tool_error,
+        args=(errors, create_mcp_server(), "start_roast_session", _ctx(context)),
+        kwargs={"purpose": "cold_characterisation", "first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    try:
+        assert entered.wait(timeout=4.0)
+        sampler_thread = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+        assert sampler_thread is not None
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], KeyboardInterrupt)
+        assert context.telemetry_sampler.active_session_id is None
+        assert context.telemetry_sampler._thread is sampler_thread  # pyright: ignore[reportPrivateUsage]
+        assert sampler_thread.is_alive()
+    finally:
+        release.set()
+        worker.join(timeout=2.0)
+
+    sampler_thread.join(timeout=2.0)
+    assert not sampler_thread.is_alive()
+    session = context.session_store.get_active_session()
+    assert session is not None
+    finalisation = context.telemetry_sampler.stop_and_join_for_finalisation(session.id)
+    assert finalisation.owned_by_session_before_stop
+    assert not finalisation.thread_alive_after_join
+
+
+def test_telemetry_sampler_stopping_generation_clears_active_before_held_callback_exits() -> None:
+    """A stopping generation remains finalisable without advertising supervision."""
+    entered = Event()
+    released = Event()
+
+    def held_callback(_session_id: str) -> bool:
+        entered.set()
+        assert released.wait(timeout=4.0)
+        return True
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=held_callback)
+    receipt = mcp_server._TelemetrySamplerStartReceipt()  # pyright: ignore[reportPrivateUsage]
+    sampler._start_for_session("synthetic", receipt=receipt)  # pyright: ignore[reportPrivateUsage]
+    thread = receipt.thread
+    assert thread is not None
+    try:
+        assert entered.wait(timeout=1.0)
+        sampler.stop_started_generation(receipt, reason="synthetic setup failure")
+        assert sampler.active_session_id is None
+        assert sampler._thread is thread  # pyright: ignore[reportPrivateUsage]
+        assert thread.is_alive()
+    finally:
+        released.set()
+        thread.join(timeout=2.0)
+
+    assert sampler.active_session_id is None
+    assert not thread.is_alive()
+    finalisation = sampler.stop_and_join_for_finalisation("synthetic")
+    assert finalisation.owned_by_session_before_stop
+    assert not finalisation.thread_alive_after_join
+
+
+def test_telemetry_sampler_stopping_generation_keeps_replacement_active() -> None:
+    """Stopping a retained generation cannot clear a replacement's supervision."""
+    first_entered = Event()
+    release_first = Event()
+    replacement_started = Event()
+
+    def sample(session_id: str) -> bool:
+        if session_id == "first":
+            first_entered.set()
+            assert release_first.wait(timeout=4.0)
+        else:
+            replacement_started.set()
+        return True
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=sample)
+    receipt = mcp_server._TelemetrySamplerStartReceipt()  # pyright: ignore[reportPrivateUsage]
+    sampler._start_for_session("first", receipt=receipt)  # pyright: ignore[reportPrivateUsage]
+    first_thread = receipt.thread
+    assert first_thread is not None
+    try:
+        assert first_entered.wait(timeout=1.0)
+        sampler.stop_started_generation(receipt, reason="synthetic setup failure")
+        assert sampler.active_session_id is None
+        assert sampler._thread is first_thread  # pyright: ignore[reportPrivateUsage]
+        assert first_thread.is_alive()
+
+        sampler.start_for_session("replacement")
+        assert replacement_started.wait(timeout=1.0)
+        replacement = sampler._thread  # pyright: ignore[reportPrivateUsage]
+        assert replacement is not None and replacement is not first_thread
+
+        release_first.set()
+        first_thread.join(timeout=2.0)
+        assert not first_thread.is_alive()
+        assert sampler.active_session_id == "replacement"
+        assert sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
+    finally:
+        release_first.set()
+        sampler.shutdown()

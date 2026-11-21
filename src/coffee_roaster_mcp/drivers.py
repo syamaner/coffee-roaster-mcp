@@ -1025,6 +1025,11 @@ class HottopStartPhase(Enum):
     RESERVED = "reserved"
     OPENING = "opening"
     OPEN_INHIBITED = "open_inhibited"
+    PROMOTING = "promoting"
+    PROMOTED = "promoted"
+    CLAIMED = "claimed"
+    ENTERING = "entering"
+    WRITTEN = "written"
     CLOSING = "closing"
     UNRESOLVED = "unresolved"
 
@@ -1037,12 +1042,31 @@ class HottopStartSettlement(Enum):
     UNRESOLVED = "unresolved"
 
 
+class HottopFirstWriteDisposition(Enum):
+    """Private evidence retained for the staged first native write."""
+
+    NOT_CLAIMED = "not_claimed"
+    WRITTEN = "written"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, eq=False)
 class HottopStartOwner:
     """Driver-minted identity bound to one server reservation and generation."""
 
     server_token: str
     generation: int
+
+
+@dataclass(frozen=True)
+class _HottopFirstWriteClaim:
+    """Immutable, exact-owner packet prepared for one staged native write."""
+
+    owner: HottopStartOwner
+    session: object
+    handle: SerialTransport
+    revision: int
+    frame: bytes
 
 
 class HottopRoasterDriver:
@@ -1097,6 +1121,9 @@ class HottopRoasterDriver:
         self._start_phase: HottopStartPhase | None = None
         self._start_handle: SerialTransport | None = None
         self._start_generation = 0
+        self._start_session: object | None = None
+        self._start_claim: _HottopFirstWriteClaim | None = None
+        self._start_write_disposition = HottopFirstWriteDisposition.NOT_CLAIMED
         self._stop_event = Event()
         self._disconnect_requested = Event()
         self._command_thread: Thread | None = None
@@ -1118,6 +1145,7 @@ class HottopRoasterDriver:
         self._solenoid_open = False
         self._drum_motor_on = False
         self._cooling_motor_on = False
+        self._command_state_revision = 0
         self._latest_bean_temp_c: float | None = None
         self._latest_env_temp_c: float | None = None
         self._latest_raw_bean_temperature: int | None = None
@@ -1215,6 +1243,8 @@ class HottopRoasterDriver:
                 if self._start_phase is HottopStartPhase.RESERVED:
                     self._start_owner = None
                     self._start_phase = None
+                    self._start_session = None
+                    self._start_claim = None
                     return HottopStartSettlement.NOT_ENTERED
                 if self._start_phase is not HottopStartPhase.OPEN_INHIBITED:
                     return HottopStartSettlement.UNRESOLVED
@@ -1237,9 +1267,143 @@ class HottopRoasterDriver:
                     self._start_owner = None
                     self._start_phase = None
                     self._start_handle = None
+                    self._start_session = None
+                    self._start_claim = None
                     return HottopStartSettlement.CLEAN_CLOSED
                 self._start_phase = HottopStartPhase.UNRESOLVED
                 return HottopStartSettlement.UNRESOLVED
+
+    def begin_inhibited_start_promotion(self, owner: HottopStartOwner) -> None:
+        """Move one exact open owner into private publication preparation."""
+        with self._state_lock:
+            if (
+                self._start_owner is not owner
+                or self._start_phase is not HottopStartPhase.OPEN_INHIBITED
+                or self._start_handle is None
+            ):
+                raise RuntimeError("Staged Hottop owner is not open and inhibited.")
+            self._start_phase = HottopStartPhase.PROMOTING
+
+    def restore_inhibited_start_after_unpublished_promotion(self, owner: HottopStartOwner) -> bool:
+        """Restore only an exact unpublished promotion so S3a disposal can run."""
+        with self._state_lock:
+            if (
+                self._start_owner is not owner
+                or self._start_phase is not HottopStartPhase.PROMOTING
+                or self._start_session is not None
+            ):
+                return False
+            self._start_phase = HottopStartPhase.OPEN_INHIBITED
+            return True
+
+    def bind_promoted_inhibited_start(self, owner: HottopStartOwner, session: object) -> None:
+        """Bind an already-published exact session to its staged driver owner."""
+        with self._state_lock:
+            if (
+                self._start_owner is not owner
+                or self._start_phase is not HottopStartPhase.PROMOTING
+                or self._start_handle is None
+            ):
+                raise RuntimeError("Staged Hottop owner cannot bind the published session.")
+            self._start_session = session
+            self._start_phase = HottopStartPhase.PROMOTED
+
+    def prepare_promoted_first_write(
+        self, owner: HottopStartOwner, session: object
+    ) -> _HottopFirstWriteClaim:
+        """Capture one immutable first-write frame without granting entry."""
+        with self._state_lock:
+            if (
+                self._start_owner is not owner
+                or self._start_session is not session
+                or self._start_phase is not HottopStartPhase.PROMOTED
+                or self._start_handle is None
+            ):
+                raise RuntimeError("Staged Hottop owner cannot claim a first write.")
+            revision = self._command_state_revision
+            values = (
+                self._heat_level_percent,
+                self._roast_fan_level_percent,
+                self._main_fan_level_percent,
+                self._solenoid_open,
+                self._drum_motor_on,
+                self._cooling_motor_on,
+            )
+            handle = self._start_handle
+        frame = build_hottop_command_packet(
+            heat_level_percent=values[0],
+            fan_level_percent=values[1],
+            main_fan_level_percent=values[2],
+            solenoid_open=values[3],
+            drum_motor_on=values[4],
+            cooling_motor_on=values[5],
+        )
+        return _HottopFirstWriteClaim(owner, session, handle, revision, frame)
+
+    def claim_prepared_first_write(
+        self, prepared: _HottopFirstWriteClaim
+    ) -> _HottopFirstWriteClaim:
+        """Publish a prepared exact-owner possible-entry claim once."""
+        with self._state_lock:
+            if (
+                self._start_owner is not prepared.owner
+                or self._start_session is not prepared.session
+                or self._start_phase is not HottopStartPhase.PROMOTED
+                or self._start_handle is not prepared.handle
+                or self._command_state_revision != prepared.revision
+            ):
+                raise RuntimeError("Staged Hottop command state changed before first-write entry.")
+            self._start_claim = prepared
+            self._start_write_disposition = HottopFirstWriteDisposition.NOT_CLAIMED
+            self._start_phase = HottopStartPhase.CLAIMED
+            return prepared
+
+    def dispatch_claimed_first_write(
+        self, claim: _HottopFirstWriteClaim
+    ) -> HottopFirstWriteDisposition:
+        """Invoke exactly one claimed native write and retain its strict receipt evidence."""
+        with self._state_lock:
+            if (
+                self._start_owner is not claim.owner
+                or self._start_session is not claim.session
+                or self._start_claim is not claim
+                or self._start_phase is not HottopStartPhase.CLAIMED
+                or self._start_handle is not claim.handle
+            ):
+                raise RuntimeError("Staged Hottop first-write claim is no longer current.")
+            # CLAIMED proves a frame may be considered for entry; ENTERING consumes
+            # that right before releasing this lock for an unbounded native write.
+            self._start_phase = HottopStartPhase.ENTERING
+        try:
+            receipt = claim.handle.write(claim.frame)
+        except BaseException:
+            with self._state_lock:
+                if self._start_claim is claim and self._start_phase is HottopStartPhase.ENTERING:
+                    self._start_write_disposition = HottopFirstWriteDisposition.UNKNOWN
+                    self._start_phase = HottopStartPhase.UNRESOLVED
+            raise
+        with self._state_lock:
+            if self._start_claim is not claim or self._start_phase is not HottopStartPhase.ENTERING:
+                raise RuntimeError("Staged Hottop first-write entry is no longer current.")
+            if type(receipt) is int and receipt == len(claim.frame):
+                self._start_write_disposition = HottopFirstWriteDisposition.WRITTEN
+                self._start_phase = HottopStartPhase.WRITTEN
+                return HottopFirstWriteDisposition.WRITTEN
+            self._start_write_disposition = HottopFirstWriteDisposition.UNKNOWN
+            self._start_phase = HottopStartPhase.UNRESOLVED
+            return HottopFirstWriteDisposition.UNKNOWN
+
+    def asserted_written_start(self, owner: HottopStartOwner, session: object) -> bool:
+        """Return whether the exact owner retains one complete first-write receipt."""
+        with self._state_lock:
+            return bool(
+                self._start_owner is owner
+                and self._start_session is session
+                and self._start_phase is HottopStartPhase.WRITTEN
+                and self._start_write_disposition is HottopFirstWriteDisposition.WRITTEN
+                and self._start_claim is not None
+                and self._command_state_revision == self._start_claim.revision
+            )
 
     def _refuse_staged_connect(self) -> None:
         """Refuse unrelated legacy reuse before waiting on native lifecycle work."""
@@ -1420,6 +1584,7 @@ class HottopRoasterDriver:
         )
         with self._state_lock:
             self._heat_level_percent = heat_level
+            self._command_state_revision += 1
             if heat_level > 0:
                 self._drum_motor_on = True
         return self.read_state()
@@ -1428,6 +1593,7 @@ class HottopRoasterDriver:
         """Set only Hottop commanded heat to zero and return command evidence."""
         with self._state_lock:
             self._heat_level_percent = 0
+            self._command_state_revision += 1
             return FixedZeroCommandedState(
                 driver=self.name,
                 capability_version=1,
@@ -1447,6 +1613,7 @@ class HottopRoasterDriver:
         )
         with self._state_lock:
             self._main_fan_level_percent = fan_level
+            self._command_state_revision += 1
         return self.read_state()
 
     def drop_beans(self) -> RoasterState:
@@ -1461,6 +1628,7 @@ class HottopRoasterDriver:
             self._solenoid_open = True
             self._cooling_motor_on = True
             self._main_fan_level_percent = 100
+            self._command_state_revision += 1
         return self.read_state()
 
     def start_cooling(self) -> RoasterState:
@@ -1468,6 +1636,7 @@ class HottopRoasterDriver:
         with self._state_lock:
             self._cooling_motor_on = True
             self._main_fan_level_percent = 100
+            self._command_state_revision += 1
         return self.read_state()
 
     def stop_cooling(self) -> RoasterState:
@@ -1481,6 +1650,7 @@ class HottopRoasterDriver:
             # drum would spin indefinitely after cooling ends.
             self._drum_motor_on = False
             self._main_fan_level_percent = 0
+            self._command_state_revision += 1
         return self.read_state()
 
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
@@ -1492,6 +1662,7 @@ class HottopRoasterDriver:
             self._solenoid_open = False
             self._cooling_motor_on = True
             self._main_fan_level_percent = 100
+            self._command_state_revision += 1
             heat_level_percent = self._heat_level_percent
             fan_level_percent = self._main_fan_level_percent
             cooling_on = self._cooling_motor_on

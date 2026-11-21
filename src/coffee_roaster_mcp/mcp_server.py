@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
 from types import TracebackType
-from typing import Annotated, Any, Literal, Never, cast
+from typing import Annotated, Any, Literal, cast
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
@@ -58,6 +58,7 @@ from coffee_roaster_mcp.drivers import (
     ExactDropArbitration,
     ExactDropCancelled,
     FixedZeroCommandedState,
+    HottopFirstWriteDisposition,
     HottopRoasterDriver,
     HottopStartSettlement,
     LifecycleEvidenceDriver,
@@ -91,7 +92,7 @@ from coffee_roaster_mcp.session import (
     SessionLifecycleError,
     SessionPresence,
     SessionPurpose,
-    SessionStartReservation,
+    StagedSessionStartPublication,
     _is_valid_mock_drop_projection,  # pyright: ignore[reportPrivateUsage]
     compute_roast_metrics,
     default_emergency_safety_payload,
@@ -1192,6 +1193,14 @@ class ServerContext:
 TelemetrySampleCallback = Callable[[str], bool]
 
 
+@dataclass
+class _TelemetrySamplerStartReceipt:
+    """Identify one sampler generation started by a caller."""
+
+    stop_event: Event | None = None
+    thread: Thread | None = None
+
+
 class _TelemetrySampler:
     """Poll driver telemetry for the currently owning roast session."""
 
@@ -1212,23 +1221,65 @@ class _TelemetrySampler:
 
     def start_for_session(self, session_id: str) -> None:
         """Start autonomous sampling for one session id."""
+        self._start_for_session(session_id, receipt=None)
+
+    def _start_for_session(
+        self, session_id: str, *, receipt: _TelemetrySamplerStartReceipt | None
+    ) -> None:
+        """Start sampling and bind an optional caller-local generation receipt."""
+        generation = receipt if receipt is not None else _TelemetrySamplerStartReceipt()
         thread: Thread | None
         with self._lock:
             thread = self._stop_locked()
         self._join_thread(thread)
 
         with self._lock:
-            self._stop_event = Event()
+            stop_event = Event()
             self._active_session_id = session_id
             self._thread_session_id = session_id
             self._last_error = None
-            self._thread = Thread(
+            worker = Thread(
                 target=self._run,
-                args=(session_id, self._stop_event),
+                args=(session_id, stop_event, generation),
                 name=f"roast-telemetry-sampler-{session_id}",
                 daemon=True,
             )
-            self._thread.start()
+            self._stop_event = stop_event
+            self._thread = worker
+            generation.stop_event = stop_event
+            generation.thread = worker
+            try:
+                worker.start()
+            except BaseException:
+                if self._owns_active_generation(session_id, stop_event, generation):
+                    self._active_session_id = None
+                    if not worker.is_alive():
+                        self._thread = None
+                        self._thread_session_id = None
+                stop_event.set()
+                raise
+
+    def stop_started_generation(
+        self, receipt: _TelemetrySamplerStartReceipt, *, reason: str
+    ) -> None:
+        """Stop only the sampler generation captured by one Start attempt."""
+        _ = reason
+        stop_event = receipt.stop_event
+        thread = receipt.thread
+        if stop_event is None or thread is None:
+            return
+        with self._lock:
+            if self._thread is thread and self._stop_event is stop_event:
+                self._active_session_id = None
+        stop_event.set()
+        self._join_thread(thread)
+        if thread.is_alive():
+            return
+        with self._lock:
+            if self._thread is thread and self._stop_event is stop_event:
+                self._active_session_id = None
+                self._thread = None
+                self._thread_session_id = None
 
     def stop_for_session(self, session_id: str, *, reason: str) -> None:
         """Stop sampling if the supplied session currently owns the sampler."""
@@ -1279,23 +1330,52 @@ class _TelemetrySampler:
         with self._lock:
             return self._last_error
 
-    def _run(self, session_id: str, stop_event: Event) -> None:
+    def _run(
+        self,
+        session_id: str,
+        stop_event: Event,
+        receipt: _TelemetrySamplerStartReceipt,
+    ) -> None:
         while not stop_event.wait(self._interval_seconds):
             try:
                 keep_sampling = self._sample_callback(session_id)
             except Exception as exc:  # noqa: BLE001 - background worker must not escape.
                 with self._lock:
-                    if self._active_session_id == session_id:
+                    if self._owns_active_generation(session_id, stop_event, receipt):
                         self._last_error = f"{type(exc).__name__}: {exc}"
                 keep_sampling = False
             if not keep_sampling:
                 with self._lock:
-                    if self._active_session_id == session_id:
+                    if self._owns_generation(session_id, stop_event, receipt):
                         self._active_session_id = None
-                    if self._thread_session_id == session_id:
                         self._thread = None
                         self._thread_session_id = None
                 return
+
+    def _owns_generation(
+        self,
+        session_id: str | None,
+        stop_event: Event,
+        receipt: _TelemetrySamplerStartReceipt,
+    ) -> bool:
+        """Return whether the calling worker still owns its exact handle."""
+        return (
+            session_id is not None
+            and self._thread_session_id == session_id
+            and self._stop_event is stop_event
+            and self._thread is receipt.thread
+        )
+
+    def _owns_active_generation(
+        self,
+        session_id: str | None,
+        stop_event: Event,
+        receipt: _TelemetrySamplerStartReceipt,
+    ) -> bool:
+        """Return whether the calling worker still owns active supervision."""
+        return self._active_session_id == session_id and self._owns_generation(
+            session_id, stop_event, receipt
+        )
 
     def _stop_locked(self) -> Thread | None:
         thread = self._thread
@@ -2134,10 +2214,108 @@ def create_mcp_server(
         )
         with server_context.lifecycle_barrier:
             reservation = server_context.session_store.reserve_session_start()
-        if manual and isinstance(server_context.roaster_driver, HottopRoasterDriver):
-            _abort_future_manual_hottop_start(server_context, reservation)
+        driver = server_context.roaster_driver
+        if manual and isinstance(driver, HottopRoasterDriver):
+            try:
+                owner = driver.reserve_inhibited_start(reservation.token)
+            except BaseException:
+                with server_context.lifecycle_barrier:
+                    server_context.session_store.clear_session_start_reservation(reservation)
+                raise
+            publication = StagedSessionStartPublication(session=None)
+            try:
+                driver.open_inhibited_start(owner)
+                with server_context.lifecycle_barrier:
+                    driver.begin_inhibited_start_promotion(owner)
+                    try:
+                        runtime_session = (
+                            server_context.session_store.complete_staged_session_start_snapshot(
+                                reservation, publication=publication, purpose=purpose
+                            )
+                        )
+                    finally:
+                        if publication.session is not None:
+                            driver.bind_promoted_inhibited_start(owner, publication.session)
+                published_session = publication.session
+                if published_session is None:
+                    raise SessionLifecycleError(
+                        "Staged Hottop session publication did not complete."
+                    )
+            except BaseException:
+                if publication.session is None:
+                    driver.restore_inhibited_start_after_unpublished_promotion(owner)
+                    settlement = driver.abort_inhibited_start(owner)
+                    if settlement in {
+                        HottopStartSettlement.NOT_ENTERED,
+                        HottopStartSettlement.CLEAN_CLOSED,
+                    }:
+                        # Revocation clears pending admission only.  Dispose the
+                        # in-flight token only after exact native non-entry or a
+                        # clean close, and only while this exact owner is current.
+                        with server_context.lifecycle_barrier:
+                            server_context.session_store.clear_session_start_reservation(
+                                reservation
+                            )
+                raise
+            try:
+                prepared = driver.prepare_promoted_first_write(owner, published_session)
+                with server_context.lifecycle_barrier:
+                    server_context.session_store.assert_staged_start_claimable(published_session)
+                    claim = driver.claim_prepared_first_write(prepared)
+                disposition = driver.dispatch_claimed_first_write(claim)
+                if disposition is not HottopFirstWriteDisposition.WRITTEN:
+                    raise SessionLifecycleError("Staged Hottop first write has an unknown receipt.")
+                with server_context.lifecycle_barrier:
+                    server_context.session_store.assert_staged_start_claimable(published_session)
+                    if not driver.asserted_written_start(owner, published_session):
+                        raise SessionLifecycleError("Staged Hottop first-write ownership changed.")
+                sampler_receipt = _TelemetrySamplerStartReceipt()
+                started: tuple[Callable[[], object], ...] = (
+                    lambda: server_context.telemetry_sampler.stop_started_generation(
+                        sampler_receipt, reason="staged start failed"
+                    ),
+                    lambda: server_context.ambient_runtime.stop_for_session(
+                        published_session.id, reason="staged start failed"
+                    ),
+                    lambda: server_context.first_crack_runtime.stop_after_failed_start(
+                        published_session.id, reason="staged start failed"
+                    ),
+                )
+                try:
+                    _start_first_crack_runtime(server_context, session=runtime_session)
+                    server_context.ambient_runtime.start_for_session(runtime_session)
+                    server_context.telemetry_sampler._start_for_session(  # pyright: ignore[reportPrivateUsage]
+                        published_session.id, receipt=sampler_receipt
+                    )
+                    with server_context.lifecycle_barrier:
+                        session = server_context.session_store.snapshot_staged_start_claimable(
+                            published_session
+                        )
+                        if not driver.asserted_written_start(owner, published_session):
+                            raise SessionLifecycleError("Staged Hottop start changed after setup.")
+                except BaseException:
+                    for stop_runtime in started:
+                        with suppress(Exception):
+                            stop_runtime()
+                    raise
+            except BaseException:
+                # A published session and its claimed/written owner are intentionally
+                # retained: neither a missing receipt nor a setup failure proves
+                # non-entry or authorises a substitute transport action.
+                raise
+            return StartRoastSessionResult(
+                session=_serialize_session_state(
+                    session,
+                    config=server_context.config,
+                    first_crack_runtime=server_context.first_crack_runtime.snapshot(),
+                    first_crack_observation=server_context.first_crack_runtime.observation_for_session(
+                        session.id
+                    ),
+                    ambient_runtime=server_context.ambient_runtime.snapshot(),
+                )
+            )
         try:
-            server_context.roaster_driver.connect()
+            driver.connect()
             with server_context.lifecycle_barrier:
                 exact_baseline: tuple[MockRoasterDriver, int, int] | None = None
                 if _exact_normal_drop_capable(server_context):
@@ -4235,35 +4413,6 @@ def _run_fixed_zero_heat_containment(
         session_projection="recorded_in_memory",
         reason_code=None,
     )
-
-
-def _abort_future_manual_hottop_start(
-    server_context: ServerContext, reservation: SessionStartReservation
-) -> Never:
-    """Stage and abort a future manual start without publishing a session.
-
-    Production policy rejects this path before reservation. Only exact positive
-    non-entry or closure releases the server owner; uncertain entry stays blocked.
-    """
-    driver = server_context.roaster_driver
-    assert isinstance(driver, HottopRoasterDriver)
-    owner = None
-    try:
-        owner = driver.reserve_inhibited_start(reservation.token)
-        driver.open_inhibited_start(owner)
-    finally:
-        settlement = (
-            HottopStartSettlement.NOT_ENTERED
-            if owner is None
-            else driver.abort_inhibited_start(owner)
-        )
-        if settlement in (
-            HottopStartSettlement.NOT_ENTERED,
-            HottopStartSettlement.CLEAN_CLOSED,
-        ):
-            with server_context.lifecycle_barrier:
-                server_context.session_store.clear_session_start_reservation(reservation)
-    raise RuntimeError("Manual Hottop start remains inhibited; no session was published.")
 
 
 def _run_reserved_driver_control(
