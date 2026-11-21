@@ -10910,3 +10910,288 @@ def test_automatic_hottop_start_uses_legacy_connect(
 
     assert result.session.phase == "pre_roast"
     assert calls == ["connect"]
+
+
+def _accept_manual_hottop_policy(*_args: object) -> None:
+    """Provide the existing policy seam for staged in-memory transport schedules."""
+
+
+def test_registered_hottop_start_emergency_after_preparation_refuses_without_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An admitted emergency invalidates a prepared, but unclaimed, first frame."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data)
+
+    prepared = Event()
+    release = Event()
+    errors: list[BaseException] = []
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    transport = Transport()
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+    original_prepare = driver.prepare_promoted_first_write
+
+    def hold_after_prepare(owner: object, session: object) -> object:
+        claim = original_prepare(cast(Any, owner), session)
+        prepared.set()
+        assert release.wait(timeout=1.0)
+        return claim
+
+    monkeypatch.setattr(driver, "prepare_promoted_first_write", hold_after_prepare)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    server = create_mcp_server()
+    worker = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "start_roast_session", _ctx(context)),
+        kwargs={"first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    assert prepared.wait(timeout=1.0)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    emergency = _call_tool(server, "emergency_stop", _ctx(context), reason="prepared")
+    release.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive() and len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "Stopped sessions cannot be mutated" in str(errors[0])
+    assert emergency.session_id == session.id and emergency.event.kind == "fault"
+    assert transport.writes == []
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None and phase is HottopStartPhase.PROMOTED
+    assert context.session_store.get_latest_session() is session
+    assert context.telemetry_sampler.active_session_id is None
+
+
+def test_registered_hottop_start_held_write_allows_emergency_without_retry_or_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claimed fake write does not delay the registered emergency handler."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[bytes] = []
+            self.write_entered = Event()
+            self.release_write = Event()
+            self.close_count = 0
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            self.write_entered.set()
+            assert self.release_write.wait(timeout=1.0)
+            return len(data)
+
+        def close(self) -> None:
+            self.close_count += 1
+            super().close()
+
+    transport = Transport()
+    errors: list[BaseException] = []
+    emergency_results: list[object] = []
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    server = create_mcp_server()
+    start_thread = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "start_roast_session", _ctx(context)),
+        kwargs={"first_crack_observer_ack": "manual/v1"},
+    )
+    start_thread.start()
+    assert transport.write_entered.wait(timeout=1.0)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    emergency_thread = Thread(
+        target=_record_tool_result,
+        args=(emergency_results, errors, server, "emergency_stop", _ctx(context)),
+        kwargs={"reason": "held write"},
+    )
+    emergency_thread.start()
+    emergency_thread.join(timeout=1.0)
+    assert not emergency_thread.is_alive() and errors == []
+    assert len(transport.writes) == 1 and transport.close_count == 0
+    transport.release_write.set()
+    start_thread.join(timeout=1.0)
+
+    assert not start_thread.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], SessionLifecycleError)
+    assert "Stopped sessions cannot be mutated" in str(errors[0])
+    assert len(emergency_results) == 1
+    assert cast(Any, emergency_results[0]).event.kind == "fault"
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None and phase is HottopStartPhase.WRITTEN
+    assert transport.close_count == 0
+    assert context.telemetry_sampler.active_session_id is None
+
+
+def test_registered_hottop_start_emergency_after_runtime_setup_reaps_started_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-write emergency suppresses stale Start success and reaps setup work."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data)
+
+    setup_entered = Event()
+    release_setup = Event()
+    errors: list[BaseException] = []
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    first_crack = FakeFirstCrackRuntime()
+    ambient = FakeAmbientRuntime()
+    _set_first_crack_runtime(context, first_crack)
+    _set_ambient_runtime(context, ambient)
+    transport = Transport()
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+    original_start = context.telemetry_sampler.start_for_session
+
+    def hold_before_sampler(session_id: str) -> None:
+        setup_entered.set()
+        assert release_setup.wait(timeout=1.0)
+        original_start(session_id)
+
+    monkeypatch.setattr(context.telemetry_sampler, "start_for_session", hold_before_sampler)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    server = create_mcp_server()
+    worker = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "start_roast_session", _ctx(context)),
+        kwargs={"first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    assert setup_entered.wait(timeout=1.0)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    emergency = _call_tool(server, "emergency_stop", _ctx(context), reason="setup")
+    release_setup.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive() and len(errors) == 1
+    assert isinstance(errors[0], SessionLifecycleError)
+    assert "Stopped sessions cannot be mutated" in str(errors[0])
+    assert emergency.event.kind == "fault" and emergency.session_id == session.id
+    assert transport.writes == [build_hottop_command_packet()]
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None and phase is HottopStartPhase.WRITTEN
+    assert first_crack.started_sessions == [session.id]
+    assert first_crack.stopped_sessions == [session.id]
+    assert ambient.started_sessions == [session.id]
+    assert ambient.stopped_sessions == [session.id, session.id]
+    assert context.telemetry_sampler.active_session_id is None
+
+
+def test_registered_hottop_start_sampler_tick_and_unknown_cold_refusals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The composed sampler and cold refusals retain the exact staged owner."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self, receipt: object) -> None:
+            super().__init__()
+            self.receipt = receipt
+            self.writes: list[bytes] = []
+            self.close_count = 0
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return cast(int, self.receipt)
+
+        def close(self) -> None:
+            self.close_count += 1
+            super().close()
+
+    def configured_context(receipt: object) -> tuple[ServerContext, HottopRoasterDriver, Transport]:
+        context_dir = tmp_path / str(id(receipt))
+        context_dir.mkdir()
+        context = _cold_finalisation_context(context_dir)
+        object.__setattr__(context, "config", _manual_authority_config())
+        transport = Transport(receipt)
+        driver = HottopRoasterDriver(
+            port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+        )
+        object.__setattr__(context, "roaster_driver", driver)
+        return context, driver, transport
+
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    success, _, successful_transport = configured_context(len(build_hottop_command_packet()))
+    started = _call_tool(
+        create_mcp_server(),
+        "start_roast_session",
+        _ctx(success),
+        first_crack_observer_ack="manual/v1",
+    )
+    assert _sample_active_session_telemetry(success, session_id=started.session.session_id)
+    assert success.session_store.get_session_snapshot(session_id=started.session.session_id).active
+    assert successful_transport.writes == [build_hottop_command_packet()]
+    success.telemetry_sampler.stop_for_session(started.session.session_id, reason="test_cleanup")
+
+    uncertain, driver, transport = configured_context(True)
+    server = create_mcp_server()
+    with pytest.raises(SessionLifecycleError, match="unknown receipt"):
+        _call_tool(
+            server,
+            "start_roast_session",
+            _ctx(uncertain),
+            purpose="cold_characterisation",
+            first_crack_observer_ack="manual/v1",
+        )
+    session = uncertain.session_store.get_active_session()
+    assert session is not None
+    uncertain.telemetry_sampler.start_for_session(session.id)
+    first = _finalise_cold_characterisation_session(uncertain, session.id)
+    second = _finalise_cold_characterisation_session(uncertain, session.id)
+    assert (first.rejection_reason, second.rejection_reason) == (
+        "driver_not_connected",
+        "driver_not_connected",
+    )
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None and phase is HottopStartPhase.UNRESOLVED
+    assert len(transport.writes) == 1 and transport.close_count == 0
+
+    def fail_read() -> RoasterState:
+        raise RuntimeError("synthetic read failure")
+
+    monkeypatch.setattr(driver, "read_state", fail_read)
+    assert not _sample_active_session_telemetry(uncertain, session_id=session.id)
+    next_refusal = _finalise_cold_characterisation_session(uncertain, session.id)
+    assert next_refusal.rejection_reason == "session_not_active"
+    assert len(transport.writes) == 1 and transport.close_count == 0
+    uncertain.telemetry_sampler.stop_for_session(session.id, reason="test_cleanup")
