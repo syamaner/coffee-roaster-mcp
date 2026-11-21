@@ -1982,8 +1982,10 @@ def create_mcp_server(
                 with server_context.lifecycle_barrier:
                     driver.begin_inhibited_start_promotion(owner)
                     try:
-                        server_context.session_store.complete_staged_session_start_snapshot(
-                            reservation, publication=publication, purpose=purpose
+                        runtime_session = (
+                            server_context.session_store.complete_staged_session_start_snapshot(
+                                reservation, publication=publication, purpose=purpose
+                            )
                         )
                     finally:
                         if publication.session is not None:
@@ -2001,7 +2003,13 @@ def create_mcp_server(
                         HottopStartSettlement.NOT_ENTERED,
                         HottopStartSettlement.CLEAN_CLOSED,
                     }:
-                        server_context.session_store.clear_session_start_reservation(reservation)
+                        # Revocation clears pending admission only.  Dispose the
+                        # in-flight token only after exact native non-entry or a
+                        # clean close, and only while this exact owner is current.
+                        with server_context.lifecycle_barrier:
+                            server_context.session_store.clear_session_start_reservation(
+                                reservation
+                            )
                 raise
             try:
                 prepared = driver.prepare_promoted_first_write(owner, published_session)
@@ -2027,11 +2035,11 @@ def create_mcp_server(
                     ),
                 )
                 try:
-                    _start_first_crack_runtime(server_context, session=published_session)
-                    server_context.ambient_runtime.start_for_session(published_session)
+                    _start_first_crack_runtime(server_context, session=runtime_session)
+                    server_context.ambient_runtime.start_for_session(runtime_session)
                     server_context.telemetry_sampler.start_for_session(published_session.id)
                     with server_context.lifecycle_barrier:
-                        server_context.session_store.assert_staged_start_claimable(
+                        session = server_context.session_store.snapshot_staged_start_claimable(
                             published_session
                         )
                         if not driver.asserted_written_start(owner, published_session):
@@ -2046,7 +2054,6 @@ def create_mcp_server(
                 # retained: neither a missing receipt nor a setup failure proves
                 # non-entry or authorises a substitute transport action.
                 raise
-            session = server_context.session_store.copy_session(published_session)
             return StartRoastSessionResult(
                 session=_serialize_session_state(
                     session,

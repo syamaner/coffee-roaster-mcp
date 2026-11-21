@@ -8078,6 +8078,7 @@ class FakeFirstCrackRuntime:
         self.inference_overrun_count = inference_overrun_count
         self.active_session_id: str | None = None
         self.started_sessions: list[str] = []
+        self.started_session_objects: list[RoastSession] = []
         self.processed_sessions: list[str] = []
         self.processed_after_drop_sessions: list[bool] = []
         self.stopped_sessions: list[str] = []
@@ -8086,6 +8087,7 @@ class FakeFirstCrackRuntime:
     def start_for_session(self, session: RoastSession) -> FirstCrackRuntimeSnapshot:
         self.active_session_id = session.id
         self.started_sessions.append(session.id)
+        self.started_session_objects.append(session)
         return self.snapshot()
 
     def process_available_windows(
@@ -8217,11 +8219,13 @@ class FakeAmbientRuntime:
         self.last_reading_monotonic_seconds = last_reading_monotonic_seconds
         self.active_session_id: str | None = None
         self.started_sessions: list[str] = []
+        self.started_session_objects: list[RoastSession] = []
         self.stopped_sessions: list[str] = []
 
     def start_for_session(self, session: RoastSession) -> AmbientRuntimeSnapshot:
         self.active_session_id = session.id
         self.started_sessions.append(session.id)
+        self.started_session_objects.append(session)
         return self.snapshot()
 
     def poll(self) -> AmbientRuntimeSnapshot:
@@ -10599,6 +10603,7 @@ def test_future_manual_registered_start_inhibited_abort(
     release = Event()
     opened = Event()
     calls: list[str] = []
+    close_owners: list[tuple[object | None, object | None]] = []
     failures: list[BaseException] = []
     context = _cold_finalisation_context(tmp_path)
     object.__setattr__(context, "config", _manual_authority_config())
@@ -10606,6 +10611,7 @@ def test_future_manual_registered_start_inhibited_abort(
     class Transport(_ObservationFakeSerialTransport):
         def close(self) -> None:
             calls.append("close")
+            close_owners.append(driver.inspect_inhibited_start())
             if outcome == "close_raise":
                 raise OSError("uncertain close")
             if outcome != "still_open":
@@ -10703,6 +10709,8 @@ def test_future_manual_registered_start_inhibited_abort(
     assert len(failures) == 1
     assert calls.count("factory") == 1
     assert calls.count("close") == (0 if outcome == "factory_raise" else 1)
+    if outcome != "factory_raise":
+        assert close_owners == [(owner, HottopStartPhase.CLOSING)]
     assert "write" not in calls
     assert context.session_store.get_active_session() is None
     if outcome == "clean":
@@ -10764,7 +10772,7 @@ def test_future_manual_registered_start_inhibited_abort(
             ),
         )
         object.__setattr__(context, "config", automatic)
-        with pytest.raises(SessionLifecycleError, match="progress"):
+        with pytest.raises(expected_error, match=expected_message):
             _call_tool(server, "start_roast_session", _ctx(context))
         assert calls.count("factory") == 1
         assert calls.count("close") == (0 if outcome == "factory_raise" else 1)
@@ -10956,6 +10964,69 @@ def test_registered_hottop_start_claims_one_immutable_fake_frame(
     owner, phase = driver.inspect_inhibited_start()
     assert owner is not None
     assert phase is HottopStartPhase.WRITTEN
+
+
+def test_registered_hottop_start_reply_and_runtimes_use_isolated_promotion_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final Start snapshot linearizes before a later emergency mutation."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def write(self, data: bytes) -> int:
+            return len(data)
+
+    serialized = Event()
+    release_serialization = Event()
+    results: list[object] = []
+    errors: list[BaseException] = []
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    first_crack = FakeFirstCrackRuntime()
+    ambient = FakeAmbientRuntime()
+    _set_first_crack_runtime(context, first_crack)
+    _set_ambient_runtime(context, ambient)
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: Transport()
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+    original_serialize = mcp_server._serialize_session_state  # pyright: ignore[reportPrivateUsage]
+
+    def hold_serialization(session: RoastSession, **kwargs: Any) -> Any:
+        serialized.set()
+        assert release_serialization.wait(timeout=1.0)
+        return original_serialize(session, **kwargs)
+
+    monkeypatch.setattr(mcp_server, "_serialize_session_state", hold_serialization)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    server = create_mcp_server()
+    worker = Thread(
+        target=_record_tool_result,
+        args=(results, errors, server, "start_roast_session", _ctx(context)),
+        kwargs={"first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    assert serialized.wait(timeout=1.0)
+    canonical = context.session_store.get_active_session()
+    assert canonical is not None
+    emergency = _call_tool(server, "emergency_stop", _ctx(context), reason="after-copy")
+    release_serialization.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive() and errors == []
+    result = cast(Any, results[0])
+    assert result.session.session_id == canonical.id
+    assert result.session.active and result.session.phase == "pre_roast"
+    assert emergency.session_id == canonical.id and emergency.phase == "fault"
+    assert context.session_store.get_session_snapshot(session_id=canonical.id).phase == "fault"
+    assert len(first_crack.started_session_objects) == 1
+    assert len(ambient.started_session_objects) == 1
+    assert first_crack.started_session_objects[0].id == canonical.id
+    assert ambient.started_session_objects[0].id == canonical.id
+    assert first_crack.started_session_objects[0] is not canonical
+    assert ambient.started_session_objects[0] is not canonical
 
 
 @pytest.mark.parametrize("receipt", [True, 0, 25, -1, None])

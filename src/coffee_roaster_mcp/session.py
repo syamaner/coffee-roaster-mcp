@@ -1243,13 +1243,19 @@ class RoastSessionStore:
     def assert_staged_start_claimable(self, session: RoastSession) -> None:
         """Require the exact live session to remain eligible for staged entry."""
         with self._lock:
-            self._assert_latest_active_session(session)
-            if session.faulted_at_utc is not None or session.phase == "fault":
-                raise SessionLifecycleError("Staged first write is blocked by an emergency fault.")
-            if session.pending_driver_command_token is not None:
-                raise SessionLifecycleError(
-                    "Staged first write is blocked by a pending driver command."
-                )
+            self._assert_staged_start_claimable_locked(session)
+
+    def snapshot_staged_start_claimable(self, session: RoastSession) -> RoastSession:
+        """Return an isolated exact-session snapshot after staged Start eligibility checks.
+
+        The caller holds the lifecycle barrier while deciding whether a staged
+        Start can succeed.  Copying under this same store critical section
+        keeps the ordinary reply independent from an immediately following
+        emergency mutation without holding the barrier during serialization.
+        """
+        with self._lock:
+            self._assert_staged_start_claimable_locked(session)
+            return _copy_session_for_read(session)
 
     def clear_session_start_reservation(
         self,
@@ -3886,6 +3892,16 @@ class RoastSessionStore:
         self._assert_latest_session(session)
         if not session.active:
             raise SessionLifecycleError("Stopped sessions cannot be mutated.")
+
+    def _assert_staged_start_claimable_locked(self, session: RoastSession) -> None:
+        """Validate staged first-write eligibility while the store lock is held."""
+        self._assert_latest_active_session(session)
+        if session.faulted_at_utc is not None or session.phase == "fault":
+            raise SessionLifecycleError("Staged first write is blocked by an emergency fault.")
+        if session.pending_driver_command_token is not None:
+            raise SessionLifecycleError(
+                "Staged first write is blocked by a pending driver command."
+            )
 
     def _fixed_zero_identity_rejection_locked(
         self, expected_session_id: str
