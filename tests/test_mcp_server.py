@@ -4997,11 +4997,15 @@ def test_exact_drop_writer_reservation_rejects_direct_fault_without_file_mutatio
     assert session.faulted_at_utc is None
 
 
-@pytest.mark.parametrize("paused_kind", ("beans_dropped", "cooling_started"))
+@pytest.mark.parametrize(
+    ("paused_kind", "fail_paused_cooling"),
+    (("beans_dropped", False), ("cooling_started", False), ("cooling_started", True)),
+)
 def test_mock_emergency_reaches_driver_while_exact_drop_endpoint_append_is_paused(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     paused_kind: str,
+    fail_paused_cooling: bool,
 ) -> None:
     """A stalled P2 endpoint cannot delay the actual MCP emergency dispatch."""
     context = _cold_finalisation_context(tmp_path)
@@ -5057,6 +5061,8 @@ def test_mock_emergency_reaches_driver_while_exact_drop_endpoint_append_is_pause
         if event.kind == paused_kind and not append_entered.is_set():
             append_entered.set()
             assert release_append.wait(timeout=1.0)
+            if fail_paused_cooling:
+                raise OSError("paused exact Drop cooling row unavailable")
         if event.kind == "fault" and not first_fault_append_entered.is_set():
             first_fault_append_entered.set()
             assert release_first_fault_append.wait(timeout=1.0)
@@ -5072,6 +5078,25 @@ def test_mock_emergency_reaches_driver_while_exact_drop_endpoint_append_is_pause
         context.session_store.normal_drop_identity(session)
     )
     assert admission.reservation is not None
+    release_snapshots: list[RoastSession] = []
+    if fail_paused_cooling:
+        drop_ticket = context.session_store._normal_drop_persistence_drop_ticket  # pyright: ignore[reportPrivateUsage]
+        assert drop_ticket is not None
+        original_completion = drop_ticket.completion
+
+        class DropTurnReleaseWitness:
+            """Capture the settlement projection immediately before turn release."""
+
+            def wait(self, timeout: float | None = None) -> bool:
+                """Delegate predecessor ordering to the original completion event."""
+                return original_completion.wait(timeout)
+
+            def set(self) -> None:
+                """Snapshot the settled Drop before its queued successor can run."""
+                release_snapshots.append(context.session_store.get_session_snapshot())
+                original_completion.set()
+
+        object.__setattr__(drop_ticket, "completion", DropTurnReleaseWitness())
     driver_state = driver.drop_beans()
     drop_results: list[NormalDropSettlement] = []
     drop_errors: list[BaseException] = []
@@ -5139,38 +5164,85 @@ def test_mock_emergency_reaches_driver_while_exact_drop_endpoint_append_is_pause
     assert reached_driver.wait(timeout=1.0)
     assert fault_prepared.wait(timeout=1.0)
     assert emergency_thread.is_alive()
+    context.session_store.assert_guarded_fault_recovery_admission(session)
     pending_fault_export = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
     assert pending_fault_export.ready is False
     assert "persistence is incomplete" in pending_fault_export.note
-    second_emergency_thread.start()
-    assert second_reached_driver.wait(timeout=1.0)
-    assert emergency_thread.is_alive()
+    if not fail_paused_cooling:
+        second_emergency_thread.start()
+        assert second_reached_driver.wait(timeout=1.0)
+        assert emergency_thread.is_alive()
     release_append.set()
-    assert first_fault_append_entered.wait(timeout=1.0)
-    release_first_fault_append.set()
+    if not fail_paused_cooling:
+        assert first_fault_append_entered.wait(timeout=1.0)
+        release_first_fault_append.set()
     drop_thread.join(timeout=1.0)
     emergency_thread.join(timeout=1.0)
-    second_emergency_thread.join(timeout=1.0)
+    if not fail_paused_cooling:
+        second_emergency_thread.join(timeout=1.0)
 
     assert not drop_thread.is_alive() and not emergency_thread.is_alive()
     assert not second_emergency_thread.is_alive()
-    assert emergency_errors == [] and len(emergency_results) == 1
-    assert second_emergency_errors == [] and len(second_emergency_results) == 1
     assert drop_errors == [] and len(drop_results) == 1
     assert drop_results[0].outcome == "unknown"
     snapshot = context.session_store.get_session_snapshot()
     assert snapshot.phase == "fault" and snapshot.faulted_at_utc is not None
+    assert snapshot.active is False
+    assert (snapshot.heat_level_percent, snapshot.fan_level_percent, snapshot.cooling_on) == (
+        0,
+        100,
+        True,
+    )
+    assert snapshot.beans_dropped_at_utc is not None
+    assert snapshot.beans_dropped_monotonic_seconds is not None
+    drop_events = [event for event in snapshot.event_timeline if event.kind == "beans_dropped"]
+    assert len(drop_events) == 1
+    assert drop_events[0].payload == {
+        "heat_level_percent": 0,
+        "fan_level_percent": 100,
+        "cooling_on": True,
+    }
+    assert drop_events[0].recorded_at_utc == snapshot.beans_dropped_at_utc
+    if fail_paused_cooling:
+        assert len(release_snapshots) == 1
+        released = release_snapshots[0]
+        assert released.phase == "fault" and released.faulted_at_utc is not None
+        assert released.active is False
+        assert (released.heat_level_percent, released.fan_level_percent, released.cooling_on) == (
+            0,
+            100,
+            True,
+        )
+        assert [event.kind for event in released.event_timeline][-1:] == ["beans_dropped"]
+        assert released.beans_dropped_at_utc == drop_events[0].recorded_at_utc
+        assert released.beans_dropped_monotonic_seconds == drop_events[0].monotonic_seconds
     assert snapshot.log_writer is not None
     rows = [
         json.loads(line)
         for line in (snapshot.log_writer.log_dir / "roast.jsonl").read_text().splitlines()
     ]
     reasons = [row["payload"].get("reason") for row in rows if row.get("kind") == "fault"]
-    assert reasons == ["paused-exact-drop", "second-paused-exact-drop"]
     endpoint_kinds = ["beans_dropped"]
-    if paused_kind == "cooling_started":
+    if paused_kind == "cooling_started" and not fail_paused_cooling:
         endpoint_kinds.append("cooling_started")
-    expected_kinds = [*endpoint_kinds, "fault", "fault"]
+    expected_kinds = [*endpoint_kinds]
+    if not fail_paused_cooling:
+        assert emergency_errors == [] and len(emergency_results) == 1
+        assert second_emergency_errors == [] and len(second_emergency_results) == 1
+        assert reasons == ["paused-exact-drop", "second-paused-exact-drop"]
+        expected_kinds.extend(("fault", "fault"))
+        fault_events = [event for event in snapshot.event_timeline if event.kind == "fault"]
+        assert fault_events[0].recorded_at_utc == snapshot.faulted_at_utc
+    else:
+        assert len(emergency_errors) == 1
+        assert second_emergency_errors == []
+        assert all(
+            isinstance(error, SessionLifecycleError) and "fault recording failed" in str(error)
+            for error in emergency_errors
+        )
+        assert reasons == []
+        assert snapshot.cooling_started_at_utc is None
+        assert snapshot.cooling_started_monotonic_seconds is None
     assert [row["kind"] for row in rows if row["type"] == "event"][-len(expected_kinds) :] == (
         expected_kinds
     )

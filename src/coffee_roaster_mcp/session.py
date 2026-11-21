@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, RLock
-from typing import Literal
+from typing import Literal, TypeVar
 from uuid import uuid4
 
 from coffee_roaster_mcp.controls import validate_control_percent
@@ -38,6 +38,7 @@ RoastEventKind = Literal[
     "fault",
 ]
 EventPayloadValue = str | int | float | bool | None
+_AppendTurnResult = TypeVar("_AppendTurnResult")
 SessionPurpose = Literal["roast", "cold_characterisation"]
 SessionPresence = Literal["none", "starting", "active", "stopped"]
 DriverCommandKind = Literal[
@@ -2023,38 +2024,8 @@ class RoastSessionStore:
         drop_row_saved = False
         cooling_row_saved = False
         torn_log = False
-        try:
 
-            def append_endpoints() -> None:
-                nonlocal cooling_row_saved, drop_row_saved, torn_log
-                try:
-                    _append_event_log_row_with_failure_evidence(session, drop_event)
-                    drop_row_saved = True
-                except _MockDropAppendMayBeTornError:
-                    torn_log = True
-                    raise
-                # An emergency can stop the session while a stalled Drop row
-                # owns this turn.  Its fault is already admitted behind the
-                # Drop row, so never manufacture a later cooling endpoint.
-                with self._lock:
-                    if (
-                        not self._normal_drop_reservation_matches_locked(session, reservation)
-                        or session.faulted_at_utc is not None
-                        or not session.active
-                    ):
-                        return
-                try:
-                    _append_event_log_row_with_failure_evidence(session, cooling_event)
-                    cooling_row_saved = True
-                except _MockDropAppendMayBeTornError:
-                    torn_log = True
-                    raise
-
-            self._append_mock_drop_turn(
-                persistence_ticket,
-                append_endpoints,
-            )
-        except Exception:  # noqa: BLE001 - a torn append remains unknowable.
+        def settle_failure(_error: Exception) -> NormalDropSettlement:
             with self._lock:
                 if self._normal_drop_reservation_matches_locked(session, reservation):
                     if torn_log:
@@ -2064,42 +2035,83 @@ class RoastSessionStore:
                         # The first endpoint is durable evidence, not an
                         # optimistic success: retain it without fabricating the
                         # unwritten cooling endpoint, then fence the operation.
-                        session.heat_level_percent = heat_level_percent
-                        session.fan_level_percent = fan_level_percent
-                        session.cooling_on = cooling_on
+                        # A queued emergency has already published the fault
+                        # projection, so retain only the Drop timestamps.
                         session.event_timeline.append(drop_event)
-                        _apply_event_timestamp(session, drop_event)
+                        if session.faulted_at_utc is not None or not session.active:
+                            session.beans_dropped_at_utc = drop_event.recorded_at_utc
+                            session.beans_dropped_monotonic_seconds = drop_event.monotonic_seconds
+                        else:
+                            _apply_event_timestamp(session, drop_event)
+                            session.heat_level_percent = heat_level_percent
+                            session.fan_level_percent = fan_level_percent
+                            session.cooling_on = cooling_on
                     self._retain_normal_drop_unknown_locked(session, reservation)
                     return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
             return NormalDropSettlement("stale")
 
-        with self._lock:
-            if not self._normal_drop_reservation_matches_locked(session, reservation):
-                return NormalDropSettlement("stale")
-            if session.faulted_at_utc is not None or not session.active:
-                # The rows are confirmed, but an intervention won the lifecycle
-                # race. Retain only durable timestamp evidence without reviving
-                # phase or projected controls, and keep the operation unresolved.
-                session.event_timeline.append(drop_event)
-                if cooling_row_saved:
-                    session.event_timeline.append(cooling_event)
-                session.beans_dropped_at_utc = drop_event.recorded_at_utc
-                session.beans_dropped_monotonic_seconds = drop_event.monotonic_seconds
-                self._retain_normal_drop_unknown_locked(session, reservation)
-                return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
+        def settle_success() -> NormalDropSettlement:
+            with self._lock:
+                if not self._normal_drop_reservation_matches_locked(session, reservation):
+                    return NormalDropSettlement("stale")
+                if session.faulted_at_utc is not None or not session.active:
+                    # The rows are confirmed, but an intervention won the lifecycle
+                    # race. Retain only durable timestamp evidence without reviving
+                    # phase or projected controls, and keep the operation unresolved.
+                    session.event_timeline.append(drop_event)
+                    if cooling_row_saved:
+                        session.event_timeline.append(cooling_event)
+                    session.beans_dropped_at_utc = drop_event.recorded_at_utc
+                    session.beans_dropped_monotonic_seconds = drop_event.monotonic_seconds
+                    self._retain_normal_drop_unknown_locked(session, reservation)
+                    return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
 
-            session.heat_level_percent = heat_level_percent
-            session.fan_level_percent = fan_level_percent
-            session.cooling_on = cooling_on
-            session.event_timeline.extend((drop_event, cooling_event))
-            _apply_event_timestamp(session, drop_event)
-            _apply_event_timestamp(session, cooling_event)
-            self._clear_normal_drop_token_locked(session, reservation)
-            self._normal_drop_in_flight = None
-            self._normal_drop_fence_state = None
-            return NormalDropSettlement(
-                "success", event=drop_event, snapshot=_copy_session_for_read(session)
-            )
+                session.heat_level_percent = heat_level_percent
+                session.fan_level_percent = fan_level_percent
+                session.cooling_on = cooling_on
+                session.event_timeline.extend((drop_event, cooling_event))
+                _apply_event_timestamp(session, drop_event)
+                _apply_event_timestamp(session, cooling_event)
+                self._clear_normal_drop_token_locked(session, reservation)
+                self._normal_drop_in_flight = None
+                self._normal_drop_fence_state = None
+                return NormalDropSettlement(
+                    "success", event=drop_event, snapshot=_copy_session_for_read(session)
+                )
+
+        def append_endpoints() -> None:
+            nonlocal cooling_row_saved, drop_row_saved, torn_log
+            try:
+                _append_event_log_row_with_failure_evidence(session, drop_event)
+                drop_row_saved = True
+            except _MockDropAppendMayBeTornError:
+                torn_log = True
+                raise
+            # An emergency can stop the session while a stalled Drop row
+            # owns this turn.  Its fault is already admitted behind the
+            # Drop row, so never manufacture a later cooling endpoint.
+            with self._lock:
+                if (
+                    not self._normal_drop_reservation_matches_locked(session, reservation)
+                    or session.faulted_at_utc is not None
+                    or not session.active
+                ):
+                    return
+            try:
+                _append_event_log_row_with_failure_evidence(session, cooling_event)
+                cooling_row_saved = True
+            except _MockDropAppendMayBeTornError:
+                torn_log = True
+                raise
+
+        settlement = self._append_mock_drop_turn(
+            persistence_ticket,
+            append_endpoints,
+            settle_success=settle_success,
+            settle_failure=settle_failure,
+        )
+        assert settlement is not None
+        return settlement
 
     def _new_event_locked(
         self,
@@ -3460,8 +3472,13 @@ class RoastSessionStore:
             return event, _copy_session_for_read(session)
 
     def _append_mock_drop_turn(
-        self, ticket: MockDropPersistenceTicket, append: Callable[[], None]
-    ) -> None:
+        self,
+        ticket: MockDropPersistenceTicket,
+        append: Callable[[], None],
+        *,
+        settle_success: Callable[[], _AppendTurnResult] | None = None,
+        settle_failure: Callable[[Exception], _AppendTurnResult] | None = None,
+    ) -> _AppendTurnResult | None:
         """Perform one exact mock persistence turn outside lifecycle/store locks."""
         ticket.previous_completion.wait()
         # This caller owns its ticket and writes its own row(s). Its predecessor
@@ -3472,10 +3489,15 @@ class RoastSessionStore:
                 if self._normal_drop_persistence_failed:
                     raise SessionLifecycleError("The exact normal bean-drop save is incomplete.")
             append()
-        except Exception:
+        except Exception as error:
             with self._lock:
                 self._normal_drop_persistence_failed = True
+            if settle_failure is not None:
+                return settle_failure(error)
             raise
+        else:
+            if settle_success is not None:
+                return settle_success()
         finally:
             ticket.completion.set()
 
@@ -3560,24 +3582,32 @@ class RoastSessionStore:
         self, session: RoastSession, *, event: RoastEvent, ticket: MockDropPersistenceTicket
     ) -> RoastSession:
         """Append one previously published mock-drop emergency fault event."""
-        try:
-            self._append_mock_drop_turn(
-                ticket,
-                lambda: _append_event_log_row_with_failure_evidence(session, event),
-            )
-        except _MockDropAppendMayBeTornError:
+
+        def settle_success() -> RoastSession:
             with self._lock:
-                if self._latest_session is session:
-                    self._normal_drop_persistence_torn = True
-                    session.mock_log_torn = True
-            raise
-        with self._lock:
-            self._assert_latest_session(session)
-            session.event_timeline.append(event)
-            _apply_event_timestamp(session, event)
-            self._normal_drop_unpersisted_fault_count -= 1
-            session.unpersisted_mock_drop_fault_count -= 1
-            return _copy_session_for_read(session)
+                self._assert_latest_session(session)
+                session.event_timeline.append(event)
+                _apply_event_timestamp(session, event)
+                self._normal_drop_unpersisted_fault_count -= 1
+                session.unpersisted_mock_drop_fault_count -= 1
+                return _copy_session_for_read(session)
+
+        def settle_failure(error: Exception) -> RoastSession:
+            if isinstance(error, _MockDropAppendMayBeTornError):
+                with self._lock:
+                    if self._latest_session is session:
+                        self._normal_drop_persistence_torn = True
+                        session.mock_log_torn = True
+            raise error
+
+        result = self._append_mock_drop_turn(
+            ticket,
+            lambda: _append_event_log_row_with_failure_evidence(session, event),
+            settle_success=settle_success,
+            settle_failure=settle_failure,
+        )
+        assert result is not None
+        return result
 
     def get_active_session(self) -> RoastSession | None:
         """Return the current active session when present."""
