@@ -1119,13 +1119,18 @@ class FirstCrackSessionRuntime:
                 and self._admitted_observer == (session_id, observer.generation)
                 and self._capture_cleanup is None
             )
-            if admitted:
-                assert observer is not None
-                observer.close_after_failed_start(reason=reason.replace(" ", "_"))
-                return self.snapshot()
-            if observer is None or observer.session_id != session_id:
-                return self.snapshot()
-        return self.stop_for_session(session_id, reason=reason)
+        if observer is None or observer.session_id != session_id:
+            return self.snapshot()
+        if admitted:
+            # The observer lock owns this decision.  Do not nest it beneath
+            # the runtime lock: boundary producers can re-enter this runtime.
+            observer.close_after_failed_start(reason=reason.replace(" ", "_"))
+        else:
+            # A claimed observer without a started worker is not admitted to
+            # yield.  Preserve the ordinary lifecycle-close handling, but act
+            # only on the exact observer selected above.
+            observer.close(cutoff=None, reason=reason.replace(" ", "_"))
+        return self.snapshot()
 
     def finalise_for_session(
         self, session_id: str

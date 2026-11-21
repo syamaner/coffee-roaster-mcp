@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from typing import Any, cast
 
 import pytest
@@ -2838,6 +2838,39 @@ def test_manual_runtime_failed_start_close_yields_to_pending_boundary_owner(
     assert observer.summary.reason.value == "emergency_stop"
     assert observer.summary.drop_cutoff.value is not None
     assert captures[0].stopped
+
+
+def test_manual_runtime_failed_start_close_does_not_hold_runtime_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The observer's atomic close decision never nests under the runtime lock."""
+    runtime, captures, _ = _manual_runtime_fixture(tmp_path)
+    store = RoastSessionStore(default_log_dir=tmp_path / "failed-start-lock")
+    session = store.start_session()
+    runtime.start_for_session(session)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - lock witness
+    assert observer is not None and len(captures) == 1
+    original_close = observer.close_after_failed_start
+    acquired = Event()
+    release = Event()
+
+    def close_without_runtime_lock(*, reason: str) -> None:
+        def acquire_runtime_lock() -> None:
+            with runtime._lock:  # pyright: ignore[reportPrivateUsage] - lock witness
+                acquired.set()
+                assert release.wait(1)
+
+        probe = Thread(target=acquire_runtime_lock)
+        probe.start()
+        assert acquired.wait(1)
+        release.set()
+        probe.join(timeout=1)
+        assert not probe.is_alive()
+        original_close(reason=reason)
+
+    monkeypatch.setattr(observer, "close_after_failed_start", close_without_runtime_lock)
+    runtime.stop_after_failed_start(session.id, reason="staged_start_failed")
+    assert observer.reaped.wait(2) and captures[0].stopped
 
 
 def test_manual_runtime_failed_start_close_uses_lifecycle_close_when_not_admitted(

@@ -8449,7 +8449,7 @@ def _ctx(server_context: ServerContext) -> Any:
 
 def _set_first_crack_runtime(
     server_context: ServerContext,
-    runtime: FakeFirstCrackRuntime,
+    runtime: FakeFirstCrackRuntime | FirstCrackSessionRuntime,
 ) -> None:
     object.__setattr__(server_context, "first_crack_runtime", runtime)
 
@@ -13397,6 +13397,194 @@ def test_registered_hottop_start_emergency_after_runtime_setup_reaps_started_wor
     assert ambient.started_sessions == [session.id]
     assert ambient.stopped_sessions == [session.id, session.id]
     assert context.telemetry_sampler.active_session_id is None
+
+
+@pytest.mark.parametrize("schedule", ["start_first", "saved", "expired"])
+def test_registered_hottop_start_failure_preserves_first_closer_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schedule: str
+) -> None:
+    """A held registered emergency cannot be replaced by staged-Start cleanup."""
+    from coffee_roaster_mcp.first_crack_observer import load_observation_model
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data)
+
+    class Pipeline:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def start(self) -> AudioCaptureSnapshot:
+            return self.snapshot()
+
+        def stop(self, *, timeout_seconds: float = 1.0) -> AudioCaptureSnapshot:
+            del timeout_seconds
+            self.stopped = True
+            return self.snapshot()
+
+        def drain_windows(self, *, max_windows: int | None = None) -> tuple[AudioWindow, ...]:
+            del max_windows
+            return ()
+
+        def discard_pending_audio(self, *, timeout_seconds: float = 1.0) -> None:
+            del timeout_seconds
+
+        def snapshot(self) -> AudioCaptureSnapshot:
+            return AudioCaptureSnapshot(
+                running=not self.stopped,
+                queued_window_count=0,
+                emitted_window_count=0,
+                dropped_window_count=0,
+                latest_error=None,
+                peak_dbfs=None,
+                rms_dbfs=None,
+            )
+
+        @property
+        def shutdown_confirmed(self) -> bool:
+            return self.stopped
+
+    entered, release_ambient, boundary_open, release_boundary = Event(), Event(), Event(), Event()
+    release_save = Event()
+    errors: list[BaseException] = []
+    emergency_results: list[object] = []
+    context = _cold_finalisation_context(tmp_path)
+    config = _manual_authority_config()
+    object.__setattr__(context, "config", config)
+    pipeline = Pipeline()
+    model = tmp_path / "model.onnx"
+    prep = tmp_path / "preprocessor.json"
+    model.write_bytes(b"model")
+    prep.write_text("{}", encoding="utf-8")
+    artifacts = ResolvedDetectorArtifacts(
+        ResolvedArtifact("synthetic", "v1", "model.onnx", model),
+        ResolvedArtifact("synthetic", "v1", "preprocessor.json", prep),
+    )
+
+    class Backend:
+        def detect(self, window: AudioWindow) -> FirstCrackDetectorOutput:
+            del window
+            return FirstCrackDetectorOutput(confirmed=False, confidence=0.0)
+
+    clock = [500.0]
+    runtime = FirstCrackSessionRuntime(
+        config=config,
+        audio_pipeline_factory=lambda _config: pipeline,
+        observation_model_loader=lambda fc: load_observation_model(
+            fc, resolver=lambda _fc: artifacts, backend_factory=lambda _fc, _artifacts: Backend()
+        ),
+        monotonic_now=lambda: clock[0],
+    )
+    _set_first_crack_runtime(context, runtime)
+    ambient = FakeAmbientRuntime()
+
+    def fail_after_admission(session: RoastSession) -> AmbientRuntimeSnapshot:
+        ambient.started_sessions.append(session.id)
+        entered.set()
+        assert release_ambient.wait(1)
+        raise RuntimeError("synthetic ambient setup failure")
+
+    monkeypatch.setattr(ambient, "start_for_session", fail_after_admission)
+    _set_ambient_runtime(context, ambient)
+    transport = Transport()
+    object.__setattr__(
+        context,
+        "roaster_driver",
+        HottopRoasterDriver(port="fake-only", serial_factory=lambda *_a, **_k: transport),
+    )
+    original_begin = runtime.begin_observation_boundary
+
+    def hold_open_boundary(session: RoastSession, *, reason: str) -> object | None:
+        if schedule == "start_first":
+            boundary_open.set()
+            assert release_boundary.wait(1)
+        ticket = original_begin(session, reason=reason)
+        if schedule != "start_first":
+            boundary_open.set()
+            assert release_boundary.wait(1)
+        return ticket
+
+    monkeypatch.setattr(runtime, "begin_observation_boundary", hold_open_boundary)
+    original_save = context.session_store.emergency_stop_snapshot
+
+    def hold_save(
+        saved_session: RoastSession,
+        *,
+        reason: str,
+        safety_payload: Mapping[str, EventPayloadValue] | None = None,
+        allow_stopped_latest: bool = False,
+    ) -> tuple[RoastEvent, RoastSession]:
+        assert release_save.wait(1)
+        return original_save(
+            saved_session,
+            reason=reason,
+            safety_payload=safety_payload,
+            allow_stopped_latest=allow_stopped_latest,
+        )
+
+    monkeypatch.setattr(context.session_store, "emergency_stop_snapshot", hold_save)
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    server = create_mcp_server()
+    start = Thread(
+        target=_record_tool_error,
+        args=(errors, server, "start_roast_session", _ctx(context)),
+        kwargs={"first_crack_observer_ack": "manual/v1"},
+    )
+    start.start()
+    assert entered.wait(1)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    emergency = Thread(
+        target=_record_tool_result,
+        args=(emergency_results, errors, server, "emergency_stop", _ctx(context)),
+        kwargs={"reason": "race"},
+    )
+    emergency.start()
+    assert boundary_open.wait(1)
+    release_ambient.set()
+    if schedule == "start_first":
+        start.join(timeout=1)
+        assert not start.is_alive()
+    if schedule == "expired":
+        observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - deadline witness
+        assert observer is not None and observer.deadline is not None
+        clock[0] = observer.deadline
+        observer.check_deadline()
+    release_boundary.set()
+    release_save.set()
+    start.join(timeout=1)
+    emergency.join(timeout=1)
+    assert not start.is_alive() and not emergency.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    assert len(emergency_results) == 1
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - result witness
+    assert observer is not None and observer.reaped.wait(1) and pipeline.stopped
+    summary = runtime.observation_for_session(session.id)
+    assert summary is not None and summary.frozen_summary.value is not None
+    frozen = summary.frozen_summary.value
+    if schedule == "start_first":
+        assert frozen.reason.value == "staged_start_failed"
+        assert frozen.drop_cutoff.value is None
+    else:
+        assert frozen.reason.value == "emergency_stop"
+    if schedule == "expired":
+        assert frozen.drop_cutoff.value is None
+    elif schedule == "saved":
+        reply = cast(Any, emergency_results[0])
+        assert frozen.drop_cutoff.value is not None
+        assert (
+            frozen.drop_cutoff.value.session_relative_seconds.value == reply.event.monotonic_seconds
+        )
+    assert [event.kind for event in session.event_timeline].count("fault") == 1
+    assert transport.writes == [build_hottop_command_packet()]
 
 
 def test_registered_hottop_start_sampler_tick_and_unknown_cold_refusals(
