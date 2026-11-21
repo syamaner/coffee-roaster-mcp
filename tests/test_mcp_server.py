@@ -3048,6 +3048,128 @@ def test_mcp_roast_controls_call_configured_driver_boundary(tmp_path: Path) -> N
     assert complete.phase == "complete"
 
 
+@pytest.mark.parametrize("authority", ["automatic", "manual"])
+def test_registered_drop_call_order_matches_legacy_drop_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, authority: str
+) -> None:
+    """The registered route retains legacy Drop sequencing in both authorities."""
+
+    def run_drop_path(*, registered: bool) -> list[str]:
+        config_path = tmp_path / f"{authority}-{registered}.yaml"
+        config_lines = [f"logging:\n  log_dir: {tmp_path / f'logs-{authority}-{registered}'}"]
+        if authority == "manual":
+            config_lines.extend(
+                [
+                    "first_crack:",
+                    "  mode: audio",
+                    "  event_authority: manual",
+                    "  allow_manual_override: true",
+                    "recording:",
+                    "  enabled: true",
+                    "  autocapture: true",
+                ]
+            )
+        config_path.write_text("\n".join(config_lines), encoding="utf-8")
+        context = build_server_context(config_path=config_path)
+        runtime = FakeFirstCrackRuntime()
+        _set_first_crack_runtime(context, runtime)
+        server = create_mcp_server(config_path=config_path)
+        ctx = _ctx(context)
+        start_kwargs = {"first_crack_observer_ack": "manual/v1"} if authority == "manual" else {}
+        _call_tool(server, "start_roast_session", ctx, **start_kwargs)
+        driver = RecordingRoasterDriver()
+        object.__setattr__(context, "roaster_driver", driver)
+        _call_tool(server, "mark_beans_added", ctx)
+
+        call_order: list[str] = []
+        original_drop = driver.drop_beans
+        original_complete = context.session_store.complete_reserved_driver_drop_snapshot
+        original_begin = runtime.begin_observation_boundary
+        original_resolve = runtime.resolve_observation_boundary
+        original_process = runtime.process_pending_windows_after_drop
+        original_stop = runtime.stop_for_session
+
+        def drop() -> RoasterState:
+            call_order.append("driver.drop")
+            return original_drop()
+
+        def complete(
+            target: RoastSession,
+            *,
+            reservation: DriverCommandReservation,
+            heat_level_percent: int,
+            fan_level_percent: int,
+            cooling_on: bool,
+        ) -> tuple[RoastEvent, RoastSession]:
+            call_order.append("store.complete")
+            return original_complete(
+                target,
+                reservation=reservation,
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=fan_level_percent,
+                cooling_on=cooling_on,
+            )
+
+        def begin(session: RoastSession, *, reason: str) -> object | None:
+            call_order.append("recording.begin")
+            return original_begin(session, reason=reason)
+
+        def resolve(
+            session: RoastSession, ticket: object | None, *, cutoff_monotonic_seconds: float
+        ) -> None:
+            call_order.append("recording.resolve")
+            original_resolve(session, ticket, cutoff_monotonic_seconds=cutoff_monotonic_seconds)
+
+        def process(
+            *, session_store: RoastSessionStore, session: RoastSession
+        ) -> FirstCrackRuntimeSnapshot:
+            call_order.append("first-crack.process")
+            return original_process(session_store=session_store, session=session)
+
+        def stop(session_id: str, *, reason: str) -> FirstCrackRuntimeSnapshot:
+            call_order.append("first-crack.stop")
+            return original_stop(session_id, reason=reason)
+
+        monkeypatch.setattr(driver, "drop_beans", drop)
+        monkeypatch.setattr(
+            context.session_store, "complete_reserved_driver_drop_snapshot", complete
+        )
+        monkeypatch.setattr(runtime, "begin_observation_boundary", begin)
+        monkeypatch.setattr(runtime, "resolve_observation_boundary", resolve)
+        monkeypatch.setattr(runtime, "process_pending_windows_after_drop", process)
+        monkeypatch.setattr(runtime, "stop_for_session", stop)
+
+        session = context.session_store.get_active_session()
+        assert session is not None
+        for _ in range(2):
+            if registered:
+                _call_tool(server, "drop_beans", ctx)
+            else:
+                event, snapshot = mcp_server._run_reserved_driver_drop(  # pyright: ignore[reportPrivateUsage]
+                    context, session
+                )
+                mcp_server._stop_runtimes_after_drop(  # pyright: ignore[reportPrivateUsage]
+                    context, session, snapshot
+                )
+                assert event.kind == "beans_dropped"
+        return call_order
+
+    expected = (
+        [
+            "driver.drop",
+            "store.complete",
+            "first-crack.process",
+            "first-crack.stop",
+            "first-crack.process",
+            "first-crack.stop",
+        ]
+        if authority == "automatic"
+        else ["driver.drop", "recording.begin", "store.complete", "recording.resolve"]
+    )
+    assert run_drop_path(registered=False) == expected
+    assert run_drop_path(registered=True) == expected
+
+
 def test_get_roast_state_exposes_current_driver_state_and_event_timestamps(
     tmp_path: Path,
 ) -> None:
@@ -7848,6 +7970,23 @@ class FakeFirstCrackRuntime:
         self.processed_after_drop_sessions.append(True)
         return self.snapshot()
 
+    def begin_observation_boundary(self, session: RoastSession, *, reason: str) -> object | None:
+        """Provide the manual-boundary port required by Drop sequencing tests."""
+        del session, reason
+        return object()
+
+    def resolve_observation_boundary(
+        self, session: RoastSession, ticket: object | None, *, cutoff_monotonic_seconds: float
+    ) -> None:
+        """Accept a synthetic manual-boundary resolution for server tests."""
+        del session, ticket, cutoff_monotonic_seconds
+
+    def freeze_observation_boundary(
+        self, session: RoastSession, ticket: object | None, *, reason: str
+    ) -> None:
+        """Accept a synthetic manual-boundary freeze for server tests."""
+        del session, ticket, reason
+
     def observation_for_session(self, session_id: str) -> None:
         """Automatic-path double has no manual observations to retain."""
         return None
@@ -9696,6 +9835,7 @@ async def _manual_shadow_stdio_normal_drop_export(tmp_path: Path) -> None:
             == before_mark["first_crack_observation"]["first_confirmation"]
         )
         assert not (tmp_path / "capture-stopped").exists()
+        await call("drop_beans", {})
         await call("drop_beans", {})
         await call("stop_cooling", {})
 
