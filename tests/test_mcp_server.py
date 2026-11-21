@@ -2659,7 +2659,7 @@ def test_nonterminal_finalisation_blocks_registered_start_session(
 
 
 def test_real_sampler_retains_thread_owner_until_timeout_retry_joins() -> None:
-    """A timed-out finalisation retry joins the same stopped sampler thread."""
+    """A stopped callback returning false clears its own retained dead handle."""
     entered = Event()
     release = Event()
 
@@ -2671,12 +2671,16 @@ def test_real_sampler_retains_thread_owner_until_timeout_retry_joins() -> None:
     sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=block_sample)
     sampler.start_for_session("cold-session")
     assert entered.wait(timeout=1.0)
+    worker = sampler._thread  # pyright: ignore[reportPrivateUsage]
+    assert worker is not None
     first = sampler.stop_and_join_for_finalisation("cold-session")
     assert first.owned_by_session_before_stop is True
     assert first.thread_alive_after_join is True
     release.set()
+    worker.join(timeout=4.0)
+    assert not worker.is_alive()
     second = sampler.stop_and_join_for_finalisation("cold-session")
-    assert second.owned_by_session_before_stop is True
+    assert second.owned_by_session_before_stop is False
     assert second.thread_alive_after_join is False
 
 
@@ -9438,7 +9442,7 @@ def test_manual_start_refuses_hottop_before_reservation_or_transport_open(
     monkeypatch.setattr(driver, "connect", forbid("connect"))
     monkeypatch.setattr(context.first_crack_runtime, "start_for_session", forbid("runtime"))
     monkeypatch.setattr(context.ambient_runtime, "start_for_session", forbid("ambient"))
-    monkeypatch.setattr(context.telemetry_sampler, "start_for_session", forbid("capture"))
+    monkeypatch.setattr(context.telemetry_sampler, "_start_for_session", forbid("capture"))  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(
         ConfigError,
         match="Composed driver does not support configured manual first-crack authority.",
@@ -11453,12 +11457,20 @@ def test_registered_hottop_start_failure_does_not_stop_cold_refusal_sampler(
         refusal = _finalise_cold_characterisation_session(context, session.id)
         assert refusal.rejection_reason == "driver_not_connected"
         assert context.telemetry_sampler.active_session_id == session.id
+        sampler_thread = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+        sampler_stop_event = context.telemetry_sampler._stop_event  # pyright: ignore[reportPrivateUsage]
+        assert sampler_thread is not None and sampler_thread.is_alive()
+        assert not sampler_stop_event.is_set()
     finally:
         transport.release_write.set()
         worker.join(timeout=4.0)
     assert not worker.is_alive()
     assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
     assert context.telemetry_sampler.active_session_id == session.id
+    assert context.telemetry_sampler._thread is sampler_thread  # pyright: ignore[reportPrivateUsage]
+    assert sampler_thread.is_alive()
+    assert context.telemetry_sampler._stop_event is sampler_stop_event  # pyright: ignore[reportPrivateUsage]
+    assert not sampler_stop_event.is_set()
     context.telemetry_sampler.shutdown()
 
 
@@ -11531,6 +11543,7 @@ def test_telemetry_sampler_stale_worker_cannot_affect_replacement(outcome: str) 
     entered = Event()
     release_first = Event()
     replacement_started = Event()
+    callback_failures: list[str] = []
     first_callback = True
 
     def sample(_session_id: str) -> bool:
@@ -11538,7 +11551,9 @@ def test_telemetry_sampler_stale_worker_cannot_affect_replacement(outcome: str) 
         if first_callback:
             first_callback = False
             entered.set()
-            assert release_first.wait(timeout=4.0)
+            if not release_first.wait(timeout=10.0):
+                callback_failures.append("superseded callback release timed out")
+                raise TimeoutError("superseded callback release timed out")
             if outcome == "error":
                 raise RuntimeError("stale worker failure")
             return False
@@ -11550,6 +11565,7 @@ def test_telemetry_sampler_stale_worker_cannot_affect_replacement(outcome: str) 
     assert entered.wait(timeout=1.0)
     superseded = sampler._thread  # pyright: ignore[reportPrivateUsage]
     assert superseded is not None
+    superseded_stop_event = sampler._stop_event  # pyright: ignore[reportPrivateUsage]
     replacement_receipt = mcp_server._TelemetrySamplerStartReceipt()  # pyright: ignore[reportPrivateUsage]
 
     def start_replacement() -> None:
@@ -11558,22 +11574,31 @@ def test_telemetry_sampler_stale_worker_cannot_affect_replacement(outcome: str) 
     replacement_worker = Thread(target=start_replacement)
     replacement_worker.start()
     try:
-        release_first.set()
-        superseded.join(timeout=2.0)
-        assert not superseded.is_alive()
-        replacement_worker.join(timeout=2.0)
+        assert superseded_stop_event.wait(timeout=5.0)
+        assert replacement_started.wait(timeout=5.0)
+        replacement_worker.join(timeout=5.0)
         assert not replacement_worker.is_alive()
         replacement = replacement_receipt.thread
         replacement_stop_event = replacement_receipt.stop_event
         assert replacement is not None and replacement is not superseded
+        assert replacement.is_alive()
         assert replacement_stop_event is not None and not replacement_stop_event.is_set()
-        assert replacement_started.wait(timeout=1.0)
+        assert sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
+        assert sampler.active_session_id == "same-session"
+        assert sampler.last_error is None
+
+        release_first.set()
+        superseded.join(timeout=5.0)
+        assert not superseded.is_alive()
+        assert not callback_failures
+        assert replacement.is_alive()
+        assert not replacement_stop_event.is_set()
         assert sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
         assert sampler.active_session_id == "same-session"
         assert sampler.last_error is None
     finally:
         release_first.set()
-        replacement_worker.join(timeout=2.0)
+        replacement_worker.join(timeout=5.0)
         sampler.shutdown()
 
 

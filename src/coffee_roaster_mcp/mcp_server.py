@@ -1181,11 +1181,25 @@ class _TelemetrySampler:
                 keep_sampling = False
             if not keep_sampling:
                 with self._lock:
-                    if self._owns_active_generation(session_id, stop_event, receipt):
+                    if self._owns_generation(session_id, stop_event, receipt):
                         self._active_session_id = None
                         self._thread = None
                         self._thread_session_id = None
                 return
+
+    def _owns_generation(
+        self,
+        session_id: str | None,
+        stop_event: Event,
+        receipt: _TelemetrySamplerStartReceipt,
+    ) -> bool:
+        """Return whether the calling worker still owns its exact handle."""
+        return (
+            session_id is not None
+            and self._thread_session_id == session_id
+            and self._stop_event is stop_event
+            and self._thread is receipt.thread
+        )
 
     def _owns_active_generation(
         self,
@@ -1194,12 +1208,8 @@ class _TelemetrySampler:
         receipt: _TelemetrySamplerStartReceipt,
     ) -> bool:
         """Return whether the calling worker still owns active supervision."""
-        return (
-            session_id is not None
-            and self._active_session_id == session_id
-            and self._thread_session_id == session_id
-            and self._stop_event is stop_event
-            and self._thread is receipt.thread
+        return self._active_session_id == session_id and self._owns_generation(
+            session_id, stop_event, receipt
         )
 
     def _stop_locked(self) -> Thread | None:
