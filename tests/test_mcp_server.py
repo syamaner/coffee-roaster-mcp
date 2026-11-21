@@ -2684,6 +2684,179 @@ def test_real_sampler_retains_thread_owner_until_timeout_retry_joins() -> None:
     assert second.thread_alive_after_join is False
 
 
+def test_registered_finalisation_keeps_replacement_sampler_until_its_callback_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disconnected refusal cannot let its displaced sampler clear a replacement."""
+    first_entered = Event()
+    replacement_entered = Event()
+    release_first = Event()
+    release_replacement = Event()
+    callback_lock = Lock()
+    callback_count = 0
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver(initially_connected=False)
+    object.__setattr__(context, "roaster_driver", driver)
+    monkeypatch.setattr(context.telemetry_sampler, "_interval_seconds", 0.01)
+
+    def held_callback(_session_id: str) -> bool:
+        nonlocal callback_count
+        with callback_lock:
+            callback_count += 1
+            callback_number = callback_count
+        if callback_number == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=4.0)
+            return False
+        assert callback_number == 2
+        replacement_entered.set()
+        assert release_replacement.wait(timeout=4.0)
+        return False
+
+    monkeypatch.setattr(context.telemetry_sampler, "_sample_callback", held_callback)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.telemetry_sampler.start_for_session(session.id)
+    first = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+    assert first is not None and first_entered.wait(timeout=4.0)
+    server = create_mcp_server()
+    try:
+        refusal = asyncio.run(
+            _call_tool(
+                server,
+                "finalise_cold_characterisation_session",
+                _ctx(context),
+                session_id=session.id,
+            )
+        )
+        assert refusal.rejection_reason == "driver_not_connected"
+        assert replacement_entered.wait(timeout=4.0)
+        replacement = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+        assert replacement is not None and replacement is not first
+
+        release_first.set()
+        first.join(timeout=4.0)
+        assert not first.is_alive()
+        assert context.telemetry_sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
+
+        driver.connect()
+        driver.actions.clear()
+        partial = asyncio.run(
+            _call_tool(
+                server,
+                "finalise_cold_characterisation_session",
+                _ctx(context),
+                session_id=session.id,
+            )
+        )
+        assert partial.status == "partial"
+        assert partial.stages[0].status == "incomplete"
+        assert partial.sampler.owned_by_session_before_stop is True
+        assert partial.sampler.thread_alive_after_join is True
+        assert driver.actions == []
+
+        release_replacement.set()
+        replacement.join(timeout=4.0)
+        assert not replacement.is_alive()
+        completed = asyncio.run(
+            _call_tool(
+                server,
+                "finalise_cold_characterisation_session",
+                _ctx(context),
+                session_id=session.id,
+            )
+        )
+        assert completed.status == "clean"
+        assert completed.clean is True
+        assert driver.actions == ["disconnect"]
+    finally:
+        release_first.set()
+        release_replacement.set()
+        first.join(timeout=4.0)
+        context.telemetry_sampler.shutdown()
+
+
+def test_registered_finalisation_retry_reports_owned_dead_sampler_after_callback_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry retains its pre-join ownership observation when the callback then exits."""
+    callback_entered = Event()
+    release_callback = Event()
+    join_entered = Event()
+    release_join = Event()
+    context = _cold_finalisation_context(tmp_path)
+    driver = LifecycleRecordingDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    monkeypatch.setattr(context.telemetry_sampler, "_interval_seconds", 0.01)
+
+    def held_callback(_session_id: str) -> bool:
+        callback_entered.set()
+        assert release_callback.wait(timeout=4.0)
+        return False
+
+    monkeypatch.setattr(context.telemetry_sampler, "_sample_callback", held_callback)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    context.telemetry_sampler.start_for_session(session.id)
+    sampler_thread = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+    assert sampler_thread is not None and callback_entered.wait(timeout=4.0)
+    server = create_mcp_server()
+    original_join = context.telemetry_sampler._join_thread  # pyright: ignore[reportPrivateUsage]
+    try:
+        partial = asyncio.run(
+            _call_tool(
+                server,
+                "finalise_cold_characterisation_session",
+                _ctx(context),
+                session_id=session.id,
+            )
+        )
+        assert partial.status == "partial"
+
+        def hold_retry_join(thread: Thread | None) -> None:
+            assert thread is sampler_thread
+            join_entered.set()
+            assert release_join.wait(timeout=4.0)
+            original_join(thread)
+
+        monkeypatch.setattr(context.telemetry_sampler, "_join_thread", hold_retry_join)
+        results: list[object] = []
+        errors: list[BaseException] = []
+
+        def retry() -> None:
+            try:
+                results.append(
+                    asyncio.run(
+                        _call_tool(
+                            server,
+                            "finalise_cold_characterisation_session",
+                            _ctx(context),
+                            session_id=session.id,
+                        )
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - report thread failure exactly.
+                errors.append(exc)
+
+        retry_thread = Thread(target=retry)
+        retry_thread.start()
+        assert join_entered.wait(timeout=4.0)
+        release_callback.set()
+        sampler_thread.join(timeout=4.0)
+        assert not sampler_thread.is_alive()
+        release_join.set()
+        retry_thread.join(timeout=4.0)
+        assert not retry_thread.is_alive() and errors == []
+        retry_result = cast(Any, results[0])
+        assert retry_result.sampler.owned_by_session_before_stop is True
+        assert retry_result.sampler.thread_alive_after_join is False
+        assert retry_result.status == "clean"
+    finally:
+        release_callback.set()
+        release_join.set()
+        sampler_thread.join(timeout=4.0)
+        monkeypatch.setattr(context.telemetry_sampler, "_join_thread", original_join)
+        context.telemetry_sampler.shutdown()
+
+
 def test_first_crack_stop_failure_resumes_without_rerunning_sampler(tmp_path: Path) -> None:
     """Capture-stop failure is partial and retries only the first-crack stage."""
     context = _cold_finalisation_context(tmp_path)
