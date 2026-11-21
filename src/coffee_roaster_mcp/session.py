@@ -2172,6 +2172,50 @@ class RoastSessionStore:
             self._clear_driver_command_reservation_locked(session, reservation)
             return _copy_session_for_read(session)
 
+    def settle_known_torn_stop_cooling_recovery(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> RoastSession | None:
+        """Retain a known stopped-fault cooling result without inventing a log row.
+
+        This narrow settlement applies only to an already-admitted exact
+        stopped-fault cooling recovery.  The normal Drop persistence fence is
+        deliberately left intact: the returned controls are known, but the
+        append-only log cannot truthfully claim ``cooling_stopped``.
+        """
+        with self._lock:
+            if not self._normal_drop_persistence_torn:
+                return None
+            try:
+                self._assert_latest_session(session)
+                if (
+                    reservation.kind != "stop_cooling"
+                    or reservation.session_id != session.id
+                    or session.pending_driver_command_token != reservation.token
+                    or session.pending_driver_command_kind != reservation.kind
+                    or session.active
+                    or session.faulted_at_utc is None
+                    or session.phase != "fault"
+                    or cooling_on
+                ):
+                    return None
+                heat = validate_control_percent(heat_level_percent, label="heat_level_percent")
+                fan = validate_control_percent(fan_level_percent, label="fan_level_percent")
+            except SessionLifecycleError:
+                return None
+            if heat != 0:
+                return None
+            session.heat_level_percent = heat
+            session.fan_level_percent = fan
+            session.cooling_on = False
+            self._clear_driver_command_reservation_locked(session, reservation)
+            return _copy_session_for_read(session)
+
     def reserve_driver_stop_cooling(self, session: RoastSession) -> DriverCommandReservation:
         """Reserve a cooling-stop command for an active cooling session."""
         with self._lock:
@@ -2760,7 +2804,12 @@ class RoastSessionStore:
                 completed = True
                 return event, _copy_session_for_read(session)
             finally:
-                self._clear_driver_command_reservation_locked(session, reservation)
+                # A torn exact Drop log can reject the recovery event after a
+                # qualifying stop-cooling driver result is known. Keep only
+                # that reservation for the caller's narrow known-state
+                # settlement; every other failure retains eager clearing.
+                if not (self._normal_drop_persistence_torn and reservation.kind == "stop_cooling"):
+                    self._clear_driver_command_reservation_locked(session, reservation)
                 if completed:
                     self._clear_fault_recovery_in_flight_locked(session, reservation)
 
@@ -3951,10 +4000,21 @@ class RoastSessionStore:
         kind: DriverCommandKind,
     ) -> DriverCommandReservation:
         """Reserve a driver command while the store lock is already held."""
-        if self._normal_drop_persistence_torn and kind not in {
-            "heat_containment",
-            "start_cooling",
-        }:
+        allow_torn_stopped_fault_cooling_stop = (
+            kind == "stop_cooling"
+            and not session.active
+            and session.faulted_at_utc is not None
+            and session.phase == "fault"
+        )
+        if (
+            self._normal_drop_persistence_torn
+            and kind
+            not in {
+                "heat_containment",
+                "start_cooling",
+            }
+            and not allow_torn_stopped_fault_cooling_stop
+        ):
             raise SessionLifecycleError("The exact normal bean-drop log has an uncertain tail.")
         if kind == "drop" and self._normal_drop_in_flight is not None:
             raise SessionLifecycleError("A normal bean-drop operation is unresolved.")

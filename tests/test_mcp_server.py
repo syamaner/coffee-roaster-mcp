@@ -5895,6 +5895,28 @@ def test_guarded_fault_recovery_commands_preserve_fault_and_exact_result(tmp_pat
     ]
 
 
+def test_guarded_stop_cooling_keeps_known_state_when_exact_fault_log_is_torn(
+    tmp_path: Path,
+) -> None:
+    """A torn row does not repeat an otherwise eligible stopped-fault cooling stop."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+    _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    store = ctx.request_context.lifespan_context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    session.mock_log_torn = True
+    store._normal_drop_persistence_torn = True  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(SessionLifecycleError, match="Cooling command completed"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and not state.active and not state.cooling_on
+    assert driver.actions.count("stop_cooling") == 1
+    assert [event.kind for event in state.events].count("cooling_stopped") == 0
+
+
 def test_guarded_drop_second_event_log_failure_preserves_recorded_drop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -9276,6 +9298,105 @@ def test_sampler_failed_event_keeps_original_early_return_cleanup_behaviour(
     )
     assert trace == ["driver", "failed_event"]
     assert context.session_store.get_session_snapshot(session_id=session.id).active
+
+
+def test_sampler_fault_commit_releases_lifecycle_barrier_while_drop_append_stalls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A queued sampler fault does not hold admission while its private row waits."""
+    context = _cold_finalisation_context(tmp_path)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.timing_evidence_sequence = 1
+    append_entered = Event()
+    release_append = Event()
+    sampler_dispatched = Event()
+    subsequent_dispatched = Event()
+    original_append = session_module._append_event_log_row  # pyright: ignore[reportPrivateUsage]
+    original_emergency = context.roaster_driver.emergency_stop
+
+    def pause_drop_row(current: RoastSession, event: RoastEvent) -> None:
+        if event.kind == "beans_dropped":
+            append_entered.set()
+            assert release_append.wait(timeout=1.0)
+        original_append(current, event)
+
+    def observe_dispatch(*, reason: str) -> EmergencyStopResult:
+        if reason.startswith("autonomous telemetry sampler failed"):
+            sampler_dispatched.set()
+        elif reason == "subsequent independent emergency":
+            subsequent_dispatched.set()
+        return original_emergency(reason=reason)
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", pause_drop_row)
+    monkeypatch.setattr(context.roaster_driver, "emergency_stop", observe_dispatch)
+    admission = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert admission.reservation is not None
+    driver_state = context.roaster_driver.drop_beans()
+    drop_results: list[NormalDropSettlement] = []
+
+    def settle_drop() -> None:
+        drop_results.append(
+            context.session_store.complete_normal_drop_success(
+                session,
+                reservation=admission.reservation,
+                heat_level_percent=driver_state.heat_level_percent,
+                fan_level_percent=driver_state.fan_level_percent,
+                cooling_on=driver_state.cooling_on,
+            )
+        )
+
+    sampler_thread = Thread(
+        target=_fault_active_session_after_sampler_failure,
+        kwargs={
+            "server_context": context,
+            "session": session,
+            "error": RuntimeError("synthetic stalled append"),
+        },
+    )
+    subsequent_errors: list[BaseException] = []
+    subsequent_thread = Thread(
+        target=_record_tool_error,
+        args=(subsequent_errors, server, "emergency_stop", ctx),
+        kwargs={
+            "reason": "subsequent independent emergency",
+            "expected_session_id": session.id,
+        },
+    )
+    drop_thread = Thread(target=settle_drop)
+    drop_thread.start()
+    assert append_entered.wait(timeout=1.0)
+    sampler_thread.start()
+    assert sampler_dispatched.wait(timeout=1.0)
+    subsequent_thread.start()
+    assert subsequent_dispatched.wait(timeout=1.0)
+    release_append.set()
+    drop_thread.join(timeout=1.0)
+    sampler_thread.join(timeout=1.0)
+    subsequent_thread.join(timeout=1.0)
+
+    assert not drop_thread.is_alive() and not sampler_thread.is_alive()
+    assert not subsequent_thread.is_alive() and subsequent_errors == []
+    assert drop_results[0].outcome == "unknown"
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert [event.kind for event in snapshot.event_timeline][-3:] == [
+        "beans_dropped",
+        "fault",
+        "fault",
+    ]
+    fault_reasons = [
+        event.payload["reason"] for event in snapshot.event_timeline if event.kind == "fault"
+    ]
+    assert fault_reasons == [
+        "autonomous telemetry sampler failed: RuntimeError: synthetic stalled append",
+        "subsequent independent emergency",
+    ]
 
 
 @pytest.mark.parametrize("held_site", ["factory", "close"])
