@@ -2311,10 +2311,10 @@ def create_mcp_server(
     ) -> ExportRoastLogResult:
         """Write a snapshot export for one roast session."""
         server_context = ctx.request_context.lifespan_context
-        session = _resolve_session(server_context, session_id=session_id)
-        if server_context.session_store.normal_drop_persistence_is_torn(
-            session
-        ) or server_context.session_store.has_unpersisted_mock_drop_fault(session):
+        session, persistence_incomplete = server_context.session_store.observe_export_readiness(
+            session_id=session_id
+        )
+        if persistence_incomplete:
             if session.log_writer is None:
                 raise ValueError("Session log target is unavailable.")
             log_dir = session.log_writer.log_dir
@@ -3548,8 +3548,9 @@ def _fail_closed_guarded_fault_recovery_command(
             reason=f"guarded fault recovery {command} failed",
         )
         try:
-            server_context.session_store.emergency_stop_snapshot(
+            _record_fault_with_owned_mock_drop_turn(
                 session,
+                server_context=server_context,
                 reason=f"guarded fault recovery {command} failed",
                 safety_payload=attempted_payload,
                 allow_stopped_latest=True,
@@ -3590,8 +3591,9 @@ def _retain_guarded_emergency_stop_block(
         else "guarded emergency stop reported incomplete containment"
     )
     try:
-        server_context.session_store.emergency_stop_snapshot(
+        _record_fault_with_owned_mock_drop_turn(
             session,
+            server_context=server_context,
             reason=reason,
             safety_payload=safety_payload,
             allow_stopped_latest=True,
@@ -3615,6 +3617,39 @@ def _guarded_emergency_stop_failure_message(
     if _guarded_emergency_stop_reported_retained_heat(safety_payload):
         return "Emergency stop reported retained heat."
     return "Emergency stop did not report complete emergency containment."
+
+
+def _record_fault_with_owned_mock_drop_turn(
+    session: RoastSession,
+    *,
+    server_context: ServerContext,
+    reason: str,
+    safety_payload: dict[str, EventPayloadValue],
+    allow_stopped_latest: bool,
+) -> tuple[RoastEvent, RoastSession]:
+    """Record a fault behind an owned mock Drop turn when one is outstanding."""
+    store = server_context.session_store
+    if (
+        type(server_context.roaster_driver) is MockRoasterDriver
+        and server_context.config.roaster.driver == "mock"
+        and store.has_pending_normal_drop_persistence(session)
+    ):
+        event, ticket = store.prepare_mock_drop_emergency_stop(
+            session,
+            reason=reason,
+            safety_payload=safety_payload,
+            allow_stopped_latest=allow_stopped_latest,
+        )
+        # This caller does not own the normal Drop turn. Preserve the fault
+        # damage fence rather than block on, or append behind, that writer.
+        _ = ticket
+        return event, store.get_session_snapshot(session_id=session.id)
+    return store.emergency_stop_snapshot(
+        session,
+        reason=reason,
+        safety_payload=safety_payload,
+        allow_stopped_latest=allow_stopped_latest,
+    )
 
 
 def _guarded_emergency_stop_reported_retained_heat(
@@ -3897,6 +3932,7 @@ def _fault_active_session_after_sampler_failure(
     """Fail closed when autonomous sampling cannot safely continue."""
     reason = f"autonomous telemetry sampler failed: {type(error).__name__}: {error}"
     observation_ticket: object | None = None
+    safety_payload = default_emergency_safety_payload()
     try:
         with server_context.lifecycle_barrier:
             latest_session = server_context.session_store.get_latest_session()
@@ -3919,13 +3955,20 @@ def _fault_active_session_after_sampler_failure(
                 observation_ticket = server_context.first_crack_runtime.begin_observation_boundary(
                     session, reason="autonomous_telemetry_sampler_failure"
                 )
-            event, snapshot = server_context.session_store.emergency_stop_snapshot(
+            event, snapshot = _record_fault_with_owned_mock_drop_turn(
                 session,
+                server_context=server_context,
                 reason=reason,
                 safety_payload=safety_payload,
                 allow_stopped_latest=True,
             )
     except SessionLifecycleError:
+        if server_context.session_store.has_pending_normal_drop_persistence(
+            session
+        ) or server_context.session_store.normal_drop_persistence_is_torn(session):
+            server_context.session_store.retain_active_fault_block(
+                session, safety_payload=safety_payload
+            )
         if server_context.config.first_crack.event_authority == "manual":
             server_context.first_crack_runtime.freeze_observation_boundary(
                 session, observation_ticket, reason="sampler_fault_recording_failed"

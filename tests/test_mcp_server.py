@@ -5403,11 +5403,21 @@ def test_torn_exact_drop_cooling_row_preserves_known_cooling_without_history(
     assert snapshot.cooling_started_at_utc is None
     assert [event.kind for event in snapshot.event_timeline].count("cooling_started") == 0
 
-    with pytest.raises(
-        SessionLifecycleError, match="Another driver command is already in progress"
-    ):
+    with pytest.raises(SessionLifecycleError, match="recording is unavailable"):
         _call_tool(server, "start_cooling", ctx)
     assert start_cooling_calls == 1
+
+    fixed_zero = _call_tool(
+        server,
+        "contain_heat_fixed_zero",
+        ctx,
+        expected_session_id=session.id,
+        containment_protocol="fixed_zero/v1",
+    )
+    assert fixed_zero.outcome == "command_state_returned"
+
+    with pytest.raises(SessionLifecycleError, match="uncertain tail"):
+        _call_tool(server, "set_fan", ctx, fan_level_percent=0)
 
     with pytest.raises(SessionLifecycleError, match="fault recording failed"):
         _call_tool(server, "emergency_stop", ctx, reason="torn-drop-log")
@@ -8718,6 +8728,46 @@ def test_export_uses_one_atomic_runtime_observation_snapshot(
     payload = json.loads(Path(result.summary_path).read_text(encoding="utf-8"))
     assert payload["first_crack_observation"]["identity"]["repo_id"] == "first"
     context.telemetry_sampler.stop_for_session(session_id, reason="test_cleanup")
+
+
+def test_export_rejects_a_fault_pending_between_legacy_snapshot_and_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Export never certifies the stale snapshot from a completed deferred fault."""
+    context = _cold_finalisation_context(tmp_path)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.timing_evidence_sequence = 1
+    admission = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert admission.reservation is not None
+    context.session_store.prepare_mock_drop_emergency_stop(
+        session,
+        reason="causal export fault",
+        safety_payload=mcp_server.default_emergency_safety_payload(),
+        allow_stopped_latest=True,
+    )
+    stale_snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    legacy_snapshot_reads = 0
+
+    def legacy_snapshot(
+        *, session_id: str | None = None, active_only: bool = False
+    ) -> RoastSession:
+        nonlocal legacy_snapshot_reads
+        legacy_snapshot_reads += 1
+        assert session_id == session.id and not active_only
+        return stale_snapshot
+
+    monkeypatch.setattr(context.session_store, "get_session_snapshot", legacy_snapshot)
+    exported = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+
+    assert legacy_snapshot_reads == 0
+    assert exported.ready is False
 
 
 @pytest.mark.parametrize("authority", ["automatic", "manual"])

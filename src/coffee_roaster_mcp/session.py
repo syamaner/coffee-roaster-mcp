@@ -670,6 +670,15 @@ class RoastSession:
     # Store only a deep-copyable opaque value here to keep the lifecycle store
     # independent of the server/tool module.
     finalisation: object | None = None
+    # Store-owned persistence facts travel with retained sessions so export
+    # cannot lose a damage fence when a successor session starts.
+    mock_log_torn: bool = field(default=False, kw_only=True, compare=False, repr=False)
+    unpersisted_mock_drop_fault_count: int = field(
+        default=0, kw_only=True, compare=False, repr=False
+    )
+    torn_start_cooling_attempted: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
 
     @property
     def active(self) -> bool:
@@ -1909,7 +1918,7 @@ class RoastSessionStore:
             return (
                 self._latest_session is not None
                 and self._latest_session.id == session.id
-                and self._normal_drop_persistence_torn
+                and session.mock_log_torn
             )
 
     def has_unpersisted_mock_drop_fault(self, session: RoastSession) -> bool:
@@ -1918,7 +1927,24 @@ class RoastSessionStore:
             return (
                 self._latest_session is not None
                 and self._latest_session.id == session.id
-                and self._normal_drop_unpersisted_fault_count > 0
+                and session.unpersisted_mock_drop_fault_count > 0
+            )
+
+    def observe_export_readiness(
+        self, *, session_id: str | None = None
+    ) -> tuple[RoastSession, bool]:
+        """Capture one export snapshot and its persistence fence atomically."""
+        with self._lock:
+            if self._latest_session is None:
+                raise SessionLifecycleError("No roast session exists.")
+            session = self._latest_session
+            if session_id is not None:
+                session = self._sessions_by_id.get(session_id)
+                if session is None:
+                    raise SessionLifecycleError(f"Unknown session_id: {session_id}")
+            snapshot = _copy_session_for_read(session)
+            return snapshot, (
+                session.mock_log_torn or session.unpersisted_mock_drop_fault_count > 0
             )
 
     def complete_normal_drop_success(
@@ -2026,6 +2052,7 @@ class RoastSessionStore:
                 if self._normal_drop_reservation_matches_locked(session, reservation):
                     if torn_log:
                         self._normal_drop_persistence_torn = True
+                        session.mock_log_torn = True
                     if drop_row_saved:
                         # The first endpoint is durable evidence, not an
                         # optimistic success: retain it without fabricating the
@@ -2099,6 +2126,10 @@ class RoastSessionStore:
                     existing_event=existing_event,
                     snapshot=_copy_session_for_read(session),
                 )
+            if session.torn_start_cooling_attempted:
+                raise SessionLifecycleError(
+                    "Cooling command completed, but roast log recording is unavailable."
+                )
             if session.beans_dropped_at_utc is None:
                 raise SessionLifecycleError("Cooling can only start after beans are dropped.")
             _validate_event_transition(session, "cooling_started")
@@ -2137,6 +2168,8 @@ class RoastSessionStore:
                 fan_level_percent=fan_level_percent,
                 cooling_on=cooling_on,
             )
+            session.torn_start_cooling_attempted = True
+            self._clear_driver_command_reservation_locked(session, reservation)
             return _copy_session_for_read(session)
 
     def reserve_driver_stop_cooling(self, session: RoastSession) -> DriverCommandReservation:
@@ -3392,6 +3425,7 @@ class RoastSessionStore:
             )
             _apply_event_timestamp(session, event)
             self._normal_drop_unpersisted_fault_count += 1
+            session.unpersisted_mock_drop_fault_count += 1
             if session.active:
                 session.stop(
                     utc_now=self._utc_now,
@@ -3421,12 +3455,14 @@ class RoastSessionStore:
             with self._lock:
                 if self._latest_session is session:
                     self._normal_drop_persistence_torn = True
+                    session.mock_log_torn = True
             raise
         with self._lock:
             self._assert_latest_session(session)
             session.event_timeline.append(event)
             _apply_event_timestamp(session, event)
             self._normal_drop_unpersisted_fault_count -= 1
+            session.unpersisted_mock_drop_fault_count -= 1
             return _copy_session_for_read(session)
 
     def get_active_session(self) -> RoastSession | None:
@@ -4094,6 +4130,10 @@ class RoastSessionStore:
         allow_stopped_latest: bool,
     ) -> RoastEvent:
         """Record an emergency fault, including a stopped latest-session race."""
+        if self._normal_drop_persistence_torn:
+            raise SessionLifecycleError(
+                "Fault history must be recorded by the owned normal-drop persistence turn."
+            )
         event = self._new_emergency_fault_event_locked(
             session, payload=payload, allow_stopped_latest=allow_stopped_latest
         )
