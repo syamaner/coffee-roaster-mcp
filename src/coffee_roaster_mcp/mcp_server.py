@@ -2312,7 +2312,9 @@ def create_mcp_server(
         """Write a snapshot export for one roast session."""
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
-        if server_context.session_store.normal_drop_persistence_is_torn(session):
+        if server_context.session_store.normal_drop_persistence_is_torn(
+            session
+        ) or server_context.session_store.has_unpersisted_mock_drop_fault(session):
             if session.log_writer is None:
                 raise ValueError("Session log target is unavailable.")
             log_dir = session.log_writer.log_dir
@@ -2323,7 +2325,7 @@ def create_mcp_server(
                 csv_path=str(log_dir / "roast.csv"),
                 summary_path=str(log_dir / "summary.json"),
                 ready=False,
-                note="Roast log recording is unavailable: JSONL has an uncertain tail.",
+                note="Roast log recording is unavailable: JSONL persistence is incomplete.",
             )
         observation = server_context.first_crack_runtime.observation_for_session(session.id)
         export = export_roast_snapshot(
@@ -2427,7 +2429,9 @@ def create_mcp_server(
                                 session,
                                 safety_payload=safety_payload,
                             )
-                        raise
+                        raise SessionLifecycleError(
+                            "Emergency stop fault recording failed; containment is unverified."
+                        ) from exc
                     server_context.session_store.retain_active_fault_block(
                         session,
                         safety_payload=safety_payload,
@@ -2450,7 +2454,9 @@ def create_mcp_server(
                             server_context.session_store.retain_fault_block(
                                 session, safety_payload=safety_payload
                             )
-                        raise
+                        raise SessionLifecycleError(
+                            "Emergency stop fault recording failed; containment is unverified."
+                        ) from exc
                     server_context.session_store.retain_active_fault_block(
                         session, safety_payload=safety_payload
                     )

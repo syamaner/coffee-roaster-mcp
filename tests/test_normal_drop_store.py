@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import Barrier, Thread
 
 import pytest
 
 import coffee_roaster_mcp.session as session_module
 from coffee_roaster_mcp.session import (
+    LogWriterReference,
     NormalDropIdentity,
     NormalDropNonDispatchProof,
     NormalDropReservation,
@@ -194,6 +197,86 @@ def test_known_cancellation_releases_only_its_exact_admission() -> None:
         proof=_non_dispatch_proof(admission.reservation),
     )
     assert duplicate.outcome == "stale"
+
+
+@pytest.mark.parametrize("settlement", ["cancelled", "unknown"])
+def test_unstarted_drop_turn_is_discharged_before_a_later_emergency(
+    settlement: str,
+) -> None:
+    """An emergency never waits behind an exact Drop that cannot append."""
+    store = RoastSessionStore()
+    session, identity = _ready_drop(store)
+    admission = store.admit_normal_drop(identity)
+    assert admission.reservation is not None
+
+    if settlement == "cancelled":
+        result = store.settle_normal_drop_cancelled(
+            session,
+            reservation=admission.reservation,
+            proof=_non_dispatch_proof(admission.reservation),
+        )
+    else:
+        result = store.retain_normal_drop_unknown(session, reservation=admission.reservation)
+
+    assert result.outcome == settlement
+    assert not store.has_pending_normal_drop_persistence(session)
+    fault = store.emergency_stop(session, reason=f"after-{settlement}")
+    assert fault.kind == "fault"
+
+
+def test_append_probe_rejects_a_nonregular_replacement_after_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bounded probe validates its opened descriptor after a path replacement."""
+    store = RoastSessionStore()
+    session, _ = _ready_drop(store)
+    session.log_writer = LogWriterReference(session_id=session.id, log_dir=tmp_path)
+    log_path = tmp_path / "roast.jsonl"
+    log_path.write_bytes(b"{}\n")
+    original_open = session_module.os.open
+
+    def replace_before_open(path: str | os.PathLike[str], flags: int) -> int:
+        assert Path(path) == log_path
+        log_path.unlink()
+        os.mkfifo(log_path)
+        return original_open(path, flags)
+
+    monkeypatch.setattr(session_module.os, "open", replace_before_open)
+
+    evidence = session_module._capture_append_failure_evidence(session)  # pyright: ignore[reportPrivateUsage]
+
+    assert evidence.complete_tail is False
+
+
+def test_recursive_tail_parse_failure_marks_drop_append_torn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parser recursion failure cannot be treated as a clean failed append."""
+    store = RoastSessionStore()
+    session, identity = _ready_drop(store)
+    session.log_writer = LogWriterReference(session_id=session.id, log_dir=tmp_path)
+    log_path = tmp_path / "roast.jsonl"
+    log_path.write_bytes((b"[" * 2_000) + b"\n")
+    admission = store.admit_normal_drop(identity)
+    assert admission.reservation is not None
+
+    def fail_append(_session: RoastSession, _event: object) -> None:
+        raise OSError("write failed")
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_append)
+    settled = store.complete_normal_drop_success(
+        session,
+        reservation=admission.reservation,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=True,
+    )
+
+    assert settled.outcome == "unknown"
+    assert store.normal_drop_persistence_is_torn(session)
+    assert store._normal_drop_persistence_last_completion.is_set()  # pyright: ignore[reportPrivateUsage]
 
 
 def test_emergency_cleared_token_can_settle_only_with_exact_positive_proof() -> None:

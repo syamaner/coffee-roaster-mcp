@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import stat
 from collections import deque
 from collections.abc import Callable, Mapping
 from copy import deepcopy
@@ -213,31 +215,117 @@ def _append_event_log_row(session: RoastSession, event: RoastEvent) -> None:
     )
 
 
-def _event_log_has_complete_jsonl_prefix(session: RoastSession) -> bool:
-    """Return whether the session event log ends on a complete JSONL record.
+_APPEND_FAILURE_TAIL_BYTES = 4096
 
-    This narrow check is used only by the exact mock Drop persistence path
-    after an append raises.  It never repairs, truncates, or otherwise changes
-    the append-only log.
-    """
+
+@dataclass(frozen=True)
+class _AppendFailureEvidence:
+    """Bounded pre-write evidence for one mock Drop-window log append."""
+
+    path: Path | None
+    identity: tuple[int, int, int, int, int] | None
+    complete_tail: bool
+
+
+def _capture_append_failure_evidence(session: RoastSession) -> _AppendFailureEvidence:
+    """Capture bounded pre-write evidence without reading roast-log history."""
     if session.log_writer is None:
-        return True
+        return _AppendFailureEvidence(path=None, identity=None, complete_tail=True)
     path = session.log_writer.log_dir / "roast.jsonl"
     try:
-        if not path.exists():
-            return True
-        contents = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
+        file_status = path.lstat()
+    except FileNotFoundError:
+        return _AppendFailureEvidence(path=path, identity=None, complete_tail=True)
+    except OSError:
+        return _AppendFailureEvidence(path=path, identity=None, complete_tail=False)
+    if not stat.S_ISREG(file_status.st_mode) or file_status.st_size < 0:
+        return _AppendFailureEvidence(path=path, identity=None, complete_tail=False)
+    identity = (
+        file_status.st_dev,
+        file_status.st_ino,
+        file_status.st_size,
+        file_status.st_mtime_ns,
+        file_status.st_ctime_ns,
+    )
+    tail_size = min(file_status.st_size, _APPEND_FAILURE_TAIL_BYTES)
+    open_flags = os.O_RDONLY | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, open_flags)
+    except OSError:
+        return _AppendFailureEvidence(path=path, identity=identity, complete_tail=False)
+    try:
+        opened_status = os.fstat(descriptor)
+        opened_identity = (
+            opened_status.st_dev,
+            opened_status.st_ino,
+            opened_status.st_size,
+            opened_status.st_mtime_ns,
+            opened_status.st_ctime_ns,
+        )
+        if not stat.S_ISREG(opened_status.st_mode) or opened_identity != identity:
+            return _AppendFailureEvidence(path=path, identity=identity, complete_tail=False)
+        os.lseek(descriptor, opened_status.st_size - tail_size, os.SEEK_SET)
+        tail = os.read(descriptor, tail_size)
+    except (OSError, ValueError):
+        return _AppendFailureEvidence(path=path, identity=identity, complete_tail=False)
+    finally:
+        os.close(descriptor)
+    if len(tail) != tail_size or (tail and not tail.endswith(b"\n")):
+        return _AppendFailureEvidence(path=path, identity=identity, complete_tail=False)
+    if opened_status.st_size == 0:
+        return _AppendFailureEvidence(path=path, identity=identity, complete_tail=True)
+    final_line_start = tail.rfind(b"\n", 0, len(tail) - 1) + 1
+    if final_line_start == 0 and file_status.st_size > tail_size:
+        return _AppendFailureEvidence(path=path, identity=identity, complete_tail=False)
+    final_line = tail[final_line_start:-1]
+    if not final_line:
+        return _AppendFailureEvidence(path=path, identity=identity, complete_tail=False)
+    try:
+        complete_tail = isinstance(json.loads(final_line), dict)
+    except Exception:  # noqa: BLE001 - malformed nested JSON must fail closed.
+        complete_tail = False
+    return _AppendFailureEvidence(path=path, identity=identity, complete_tail=complete_tail)
+
+
+def _append_failure_may_have_damaged_log(evidence: _AppendFailureEvidence) -> bool:
+    """Fail closed unless a failed append left known-clean pre-write bytes unchanged."""
+    if evidence.path is None:
         return False
-    if contents and not contents.endswith("\n"):
-        return False
-    for line in contents.splitlines():
-        try:
-            if not isinstance(json.loads(line), dict):
-                return False
-        except json.JSONDecodeError:
-            return False
-    return True
+    if not evidence.complete_tail:
+        return True
+    try:
+        file_status = evidence.path.lstat()
+    except FileNotFoundError:
+        return evidence.identity is not None
+    except OSError:
+        return True
+    if evidence.identity is None or not stat.S_ISREG(file_status.st_mode):
+        return True
+    identity = (
+        file_status.st_dev,
+        file_status.st_ino,
+        file_status.st_size,
+        file_status.st_mtime_ns,
+        file_status.st_ctime_ns,
+    )
+    return identity != evidence.identity
+
+
+def _append_event_log_row_with_failure_evidence(session: RoastSession, event: RoastEvent) -> None:
+    """Append one protected row and expose bounded evidence if its write raises."""
+    evidence = _capture_append_failure_evidence(session)
+    try:
+        _append_event_log_row(session, event)
+    except Exception as error:
+        if _append_failure_may_have_damaged_log(evidence):
+            raise _MockDropAppendMayBeTornError from error
+        raise
+
+
+class _MockDropAppendMayBeTornError(Exception):
+    """A protected mock Drop-window append failed after ambiguous file evidence."""
 
 
 def _telemetry_log_row_if_due(
@@ -1029,8 +1117,10 @@ class RoastSessionStore:
         self._normal_drop_persistence_last_completion = Event()
         self._normal_drop_persistence_last_completion.set()
         self._normal_drop_persistence_drop_ticket: MockDropPersistenceTicket | None = None
+        self._normal_drop_persistence_drop_started = False
         self._normal_drop_persistence_failed = False
         self._normal_drop_persistence_torn = False
+        self._normal_drop_unpersisted_fault_count = 0
         self._fault_recovery_in_flight_tokens: dict[str, str] = {}
         self._fault_recovery_admission_blocks: set[str] = set()
         self._fault_drop_cooling_cycle_required: set[str] = set()
@@ -1247,7 +1337,10 @@ class RoastSessionStore:
                 return None
             if self._finalisation_blocks_mutation(self._latest_session):
                 return None
-            if not self._normal_drop_persistence_last_completion.is_set():
+            if (
+                self._normal_drop_persistence_torn
+                or not self._normal_drop_persistence_last_completion.is_set()
+            ):
                 return None
             if session_id is not None and self._latest_session.id != session_id:
                 return None
@@ -1739,8 +1832,10 @@ class RoastSessionStore:
             self._normal_drop_persistence_last_completion = Event()
             self._normal_drop_persistence_last_completion.set()
             self._normal_drop_persistence_drop_ticket = self._reserve_mock_drop_ticket_locked()
+            self._normal_drop_persistence_drop_started = False
             self._normal_drop_persistence_failed = False
             self._normal_drop_persistence_torn = False
+            self._normal_drop_unpersisted_fault_count = 0
             return NormalDropAdmission("dispatch", reservation=reservation)
 
     def settle_normal_drop_cancelled(
@@ -1770,6 +1865,7 @@ class RoastSessionStore:
                 return NormalDropSettlement("stale")
             if self._normal_drop_fence_state != "pending":
                 return NormalDropSettlement("stale")
+            self._discharge_unused_mock_drop_turn_locked(session, reservation)
             self._clear_normal_drop_token_locked(session, reservation)
             self._normal_drop_in_flight = None
             self._normal_drop_fence_state = None
@@ -1787,6 +1883,7 @@ class RoastSessionStore:
                 return NormalDropSettlement("stale")
             if not self._normal_drop_reservation_matches_locked(session, reservation):
                 return NormalDropSettlement("stale")
+            self._discharge_unused_mock_drop_turn_locked(session, reservation)
             self._retain_normal_drop_unknown_locked(session, reservation)
             return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
 
@@ -1815,6 +1912,15 @@ class RoastSessionStore:
                 and self._normal_drop_persistence_torn
             )
 
+    def has_unpersisted_mock_drop_fault(self, session: RoastSession) -> bool:
+        """Return whether this session has a dispatched but unrecorded mock fault."""
+        with self._lock:
+            return (
+                self._latest_session is not None
+                and self._latest_session.id == session.id
+                and self._normal_drop_unpersisted_fault_count > 0
+            )
+
     def complete_normal_drop_success(
         self,
         session: RoastSession,
@@ -1836,14 +1942,17 @@ class RoastSessionStore:
             if not self._normal_drop_reservation_matches_locked(session, reservation):
                 return NormalDropSettlement("stale")
             if self._normal_drop_fence_state == "unknown":
+                self._discharge_unused_mock_drop_turn_locked(session, reservation)
                 return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
             if not session.active or session.faulted_at_utc is not None or session.phase == "fault":
+                self._discharge_unused_mock_drop_turn_locked(session, reservation)
                 self._retain_normal_drop_unknown_locked(session, reservation)
                 return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
             if (
                 session.pending_driver_command_token != reservation.token
                 or session.pending_driver_command_kind != "drop"
             ):
+                self._discharge_unused_mock_drop_turn_locked(session, reservation)
                 self._retain_normal_drop_unknown_locked(session, reservation)
                 return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
             if not _is_valid_mock_drop_projection(
@@ -1851,6 +1960,7 @@ class RoastSessionStore:
                 fan_level_percent=fan_level_percent,
                 cooling_on=cooling_on,
             ):
+                self._discharge_unused_mock_drop_turn_locked(session, reservation)
                 self._retain_normal_drop_unknown_locked(session, reservation)
                 return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
 
@@ -1869,8 +1979,10 @@ class RoastSessionStore:
                 if persistence_ticket is None:
                     raise SessionLifecycleError("Normal mock bean-drop save has no append ticket.")
             except Exception:  # noqa: BLE001 - close an invalid projection conservatively.
+                self._discharge_unused_mock_drop_turn_locked(session, reservation)
                 self._retain_normal_drop_unknown_locked(session, reservation)
                 return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
+            self._normal_drop_persistence_drop_started = True
 
         # No lifecycle/store lock is held while a filesystem writer is stalled.
         # This caller owns both reserved endpoint turns; no emergency writer
@@ -1883,10 +1995,10 @@ class RoastSessionStore:
             def append_endpoints() -> None:
                 nonlocal cooling_row_saved, drop_row_saved, torn_log
                 try:
-                    _append_event_log_row(session, drop_event)
+                    _append_event_log_row_with_failure_evidence(session, drop_event)
                     drop_row_saved = True
-                except Exception:
-                    torn_log = not _event_log_has_complete_jsonl_prefix(session)
+                except _MockDropAppendMayBeTornError:
+                    torn_log = True
                     raise
                 # An emergency can stop the session while a stalled Drop row
                 # owns this turn.  Its fault is already admitted behind the
@@ -1899,10 +2011,10 @@ class RoastSessionStore:
                     ):
                         return
                 try:
-                    _append_event_log_row(session, cooling_event)
+                    _append_event_log_row_with_failure_evidence(session, cooling_event)
                     cooling_row_saved = True
-                except Exception:
-                    torn_log = not _event_log_has_complete_jsonl_prefix(session)
+                except _MockDropAppendMayBeTornError:
+                    torn_log = True
                     raise
 
             self._append_mock_drop_turn(
@@ -3000,6 +3112,7 @@ class RoastSessionStore:
         with self._lock:
             self._assert_latest_active_session(session)
             self._assert_finalisation_allows_mutation(session)
+            self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
             recorded_at_utc = self._utc_now()
             monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
             session.fc_window_count += 1
@@ -3069,6 +3182,7 @@ class RoastSessionStore:
         with self._lock:
             self._assert_latest_active_session(session)
             self._assert_finalisation_allows_mutation(session)
+            self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
             if session.faulted_at_utc is not None:
                 raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
 
@@ -3229,6 +3343,23 @@ class RoastSessionStore:
         self._normal_drop_persistence_last_completion = ticket.completion
         return ticket
 
+    def _discharge_unused_mock_drop_turn_locked(
+        self,
+        session: RoastSession,
+        reservation: NormalDropReservation,
+    ) -> bool:
+        """Complete only the exact unstarted Drop turn owned by this settlement."""
+        ticket = self._normal_drop_persistence_drop_ticket
+        if (
+            ticket is None
+            or self._normal_drop_persistence_drop_started
+            or not self._normal_drop_reservation_matches_locked(session, reservation)
+        ):
+            return False
+        ticket.completion.set()
+        self._normal_drop_persistence_drop_ticket = None
+        return True
+
     def prepare_mock_drop_emergency_stop(
         self,
         session: RoastSession,
@@ -3260,6 +3391,7 @@ class RoastSessionStore:
                 allow_stopped_latest=allow_stopped_latest,
             )
             _apply_event_timestamp(session, event)
+            self._normal_drop_unpersisted_fault_count += 1
             if session.active:
                 session.stop(
                     utc_now=self._utc_now,
@@ -3280,10 +3412,21 @@ class RoastSessionStore:
         self, session: RoastSession, *, event: RoastEvent, ticket: MockDropPersistenceTicket
     ) -> RoastSession:
         """Append one previously published mock-drop emergency fault event."""
-        self._append_mock_drop_turn(ticket, lambda: _append_event_log_row(session, event))
+        try:
+            self._append_mock_drop_turn(
+                ticket,
+                lambda: _append_event_log_row_with_failure_evidence(session, event),
+            )
+        except _MockDropAppendMayBeTornError:
+            with self._lock:
+                if self._latest_session is session:
+                    self._normal_drop_persistence_torn = True
+            raise
         with self._lock:
             self._assert_latest_session(session)
             session.event_timeline.append(event)
+            _apply_event_timestamp(session, event)
+            self._normal_drop_unpersisted_fault_count -= 1
             return _copy_session_for_read(session)
 
     def get_active_session(self) -> RoastSession | None:
@@ -3640,6 +3783,7 @@ class RoastSessionStore:
         payload: dict[str, EventPayloadValue],
     ) -> RoastEvent:
         """Record a narrowly allowed event for a stopped latest session."""
+        self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
         existing_event = self._get_existing_singleton_event(session, kind)
         is_post_fault_recovery = (
             kind in {"cooling_started", "cooling_stopped"}
@@ -3970,7 +4114,7 @@ class RoastSessionStore:
             _validate_event_transition(session, "fault")
         elif not allow_stopped_latest:
             raise SessionLifecycleError("Stopped sessions cannot be mutated.")
-        elif session.faulted_at_utc is None:
+        elif session.faulted_at_utc is None and self._normal_drop_unpersisted_fault_count == 0:
             _validate_event_transition(session, "fault")
         recorded_at_utc = self._utc_now()
         monotonic_seconds = max(0.0, self._monotonic_now() - session.monotonic_start)
