@@ -2312,6 +2312,19 @@ def create_mcp_server(
         """Write a snapshot export for one roast session."""
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
+        if server_context.session_store.normal_drop_persistence_is_torn(session):
+            if session.log_writer is None:
+                raise ValueError("Session log target is unavailable.")
+            log_dir = session.log_writer.log_dir
+            return ExportRoastLogResult(
+                session_id=session.id,
+                log_dir=str(log_dir),
+                jsonl_path=str(log_dir / "roast.jsonl"),
+                csv_path=str(log_dir / "roast.csv"),
+                summary_path=str(log_dir / "summary.json"),
+                ready=False,
+                note="Roast log recording is unavailable: JSONL has an uncertain tail.",
+            )
         observation = server_context.first_crack_runtime.observation_for_session(session.id)
         export = export_roast_snapshot(
             session,
@@ -3388,19 +3401,30 @@ def _run_reserved_driver_start_cooling(
     reservation = event_reservation.reservation
     try:
         driver_state = server_context.roaster_driver.start_cooling()
-        try:
-            return server_context.session_store.complete_reserved_driver_start_cooling_snapshot(
-                session,
-                reservation=reservation,
-                heat_level_percent=driver_state.heat_level_percent,
-                fan_level_percent=driver_state.fan_level_percent,
-                cooling_on=driver_state.cooling_on,
-            )
-        except SessionLifecycleError:
-            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
-            raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
+        raise
+    try:
+        return server_context.session_store.complete_reserved_driver_start_cooling_snapshot(
+            session,
+            reservation=reservation,
+            heat_level_percent=driver_state.heat_level_percent,
+            fan_level_percent=driver_state.fan_level_percent,
+            cooling_on=driver_state.cooling_on,
+        )
+    except SessionLifecycleError as error:
+        settled = server_context.session_store.settle_known_torn_start_cooling(
+            session,
+            reservation=reservation,
+            heat_level_percent=driver_state.heat_level_percent,
+            fan_level_percent=driver_state.fan_level_percent,
+            cooling_on=driver_state.cooling_on,
+        )
+        if settled is not None:
+            raise SessionLifecycleError(
+                "Cooling command completed, but roast log recording is unavailable."
+            ) from error
+        _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
         raise
 
 

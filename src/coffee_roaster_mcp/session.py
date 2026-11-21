@@ -213,6 +213,33 @@ def _append_event_log_row(session: RoastSession, event: RoastEvent) -> None:
     )
 
 
+def _event_log_has_complete_jsonl_prefix(session: RoastSession) -> bool:
+    """Return whether the session event log ends on a complete JSONL record.
+
+    This narrow check is used only by the exact mock Drop persistence path
+    after an append raises.  It never repairs, truncates, or otherwise changes
+    the append-only log.
+    """
+    if session.log_writer is None:
+        return True
+    path = session.log_writer.log_dir / "roast.jsonl"
+    try:
+        if not path.exists():
+            return True
+        contents = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    if contents and not contents.endswith("\n"):
+        return False
+    for line in contents.splitlines():
+        try:
+            if not isinstance(json.loads(line), dict):
+                return False
+        except json.JSONDecodeError:
+            return False
+    return True
+
+
 def _telemetry_log_row_if_due(
     session: RoastSession,
     sample: TelemetrySample,
@@ -1003,6 +1030,7 @@ class RoastSessionStore:
         self._normal_drop_persistence_last_completion.set()
         self._normal_drop_persistence_drop_ticket: MockDropPersistenceTicket | None = None
         self._normal_drop_persistence_failed = False
+        self._normal_drop_persistence_torn = False
         self._fault_recovery_in_flight_tokens: dict[str, str] = {}
         self._fault_recovery_admission_blocks: set[str] = set()
         self._fault_drop_cooling_cycle_required: set[str] = set()
@@ -1712,6 +1740,7 @@ class RoastSessionStore:
             self._normal_drop_persistence_last_completion.set()
             self._normal_drop_persistence_drop_ticket = self._reserve_mock_drop_ticket_locked()
             self._normal_drop_persistence_failed = False
+            self._normal_drop_persistence_torn = False
             return NormalDropAdmission("dispatch", reservation=reservation)
 
     def settle_normal_drop_cancelled(
@@ -1772,7 +1801,19 @@ class RoastSessionStore:
         with self._lock:
             if self._latest_session is not session:
                 return False
-            return not self._normal_drop_persistence_last_completion.is_set()
+            return (
+                self._normal_drop_persistence_torn
+                or not self._normal_drop_persistence_last_completion.is_set()
+            )
+
+    def normal_drop_persistence_is_torn(self, session: RoastSession) -> bool:
+        """Return whether this session's exact mock Drop log has an uncertain tail."""
+        with self._lock:
+            return (
+                self._latest_session is not None
+                and self._latest_session.id == session.id
+                and self._normal_drop_persistence_torn
+            )
 
     def complete_normal_drop_success(
         self,
@@ -1836,12 +1877,17 @@ class RoastSessionStore:
         # drains or fabricates either row on its behalf.
         drop_row_saved = False
         cooling_row_saved = False
+        torn_log = False
         try:
 
             def append_endpoints() -> None:
-                nonlocal cooling_row_saved, drop_row_saved
-                _append_event_log_row(session, drop_event)
-                drop_row_saved = True
+                nonlocal cooling_row_saved, drop_row_saved, torn_log
+                try:
+                    _append_event_log_row(session, drop_event)
+                    drop_row_saved = True
+                except Exception:
+                    torn_log = not _event_log_has_complete_jsonl_prefix(session)
+                    raise
                 # An emergency can stop the session while a stalled Drop row
                 # owns this turn.  Its fault is already admitted behind the
                 # Drop row, so never manufacture a later cooling endpoint.
@@ -1852,8 +1898,12 @@ class RoastSessionStore:
                         or not session.active
                     ):
                         return
-                _append_event_log_row(session, cooling_event)
-                cooling_row_saved = True
+                try:
+                    _append_event_log_row(session, cooling_event)
+                    cooling_row_saved = True
+                except Exception:
+                    torn_log = not _event_log_has_complete_jsonl_prefix(session)
+                    raise
 
             self._append_mock_drop_turn(
                 persistence_ticket,
@@ -1862,6 +1912,8 @@ class RoastSessionStore:
         except Exception:  # noqa: BLE001 - a torn append remains unknowable.
             with self._lock:
                 if self._normal_drop_reservation_matches_locked(session, reservation):
+                    if torn_log:
+                        self._normal_drop_persistence_torn = True
                     if drop_row_saved:
                         # The first endpoint is durable evidence, not an
                         # optimistic success: retain it without fabricating the
@@ -1941,6 +1993,39 @@ class RoastSessionStore:
             return DriverEventReservation(
                 reservation=self._reserve_driver_command_locked(session, kind="start_cooling")
             )
+
+    def settle_known_torn_start_cooling(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> RoastSession | None:
+        """Retain a known cooling result when its exact P2 log cannot be extended.
+
+        The normal Drop's retained UNKNOWN fence remains the recovery owner.
+        This records the driver-returned control projection only: no
+        ``cooling_started`` history row can be claimed once the append-only
+        JSONL has a torn tail.
+        """
+        with self._lock:
+            if not self._normal_drop_persistence_torn:
+                return None
+            try:
+                self._assert_driver_command_reservation(session, reservation)
+            except SessionLifecycleError:
+                return None
+            if reservation.kind != "start_cooling" or not cooling_on:
+                return None
+            self.apply_driver_control_state(
+                session,
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=fan_level_percent,
+                cooling_on=cooling_on,
+            )
+            return _copy_session_for_read(session)
 
     def reserve_driver_stop_cooling(self, session: RoastSession) -> DriverCommandReservation:
         """Reserve a cooling-stop command for an active cooling session."""
@@ -2173,7 +2258,12 @@ class RoastSessionStore:
                 ) = previous_control_state
                 raise
             finally:
-                self._clear_driver_command_reservation_locked(session, reservation)
+                # The caller may still settle a known driver result without a
+                # history row for the exact torn-P2 path.  It needs this
+                # reservation to prove ownership; all ordinary failures keep
+                # their established eager clear.
+                if not self._normal_drop_persistence_torn:
+                    self._clear_driver_command_reservation_locked(session, reservation)
             return event, _copy_session_for_read(session)
 
     def complete_reserved_driver_stop_cooling_snapshot(
@@ -2708,9 +2798,9 @@ class RoastSessionStore:
         self, session: RoastSession
     ) -> None:
         """Refuse ordinary log writers while an exact Drop owns this log window."""
-        if (
-            self._latest_session is session
-            and not self._normal_drop_persistence_last_completion.is_set()
+        if self._latest_session is session and (
+            self._normal_drop_persistence_torn
+            or not self._normal_drop_persistence_last_completion.is_set()
         ):
             raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
 
@@ -3681,6 +3771,11 @@ class RoastSessionStore:
         kind: DriverCommandKind,
     ) -> DriverCommandReservation:
         """Reserve a driver command while the store lock is already held."""
+        if self._normal_drop_persistence_torn and kind not in {
+            "heat_containment",
+            "start_cooling",
+        }:
+            raise SessionLifecycleError("The exact normal bean-drop log has an uncertain tail.")
         if kind == "drop" and self._normal_drop_in_flight is not None:
             raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
         if session.pending_driver_command_token is not None:

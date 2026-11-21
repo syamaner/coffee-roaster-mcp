@@ -5163,6 +5163,102 @@ def test_exact_mock_drop_first_row_failure_has_no_recorded_endpoint(
     assert repeated.outcome == "ambiguous"
 
 
+def test_torn_exact_drop_cooling_row_preserves_known_cooling_without_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial P2 endpoint remains unknown and cannot be glued to later evidence."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = MockRoasterDriver()
+    start_cooling_calls = 0
+    emergency_stop_calls = 0
+    original_start_cooling = driver.start_cooling
+    original_emergency_stop = driver.emergency_stop
+
+    def record_start_cooling() -> RoasterState:
+        nonlocal start_cooling_calls
+        start_cooling_calls += 1
+        return original_start_cooling()
+
+    def record_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        nonlocal emergency_stop_calls
+        emergency_stop_calls += 1
+        return original_emergency_stop(reason=reason)
+
+    monkeypatch.setattr(driver, "start_cooling", record_start_cooling)
+    monkeypatch.setattr(driver, "emergency_stop", record_emergency_stop)
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.timing_evidence_sequence = 1
+    original_append = session_module._append_event_log_row  # pyright: ignore[reportPrivateUsage]
+
+    def tear_only_cooling_endpoint(current: RoastSession, event: RoastEvent) -> None:
+        if event.kind != "cooling_started":
+            original_append(current, event)
+            return
+        assert current.log_writer is not None
+        with (current.log_writer.log_dir / "roast.jsonl").open("a", encoding="utf-8") as log:
+            log.write('{"partial":')
+            log.flush()
+        raise OSError("torn exact Drop cooling row")
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", tear_only_cooling_endpoint)
+    admission = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert admission.reservation is not None
+    driver_state = driver.drop_beans()
+    settlement = context.session_store.complete_normal_drop_success(
+        session,
+        reservation=admission.reservation,
+        heat_level_percent=driver_state.heat_level_percent,
+        fan_level_percent=driver_state.fan_level_percent,
+        cooling_on=driver_state.cooling_on,
+    )
+
+    assert settlement.outcome == "unknown"
+    assert context.session_store.normal_drop_persistence_is_torn(session)
+    assert session.log_writer is not None
+    log_path = session.log_writer.log_dir / "roast.jsonl"
+    torn_bytes = log_path.read_bytes()
+    assert torn_bytes.endswith(b'{"partial":')
+    assert session.phase == "dropped"
+    assert session.beans_dropped_at_utc is not None
+    assert session.cooling_started_at_utc is None
+
+    exported = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+    assert exported.ready is False
+    assert "recording is unavailable" in exported.note
+    assert not Path(exported.summary_path).exists()
+
+    with pytest.raises(SessionLifecycleError, match="recording is unavailable"):
+        _call_tool(server, "start_cooling", ctx)
+    assert start_cooling_calls == 1
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.cooling_on is True
+    assert snapshot.cooling_started_at_utc is None
+    assert [event.kind for event in snapshot.event_timeline].count("cooling_started") == 0
+
+    with pytest.raises(
+        SessionLifecycleError, match="Another driver command is already in progress"
+    ):
+        _call_tool(server, "start_cooling", ctx)
+    assert start_cooling_calls == 1
+
+    with pytest.raises(SessionLifecycleError, match="fault recording failed"):
+        _call_tool(server, "emergency_stop", ctx, reason="torn-drop-log")
+    assert emergency_stop_calls == 1
+    assert log_path.read_bytes() == torn_bytes
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.phase == "fault"
+    assert snapshot.faulted_at_utc is not None
+
+
 class _QueuedWindowAudioPipeline:
     """Fake audio pipeline exposing detector windows queued after construction.
 
