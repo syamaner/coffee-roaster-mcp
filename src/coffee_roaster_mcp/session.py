@@ -416,9 +416,9 @@ class SessionStartReservation:
     token: str
 
 
-@dataclass(frozen=True)
+@dataclass
 class StagedSessionStartPublication:
-    """Private identity result for a staged driver start publication."""
+    """Caller-owned identity result for one staged session publication."""
 
     session: RoastSession | None
 
@@ -1130,7 +1130,6 @@ class RoastSessionStore:
         self._session_id_order: deque[str] = deque()
         self._pending_session_start_token: str | None = None
         self._session_start_in_flight_token: str | None = None
-        self._staged_start_publications: dict[str, RoastSession] = {}
         # Unlike an ordinary driver token, this fence survives an emergency
         # cancellation until the exact operation is settled. It prevents a
         # later call from treating a cleared token as evidence of non-dispatch.
@@ -1216,14 +1215,15 @@ class RoastSessionStore:
         self,
         reservation: SessionStartReservation,
         *,
+        publication: StagedSessionStartPublication,
         purpose: SessionPurpose = "roast",
     ) -> RoastSession:
         """Publish a reserved session while retaining its exact identity on handoff failure.
 
-        The private publication record is written in ``finally`` before the
-        snapshot copy.  A caller that receives an exception can therefore
-        retrieve the exact published object without deriving it from a return
-        value or from a later latest-session lookup.
+        The caller-owned publication result is bound in ``finally`` before the
+        snapshot copy. A caller that receives an exception can therefore retain
+        the exact published object without deriving it from a return value or a
+        later latest-session lookup.
         """
         with self._lock:
             previous = self._latest_session
@@ -1233,24 +1233,12 @@ class RoastSessionStore:
             finally:
                 published = self._latest_session
                 if published is not previous and published is not None:
-                    self._staged_start_publications[reservation.token] = published
-                self._pending_session_start_token = None
-                if (
-                    published is not previous
-                    and published is not None
-                    and self._session_start_in_flight_token == reservation.token
-                ):
+                    publication.session = published
+                if self._pending_session_start_token == reservation.token:
+                    self._pending_session_start_token = None
+                if self._session_start_in_flight_token == reservation.token:
                     self._session_start_in_flight_token = None
             return _copy_session_for_read(session)
-
-    def staged_session_start_publication(
-        self, reservation: SessionStartReservation
-    ) -> StagedSessionStartPublication:
-        """Return the exact private publication identity for one reservation."""
-        with self._lock:
-            return StagedSessionStartPublication(
-                session=self._staged_start_publications.get(reservation.token)
-            )
 
     def assert_staged_start_claimable(self, session: RoastSession) -> None:
         """Require the exact live session to remain eligible for staged entry."""

@@ -86,6 +86,7 @@ from coffee_roaster_mcp.session import (
     SessionLifecycleError,
     SessionPresence,
     SessionPurpose,
+    StagedSessionStartPublication,
     compute_roast_metrics,
     default_emergency_safety_payload,
     has_verified_emergency_containment,
@@ -1968,34 +1969,27 @@ def create_mcp_server(
         with server_context.lifecycle_barrier:
             reservation = server_context.session_store.reserve_session_start()
         driver = server_context.roaster_driver
-        if isinstance(driver, HottopRoasterDriver):
+        if manual and isinstance(driver, HottopRoasterDriver):
             owner = driver.reserve_inhibited_start(reservation.token)
-            published_session: RoastSession | None = None
-            promoted_identity_bound = False
+            publication = StagedSessionStartPublication(session=None)
             try:
                 driver.open_inhibited_start(owner)
                 with server_context.lifecycle_barrier:
                     driver.begin_inhibited_start_promotion(owner)
                     try:
                         server_context.session_store.complete_staged_session_start_snapshot(
-                            reservation, purpose=purpose
+                            reservation, publication=publication, purpose=purpose
                         )
                     finally:
-                        publication = server_context.session_store.staged_session_start_publication(
-                            reservation
-                        )
-                        published_session = publication.session
+                        if publication.session is not None:
+                            driver.bind_promoted_inhibited_start(owner, publication.session)
+                published_session = publication.session
                 if published_session is None:
                     raise SessionLifecycleError(
                         "Staged Hottop session publication did not complete."
                     )
-                driver.bind_promoted_inhibited_start(owner, published_session)
-                promoted_identity_bound = True
             except BaseException:
-                if published_session is not None and not promoted_identity_bound:
-                    driver.bind_promoted_inhibited_start(owner, published_session)
-                    promoted_identity_bound = True
-                elif published_session is None:
+                if publication.session is None:
                     driver.restore_inhibited_start_after_unpublished_promotion(owner)
                     settlement = driver.abort_inhibited_start(owner)
                     if settlement in {
@@ -2005,9 +1999,10 @@ def create_mcp_server(
                         server_context.session_store.clear_session_start_reservation(reservation)
                 raise
             try:
+                prepared = driver.prepare_promoted_first_write(owner, published_session)
                 with server_context.lifecycle_barrier:
                     server_context.session_store.assert_staged_start_claimable(published_session)
-                claim = driver.claim_promoted_first_write(owner, published_session)
+                    claim = driver.claim_prepared_first_write(prepared)
                 disposition = driver.dispatch_claimed_first_write(claim)
                 if disposition is not HottopFirstWriteDisposition.WRITTEN:
                     raise SessionLifecycleError("Staged Hottop first write has an unknown receipt.")

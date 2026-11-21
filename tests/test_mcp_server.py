@@ -10750,7 +10750,9 @@ def test_future_manual_registered_start_inhibited_abort(
         assert "write" not in calls
     else:
         assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.UNRESOLVED)
-        with pytest.raises(SessionLifecycleError, match="progress"):
+        expected_error = SessionLifecycleError if outcome == "factory_raise" else RuntimeError
+        expected_message = "progress" if outcome == "factory_raise" else "staged"
+        with pytest.raises(expected_error, match=expected_message):
             _call_tool(
                 server, "start_roast_session", _ctx(context), first_crack_observer_ack="manual/v1"
             )
@@ -10796,7 +10798,9 @@ def test_future_manual_early_driver_refusal_releases_server_only(
     assert context.session_store.reserve_session_start().token
 
 
-def test_registered_hottop_start_claims_one_immutable_fake_frame(tmp_path: Path) -> None:
+def test_registered_hottop_start_claims_one_immutable_fake_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The staged route writes exactly its captured command frame once."""
 
     class Transport(_ObservationFakeSerialTransport):
@@ -10809,13 +10813,27 @@ def test_registered_hottop_start_claims_one_immutable_fake_frame(tmp_path: Path)
             return len(data)
 
     context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
     transport = Transport()
     driver = HottopRoasterDriver(
         port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
     )
     object.__setattr__(context, "roaster_driver", driver)
 
-    result = _call_tool(create_mcp_server(), "start_roast_session", _ctx(context))
+    def accept_policy(*_args: object) -> None:
+        pass
+
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", accept_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", accept_policy
+    )
+
+    result = _call_tool(
+        create_mcp_server(),
+        "start_roast_session",
+        _ctx(context),
+        first_crack_observer_ack="manual/v1",
+    )
 
     assert result.session.phase == "pre_roast"
     assert transport.writes == [build_hottop_command_packet()]
@@ -10826,7 +10844,7 @@ def test_registered_hottop_start_claims_one_immutable_fake_frame(tmp_path: Path)
 
 @pytest.mark.parametrize("receipt", [True, 0, 25, -1, None])
 def test_registered_hottop_start_retains_unknown_first_write_receipt(
-    tmp_path: Path, receipt: object
+    tmp_path: Path, receipt: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A non-exact native receipt cannot be reported as a normal Start success."""
 
@@ -10840,17 +10858,55 @@ def test_registered_hottop_start_retains_unknown_first_write_receipt(
             return cast(int, receipt)
 
     context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
     transport = Transport()
     driver = HottopRoasterDriver(
         port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
     )
     object.__setattr__(context, "roaster_driver", driver)
 
+    def accept_policy(*_args: object) -> None:
+        pass
+
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", accept_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", accept_policy
+    )
+
     with pytest.raises(SessionLifecycleError, match="unknown receipt"):
-        _call_tool(create_mcp_server(), "start_roast_session", _ctx(context))
+        _call_tool(
+            create_mcp_server(),
+            "start_roast_session",
+            _ctx(context),
+            first_crack_observer_ack="manual/v1",
+        )
 
     assert len(transport.writes) == 1
     owner, phase = driver.inspect_inhibited_start()
     assert owner is not None
     assert phase is HottopStartPhase.UNRESOLVED
     assert context.session_store.get_active_session() is not None
+
+
+def test_automatic_hottop_start_uses_legacy_connect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Automatic authority never enters the staged manual-Hottop route."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = HottopRoasterDriver(port="fake-only")
+    calls: list[str] = []
+
+    def legacy_connect() -> None:
+        calls.append("connect")
+
+    def forbidden_reservation(_token: str) -> object:
+        raise AssertionError("automatic Start entered manual staging")
+
+    monkeypatch.setattr(driver, "connect", legacy_connect)
+    monkeypatch.setattr(driver, "reserve_inhibited_start", forbidden_reservation)
+    object.__setattr__(context, "roaster_driver", driver)
+
+    result = _call_tool(create_mcp_server(), "start_roast_session", _ctx(context))
+
+    assert result.session.phase == "pre_roast"
+    assert calls == ["connect"]

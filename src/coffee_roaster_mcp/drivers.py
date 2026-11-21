@@ -1307,10 +1307,10 @@ class HottopRoasterDriver:
             self._start_session = session
             self._start_phase = HottopStartPhase.PROMOTED
 
-    def claim_promoted_first_write(
+    def prepare_promoted_first_write(
         self, owner: HottopStartOwner, session: object
     ) -> _HottopFirstWriteClaim:
-        """Publish one immutable possible-entry claim without using legacy barriers."""
+        """Capture one immutable first-write frame without granting entry."""
         with self._state_lock:
             if (
                 self._start_owner is not owner
@@ -1337,20 +1337,25 @@ class HottopRoasterDriver:
             drum_motor_on=values[4],
             cooling_motor_on=values[5],
         )
-        claim = _HottopFirstWriteClaim(owner, session, handle, revision, frame)
+        return _HottopFirstWriteClaim(owner, session, handle, revision, frame)
+
+    def claim_prepared_first_write(
+        self, prepared: _HottopFirstWriteClaim
+    ) -> _HottopFirstWriteClaim:
+        """Publish a prepared exact-owner possible-entry claim once."""
         with self._state_lock:
             if (
-                self._start_owner is not owner
-                or self._start_session is not session
+                self._start_owner is not prepared.owner
+                or self._start_session is not prepared.session
                 or self._start_phase is not HottopStartPhase.PROMOTED
-                or self._start_handle is not handle
-                or self._command_state_revision != revision
+                or self._start_handle is not prepared.handle
+                or self._command_state_revision != prepared.revision
             ):
                 raise RuntimeError("Staged Hottop command state changed before first-write entry.")
-            self._start_claim = claim
+            self._start_claim = prepared
             self._start_write_disposition = HottopFirstWriteDisposition.NOT_CLAIMED
             self._start_phase = HottopStartPhase.CLAIMED
-            return claim
+            return prepared
 
     def dispatch_claimed_first_write(
         self, claim: _HottopFirstWriteClaim
