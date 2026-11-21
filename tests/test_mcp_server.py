@@ -13549,15 +13549,31 @@ def test_registered_hottop_start_failure_preserves_first_closer_observation(
     )
     emergency.start()
     assert boundary_open.wait(1)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - deadline witness
+    original_deadline = observer.deadline if observer is not None else None
+    if schedule != "start_first":
+        assert observer is not None and original_deadline is not None
     release_ambient.set()
     if schedule == "start_first":
         start.join(timeout=1)
         assert not start.is_alive()
+    else:
+        # Start cleanup has completed while the emergency save remains held.
+        start.join(timeout=1)
+        assert not start.is_alive()
+        assert observer is not None
+        assert observer.summary is None
+        assert observer.reason == "emergency_stop"
+        assert observer.deadline == original_deadline
+        assert observer.cutoff is None
     if schedule == "expired":
-        observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - deadline witness
-        assert observer is not None and observer.deadline is not None
-        clock[0] = observer.deadline
+        assert observer is not None and original_deadline is not None
+        clock[0] = original_deadline
         observer.check_deadline()
+        assert observer.summary is not None
+        assert observer.summary.reason.value == "emergency_stop"
+        assert observer.summary.drop_cutoff.value is None
+        assert observer.deadline == original_deadline
     release_boundary.set()
     release_save.set()
     start.join(timeout=1)
@@ -13565,7 +13581,6 @@ def test_registered_hottop_start_failure_preserves_first_closer_observation(
     assert not start.is_alive() and not emergency.is_alive()
     assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
     assert len(emergency_results) == 1
-    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - result witness
     assert observer is not None and observer.reaped.wait(1) and pipeline.stopped
     summary = runtime.observation_for_session(session.id)
     assert summary is not None and summary.frozen_summary.value is not None
@@ -13577,6 +13592,7 @@ def test_registered_hottop_start_failure_preserves_first_closer_observation(
         assert frozen.reason.value == "emergency_stop"
     if schedule == "expired":
         assert frozen.drop_cutoff.value is None
+        assert frozen.drop_cutoff.null_reason == "not_yet_observed"
     elif schedule == "saved":
         reply = cast(Any, emergency_results[0])
         assert frozen.drop_cutoff.value is not None

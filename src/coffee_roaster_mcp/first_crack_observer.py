@@ -437,7 +437,6 @@ class FirstCrackObserver:
         self._eligible_inferred = 0
         self._inference_failed = False
         self._thread: threading.Thread | None = None
-        self._failed_start_cleanup_admitted = False
 
     def start(self, reservation: object | None = None) -> bool:
         if not coordinator().claim(self, reservation):
@@ -449,13 +448,6 @@ class FirstCrackObserver:
         self._thread = threading.Thread(target=self._run, name="fc-observation-worker", daemon=True)
         self._thread.start()
         return True
-
-    def admit_failed_start_cleanup(self) -> None:
-        """Record that this started worker may yield to an existing closer."""
-        with self.lock:
-            if self._thread is None:
-                raise RuntimeError("Observation worker was not started.")
-            self._failed_start_cleanup_admitted = True
 
     @property
     def worker_running(self) -> bool:
@@ -588,38 +580,14 @@ class FirstCrackObserver:
     def close_after_failed_start(self, *, reason: str) -> None:
         """Apply failed-Start cleanup without replacing an admitted closer."""
         with self.lock:
-            if self._failed_start_cleanup_admitted and (
-                self.summary is not None or self.deadline is not None or self._pending_boundaries
-            ):
+            if self.summary is not None or self.deadline is not None or self._pending_boundaries:
                 return
-            if self._pending_boundaries:
-                self.failed = True
-                self.reason = "boundary_not_observed"
-                self.deadline = self.now()
-                self._freeze_locked()
-                self.changed.set()
-                coordinator().wake.set()
-                return
-            if self.cutoff is None:
-                self.failed = True
-                self.reason = (
-                    reason if re.fullmatch(r"[a-z][a-z0-9_]{0,159}", reason) else "observer_stop"
-                )
-                self.deadline = self.now()
-                self._freeze_locked()
-                self.changed.set()
-                coordinator().wake.set()
-                return
-            if self.deadline is None:
-                self.cutoff = None
-                self.deadline = (
-                    self.now() + self.config.first_crack.observation_closing_timeout_seconds
-                )
-                self.state = "closing"
-                self.failed = True
-                self.reason = (
-                    reason if re.fullmatch(r"[a-z][a-z0-9_]{0,159}", reason) else "observer_stop"
-                )
+            self.failed = True
+            self.reason = (
+                reason if re.fullmatch(r"[a-z][a-z0-9_]{0,159}", reason) else "observer_stop"
+            )
+            self.deadline = self.now()
+            self._freeze_locked()
             self.changed.set()
             coordinator().wake.set()
 

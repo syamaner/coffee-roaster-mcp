@@ -2840,6 +2840,38 @@ def test_manual_runtime_failed_start_close_yields_to_pending_boundary_owner(
     assert captures[0].stopped
 
 
+def test_manual_runtime_publishes_observer_before_worker_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A boundary producer can find the published observer before worker admission."""
+    runtime, captures, _ = _manual_runtime_fixture(tmp_path)
+    store = RoastSessionStore(default_log_dir=tmp_path / "published-observer")
+    session = store.start_session()
+    original_start = FirstCrackObserver.start
+    tickets: list[object] = []
+
+    def start_after_boundary(
+        observer: FirstCrackObserver, reservation: object | None = None
+    ) -> bool:
+        assert runtime._observer is observer  # pyright: ignore[reportPrivateUsage] - publication witness
+        assert runtime._admitted_observer is None  # pyright: ignore[reportPrivateUsage] - admission witness
+        ticket = runtime.begin_observation_boundary(session, reason="emergency_stop")
+        assert ticket is not None
+        tickets.append(ticket)
+        return original_start(observer, reservation)
+
+    monkeypatch.setattr(FirstCrackObserver, "start", start_after_boundary)
+    runtime.start_for_session(session)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - boundary witness
+    assert observer is not None and len(tickets) == 1 and len(captures) == 1
+    assert runtime._admitted_observer == (session.id, observer.generation)  # pyright: ignore[reportPrivateUsage]
+
+    runtime.resolve_observation_boundary(
+        session, tickets[0], cutoff_monotonic_seconds=session.monotonic_start + 1.0
+    )
+    assert observer.reaped.wait(2) and captures[0].stopped
+
+
 def test_manual_runtime_failed_start_cleanup_skips_snapshot_and_runtime_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2880,25 +2912,34 @@ def test_manual_runtime_failed_start_cleanup_skips_snapshot_and_runtime_lock(
 def test_manual_runtime_failed_start_close_uses_lifecycle_close_when_not_admitted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A setup-failed observer cannot receive the admitted-observer yield."""
-    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+    """A claimed worker-start failure uses ordinary close rather than yielding."""
+    import coffee_roaster_mcp.first_crack_observer as observer_module
 
-    runtime, _, _ = _manual_runtime_fixture(tmp_path)
+    runtime, captures, _ = _manual_runtime_fixture(tmp_path)
     store = RoastSessionStore(default_log_dir=tmp_path / "failed-start-not-admitted")
     session = store.start_session()
+    original_thread_start = observer_module.threading.Thread.start
 
-    def refused_start(_observer: FirstCrackObserver, _reservation: object | None = None) -> bool:
-        return False
+    def refuse_observer_worker(thread: Thread) -> None:
+        if thread.name == "fc-observation-worker":
+            raise RuntimeError("synthetic observer worker refusal")
+        original_thread_start(thread)
 
-    monkeypatch.setattr(runtime_module.FirstCrackObserver, "start", refused_start)
+    monkeypatch.setattr(observer_module.threading.Thread, "start", refuse_observer_worker)
     runtime.start_for_session(session)
     observer = runtime._observer  # pyright: ignore[reportPrivateUsage]
     assert observer is not None
+    ticket = runtime.begin_observation_boundary(session, reason="emergency_stop")
+    assert ticket is not None
 
     runtime.stop_after_failed_start(session.id, reason="staged_start_failed")
 
     assert observer.summary is not None
-    assert observer.summary.reason.value == "staged_start_failed"
+    assert observer.summary.reason.value == "boundary_not_observed"
+    assert observer.summary.drop_cutoff.value is None
+    cleanup = runtime._capture_cleanup  # pyright: ignore[reportPrivateUsage] - cleanup witness
+    assert cleanup is not None and cleanup.reaped.wait(2)
+    assert captures[0].stopped
 
 
 @pytest.mark.parametrize("lifecycle", ["stop", "finalise"])
