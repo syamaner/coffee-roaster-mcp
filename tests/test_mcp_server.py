@@ -4856,6 +4856,64 @@ def test_mcp_control_succeeds_after_exact_normal_drop_cancellation_and_in_new_se
     assert driver.actions == ["connect", "set_heat:0", "connect", "set_fan:0"]
 
 
+def test_mcp_start_cooling_after_partial_normal_drop_append_is_not_indefinitely_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finished torn Drop turn permits the separately persisted cooling audit."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.timing_evidence_sequence = 1
+    original_append = session_module._append_event_log_row  # pyright: ignore[reportPrivateUsage]
+    cooling_append_failed = False
+
+    def fail_exact_drop_cooling_append(current: RoastSession, event: RoastEvent) -> None:
+        nonlocal cooling_append_failed
+        if event.kind == "cooling_started" and not cooling_append_failed:
+            cooling_append_failed = True
+            raise OSError("exact Drop cooling row unavailable")
+        original_append(current, event)
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_exact_drop_cooling_append)
+    admission = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert admission.reservation is not None
+    driver_state = driver.drop_beans()
+    settlement = context.session_store.complete_normal_drop_success(
+        session,
+        reservation=admission.reservation,
+        heat_level_percent=driver_state.heat_level_percent,
+        fan_level_percent=driver_state.fan_level_percent,
+        cooling_on=driver_state.cooling_on,
+    )
+
+    assert settlement.outcome == "unknown"
+    assert session.phase == "dropped"
+    telemetry = context.session_store.record_active_telemetry_sample(
+        session_id=session.id,
+        bean_temp_c=None,
+        env_temp_c=None,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=True,
+    )
+    cooling = _call_tool(server, "start_cooling", ctx)
+
+    assert telemetry is not None
+    assert cooling.event.kind == "cooling_started"
+    assert cooling.phase == "cooling"
+    assert driver.actions == ["connect", "drop_beans", "start_cooling"]
+
+
 def test_mcp_fixed_zero_and_emergency_remain_eligible_after_unknown_normal_drop(
     tmp_path: Path,
 ) -> None:

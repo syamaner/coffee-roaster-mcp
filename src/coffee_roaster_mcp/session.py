@@ -1219,7 +1219,7 @@ class RoastSessionStore:
                 return None
             if self._finalisation_blocks_mutation(self._latest_session):
                 return None
-            if self._normal_drop_in_flight is not None:
+            if not self._normal_drop_persistence_last_completion.is_set():
                 return None
             if session_id is not None and self._latest_session.id != session_id:
                 return None
@@ -2648,11 +2648,6 @@ class RoastSessionStore:
         or ambiguous operation into a claimed endpoint.
         """
         self._assert_latest_active_session(session)
-        if kind != "fault":
-            self._assert_finalisation_allows_mutation(session)
-            self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
-        if session.faulted_at_utc is not None and kind != "fault":
-            raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
         if (
             kind == "beans_dropped"
             and self._normal_drop_in_flight is not None
@@ -2667,6 +2662,11 @@ class RoastSessionStore:
             raise SessionLifecycleError(
                 "Beans dropped can only be recorded by the owned normal-drop settlement."
             )
+        if kind != "fault":
+            self._assert_finalisation_allows_mutation(session)
+            self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
+        if session.faulted_at_utc is not None and kind != "fault":
+            raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
 
         existing_event = self._get_existing_singleton_event(session, kind)
         if existing_event is not None:
@@ -2708,7 +2708,10 @@ class RoastSessionStore:
         self, session: RoastSession
     ) -> None:
         """Refuse ordinary log writers while an exact Drop owns this log window."""
-        if self._normal_drop_in_flight is not None and self._latest_session is session:
+        if (
+            self._latest_session is session
+            and not self._normal_drop_persistence_last_completion.is_set()
+        ):
             raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
 
     def record_event_snapshot(
