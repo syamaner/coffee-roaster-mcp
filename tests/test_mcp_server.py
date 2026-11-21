@@ -86,6 +86,7 @@ from coffee_roaster_mcp.session import (
     DriverCommandReservation,
     EventPayloadValue,
     MockDropPersistenceTicket,
+    NormalDropIdentity,
     NormalDropSettlement,
     RoastEvent,
     RoastSession,
@@ -9327,6 +9328,72 @@ def _exact_normal_drop(
         ownership_sequence=identity.ownership_sequence,
         timing_evidence_sequence=identity.timing_evidence_sequence,
     )
+
+
+def test_manual_mock_start_preserves_ordinary_start_when_exact_identity_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing optional exact identity cannot roll back a published manual mock Start."""
+    context = _cold_finalisation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    runtime = FakeFirstCrackRuntime()
+    ambient = FakeAmbientRuntime()
+    telemetry_starts: list[str] = []
+    object.__setattr__(context, "config", _manual_authority_config())
+    _set_first_crack_runtime(context, runtime)
+    _set_ambient_runtime(context, ambient)
+    monkeypatch.setattr(context.telemetry_sampler, "start_for_session", telemetry_starts.append)
+    object.__setattr__(
+        context,
+        "exact_normal_drop_baseline",
+        mcp_server._ExactNormalDropBaseline(  # pyright: ignore[reportPrivateUsage]
+            session_id="previous-session",
+            driver_ref=driver,
+            clock_epoch_id="previous-epoch",
+            emergency_baseline=0,
+            drop_baseline=0,
+        ),
+    )
+    original_identity = context.session_store.normal_drop_identity
+    identity_reads = 0
+
+    def missing_start_identity(session: RoastSession) -> NormalDropIdentity:
+        nonlocal identity_reads
+        identity_reads += 1
+        if identity_reads == 1:
+            raise SessionLifecycleError("synthetic missing exact identity")
+        return original_identity(session)
+
+    monkeypatch.setattr(context.session_store, "normal_drop_identity", missing_start_identity)
+    started = _call_tool(
+        create_mcp_server(),
+        "start_roast_session",
+        _ctx(context),
+        first_crack_observer_ack="manual/v1",
+    )
+
+    session_id = started.session.session_id
+    session = context.session_store.get_active_session()
+    assert session is not None and session.id == session_id
+    assert context.exact_normal_drop_baseline is None
+    assert runtime.started_sessions == [session_id]
+    assert ambient.started_sessions == [session_id]
+    assert telemetry_starts == [session_id]
+
+    identity = context.session_store.normal_drop_identity(session)
+    transition_count = driver.drop_transition_count
+    exact = _run_normal_drop_exact_session(
+        context,
+        session_id=identity.session_id,
+        clock_epoch_id=identity.clock_epoch_id,
+        ownership_sequence=identity.ownership_sequence,
+        timing_evidence_sequence=identity.timing_evidence_sequence,
+    )
+
+    assert exact.outcome == "refused_state"
+    assert exact.reason == "exact_baseline_unavailable"
+    assert driver.drop_transition_count == transition_count
 
 
 def test_exact_normal_drop_private_producer_saves_one_mock_drop(

@@ -2024,25 +2024,32 @@ def create_mcp_server(
                 session = server_context.session_store.complete_session_start_snapshot(
                     reservation, purpose=purpose
                 )
-                if exact_baseline is None:
-                    object.__setattr__(server_context, "exact_normal_drop_baseline", None)
-                else:
+                object.__setattr__(server_context, "exact_normal_drop_baseline", None)
+                if exact_baseline is not None:
                     driver, emergency_baseline, drop_baseline = exact_baseline
-                    live_session = server_context.session_store.get_active_session()
-                    if live_session is None or live_session.id != session.id:
-                        raise RuntimeError("Started session was not published as the active owner.")
-                    identity = server_context.session_store.normal_drop_identity(live_session)
-                    object.__setattr__(
-                        server_context,
-                        "exact_normal_drop_baseline",
-                        _ExactNormalDropBaseline(
-                            session_id=session.id,
-                            driver_ref=driver,
-                            clock_epoch_id=identity.clock_epoch_id,
-                            emergency_baseline=emergency_baseline,
-                            drop_baseline=drop_baseline,
-                        ),
-                    )
+                    try:
+                        live_session = server_context.session_store.get_active_session()
+                        if live_session is None or live_session.id != session.id:
+                            raise RuntimeError(
+                                "Started session was not published as the active owner."
+                            )
+                        identity = server_context.session_store.normal_drop_identity(live_session)
+                    except SessionLifecycleError:
+                        # Exact Drop is optional to ordinary Start. A missing post-publication
+                        # identity leaves its holder unavailable for this session.
+                        pass
+                    else:
+                        object.__setattr__(
+                            server_context,
+                            "exact_normal_drop_baseline",
+                            _ExactNormalDropBaseline(
+                                session_id=session.id,
+                                driver_ref=driver,
+                                clock_epoch_id=identity.clock_epoch_id,
+                                emergency_baseline=emergency_baseline,
+                                drop_baseline=drop_baseline,
+                            ),
+                        )
         except Exception:
             server_context.session_store.clear_session_start_reservation(reservation)
             raise
