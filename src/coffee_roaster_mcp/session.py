@@ -215,6 +215,10 @@ def _append_event_log_row(session: RoastSession, event: RoastEvent) -> None:
     )
 
 
+class EventLogRecordingError(OSError):
+    """An event's validated append failed before its history could be recorded."""
+
+
 _APPEND_FAILURE_TAIL_BYTES = 4096
 
 
@@ -2145,6 +2149,7 @@ class RoastSessionStore:
         heat_level_percent: int,
         fan_level_percent: int,
         cooling_on: bool,
+        connected: bool | None = None,
     ) -> RoastSession | None:
         """Retain a known cooling result when its exact P2 log cannot be extended.
 
@@ -2177,7 +2182,7 @@ class RoastSessionStore:
                 fan = validate_control_percent(fan_level_percent, label="fan_level_percent")
             except SessionLifecycleError:
                 return None
-            if stopped_fault_recovery and (heat != 0 or fan != 100):
+            if heat != 0 or fan != 100 or connected is not True:
                 return None
             session.heat_level_percent = heat
             session.fan_level_percent = fan
@@ -2449,6 +2454,8 @@ class RoastSessionStore:
                 cooling_on=cooling_on,
             )
             try:
+                if self._normal_drop_persistence_torn:
+                    raise EventLogRecordingError
                 event = self.record_event(
                     session,
                     "cooling_started",
@@ -2775,6 +2782,11 @@ class RoastSessionStore:
                     raise SessionLifecycleError(
                         "Fault recovery cooling requires fan 100 and cooling active."
                     )
+                if self._normal_drop_persistence_torn and reservation.kind in {
+                    "start_cooling",
+                    "stop_cooling",
+                }:
+                    raise EventLogRecordingError
 
                 payload: dict[str, EventPayloadValue] = {
                     "heat_level_percent": validated_heat,

@@ -5658,6 +5658,30 @@ def test_torn_exact_drop_cooling_row_preserves_known_cooling_without_history(
     assert snapshot.faulted_at_utc is not None
 
 
+def test_ordinary_torn_start_cooling_rejects_disconnected_projection(tmp_path: Path) -> None:
+    """A disconnected ordinary P2 result cannot be retained as known cooling."""
+    context = _cold_finalisation_context(tmp_path)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    context.session_store.record_event(session, "beans_dropped")
+    session.mock_log_torn = True
+    context.session_store._normal_drop_persistence_torn = True  # pyright: ignore[reportPrivateUsage]
+    driver = context.roaster_driver
+    assert isinstance(driver, MockRoasterDriver)
+    driver.disconnect()
+
+    with pytest.raises(session_module.EventLogRecordingError):
+        _call_tool(server, "start_cooling", ctx)
+
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.cooling_started_at_utc is None
+    assert snapshot.torn_start_cooling_attempted is False
+
+
 class _QueuedWindowAudioPipeline:
     """Fake audio pipeline exposing detector windows queued after construction.
 
@@ -6126,7 +6150,7 @@ def test_guarded_fault_recovery_commands_preserve_fault_and_exact_result(tmp_pat
 
 
 def test_guarded_stop_cooling_keeps_known_state_when_exact_fault_log_is_torn(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A torn row does not repeat an otherwise eligible stopped-fault cooling stop."""
     server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
@@ -6137,6 +6161,11 @@ def test_guarded_stop_cooling_keeps_known_state_when_exact_fault_log_is_torn(
     assert session is not None
     session.mock_log_torn = True
     store._normal_drop_persistence_torn = True  # pyright: ignore[reportPrivateUsage]
+
+    def fail_event_log_write(_session: RoastSession, _event: RoastEvent) -> None:
+        raise OSError("log unavailable")
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_event_log_write)
 
     with pytest.raises(SessionLifecycleError, match="Cooling command completed"):
         _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
@@ -6177,6 +6206,69 @@ def test_guarded_torn_stop_cooling_disconnect_fails_closed(tmp_path: Path) -> No
     assert driver.actions[-1] == "emergency_stop:guarded fault recovery stop_cooling failed"
     with pytest.raises(ValueError, match="verified emergency-stop containment"):
         _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+
+
+def test_guarded_torn_start_cooling_disconnect_fails_closed(tmp_path: Path) -> None:
+    """A disconnected result cannot settle the torn-log recovery as known."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+    _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    store = ctx.request_context.lifespan_context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    session.mock_log_torn = True
+    store._normal_drop_persistence_torn = True  # pyright: ignore[reportPrivateUsage]
+    driver.connected = False
+
+    with pytest.raises(SessionLifecycleError, match="disconnected during fault recovery"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.heat_level_percent == 0 and state.cooling_on is True
+    assert driver.actions.count("start_cooling") == 1
+    assert driver.actions[-1] == "emergency_stop:guarded fault recovery start_cooling failed"
+    with pytest.raises(ValueError, match="verified emergency-stop containment"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+
+def test_guarded_torn_start_cooling_lost_ownership_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lost recovery reservation cannot be recast as recording-only."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+    _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    store = ctx.request_context.lifespan_context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    session.mock_log_torn = True
+    store._normal_drop_persistence_torn = True  # pyright: ignore[reportPrivateUsage]
+    original_complete = store.complete_reserved_driver_fault_recovery_snapshot
+
+    def lose_ownership(
+        target: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+        connected: bool = True,
+    ) -> tuple[RoastEvent, RoastSession]:
+        store.clear_driver_command_reservation(target, reservation)
+        return original_complete(
+            target,
+            reservation=reservation,
+            heat_level_percent=heat_level_percent,
+            fan_level_percent=fan_level_percent,
+            cooling_on=cooling_on,
+            connected=connected,
+        )
+
+    monkeypatch.setattr(store, "complete_reserved_driver_fault_recovery_snapshot", lose_ownership)
+
+    with pytest.raises(SessionLifecycleError, match="reservation is no longer active"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+
+    assert driver.actions.count("start_cooling") == 1
+    assert driver.actions[-1] == "emergency_stop:guarded fault recovery start_cooling failed"
 
 
 def test_guarded_drop_second_event_log_failure_preserves_recorded_drop(
@@ -9052,6 +9144,33 @@ def test_export_rejects_a_fault_pending_between_legacy_snapshot_and_guard(
 
     assert legacy_snapshot_reads == 0
     assert exported.ready is False
+
+
+@pytest.mark.parametrize(
+    ("start_session", "session_id", "message"),
+    [
+        (False, None, "No roast session exists."),
+        (True, "missing-session", "Unknown session_id: missing-session"),
+    ],
+)
+def test_export_translates_absent_or_unknown_session_lifecycle_errors(
+    tmp_path: Path,
+    start_session: bool,
+    session_id: str | None,
+    message: str,
+) -> None:
+    """The MCP export entry retains its public lifecycle-error translation."""
+    context = _cold_finalisation_context(tmp_path)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    if start_session:
+        _call_tool(server, "start_roast_session", ctx)
+
+    with pytest.raises(ValueError) as raised:
+        _call_tool(server, "export_roast_log", ctx, session_id=session_id)
+
+    assert str(raised.value) == message
+    assert isinstance(raised.value.__cause__, SessionLifecycleError)
 
 
 @pytest.mark.parametrize("authority", ["automatic", "manual"])

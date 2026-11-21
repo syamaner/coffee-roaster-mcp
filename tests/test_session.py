@@ -531,6 +531,26 @@ def test_event_log_write_failure_does_not_commit_event(tmp_path: Path) -> None:
     assert session.beans_added_at_utc is None
 
 
+def test_event_log_append_preserves_legacy_storage_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-P2 event append retains the original storage failure details."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+
+    def fail_append(_session: RoastSession, _row: object) -> None:
+        raise OSError(28, "synthetic no space")
+
+    monkeypatch.setattr(session_module, "_append_jsonl_log_row", fail_append)
+
+    with pytest.raises(OSError) as raised:
+        store.record_event(session, "beans_added")
+
+    assert raised.value.errno == 28
+    assert str(raised.value) == "[Errno 28] synthetic no space"
+
+
 def test_telemetry_log_write_failure_does_not_advance_buffer(tmp_path: Path) -> None:
     clock = ClockHarness()
     store = RoastSessionStore(

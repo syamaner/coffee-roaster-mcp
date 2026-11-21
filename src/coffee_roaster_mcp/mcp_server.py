@@ -75,6 +75,7 @@ from coffee_roaster_mcp.first_crack_runtime import (
 from coffee_roaster_mcp.session import (
     CaptureSubject,
     DriverCommandReservation,
+    EventLogRecordingError,
     EventPayloadValue,
     MockDropPersistenceTicket,
     RoastEvent,
@@ -2311,9 +2312,12 @@ def create_mcp_server(
     ) -> ExportRoastLogResult:
         """Write a snapshot export for one roast session."""
         server_context = ctx.request_context.lifespan_context
-        session, persistence_incomplete = server_context.session_store.observe_export_readiness(
-            session_id=session_id
-        )
+        try:
+            session, persistence_incomplete = server_context.session_store.observe_export_readiness(
+                session_id=session_id
+            )
+        except SessionLifecycleError as error:
+            raise ValueError(str(error)) from error
         if persistence_incomplete:
             if session.log_writer is None:
                 raise ValueError("Session log target is unavailable.")
@@ -3452,18 +3456,21 @@ def _run_reserved_driver_start_cooling(
             fan_level_percent=driver_state.fan_level_percent,
             cooling_on=driver_state.cooling_on,
         )
-    except SessionLifecycleError as error:
+    except EventLogRecordingError as error:
         settled = server_context.session_store.settle_known_torn_start_cooling(
             session,
             reservation=reservation,
             heat_level_percent=driver_state.heat_level_percent,
             fan_level_percent=driver_state.fan_level_percent,
             cooling_on=driver_state.cooling_on,
+            connected=driver_state.connected,
         )
         if settled is not None:
             raise SessionLifecycleError(
                 "Cooling command completed, but roast log recording is unavailable."
             ) from error
+        raise
+    except SessionLifecycleError:
         _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
         raise
 
@@ -3536,7 +3543,7 @@ def _run_reserved_driver_fault_recovery(
                     connected=driver_state.connected,
                 )
             )
-        except SessionLifecycleError as error:
+        except EventLogRecordingError as error:
             if command == "start_cooling":
                 settled = server_context.session_store.settle_known_torn_start_cooling(
                     session,
@@ -3544,6 +3551,7 @@ def _run_reserved_driver_fault_recovery(
                     heat_level_percent=driver_state.heat_level_percent,
                     fan_level_percent=driver_state.fan_level_percent,
                     cooling_on=driver_state.cooling_on,
+                    connected=driver_state.connected,
                 )
                 if settled is not None:
                     known_torn_completion = True
@@ -3564,6 +3572,8 @@ def _run_reserved_driver_fault_recovery(
                     raise SessionLifecycleError(
                         "Cooling command completed, but roast log recording is unavailable."
                     ) from error
+            raise
+        except SessionLifecycleError:
             raise
         if command == "drop" and server_context.config.first_crack.event_authority == "manual":
             server_context.first_crack_runtime.resolve_observation_boundary(
