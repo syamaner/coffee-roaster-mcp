@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
-from typing import Annotated, Any, Literal, Never, cast
+from typing import Annotated, Any, Literal, cast
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
@@ -55,6 +55,7 @@ from coffee_roaster_mcp.config import (
 from coffee_roaster_mcp.drivers import (
     DriverLifecycleEvidence,
     FixedZeroCommandedState,
+    HottopFirstWriteDisposition,
     HottopRoasterDriver,
     HottopStartSettlement,
     LifecycleEvidenceDriver,
@@ -85,7 +86,6 @@ from coffee_roaster_mcp.session import (
     SessionLifecycleError,
     SessionPresence,
     SessionPurpose,
-    SessionStartReservation,
     compute_roast_metrics,
     default_emergency_safety_payload,
     has_verified_emergency_containment,
@@ -1967,10 +1967,99 @@ def create_mcp_server(
         )
         with server_context.lifecycle_barrier:
             reservation = server_context.session_store.reserve_session_start()
-        if manual and isinstance(server_context.roaster_driver, HottopRoasterDriver):
-            _abort_future_manual_hottop_start(server_context, reservation)
+        driver = server_context.roaster_driver
+        if isinstance(driver, HottopRoasterDriver):
+            owner = driver.reserve_inhibited_start(reservation.token)
+            published_session: RoastSession | None = None
+            promoted_identity_bound = False
+            try:
+                driver.open_inhibited_start(owner)
+                with server_context.lifecycle_barrier:
+                    driver.begin_inhibited_start_promotion(owner)
+                    try:
+                        server_context.session_store.complete_staged_session_start_snapshot(
+                            reservation, purpose=purpose
+                        )
+                    finally:
+                        publication = server_context.session_store.staged_session_start_publication(
+                            reservation
+                        )
+                        published_session = publication.session
+                if published_session is None:
+                    raise SessionLifecycleError(
+                        "Staged Hottop session publication did not complete."
+                    )
+                driver.bind_promoted_inhibited_start(owner, published_session)
+                promoted_identity_bound = True
+            except BaseException:
+                if published_session is not None and not promoted_identity_bound:
+                    driver.bind_promoted_inhibited_start(owner, published_session)
+                    promoted_identity_bound = True
+                elif published_session is None:
+                    driver.restore_inhibited_start_after_unpublished_promotion(owner)
+                    settlement = driver.abort_inhibited_start(owner)
+                    if settlement in {
+                        HottopStartSettlement.NOT_ENTERED,
+                        HottopStartSettlement.CLEAN_CLOSED,
+                    }:
+                        server_context.session_store.clear_session_start_reservation(reservation)
+                raise
+            try:
+                with server_context.lifecycle_barrier:
+                    server_context.session_store.assert_staged_start_claimable(published_session)
+                claim = driver.claim_promoted_first_write(owner, published_session)
+                disposition = driver.dispatch_claimed_first_write(claim)
+                if disposition is not HottopFirstWriteDisposition.WRITTEN:
+                    raise SessionLifecycleError("Staged Hottop first write has an unknown receipt.")
+                with server_context.lifecycle_barrier:
+                    server_context.session_store.assert_staged_start_claimable(published_session)
+                    if not driver.asserted_written_start(owner, published_session):
+                        raise SessionLifecycleError("Staged Hottop first-write ownership changed.")
+                started: tuple[Callable[[], object], ...] = (
+                    lambda: server_context.telemetry_sampler.stop_for_session(
+                        published_session.id, reason="staged start failed"
+                    ),
+                    lambda: server_context.ambient_runtime.stop_for_session(
+                        published_session.id, reason="staged start failed"
+                    ),
+                    lambda: server_context.first_crack_runtime.stop_for_session(
+                        published_session.id, reason="staged start failed"
+                    ),
+                )
+                try:
+                    _start_first_crack_runtime(server_context, session=published_session)
+                    server_context.ambient_runtime.start_for_session(published_session)
+                    server_context.telemetry_sampler.start_for_session(published_session.id)
+                    with server_context.lifecycle_barrier:
+                        server_context.session_store.assert_staged_start_claimable(
+                            published_session
+                        )
+                        if not driver.asserted_written_start(owner, published_session):
+                            raise SessionLifecycleError("Staged Hottop start changed after setup.")
+                except BaseException:
+                    for stop_runtime in started:
+                        with suppress(Exception):
+                            stop_runtime()
+                    raise
+            except BaseException:
+                # A published session and its claimed/written owner are intentionally
+                # retained: neither a missing receipt nor a setup failure proves
+                # non-entry or authorises a substitute transport action.
+                raise
+            session = server_context.session_store.copy_session(published_session)
+            return StartRoastSessionResult(
+                session=_serialize_session_state(
+                    session,
+                    config=server_context.config,
+                    first_crack_runtime=server_context.first_crack_runtime.snapshot(),
+                    first_crack_observation=server_context.first_crack_runtime.observation_for_session(
+                        session.id
+                    ),
+                    ambient_runtime=server_context.ambient_runtime.snapshot(),
+                )
+            )
         try:
-            server_context.roaster_driver.connect()
+            driver.connect()
             with server_context.lifecycle_barrier:
                 session = server_context.session_store.complete_session_start_snapshot(
                     reservation, purpose=purpose
@@ -3316,35 +3405,6 @@ def _run_fixed_zero_heat_containment(
         session_projection="recorded_in_memory",
         reason_code=None,
     )
-
-
-def _abort_future_manual_hottop_start(
-    server_context: ServerContext, reservation: SessionStartReservation
-) -> Never:
-    """Stage and abort a future manual start without publishing a session.
-
-    Production policy rejects this path before reservation. Only exact positive
-    non-entry or closure releases the server owner; uncertain entry stays blocked.
-    """
-    driver = server_context.roaster_driver
-    assert isinstance(driver, HottopRoasterDriver)
-    owner = None
-    try:
-        owner = driver.reserve_inhibited_start(reservation.token)
-        driver.open_inhibited_start(owner)
-    finally:
-        settlement = (
-            HottopStartSettlement.NOT_ENTERED
-            if owner is None
-            else driver.abort_inhibited_start(owner)
-        )
-        if settlement in (
-            HottopStartSettlement.NOT_ENTERED,
-            HottopStartSettlement.CLEAN_CLOSED,
-        ):
-            with server_context.lifecycle_barrier:
-                server_context.session_store.clear_session_start_reservation(reservation)
-    raise RuntimeError("Manual Hottop start remains inhibited; no session was published.")
 
 
 def _run_reserved_driver_control(

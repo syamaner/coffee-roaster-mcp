@@ -49,6 +49,7 @@ from coffee_roaster_mcp.drivers import (
     MockRoasterDriver,
     RoasterCapabilities,
     RoasterState,
+    build_hottop_command_packet,
 )
 from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackRuntimeSnapshot,
@@ -10589,10 +10590,9 @@ def test_sampler_fault_commit_releases_lifecycle_barrier_while_drop_append_stall
     ]
 
 
-@pytest.mark.parametrize("held_site", ["factory", "close"])
 @pytest.mark.parametrize("outcome", ["clean", "factory_raise", "close_raise", "still_open"])
 def test_future_manual_registered_start_inhibited_abort(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held_site: str, outcome: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
     """Exact revoke is prompt during native work and uncertain starts stay owned."""
     entered = Event()
@@ -10606,9 +10606,6 @@ def test_future_manual_registered_start_inhibited_abort(
     class Transport(_ObservationFakeSerialTransport):
         def close(self) -> None:
             calls.append("close")
-            if held_site == "close":
-                entered.set()
-                assert release.wait(3)
             if outcome == "close_raise":
                 raise OSError("uncertain close")
             if outcome != "still_open":
@@ -10625,9 +10622,8 @@ def test_future_manual_registered_start_inhibited_abort(
         assert context.session_store.get_active_session() is None
         assert driver.read_state() == baseline[0]
         assert driver.read_lifecycle_evidence() == baseline[1]
-        if held_site == "factory":
-            entered.set()
-            assert release.wait(3)
+        entered.set()
+        assert release.wait(3)
         if outcome == "factory_raise":
             raise OSError("uncertain native entry")
         opened.set()
@@ -10658,19 +10654,13 @@ def test_future_manual_registered_start_inhibited_abort(
     worker = Thread(target=start)
     worker.start()
     try:
-        if held_site == "close" and outcome == "factory_raise":
-            worker.join(3)
-            assert not worker.is_alive()
-        else:
-            assert entered.wait(3)
+        assert entered.wait(3)
         owner, phase = driver.inspect_inhibited_start()
         assert owner is not None
         assert owner.generation == 1
         reservation = session_module.SessionStartReservation(owner.server_token)
         if worker.is_alive():
-            assert phase is (
-                HottopStartPhase.OPENING if held_site == "factory" else HottopStartPhase.CLOSING
-            )
+            assert phase is HottopStartPhase.OPENING
             assert driver.read_state() == baseline[0]
             assert driver.read_lifecycle_evidence() == baseline[1]
         revoked = Event()
@@ -10804,3 +10794,63 @@ def test_future_manual_early_driver_refusal_releases_server_only(
     assert driver.inspect_inhibited_start() == (None, None)
     assert context.session_store.get_active_session() is None
     assert context.session_store.reserve_session_start().token
+
+
+def test_registered_hottop_start_claims_one_immutable_fake_frame(tmp_path: Path) -> None:
+    """The staged route writes exactly its captured command frame once."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data)
+
+    context = _cold_finalisation_context(tmp_path)
+    transport = Transport()
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+
+    result = _call_tool(create_mcp_server(), "start_roast_session", _ctx(context))
+
+    assert result.session.phase == "pre_roast"
+    assert transport.writes == [build_hottop_command_packet()]
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None
+    assert phase is HottopStartPhase.WRITTEN
+
+
+@pytest.mark.parametrize("receipt", [True, 0, 25, -1, None])
+def test_registered_hottop_start_retains_unknown_first_write_receipt(
+    tmp_path: Path, receipt: object
+) -> None:
+    """A non-exact native receipt cannot be reported as a normal Start success."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return cast(int, receipt)
+
+    context = _cold_finalisation_context(tmp_path)
+    transport = Transport()
+    driver = HottopRoasterDriver(
+        port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
+    )
+    object.__setattr__(context, "roaster_driver", driver)
+
+    with pytest.raises(SessionLifecycleError, match="unknown receipt"):
+        _call_tool(create_mcp_server(), "start_roast_session", _ctx(context))
+
+    assert len(transport.writes) == 1
+    owner, phase = driver.inspect_inhibited_start()
+    assert owner is not None
+    assert phase is HottopStartPhase.UNRESOLVED
+    assert context.session_store.get_active_session() is not None
