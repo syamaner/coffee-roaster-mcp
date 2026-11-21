@@ -10269,20 +10269,44 @@ def test_exact_normal_drop_reports_the_existing_pending_store_fence(
     tmp_path: Path,
 ) -> None:
     """A prior exact reservation remains the authoritative in-flight outcome."""
-    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
     driver = cast(MockRoasterDriver, context.roaster_driver)
     identity = context.session_store.normal_drop_identity(session)
     admission = context.session_store.admit_normal_drop(identity)
     assert admission.outcome == "dispatch" and admission.reservation is not None
 
-    result = _exact_normal_drop(context, session)
+    result = _call_tool(
+        server,
+        "drop_beans_exact_session",
+        ctx,
+        session_id=identity.session_id,
+        clock_epoch_id=identity.clock_epoch_id,
+        ownership_sequence=identity.ownership_sequence,
+        timing_evidence_sequence=identity.timing_evidence_sequence,
+    )
 
+    assert (
+        result.session_id,
+        result.clock_epoch_id,
+        result.ownership_sequence,
+        result.timing_evidence_sequence,
+    ) == (
+        identity.session_id,
+        identity.clock_epoch_id,
+        identity.ownership_sequence,
+        identity.timing_evidence_sequence,
+    )
     assert result.outcome == "in_progress"
     assert result.reason == "normal_drop_in_progress"
     assert result.request_dispatch == "not_invoked"
     assert result.this_request == "no_reservation"
     assert result.history == "not_applicable"
+    assert result.fence == "not_applicable"
+    assert result.prior_transition == "not_applicable"
+    assert result.retry == "forbidden"
+    assert result.physical_effect == "not_established"
     assert driver.drop_transition_count == 0
+    assert driver.emergency_count == 0
 
 
 def test_exact_normal_drop_cancels_after_failed_legacy_drop_stale_emergency(
@@ -10545,7 +10569,7 @@ def test_exact_normal_drop_stale_cancellation_does_not_claim_a_released_fence(
     assert result.request_dispatch == "invoked_no_state_transition"
     assert result.reason == "settlement_stale"
     assert result.fence == "not_established"
-    assert result.prior_transition == "not_established"
+    assert result.prior_transition == "unknown"
     assert driver.drop_transition_count == 0
 
 
@@ -10586,8 +10610,8 @@ def test_exact_normal_drop_stale_settlement_never_claims_a_fence_in_either_prior
     monkeypatch: pytest.MonkeyPatch,
     prior_state: str,
 ) -> None:
-    """S1: both cancellation discriminators preserve an unestablished stale fence."""
-    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    """Stale settlement never projects affirmative prior-transition evidence."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
     driver = cast(MockRoasterDriver, context.roaster_driver)
     if prior_state == "emergency":
         driver.emergency_stop(reason="stale emergency settlement")
@@ -10604,15 +10628,39 @@ def test_exact_normal_drop_stale_settlement_never_claims_a_fence_in_either_prior
 
         monkeypatch.setattr(context.session_store, "retain_normal_drop_unknown", stale_retention)
 
-    result = _exact_normal_drop(context, session)
+    identity = context.session_store.normal_drop_identity(session)
+    result = _call_tool(
+        server,
+        "drop_beans_exact_session",
+        ctx,
+        session_id=identity.session_id,
+        clock_epoch_id=identity.clock_epoch_id,
+        ownership_sequence=identity.ownership_sequence,
+        timing_evidence_sequence=identity.timing_evidence_sequence,
+    )
 
+    assert (
+        result.session_id,
+        result.clock_epoch_id,
+        result.ownership_sequence,
+        result.timing_evidence_sequence,
+    ) == (
+        identity.session_id,
+        identity.clock_epoch_id,
+        identity.ownership_sequence,
+        identity.timing_evidence_sequence,
+    )
     assert result.outcome == "unknown"
     assert result.request_dispatch == "invoked_no_state_transition"
     assert result.reason == "settlement_stale"
+    assert result.this_request == "reservation_owned"
+    assert result.history == "unknown"
     assert result.fence == "not_established"
-    assert result.prior_transition == (
-        "not_established" if prior_state == "emergency" else "unaccounted"
-    )
+    assert result.prior_transition == "unknown"
+    assert result.retry == "forbidden"
+    assert result.physical_effect == "not_established"
+    assert driver.drop_transition_count == (0 if prior_state == "emergency" else 1)
+    assert driver.emergency_count == (1 if prior_state == "emergency" else 0)
 
 
 def test_exact_normal_drop_retains_unknown_when_the_mock_driver_raises(
@@ -10777,7 +10825,7 @@ def test_exact_normal_drop_releases_the_pending_writer_before_reraising_interrup
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An interrupted returned mock dispatch settles ownership before propagating."""
-    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
     driver = context.roaster_driver
     assert type(driver) is MockRoasterDriver
     original_drop = driver.drop_beans
@@ -10788,12 +10836,50 @@ def test_exact_normal_drop_releases_the_pending_writer_before_reraising_interrup
 
     monkeypatch.setattr(driver, "drop_beans", interrupted_drop)
 
+    identity = context.session_store.normal_drop_identity(session)
     with pytest.raises(KeyboardInterrupt):
-        _exact_normal_drop(context, session)
+        _call_tool(
+            server,
+            "drop_beans_exact_session",
+            ctx,
+            session_id=identity.session_id,
+            clock_epoch_id=identity.clock_epoch_id,
+            ownership_sequence=identity.ownership_sequence,
+            timing_evidence_sequence=identity.timing_evidence_sequence,
+        )
 
     assert driver.drop_transition_count == 1
     assert not context.session_store.has_pending_normal_drop_persistence(session)
-    assert _exact_normal_drop(context, session).outcome == "ambiguous"
+    unresolved = _call_tool(
+        server,
+        "drop_beans_exact_session",
+        ctx,
+        session_id=identity.session_id,
+        clock_epoch_id=identity.clock_epoch_id,
+        ownership_sequence=identity.ownership_sequence,
+        timing_evidence_sequence=identity.timing_evidence_sequence,
+    )
+    assert (
+        unresolved.session_id,
+        unresolved.clock_epoch_id,
+        unresolved.ownership_sequence,
+        unresolved.timing_evidence_sequence,
+    ) == (
+        identity.session_id,
+        identity.clock_epoch_id,
+        identity.ownership_sequence,
+        identity.timing_evidence_sequence,
+    )
+    assert unresolved.outcome == "ambiguous"
+    assert unresolved.reason == "normal_drop_unresolved"
+    assert unresolved.request_dispatch == "not_invoked"
+    assert unresolved.this_request == "no_reservation"
+    assert unresolved.history == "unknown"
+    assert unresolved.fence == "retained"
+    assert unresolved.prior_transition == "unknown"
+    assert unresolved.retry == "forbidden"
+    assert unresolved.physical_effect == "not_established"
+    assert driver.emergency_count == 0
 
 
 def test_exact_normal_drop_retains_before_reraising_arbitration_construction_interrupt(

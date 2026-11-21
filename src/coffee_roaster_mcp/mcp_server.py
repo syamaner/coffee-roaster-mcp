@@ -3054,7 +3054,7 @@ def _exact_normal_drop_settlement_result(
         this_request="reservation_owned",
         history="unknown",
         fence="retained" if settlement.outcome == "unknown" else "not_established",
-        prior_transition=prior_transition,
+        prior_transition=("unknown" if settlement.outcome == "stale" else prior_transition),
         observer_failure=observer_failure,
         cleanup_failure=cleanup_failure,
     )
