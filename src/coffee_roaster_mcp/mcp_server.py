@@ -1093,7 +1093,10 @@ class _TelemetrySampler:
         thread = receipt.thread
         if stop_event is None or thread is None:
             return
-        stop_event.set()
+        with self._lock:
+            if self._thread is thread and self._stop_event is stop_event:
+                self._active_session_id = None
+            stop_event.set()
         self._join_thread(thread)
         if thread.is_alive():
             return

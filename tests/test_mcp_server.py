@@ -11553,3 +11553,76 @@ def test_telemetry_sampler_stale_worker_cannot_clear_replacement() -> None:
     assert sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
     assert sampler.active_session_id == "same-session"
     sampler.shutdown()
+
+
+def test_telemetry_sampler_stopping_generation_clears_active_before_held_callback_exits() -> None:
+    """A stopping generation remains finalisable without advertising supervision."""
+    entered = Event()
+    released = Event()
+
+    def held_callback(_session_id: str) -> bool:
+        entered.set()
+        assert released.wait(timeout=4.0)
+        return True
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=held_callback)
+    receipt = mcp_server._TelemetrySamplerStartReceipt()  # pyright: ignore[reportPrivateUsage]
+    sampler._start_for_session("synthetic", receipt=receipt)  # pyright: ignore[reportPrivateUsage]
+    thread = receipt.thread
+    assert thread is not None
+    try:
+        assert entered.wait(timeout=1.0)
+        sampler.stop_started_generation(receipt, reason="synthetic setup failure")
+        assert sampler.active_session_id is None
+        assert sampler._thread is thread  # pyright: ignore[reportPrivateUsage]
+        assert thread.is_alive()
+    finally:
+        released.set()
+        thread.join(timeout=2.0)
+
+    assert sampler.active_session_id is None
+    assert not thread.is_alive()
+    finalisation = sampler.stop_and_join_for_finalisation("synthetic")
+    assert finalisation.owned_by_session_before_stop
+    assert not finalisation.thread_alive_after_join
+
+
+def test_telemetry_sampler_stopping_generation_keeps_replacement_active() -> None:
+    """Stopping a retained generation cannot clear a replacement's supervision."""
+    first_entered = Event()
+    release_first = Event()
+    replacement_started = Event()
+
+    def sample(session_id: str) -> bool:
+        if session_id == "first":
+            first_entered.set()
+            assert release_first.wait(timeout=4.0)
+        else:
+            replacement_started.set()
+        return True
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=sample)
+    receipt = mcp_server._TelemetrySamplerStartReceipt()  # pyright: ignore[reportPrivateUsage]
+    sampler._start_for_session("first", receipt=receipt)  # pyright: ignore[reportPrivateUsage]
+    first_thread = receipt.thread
+    assert first_thread is not None
+    try:
+        assert first_entered.wait(timeout=1.0)
+        sampler.stop_started_generation(receipt, reason="synthetic setup failure")
+        assert sampler.active_session_id is None
+        assert sampler._thread is first_thread  # pyright: ignore[reportPrivateUsage]
+        assert first_thread.is_alive()
+
+        sampler.start_for_session("replacement")
+        assert replacement_started.wait(timeout=1.0)
+        replacement = sampler._thread  # pyright: ignore[reportPrivateUsage]
+        assert replacement is not None and replacement is not first_thread
+
+        release_first.set()
+        first_thread.join(timeout=2.0)
+        assert not first_thread.is_alive()
+        assert sampler.active_session_id == "replacement"
+        assert sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
+    finally:
+        release_first.set()
+        sampler.shutdown()
