@@ -9665,22 +9665,49 @@ def test_exact_normal_drop_emergency_during_pretransition_pause_settles_then_fau
     entered_drop = Event()
     release_drop = Event()
     emergency_dispatched = Event()
+    fault_write_admitted = Event()
     original_drop = driver.drop_beans
     original_emergency = driver.emergency_stop
+    original_prepare_fault = context.session_store.prepare_mock_drop_emergency_stop
 
     def pause_before_mock_transition(
         *, exact_drop: ExactDropArbitration | None = None
     ) -> RoasterState:
-        entered_drop.set()
-        assert release_drop.wait(timeout=1.0)
-        return original_drop(exact_drop=exact_drop)
+        assert exact_drop is not None
+
+        def pause_at_driver_seam() -> None:
+            entered_drop.set()
+            assert release_drop.wait(timeout=1.0)
+
+        return original_drop(
+            exact_drop=dataclasses.replace(exact_drop, before_transition=pause_at_driver_seam)
+        )
 
     def record_emergency(*, reason: str) -> EmergencyStopResult:
         emergency_dispatched.set()
         return original_emergency(reason=reason)
 
+    def record_fault_admission(
+        current: RoastSession,
+        *,
+        reason: str,
+        safety_payload: Mapping[str, EventPayloadValue],
+        allow_stopped_latest: bool,
+    ) -> tuple[RoastEvent, MockDropPersistenceTicket]:
+        admitted = original_prepare_fault(
+            current,
+            reason=reason,
+            safety_payload=safety_payload,
+            allow_stopped_latest=allow_stopped_latest,
+        )
+        fault_write_admitted.set()
+        return admitted
+
     monkeypatch.setattr(driver, "drop_beans", pause_before_mock_transition)
     monkeypatch.setattr(driver, "emergency_stop", record_emergency)
+    monkeypatch.setattr(
+        context.session_store, "prepare_mock_drop_emergency_stop", record_fault_admission
+    )
     drop_results: list[mcp_server._ExactNormalDropSessionResult] = []  # pyright: ignore[reportPrivateUsage]
     emergency_results: list[object] = []
     drop_thread = Thread(target=lambda: drop_results.append(_exact_normal_drop(context, session)))
@@ -9694,12 +9721,14 @@ def test_exact_normal_drop_emergency_during_pretransition_pause_settles_then_fau
     assert entered_drop.wait(timeout=1.0)
     emergency_thread.start()
     assert emergency_dispatched.wait(timeout=1.0)
+    assert fault_write_admitted.wait(timeout=1.0)
     release_drop.set()
     drop_thread.join(timeout=1.0)
     emergency_thread.join(timeout=1.0)
 
     assert not drop_thread.is_alive() and not emergency_thread.is_alive()
-    assert drop_results[0].outcome in {"cancelled", "unknown"}
+    assert drop_results[0].outcome == "cancelled"
+    assert drop_results[0].fence == "released"
     assert driver.drop_transition_count == 0
     assert cast(Any, emergency_results[0]).event.kind == "fault"
 
@@ -9715,11 +9744,13 @@ def test_exact_normal_drop_success_does_not_weaken_a_later_registered_emergency(
     emergency = _call_tool(server, "emergency_stop", ctx, reason="after-exact-drop")
     state = driver.read_state()
 
-    assert dropped.outcome in {"success", "unknown"}
+    assert dropped.outcome == "success"
     assert emergency.event.kind == "fault"
     assert driver.emergency_count == 1
     assert state.heat_level_percent == 0
     assert state.cooling_on is True
+    assert driver._drum_motor_on is False  # pyright: ignore[reportPrivateUsage]
+    assert driver._solenoid_open is False  # pyright: ignore[reportPrivateUsage]
 
 
 def test_exact_normal_drop_after_recorded_legacy_drop_never_repeats_transition(
@@ -9918,8 +9949,14 @@ def test_exact_normal_drop_endpoint_append_interruption_freezes_without_cleanup(
     append_entered = Event()
     release_append = Event()
     emergency_dispatched = Event()
+    fault_write_admitted = Event()
+    freezes: list[object | None] = []
+    observation_tickets: list[object | None] = []
+    cleanup_calls: list[None] = []
     original_append = session_module._append_event_log_row  # pyright: ignore[reportPrivateUsage]
     original_emergency = driver.emergency_stop
+    original_prepare_fault = context.session_store.prepare_mock_drop_emergency_stop
+    original_begin = runtime.begin_observation_boundary
 
     def pause_or_fail_endpoint(current: RoastSession, event: RoastEvent) -> None:
         if event.kind == endpoint_kind and not append_entered.is_set():
@@ -9933,8 +9970,41 @@ def test_exact_normal_drop_endpoint_append_interruption_freezes_without_cleanup(
         emergency_dispatched.set()
         return original_emergency(reason=reason)
 
+    def record_fault_admission(
+        current: RoastSession,
+        *,
+        reason: str,
+        safety_payload: Mapping[str, EventPayloadValue],
+        allow_stopped_latest: bool,
+    ) -> tuple[RoastEvent, MockDropPersistenceTicket]:
+        admitted = original_prepare_fault(
+            current,
+            reason=reason,
+            safety_payload=safety_payload,
+            allow_stopped_latest=allow_stopped_latest,
+        )
+        fault_write_admitted.set()
+        return admitted
+
+    def record_freeze(_session: object, ticket: object | None, **_kwargs: object) -> None:
+        freezes.append(ticket)
+
+    def record_begin(current: RoastSession, *, reason: str) -> object | None:
+        ticket = original_begin(current, reason=reason)
+        observation_tickets.append(ticket)
+        return ticket
+
+    def record_cleanup(*_args: object, **_kwargs: object) -> None:
+        cleanup_calls.append(None)
+
     monkeypatch.setattr(session_module, "_append_event_log_row", pause_or_fail_endpoint)
     monkeypatch.setattr(driver, "emergency_stop", record_emergency)
+    monkeypatch.setattr(
+        context.session_store, "prepare_mock_drop_emergency_stop", record_fault_admission
+    )
+    monkeypatch.setattr(runtime, "begin_observation_boundary", record_begin)
+    monkeypatch.setattr(runtime, "freeze_observation_boundary", record_freeze)
+    monkeypatch.setattr(mcp_server, "_stop_runtimes_after_drop", record_cleanup)
     exact_results: list[mcp_server._ExactNormalDropSessionResult] = []  # pyright: ignore[reportPrivateUsage]
     emergency_errors: list[BaseException] = []
     exact_thread = Thread(target=lambda: exact_results.append(_exact_normal_drop(context, session)))
@@ -9947,6 +10017,7 @@ def test_exact_normal_drop_endpoint_append_interruption_freezes_without_cleanup(
     assert append_entered.wait(timeout=1.0)
     emergency_thread.start()
     assert emergency_dispatched.wait(timeout=1.0)
+    assert fault_write_admitted.wait(timeout=1.0)
     release_append.set()
     exact_thread.join(timeout=1.0)
     emergency_thread.join(timeout=1.0)
@@ -9954,6 +10025,9 @@ def test_exact_normal_drop_endpoint_append_interruption_freezes_without_cleanup(
     assert not exact_thread.is_alive() and not emergency_thread.is_alive()
     assert exact_results[0].history == "unknown"
     assert exact_results[0].fence in {"retained", "not_established"}
+    assert observation_tickets[0] is not None
+    assert observation_tickets[0] in freezes
+    assert cleanup_calls == []
     assert runtime.stopped_sessions == []
     if append_fails:
         assert len(emergency_errors) == 1
@@ -10191,6 +10265,74 @@ def test_exact_normal_drop_releases_the_pending_writer_before_reraising_interrup
     assert driver.drop_transition_count == 1
     assert not context.session_store.has_pending_normal_drop_persistence(session)
     assert _exact_normal_drop(context, session).outcome == "ambiguous"
+
+
+def test_exact_normal_drop_retains_before_reraising_arbitration_construction_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted arbitration construction releases its writer for an explicit fault."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+    retain_calls = 0
+    original_retain = context.session_store.retain_normal_drop_unknown
+
+    def interrupt_arbitration(**_kwargs: object) -> None:
+        raise KeyboardInterrupt()
+
+    def count_retain(current: RoastSession, *, reservation: object) -> NormalDropSettlement:
+        nonlocal retain_calls
+        retain_calls += 1
+        return original_retain(current, reservation=reservation)
+
+    monkeypatch.setattr(mcp_server, "ExactDropArbitration", interrupt_arbitration)
+    monkeypatch.setattr(context.session_store, "retain_normal_drop_unknown", count_retain)
+
+    with pytest.raises(KeyboardInterrupt):
+        _exact_normal_drop(context, session)
+
+    assert retain_calls == 1
+    assert not context.session_store.has_pending_normal_drop_persistence(session)
+    emergency = _call_tool(server, "emergency_stop", ctx, reason="after-arbitration-interrupt")
+    assert emergency.event.kind == "fault"
+    snapshot = context.session_store.get_session_snapshot()
+    event_kinds = [event.kind for event in snapshot.event_timeline]
+    assert event_kinds.count("fault") == 1
+
+
+def test_exact_normal_drop_retains_before_reraising_cancelled_settlement_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted cancellation settlement releases its writer for an explicit fault."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+    driver = cast(MockRoasterDriver, context.roaster_driver)
+    retain_calls = 0
+    original_retain = context.session_store.retain_normal_drop_unknown
+    driver.emergency_stop(reason="force exact cancellation")
+
+    def interrupt_cancelled_settlement(*_args: object, **_kwargs: object) -> NormalDropSettlement:
+        raise KeyboardInterrupt()
+
+    def count_retain(current: RoastSession, *, reservation: object) -> NormalDropSettlement:
+        nonlocal retain_calls
+        retain_calls += 1
+        return original_retain(current, reservation=reservation)
+
+    monkeypatch.setattr(
+        context.session_store, "settle_normal_drop_cancelled", interrupt_cancelled_settlement
+    )
+    monkeypatch.setattr(context.session_store, "retain_normal_drop_unknown", count_retain)
+
+    with pytest.raises(KeyboardInterrupt):
+        _exact_normal_drop(context, session)
+
+    assert retain_calls == 1
+    assert not context.session_store.has_pending_normal_drop_persistence(session)
+    emergency = _call_tool(
+        server, "emergency_stop", ctx, reason="after-cancelled-settlement-interrupt"
+    )
+    assert emergency.event.kind == "fault"
+    snapshot = context.session_store.get_session_snapshot()
+    event_kinds = [event.kind for event in snapshot.event_timeline]
+    assert event_kinds.count("fault") == 1
 
 
 def test_exact_normal_drop_validates_projection_before_opening_observation_boundary(

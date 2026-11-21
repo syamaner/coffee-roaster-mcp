@@ -3202,6 +3202,12 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             request_dispatch="not_invoked",
             reason="arbitration_unavailable",
         )
+    except BaseException:
+        with suppress(BaseException):
+            _retain_exact_normal_drop_unknown(
+                server_context, session=session, reservation=reservation
+            )
+        raise
 
     try:
         driver_state = cast(object, driver.drop_beans(exact_drop=arbitration))
@@ -3216,6 +3222,12 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
                 settlement = _retain_exact_normal_drop_unknown(
                     server_context, session=session, reservation=reservation
                 )
+            except BaseException:
+                with suppress(BaseException):
+                    _retain_exact_normal_drop_unknown(
+                        server_context, session=session, reservation=reservation
+                    )
+                raise
             return _exact_normal_drop_settlement_result(
                 identity=identity,
                 settlement=settlement,
