@@ -3125,6 +3125,186 @@ def test_get_roast_state_appends_normalized_driver_telemetry_samples(
     assert samples[0].monotonic_seconds <= samples[1].monotonic_seconds
 
 
+def test_registered_mock_state_and_background_sampling_keep_coherent_samples(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overlapped registered polling and sampling retain their own mock samples."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    context = build_server_context(config_path=config_path)
+    assert type(context.roaster_driver) is MockRoasterDriver
+    driver = context.roaster_driver
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(context)
+    start = _call_tool(server, "start_roast_session", ctx)
+    context.telemetry_sampler.stop_for_session(start.session.session_id, reason="controlled sample")
+    _call_tool(server, "set_heat", ctx, heat_level_percent=100)
+    foreground_assembly_entered = Event()
+    release_foreground_assembly = Event()
+    sampler_completed = Event()
+    reads: list[RoasterState] = []
+    registered_results: list[object] = []
+    registered_errors: list[BaseException] = []
+    sampler_results: list[bool] = []
+    sampler_errors: list[BaseException] = []
+    original_snapshot = driver._state_snapshot  # pyright: ignore[reportPrivateUsage]
+    original_read = driver.read_state
+
+    def hold_foreground_assembly(thermal_sample: object = None) -> RoasterState:
+        if getattr(thermal_sample, "index", None) == 1:
+            foreground_assembly_entered.set()
+            assert release_foreground_assembly.wait(timeout=1.0)
+        return original_snapshot(thermal_sample)  # type: ignore[arg-type]
+
+    def observe_read() -> RoasterState:
+        state = original_read()
+        reads.append(state)
+        return state
+
+    def sample_into_result() -> None:
+        try:
+            sampler_results.append(
+                _sample_active_session_telemetry(context, session_id=start.session.session_id)
+            )
+        except BaseException as exc:  # noqa: BLE001 - report the background witness failure.
+            sampler_errors.append(exc)
+        finally:
+            sampler_completed.set()
+
+    monkeypatch.setattr(driver, "_state_snapshot", hold_foreground_assembly)
+    monkeypatch.setattr(driver, "read_state", observe_read)
+    registered_thread = Thread(
+        target=_record_tool_result,
+        args=(registered_results, registered_errors, server, "get_roast_state", ctx),
+        kwargs={"session_id": start.session.session_id},
+    )
+    sampler_thread = Thread(target=sample_into_result)
+    sampler_thread_started = False
+    registered_thread.start()
+    try:
+        assert foreground_assembly_entered.wait(timeout=1.0)
+        sampler_thread.start()
+        sampler_thread_started = True
+        assert sampler_completed.wait(timeout=1.0)
+        assert not sampler_errors
+        assert sampler_results == [True]
+    finally:
+        release_foreground_assembly.set()
+        registered_thread.join(timeout=1.0)
+        if sampler_thread_started:
+            sampler_thread.join(timeout=1.0)
+
+    assert not registered_thread.is_alive()
+    assert sampler_thread_started and not sampler_thread.is_alive()
+    assert not registered_errors
+    assert len(registered_results) == 1
+    registered = registered_results[0]
+    assert isinstance(registered, mcp_server.RoastSessionState)
+    snapshot = context.session_store.get_session_snapshot(session_id=start.session.session_id)
+    assert registered.device_state is not None
+    registered_sample_index = registered.device_state.raw_vendor_data["sample_index"]
+    assert type(registered_sample_index) is int
+    assert (
+        registered_sample_index,
+        registered.device_state.bean_temp_c,
+        registered.device_state.env_temp_c,
+    ) == (1, 20.2, 22.0)
+    read_samples: list[tuple[int, float, float]] = []
+    for state in reads:
+        sample_index = state.raw_vendor_data["sample_index"]
+        bean_temp_c = state.bean_temp_c
+        env_temp_c = state.env_temp_c
+        assert type(sample_index) is int
+        assert bean_temp_c is not None
+        assert env_temp_c is not None
+        read_samples.append((sample_index, bean_temp_c, env_temp_c))
+    assert sorted(read_samples) == [(1, 20.2, 22.0), (2, 20.6, 24.0)]
+    assert sorted(
+        (sample.bean_temp_c, sample.env_temp_c) for sample in snapshot.telemetry_buffer
+    ) == [
+        (20.2, 22.0),
+        (20.6, 24.0),
+    ]
+
+
+def test_registered_mock_emergency_dispatches_while_a_thermal_read_is_held(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #249 emergency route reaches the real mock before a held read releases."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    context = build_server_context(config_path=config_path)
+    assert type(context.roaster_driver) is MockRoasterDriver
+    driver = context.roaster_driver
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(context)
+    start = _call_tool(server, "start_roast_session", ctx)
+    context.telemetry_sampler.stop_for_session(
+        start.session.session_id, reason="controlled emergency"
+    )
+    _call_tool(server, "set_heat", ctx, heat_level_percent=100)
+    thermal_compute_entered = Event()
+    release_thermal_compute = Event()
+    driver_dispatched = Event()
+    read_results: list[object] = []
+    read_errors: list[BaseException] = []
+    emergency_results: list[EmergencyStopResult] = []
+    original_delta = driver._environment_delta_c  # pyright: ignore[reportPrivateUsage]
+    original_emergency_stop = driver.emergency_stop
+
+    def hold_thermal_compute() -> float:
+        thermal_compute_entered.set()
+        assert release_thermal_compute.wait(timeout=1.0)
+        return original_delta()
+
+    def observe_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        result = original_emergency_stop(reason=reason)
+        emergency_results.append(result)
+        driver_dispatched.set()
+        return result
+
+    monkeypatch.setattr(driver, "_environment_delta_c", hold_thermal_compute)
+    monkeypatch.setattr(driver, "emergency_stop", observe_emergency_stop)
+    reader = Thread(
+        target=_record_tool_result,
+        args=(read_results, read_errors, server, "get_roast_state", ctx),
+        kwargs={"session_id": start.session.session_id},
+    )
+    reader.start()
+    try:
+        assert thermal_compute_entered.wait(timeout=1.0)
+        emergency = _call_tool(
+            server,
+            "emergency_stop",
+            ctx,
+            reason="held coherent mock sample",
+        )
+        assert driver_dispatched.is_set()
+        assert emergency_results == [
+            EmergencyStopResult(
+                driver="mock",
+                safety_method="emergency_stop",
+                heat_level_percent=0,
+                fan_level_percent=100,
+                cooling_on=True,
+            )
+        ]
+        assert emergency.event.kind == "fault"
+    finally:
+        release_thermal_compute.set()
+        reader.join(timeout=1.0)
+
+    assert not reader.is_alive()
+    assert not read_errors
+    assert len(read_results) == 1
+    evidence = driver.read_lifecycle_evidence()
+    assert evidence.heat_level_percent == 0
+    assert evidence.main_fan_level_percent == 100
+    assert evidence.cooling_motor_on is True
+
+
 def test_get_roast_state_driver_read_failure_does_not_mutate_session(
     tmp_path: Path,
 ) -> None:

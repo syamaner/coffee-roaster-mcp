@@ -675,6 +675,15 @@ def is_hottop_command_packet(packet: bytes) -> bool:
     return len(packet) == HOTTOP_PACKET_LENGTH and packet.startswith(_HOTTOP_COMMAND_HEADER)
 
 
+@dataclass(frozen=True)
+class _MockThermalSample:
+    """One completed mock thermal observation, kept private to the driver."""
+
+    index: int
+    bean_temp_c: float
+    env_temp_c: float
+
+
 class MockRoasterDriver:
     """Mock roaster driver with deterministic local-only telemetry and controls."""
 
@@ -692,13 +701,17 @@ class MockRoasterDriver:
     def __init__(self) -> None:
         """Initialize deterministic mock roaster state."""
         self._connected = False
-        self._bean_temp_c = self._INITIAL_TEMP_C
-        self._env_temp_c = self._INITIAL_TEMP_C
+        self._thermal_writer_lock = Lock()
+        self._thermal_sample_lock = Lock()
+        self._thermal_sample = _MockThermalSample(
+            index=0,
+            bean_temp_c=self._INITIAL_TEMP_C,
+            env_temp_c=self._INITIAL_TEMP_C,
+        )
         self._heat_level_percent = 0
         self._fan_level_percent = 0
         self._cooling_on = False
         self._beans_dropped = False
-        self._sample_index = 0
         self._drum_motor_on = False
         self._solenoid_open = False
 
@@ -758,22 +771,24 @@ class MockRoasterDriver:
 
     def read_state(self) -> RoasterState:
         """Return deterministic mock roaster state."""
-        self._advance_telemetry()
-        return self._state_snapshot()
+        return self._state_snapshot(self._advance_telemetry())
 
-    def _state_snapshot(self) -> RoasterState:
+    def _state_snapshot(self, thermal_sample: _MockThermalSample | None = None) -> RoasterState:
         """Return the current mock roaster state without advancing telemetry."""
+        if thermal_sample is None:
+            with self._thermal_sample_lock:
+                thermal_sample = self._thermal_sample
         return RoasterState(
             driver=self.name,
             connected=self._connected,
-            bean_temp_c=self._bean_temp_c,
-            env_temp_c=self._env_temp_c,
+            bean_temp_c=thermal_sample.bean_temp_c,
+            env_temp_c=thermal_sample.env_temp_c,
             heat_level_percent=self._heat_level_percent,
             fan_level_percent=self._fan_level_percent,
             cooling_on=self._cooling_on,
             raw_vendor_data={
                 "beans_dropped": self._beans_dropped,
-                "sample_index": self._sample_index,
+                "sample_index": thermal_sample.index,
                 "telemetry_model": "fixed_step_thermal_v1",
             },
         )
@@ -850,27 +865,34 @@ class MockRoasterDriver:
             cooling_on=self._cooling_on,
         )
 
-    def _advance_telemetry(self) -> None:
-        """Advance one deterministic mock telemetry sample."""
-        self._sample_index += 1
-        env_delta_c = self._environment_delta_c()
-        self._env_temp_c = _clamp_float(
-            self._env_temp_c + env_delta_c,
-            minimum=self._MIN_TEMP_C,
-            maximum=self._MAX_ENV_TEMP_C,
-        )
-
-        bean_target_c = self._env_temp_c
-        bean_delta_c = (
-            (bean_target_c - self._bean_temp_c)
-            * self._BEAN_THERMAL_LAG_FACTOR
-            * self._SAMPLE_INTERVAL_SECONDS
-        )
-        self._bean_temp_c = _clamp_float(
-            self._bean_temp_c + bean_delta_c,
-            minimum=self._MIN_TEMP_C,
-            maximum=self._MAX_BEAN_TEMP_C,
-        )
+    def _advance_telemetry(self) -> _MockThermalSample:
+        """Advance, publish, and return one deterministic mock telemetry sample."""
+        with self._thermal_writer_lock:
+            with self._thermal_sample_lock:
+                predecessor = self._thermal_sample
+            env_delta_c = self._environment_delta_c()
+            env_temp_c = _clamp_float(
+                predecessor.env_temp_c + env_delta_c,
+                minimum=self._MIN_TEMP_C,
+                maximum=self._MAX_ENV_TEMP_C,
+            )
+            bean_delta_c = (
+                (env_temp_c - predecessor.bean_temp_c)
+                * self._BEAN_THERMAL_LAG_FACTOR
+                * self._SAMPLE_INTERVAL_SECONDS
+            )
+            completed = _MockThermalSample(
+                index=predecessor.index + 1,
+                bean_temp_c=_clamp_float(
+                    predecessor.bean_temp_c + bean_delta_c,
+                    minimum=self._MIN_TEMP_C,
+                    maximum=self._MAX_BEAN_TEMP_C,
+                ),
+                env_temp_c=env_temp_c,
+            )
+            with self._thermal_sample_lock:
+                self._thermal_sample = completed
+            return completed
 
     def _environment_delta_c(self) -> float:
         """Return one fixed-step environment temperature delta."""
