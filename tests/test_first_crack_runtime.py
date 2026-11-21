@@ -2840,10 +2840,10 @@ def test_manual_runtime_failed_start_close_yields_to_pending_boundary_owner(
     assert captures[0].stopped
 
 
-def test_manual_runtime_failed_start_close_does_not_hold_runtime_lock(
+def test_manual_runtime_failed_start_cleanup_skips_snapshot_and_runtime_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The observer's atomic close decision never nests under the runtime lock."""
+    """Private staged cleanup does not poll capture or retain the runtime lock."""
     runtime, captures, _ = _manual_runtime_fixture(tmp_path)
     store = RoastSessionStore(default_log_dir=tmp_path / "failed-start-lock")
     session = store.start_session()
@@ -2868,7 +2868,11 @@ def test_manual_runtime_failed_start_close_does_not_hold_runtime_lock(
         assert not probe.is_alive()
         original_close(reason=reason)
 
+    def unexpected_snapshot() -> FirstCrackRuntimeSnapshot:
+        raise AssertionError("failed-Start cleanup must not request a runtime snapshot")
+
     monkeypatch.setattr(observer, "close_after_failed_start", close_without_runtime_lock)
+    monkeypatch.setattr(runtime, "snapshot", unexpected_snapshot)
     runtime.stop_after_failed_start(session.id, reason="staged_start_failed")
     assert observer.reaped.wait(2) and captures[0].stopped
 

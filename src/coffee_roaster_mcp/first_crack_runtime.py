@@ -206,7 +206,6 @@ class FirstCrackSessionRuntime:
         """
         self._config = config
         self._observer: FirstCrackObserver | None = None
-        self._admitted_observer: tuple[str, int] | None = None
         self._refused_observation: ObservationSnapshot | None = None
         self._capture_cleanup: CaptureCleanup | None = None
         self._capture_cleanup_session_id: str | None = None
@@ -536,7 +535,6 @@ class FirstCrackSessionRuntime:
             self._recorder_built_for_session = False
             self._completed_observation = None
             self._refused_observation = None
-            self._admitted_observer = None
             try:
                 # Preserve the closed refusal projection whenever the actual
                 # settings are representable; never invent valid defaults.
@@ -624,15 +622,20 @@ class FirstCrackSessionRuntime:
                     if recorder is not None
                     else None,
                 )
-                self._observer = observer
                 self._status = "pending"
                 self._reason = (
                     "Human first crack is authoritative; model observations are diagnostic only."
                 )
                 if not observer.start(token):
                     raise RuntimeError("Observation worker could not acquire its reservation.")
-                self._admitted_observer = (session.id, self._observation_generation)
+                observer.admit_failed_start_cleanup()
+                self._observer = observer
             except Exception:  # noqa: BLE001 - no fall back to automatic authority.
+                # An observer whose worker did not start is deliberately not
+                # admitted, but remains the exact lifecycle-close target for
+                # truthful failed-Start cleanup.
+                if observer is not None:
+                    self._observer = observer
                 if isinstance(recorder, EvidenceRoastRecorder):
                     recorder.publish_setup_failure()
                 else:
@@ -1107,30 +1110,19 @@ class FirstCrackSessionRuntime:
         session_id: str,
         *,
         reason: str,
-    ) -> FirstCrackRuntimeSnapshot:
+    ) -> None:
         """Close staged-Start observation without replacing an existing closer."""
         if self._config.first_crack.event_authority != "manual":
-            return self.stop_for_session(session_id, reason=reason)
+            self.stop_for_session(session_id, reason=reason)
+            return
         with self._lock:
             observer = self._observer
-            admitted = (
-                observer is not None
-                and observer.session_id == session_id
-                and self._admitted_observer == (session_id, observer.generation)
-                and self._capture_cleanup is None
-            )
         if observer is None or observer.session_id != session_id:
-            return self.snapshot()
-        if admitted:
-            # The observer lock owns this decision.  Do not nest it beneath
-            # the runtime lock: boundary producers can re-enter this runtime.
-            observer.close_after_failed_start(reason=reason.replace(" ", "_"))
-        else:
-            # A claimed observer without a started worker is not admitted to
-            # yield.  Preserve the ordinary lifecycle-close handling, but act
-            # only on the exact observer selected above.
-            observer.close(cutoff=None, reason=reason.replace(" ", "_"))
-        return self.snapshot()
+            return
+        # The selected observer holds admission proof and atomically decides
+        # whether staged cleanup owns the close. Do not request a runtime or
+        # capture snapshot: this command's staged caller intentionally ignores it.
+        observer.close_after_failed_start(reason=reason.replace(" ", "_"))
 
     def finalise_for_session(
         self, session_id: str

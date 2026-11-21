@@ -8334,9 +8334,9 @@ class FakeFirstCrackRuntime:
         self.reason = reason
         return self.snapshot()
 
-    def stop_after_failed_start(self, session_id: str, *, reason: str) -> FirstCrackRuntimeSnapshot:
+    def stop_after_failed_start(self, session_id: str, *, reason: str) -> None:
         """Model the staged failed-Start cleanup port."""
-        return self.stop_for_session(session_id, reason=reason)
+        self.stop_for_session(session_id, reason=reason)
 
     def finalise_for_session(self, session_id: str) -> tuple[str, str | None, bool]:
         """Report the default fake as inactive with no capture to stop."""
