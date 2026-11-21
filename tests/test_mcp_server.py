@@ -3048,6 +3048,277 @@ def test_mcp_roast_controls_call_configured_driver_boundary(tmp_path: Path) -> N
     assert complete.phase == "complete"
 
 
+@pytest.mark.parametrize("authority", ["automatic", "manual"])
+def test_registered_drop_call_order_preserves_semantic_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, authority: str
+) -> None:
+    """The registered Drop route retains its live and saved ownership inputs."""
+    config_path = tmp_path / f"{authority}.yaml"
+    config_lines = [f"logging:\n  log_dir: {tmp_path / f'logs-{authority}'}"]
+    if authority == "manual":
+        config_lines.extend(
+            [
+                "first_crack:",
+                "  mode: audio",
+                "  event_authority: manual",
+                "  allow_manual_override: true",
+                "recording:",
+                "  enabled: true",
+                "  autocapture: true",
+            ]
+        )
+    config_path.write_text("\n".join(config_lines), encoding="utf-8")
+    context = build_server_context(config_path=config_path)
+    runtime = FakeFirstCrackRuntime()
+    _set_first_crack_runtime(context, runtime)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    start_kwargs = {"first_crack_observer_ack": "manual/v1"} if authority == "manual" else {}
+    _call_tool(server, "start_roast_session", ctx, **start_kwargs)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    _call_tool(server, "mark_beans_added", ctx)
+    live_session = context.session_store.get_active_session()
+    assert live_session is not None
+
+    order: list[str] = []
+    ticket = object()
+    resolved: list[tuple[RoastSession, object | None, float]] = []
+    original_complete = context.session_store.complete_reserved_driver_drop_snapshot
+    original_drop = driver.drop_beans
+    lifecycle_cleanup: list[str] = []
+
+    def complete(
+        target: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> tuple[RoastEvent, RoastSession]:
+        order.append("store.complete")
+        return original_complete(
+            target,
+            reservation=reservation,
+            heat_level_percent=heat_level_percent,
+            fan_level_percent=fan_level_percent,
+            cooling_on=cooling_on,
+        )
+
+    def process(
+        *, session_store: RoastSessionStore, session: RoastSession
+    ) -> FirstCrackRuntimeSnapshot:
+        assert session_store is context.session_store and session is live_session
+        assert session.beans_dropped_monotonic_seconds is not None
+        order.append("first-crack.process")
+        return runtime.snapshot()
+
+    def stop(session_id: str, *, reason: str) -> FirstCrackRuntimeSnapshot:
+        assert session_id == live_session.id and reason == "beans dropped"
+        order.append("first-crack.stop")
+        return runtime.snapshot()
+
+    monkeypatch.setattr(context.session_store, "complete_reserved_driver_drop_snapshot", complete)
+    monkeypatch.setattr(runtime, "process_pending_windows_after_drop", process)
+    monkeypatch.setattr(runtime, "stop_for_session", stop)
+
+    def drop() -> RoasterState:
+        order.append("driver.drop")
+        return original_drop()
+
+    def stop_telemetry(_session_id: str, *, reason: str) -> None:
+        lifecycle_cleanup.append(f"telemetry:{reason}")
+
+    def stop_ambient(_session_id: str, *, reason: str) -> AmbientRuntimeSnapshot:
+        lifecycle_cleanup.append(f"ambient:{reason}")
+        return context.ambient_runtime.snapshot()
+
+    monkeypatch.setattr(driver, "drop_beans", drop)
+    monkeypatch.setattr(context.telemetry_sampler, "stop_for_session", stop_telemetry)
+    monkeypatch.setattr(context.ambient_runtime, "stop_for_session", stop_ambient)
+
+    if authority == "manual":
+
+        def begin(session: RoastSession, *, reason: str) -> object:
+            assert session is live_session and reason == "beans_dropped"
+            order.append("recording.begin")
+            return ticket
+
+        def resolve(
+            session: RoastSession,
+            observed_ticket: object | None,
+            *,
+            cutoff_monotonic_seconds: float,
+        ) -> None:
+            order.append("recording.resolve")
+            resolved.append((session, observed_ticket, cutoff_monotonic_seconds))
+
+        monkeypatch.setattr(runtime, "begin_observation_boundary", begin)
+        monkeypatch.setattr(runtime, "resolve_observation_boundary", resolve)
+
+    _call_tool(server, "drop_beans", ctx)
+    _call_tool(server, "drop_beans", ctx)
+
+    assert lifecycle_cleanup == []
+    if authority == "automatic":
+        assert order == [
+            "driver.drop",
+            "store.complete",
+            "first-crack.process",
+            "first-crack.stop",
+            "first-crack.process",
+            "first-crack.stop",
+        ]
+    else:
+        saved_event = next(
+            event for event in live_session.event_timeline if event.kind == "beans_dropped"
+        )
+        assert order == ["driver.drop", "recording.begin", "store.complete", "recording.resolve"]
+        assert resolved == [
+            (live_session, ticket, live_session.monotonic_start + saved_event.monotonic_seconds)
+        ]
+
+
+def test_drop_cleanup_uses_inactive_snapshot_in_established_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inactive saved Drop snapshots stop first-crack, telemetry, then ambient."""
+    context = _cold_finalisation_context(tmp_path)
+    session = context.session_store.start_session()
+    snapshot = dataclasses.replace(session, monotonic_stop=time.monotonic())
+    order: list[str] = []
+
+    def stop_telemetry(_session_id: str, *, reason: str) -> None:
+        order.append(f"telemetry:{reason}")
+
+    def stop_first_crack(_session_id: str, *, reason: str) -> FirstCrackRuntimeSnapshot:
+        order.append(f"first-crack:{reason}")
+        return context.first_crack_runtime.snapshot()
+
+    def stop_ambient(_session_id: str, *, reason: str) -> AmbientRuntimeSnapshot:
+        order.append(f"ambient:{reason}")
+        return context.ambient_runtime.snapshot()
+
+    monkeypatch.setattr(context.first_crack_runtime, "stop_for_session", stop_first_crack)
+    monkeypatch.setattr(context.telemetry_sampler, "stop_for_session", stop_telemetry)
+    monkeypatch.setattr(context.ambient_runtime, "stop_for_session", stop_ambient)
+
+    mcp_server._stop_runtimes_after_drop(  # pyright: ignore[reportPrivateUsage]
+        context, session=session, snapshot=snapshot
+    )
+    assert order == [
+        "first-crack:beans dropped",
+        "telemetry:beans dropped",
+        "ambient:beans dropped",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("route", "freeze_reason"),
+    [("ordinary", "drop_recording_failed"), ("guarded", "fault_recovery_incomplete")],
+)
+def test_registered_manual_drop_freezes_same_ticket_after_rejected_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+    freeze_reason: str,
+) -> None:
+    """Each registered manual Drop route contains rejected persistence with its ticket."""
+    if route == "ordinary":
+        config_path = tmp_path / "manual.yaml"
+        config_path.write_text(
+            "first_crack:\n  mode: audio\n  event_authority: manual\n"
+            "  allow_manual_override: true\n"
+            "recording:\n  enabled: true\n  autocapture: true\n"
+            f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+            encoding="utf-8",
+        )
+        context = build_server_context(config_path=config_path)
+        server = create_mcp_server()
+        ctx = _ctx(context)
+        _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+        _call_tool(server, "mark_beans_added", ctx)
+        expected_session_id: str | None = None
+    else:
+        server, ctx, _, recovered_session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+        context = ctx.request_context.lifespan_context
+        object.__setattr__(
+            context,
+            "config",
+            dataclasses.replace(
+                context.config,
+                first_crack=dataclasses.replace(
+                    context.config.first_crack, event_authority="manual"
+                ),
+            ),
+        )
+        expected_session_id = recovered_session_id
+
+    runtime = FakeFirstCrackRuntime()
+    _set_first_crack_runtime(context, runtime)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(context, "roaster_driver", driver)
+    trace: list[str] = []
+    ticket = object()
+    frozen: list[tuple[object | None, str]] = []
+    original_emergency_stop = driver.emergency_stop
+
+    def drop() -> RoasterState:
+        trace.append("driver.drop")
+        return RecordingRoasterDriver.drop_beans(driver)
+
+    def begin(session: RoastSession, *, reason: str) -> object:
+        assert reason == "beans_dropped"
+        trace.append("recording.begin")
+        return ticket
+
+    def freeze(session: RoastSession, observed_ticket: object | None, *, reason: str) -> None:
+        trace.append("recording.freeze")
+        frozen.append((observed_ticket, reason))
+
+    def emergency(*, reason: str) -> EmergencyStopResult:
+        trace.append("emergency.dispatch")
+        return original_emergency_stop(reason=reason)
+
+    monkeypatch.setattr(driver, "drop_beans", drop)
+    monkeypatch.setattr(driver, "emergency_stop", emergency)
+    monkeypatch.setattr(runtime, "begin_observation_boundary", begin)
+    monkeypatch.setattr(runtime, "freeze_observation_boundary", freeze)
+
+    if route == "ordinary":
+
+        def reject_ordinary(*_args: object, **_kwargs: object) -> tuple[RoastEvent, RoastSession]:
+            trace.append("store.rejected")
+            raise SessionLifecycleError("synthetic rejected persistence")
+
+        monkeypatch.setattr(
+            context.session_store, "complete_reserved_driver_drop_snapshot", reject_ordinary
+        )
+    else:
+
+        def reject_guarded(*_args: object, **_kwargs: object) -> tuple[RoastEvent, RoastSession]:
+            trace.append("store.rejected")
+            raise SessionLifecycleError("synthetic rejected persistence")
+
+        monkeypatch.setattr(
+            context.session_store,
+            "complete_reserved_driver_fault_recovery_snapshot",
+            reject_guarded,
+        )
+
+    with pytest.raises(SessionLifecycleError, match="synthetic rejected persistence"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=expected_session_id)
+
+    assert trace == [
+        "driver.drop",
+        "recording.begin",
+        "store.rejected",
+        "emergency.dispatch",
+        "recording.freeze",
+    ]
+    assert frozen == [(ticket, freeze_reason)]
+
+
 def test_get_roast_state_exposes_current_driver_state_and_event_timestamps(
     tmp_path: Path,
 ) -> None:
@@ -7848,6 +8119,23 @@ class FakeFirstCrackRuntime:
         self.processed_after_drop_sessions.append(True)
         return self.snapshot()
 
+    def begin_observation_boundary(self, session: RoastSession, *, reason: str) -> object | None:
+        """Provide the manual-boundary port required by Drop sequencing tests."""
+        del session, reason
+        return object()
+
+    def resolve_observation_boundary(
+        self, session: RoastSession, ticket: object | None, *, cutoff_monotonic_seconds: float
+    ) -> None:
+        """Accept a synthetic manual-boundary resolution for server tests."""
+        del session, ticket, cutoff_monotonic_seconds
+
+    def freeze_observation_boundary(
+        self, session: RoastSession, ticket: object | None, *, reason: str
+    ) -> None:
+        """Accept a synthetic manual-boundary freeze for server tests."""
+        del session, ticket, reason
+
     def observation_for_session(self, session_id: str) -> None:
         """Automatic-path double has no manual observations to retain."""
         return None
@@ -9634,14 +9922,15 @@ def test_retained_roast_observation_survives_successor_state_and_reexport(tmp_pa
     asyncio.run(_historical_observation_stdio(tmp_path))
 
 
+@pytest.mark.parametrize("drop_count", [1, 2])
 def test_manual_shadow_real_stdio_normal_drop_export_retains_recording_sibling(
-    tmp_path: Path,
+    tmp_path: Path, drop_count: int
 ) -> None:
     """The real synthetic stdio child retains recording and shadow sidecars after normal drop."""
-    asyncio.run(_manual_shadow_stdio_normal_drop_export(tmp_path))
+    asyncio.run(_manual_shadow_stdio_normal_drop_export(tmp_path, drop_count=drop_count))
 
 
-async def _manual_shadow_stdio_normal_drop_export(tmp_path: Path) -> None:
+async def _manual_shadow_stdio_normal_drop_export(tmp_path: Path, *, drop_count: int) -> None:
     import wave
 
     root = Path(__file__).resolve().parents[1]
@@ -9696,7 +9985,8 @@ async def _manual_shadow_stdio_normal_drop_export(tmp_path: Path) -> None:
             == before_mark["first_crack_observation"]["first_confirmation"]
         )
         assert not (tmp_path / "capture-stopped").exists()
-        await call("drop_beans", {})
+        for _ in range(drop_count):
+            await call("drop_beans", {})
         await call("stop_cooling", {})
 
         async def reaped() -> dict[str, Any]:

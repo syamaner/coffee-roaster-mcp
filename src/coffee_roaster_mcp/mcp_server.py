@@ -2205,25 +2205,7 @@ def create_mcp_server(
                 reservation=reservation,
             )
             return _serialize_event_result(snapshot=snapshot, event=event)
-        # coffee-roaster-mcp#191: classify any detector window captured BEFORE
-        # this drop but not yet drained by the poll cadence, so a genuine
-        # pre-drop first crack is not silently lost from the RECORDING'S
-        # milestone. Deliberately AFTER the drop command above (never before
-        # it) — inference must never delay a safety-relevant hardware drop.
-        # `session` already carries beans_dropped_monotonic_seconds from the
-        # mutation above, which bounds acceptance to windows that finished
-        # capturing strictly before the drop. This never writes
-        # first_crack_detected to the session event log — see
-        # process_pending_windows_after_drop's docstring for why that stays
-        # untouched by design.
-        if server_context.config.first_crack.event_authority != "manual":
-            server_context.first_crack_runtime.process_pending_windows_after_drop(
-                session_store=server_context.session_store, session=session
-            )
-            server_context.first_crack_runtime.stop_for_session(snapshot.id, reason="beans dropped")
-        if not snapshot.active:
-            server_context.telemetry_sampler.stop_for_session(snapshot.id, reason="beans dropped")
-            server_context.ambient_runtime.stop_for_session(snapshot.id, reason="beans dropped")
+        _stop_runtimes_after_drop(server_context, session=session, snapshot=snapshot)
         return _serialize_event_result(snapshot=snapshot, event=event)
 
     @mcp.tool()
@@ -3383,6 +3365,69 @@ def _run_reserved_driver_control(
         raise
 
 
+def _begin_drop_observation_boundary(
+    server_context: ServerContext, *, session: RoastSession
+) -> object | None:
+    """Begin the manual recording boundary after a drop driver dispatch."""
+    if server_context.config.first_crack.event_authority != "manual":
+        return None
+    return server_context.first_crack_runtime.begin_observation_boundary(
+        session, reason="beans_dropped"
+    )
+
+
+def _resolve_drop_observation_boundary(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    ticket: object | None,
+    event: RoastEvent,
+) -> None:
+    """Resolve the manual drop boundary from the accepted event timestamp."""
+    if server_context.config.first_crack.event_authority == "manual":
+        server_context.first_crack_runtime.resolve_observation_boundary(
+            session,
+            ticket,
+            cutoff_monotonic_seconds=session.monotonic_start + event.monotonic_seconds,
+        )
+
+
+def _freeze_drop_observation_boundary(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    ticket: object | None,
+    reason: str,
+) -> None:
+    """Freeze an unresolved manual drop boundary after failed persistence."""
+    if server_context.config.first_crack.event_authority == "manual":
+        server_context.first_crack_runtime.freeze_observation_boundary(
+            session, ticket, reason=reason
+        )
+
+
+def _stop_runtimes_after_drop(
+    server_context: ServerContext, *, session: RoastSession, snapshot: RoastSession
+) -> None:
+    """Perform the ordinary post-drop runtime cleanup in its established order.
+
+    Pending automatic windows are deliberately classified only after driver
+    dispatch and accepted Drop persistence. Per #191, ``session`` is the live
+    session so its accepted beans-dropped cutoff bounds classification, while
+    ``snapshot`` is the saved lifecycle result used for cleanup ownership.
+    This never adds a first-crack event to the causal session timeline.
+    Repeated successful Drops retain this cleanup.
+    """
+    if server_context.config.first_crack.event_authority != "manual":
+        server_context.first_crack_runtime.process_pending_windows_after_drop(
+            session_store=server_context.session_store, session=session
+        )
+        server_context.first_crack_runtime.stop_for_session(snapshot.id, reason="beans dropped")
+    if not snapshot.active:
+        server_context.telemetry_sampler.stop_for_session(snapshot.id, reason="beans dropped")
+        server_context.ambient_runtime.stop_for_session(snapshot.id, reason="beans dropped")
+
+
 def _run_reserved_driver_drop(
     server_context: ServerContext,
     session: RoastSession,
@@ -3398,10 +3443,7 @@ def _run_reserved_driver_drop(
     observation_ticket: object | None = None
     try:
         driver_state = server_context.roaster_driver.drop_beans()
-        if server_context.config.first_crack.event_authority == "manual":
-            observation_ticket = server_context.first_crack_runtime.begin_observation_boundary(
-                session, reason="beans_dropped"
-            )
+        observation_ticket = _begin_drop_observation_boundary(server_context, session=session)
         try:
             event, snapshot = server_context.session_store.complete_reserved_driver_drop_snapshot(
                 session,
@@ -3410,19 +3452,21 @@ def _run_reserved_driver_drop(
                 fan_level_percent=driver_state.fan_level_percent,
                 cooling_on=driver_state.cooling_on,
             )
-            if server_context.config.first_crack.event_authority == "manual":
-                server_context.first_crack_runtime.resolve_observation_boundary(
-                    session,
-                    observation_ticket,
-                    cutoff_monotonic_seconds=session.monotonic_start + event.monotonic_seconds,
-                )
+            _resolve_drop_observation_boundary(
+                server_context,
+                session=session,
+                ticket=observation_ticket,
+                event=event,
+            )
             return event, snapshot
         except SessionLifecycleError:
             _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
-            if server_context.config.first_crack.event_authority == "manual":
-                server_context.first_crack_runtime.freeze_observation_boundary(
-                    session, observation_ticket, reason="drop_recording_failed"
-                )
+            _freeze_drop_observation_boundary(
+                server_context,
+                session=session,
+                ticket=observation_ticket,
+                reason="drop_recording_failed",
+            )
             raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
@@ -3534,10 +3578,8 @@ def _run_reserved_driver_fault_recovery(
             driver_state = server_context.roaster_driver.stop_cooling()
         else:
             raise SessionLifecycleError("Unsupported stopped-fault recovery command.")
-        if command == "drop" and server_context.config.first_crack.event_authority == "manual":
-            observation_ticket = server_context.first_crack_runtime.begin_observation_boundary(
-                session, reason="beans_dropped"
-            )
+        if command == "drop":
+            observation_ticket = _begin_drop_observation_boundary(server_context, session=session)
         try:
             event, snapshot = (
                 server_context.session_store.complete_reserved_driver_fault_recovery_snapshot(
@@ -3581,11 +3623,12 @@ def _run_reserved_driver_fault_recovery(
             raise
         except SessionLifecycleError:
             raise
-        if command == "drop" and server_context.config.first_crack.event_authority == "manual":
-            server_context.first_crack_runtime.resolve_observation_boundary(
-                session,
-                observation_ticket,
-                cutoff_monotonic_seconds=session.monotonic_start + event.monotonic_seconds,
+        if command == "drop":
+            _resolve_drop_observation_boundary(
+                server_context,
+                session=session,
+                ticket=observation_ticket,
+                event=event,
             )
         return event, snapshot
     except Exception:
@@ -3604,9 +3647,12 @@ def _run_reserved_driver_fault_recovery(
             or (command in {"drop", "start_cooling"} and driver_state.fan_level_percent != 100)
         ):
             server_context.session_store.retain_fault_recovery_admission_block(session)
-        if command == "drop" and server_context.config.first_crack.event_authority == "manual":
-            server_context.first_crack_runtime.freeze_observation_boundary(
-                session, observation_ticket, reason="fault_recovery_incomplete"
+        if command == "drop":
+            _freeze_drop_observation_boundary(
+                server_context,
+                session=session,
+                ticket=observation_ticket,
+                reason="fault_recovery_incomplete",
             )
         raise
 
