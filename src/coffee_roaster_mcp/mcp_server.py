@@ -2277,7 +2277,7 @@ def create_mcp_server(
                     lambda: server_context.ambient_runtime.stop_for_session(
                         published_session.id, reason="staged start failed"
                     ),
-                    lambda: server_context.first_crack_runtime.stop_for_session(
+                    lambda: server_context.first_crack_runtime.stop_after_failed_start(
                         published_session.id, reason="staged start failed"
                     ),
                 )

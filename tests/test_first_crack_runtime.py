@@ -2801,6 +2801,69 @@ def test_manual_runtime_lifecycle_close_has_no_synthetic_cutoff(
     assert captures[0].stopped
 
 
+def test_manual_runtime_failed_start_close_yields_to_pending_boundary_owner(
+    tmp_path: Path,
+) -> None:
+    """Staged cleanup cannot replace an admitted boundary owner's evidence."""
+    clock = ClockHarness()
+    runtime, captures, _ = _manual_runtime_fixture(tmp_path)
+    runtime._monotonic_now = clock.monotonic_now  # pyright: ignore[reportPrivateUsage]
+    store = RoastSessionStore(
+        default_log_dir=tmp_path / "failed-start-boundary",
+        monotonic_now=clock.monotonic_now,
+        utc_now=clock.utc_now,
+    )
+    session = store.start_session()
+    runtime.start_for_session(session)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert observer is not None and len(captures) == 1
+    ticket = runtime.begin_observation_boundary(session, reason="emergency_stop")
+    assert ticket is not None
+    original_deadline = observer.deadline
+    assert original_deadline is not None
+
+    try:
+        runtime.stop_after_failed_start(session.id, reason="staged_start_failed")
+
+        assert observer.summary is None
+        assert observer.reason == "emergency_stop"
+        assert observer.deadline == original_deadline
+        assert observer.cutoff is None
+    finally:
+        runtime.resolve_observation_boundary(
+            session, ticket, cutoff_monotonic_seconds=session.monotonic_start + 1.0
+        )
+        assert observer.reaped.wait(2)
+    assert observer.summary is not None
+    assert observer.summary.reason.value == "emergency_stop"
+    assert observer.summary.drop_cutoff.value is not None
+    assert captures[0].stopped
+
+
+def test_manual_runtime_failed_start_close_uses_lifecycle_close_when_not_admitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A setup-failed observer cannot receive the admitted-observer yield."""
+    import coffee_roaster_mcp.first_crack_runtime as runtime_module
+
+    runtime, _, _ = _manual_runtime_fixture(tmp_path)
+    store = RoastSessionStore(default_log_dir=tmp_path / "failed-start-not-admitted")
+    session = store.start_session()
+
+    def refused_start(_observer: FirstCrackObserver, _reservation: object | None = None) -> bool:
+        return False
+
+    monkeypatch.setattr(runtime_module.FirstCrackObserver, "start", refused_start)
+    runtime.start_for_session(session)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage]
+    assert observer is not None
+
+    runtime.stop_after_failed_start(session.id, reason="staged_start_failed")
+
+    assert observer.summary is not None
+    assert observer.summary.reason.value == "staged_start_failed"
+
+
 @pytest.mark.parametrize("lifecycle", ["stop", "finalise"])
 def test_manual_runtime_lifecycle_close_preserves_resolved_cutoff_deadline(
     tmp_path: Path, lifecycle: str

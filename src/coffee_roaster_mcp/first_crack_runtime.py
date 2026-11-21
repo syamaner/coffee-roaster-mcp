@@ -206,6 +206,7 @@ class FirstCrackSessionRuntime:
         """
         self._config = config
         self._observer: FirstCrackObserver | None = None
+        self._admitted_observer: tuple[str, int] | None = None
         self._refused_observation: ObservationSnapshot | None = None
         self._capture_cleanup: CaptureCleanup | None = None
         self._capture_cleanup_session_id: str | None = None
@@ -535,6 +536,7 @@ class FirstCrackSessionRuntime:
             self._recorder_built_for_session = False
             self._completed_observation = None
             self._refused_observation = None
+            self._admitted_observer = None
             try:
                 # Preserve the closed refusal projection whenever the actual
                 # settings are representable; never invent valid defaults.
@@ -629,6 +631,7 @@ class FirstCrackSessionRuntime:
                 )
                 if not observer.start(token):
                     raise RuntimeError("Observation worker could not acquire its reservation.")
+                self._admitted_observer = (session.id, self._observation_generation)
             except Exception:  # noqa: BLE001 - no fall back to automatic authority.
                 if isinstance(recorder, EvidenceRoastRecorder):
                     recorder.publish_setup_failure()
@@ -1098,6 +1101,31 @@ class FirstCrackSessionRuntime:
                 return self.snapshot()
             self._stop_locked(reason=reason)
             return self.snapshot()
+
+    def stop_after_failed_start(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+    ) -> FirstCrackRuntimeSnapshot:
+        """Close staged-Start observation without replacing an existing closer."""
+        if self._config.first_crack.event_authority != "manual":
+            return self.stop_for_session(session_id, reason=reason)
+        with self._lock:
+            observer = self._observer
+            admitted = (
+                observer is not None
+                and observer.session_id == session_id
+                and self._admitted_observer == (session_id, observer.generation)
+                and self._capture_cleanup is None
+            )
+            if admitted:
+                assert observer is not None
+                observer.close_after_failed_start(reason=reason.replace(" ", "_"))
+                return self.snapshot()
+            if observer is None or observer.session_id != session_id:
+                return self.snapshot()
+        return self.stop_for_session(session_id, reason=reason)
 
     def finalise_for_session(
         self, session_id: str

@@ -577,6 +577,20 @@ class FirstCrackObserver:
         self.changed.set()
         coordinator().wake.set()
 
+    def close_after_failed_start(self, *, reason: str) -> None:
+        """Close only when this observer still owns an unstarted lifecycle close."""
+        with self.lock:
+            if self.summary is not None or self.deadline is not None or self._pending_boundaries:
+                return
+            self.failed = True
+            self.reason = (
+                reason if re.fullmatch(r"[a-z][a-z0-9_]{0,159}", reason) else "observer_stop"
+            )
+            self.deadline = self.now()
+            self._freeze_locked()
+            self.changed.set()
+            coordinator().wake.set()
+
     def open_boundary(self, ticket: object, *, reason: str) -> None:
         """Fence acceptance after a driver return and before canonical commit."""
         with self.lock:
