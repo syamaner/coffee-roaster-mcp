@@ -4970,6 +4970,33 @@ def test_mcp_fixed_zero_and_emergency_remain_eligible_after_unknown_normal_drop(
     assert driver.emergency_stop_calls == 1
 
 
+def test_exact_drop_writer_reservation_rejects_direct_fault_without_file_mutation(
+    tmp_path: Path,
+) -> None:
+    """A competing direct fault cannot append while an exact Drop owns the log."""
+    context = _cold_finalisation_context(tmp_path)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.timing_evidence_sequence = 1
+    admission = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert admission.reservation is not None
+    assert session.log_writer is not None
+    log_path = session.log_writer.log_dir / "roast.jsonl"
+    before = log_path.read_bytes()
+
+    with pytest.raises(SessionLifecycleError, match="normal bean-drop operation is unresolved"):
+        context.session_store.record_event(session, "fault", payload={"reason": "test"})
+
+    assert log_path.read_bytes() == before
+    assert session.faulted_at_utc is None
+
+
 @pytest.mark.parametrize("paused_kind", ("beans_dropped", "cooling_started"))
 def test_mock_emergency_reaches_driver_while_exact_drop_endpoint_append_is_paused(
     tmp_path: Path,
@@ -5619,7 +5646,7 @@ def test_torn_exact_drop_cooling_row_preserves_known_cooling_without_history(
     )
     assert fixed_zero.outcome == "command_state_returned"
 
-    with pytest.raises(SessionLifecycleError, match="disconnected during fault recovery"):
+    with pytest.raises(SessionLifecycleError, match="uncertain tail"):
         _call_tool(server, "set_fan", ctx, fan_level_percent=0)
 
     with pytest.raises(SessionLifecycleError, match="fault recording failed"):

@@ -72,6 +72,19 @@ def test_exact_admission_reserves_once_and_blocks_legacy_and_recovery_drop() -> 
         store.reserve_driver_fault_recovery(session, kind="drop")
 
 
+def test_exact_admission_without_writer_allows_direct_fault_recording() -> None:
+    """An in-memory exact Drop reservation does not suppress a direct fault."""
+    store = RoastSessionStore()
+    session, identity = _ready_drop(store)
+    admission = store.admit_normal_drop(identity)
+    assert admission.reservation is not None
+
+    event = store.record_event(session, "fault", payload={"reason": "test"})
+
+    assert event.kind == "fault"
+    assert session.faulted_at_utc is not None
+
+
 def test_unresolved_drop_blocks_p1_timing_after_token_cancellation() -> None:
     """P1 admission and assembly use the retained P2 fence, not the token."""
     store = RoastSessionStore()

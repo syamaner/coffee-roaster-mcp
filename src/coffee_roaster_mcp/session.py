@@ -3014,9 +3014,13 @@ class RoastSessionStore:
         self, session: RoastSession
     ) -> None:
         """Refuse ordinary log writers while an exact Drop owns this log window."""
-        if self._latest_session is session and (
-            self._normal_drop_persistence_torn
-            or not self._normal_drop_persistence_last_completion.is_set()
+        if (
+            session.log_writer is not None
+            and self._latest_session is session
+            and (
+                self._normal_drop_persistence_torn
+                or not self._normal_drop_persistence_last_completion.is_set()
+            )
         ):
             raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
 
