@@ -185,6 +185,10 @@ def test_staged_completion_binds_published_identity_before_handoff_failure(
     if failure_site == "id":
         assert publication.session is None
         assert store.get_active_session() is None
+        with pytest.raises(SessionLifecycleError, match="in progress"):
+            store.reserve_session_start()
+        store.clear_session_start_reservation(reservation)
+        assert store.reserve_session_start()
     else:
         assert publication.session is store.get_active_session()
         assert publication.session is not None

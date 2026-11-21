@@ -1226,18 +1226,18 @@ class RoastSessionStore:
         later latest-session lookup.
         """
         with self._lock:
+            self._assert_session_start_reservation(reservation)
             previous = self._latest_session
             try:
-                self._assert_session_start_reservation(reservation)
                 session = self._start_session_locked(purpose=purpose)
             finally:
                 published = self._latest_session
                 if published is not previous and published is not None:
                     publication.session = published
-                if self._pending_session_start_token == reservation.token:
-                    self._pending_session_start_token = None
-                if self._session_start_in_flight_token == reservation.token:
-                    self._session_start_in_flight_token = None
+                    if self._pending_session_start_token == reservation.token:
+                        self._pending_session_start_token = None
+                    if self._session_start_in_flight_token == reservation.token:
+                        self._session_start_in_flight_token = None
             return _copy_session_for_read(session)
 
     def assert_staged_start_claimable(self, session: RoastSession) -> None:

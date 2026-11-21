@@ -10602,6 +10602,8 @@ def test_future_manual_registered_start_inhibited_abort(
     entered = Event()
     release = Event()
     opened = Event()
+    close_started = Event()
+    finish_close = Event()
     calls: list[str] = []
     close_owners: list[tuple[object | None, object | None]] = []
     failures: list[BaseException] = []
@@ -10612,6 +10614,8 @@ def test_future_manual_registered_start_inhibited_abort(
         def close(self) -> None:
             calls.append("close")
             close_owners.append(driver.inspect_inhibited_start())
+            close_started.set()
+            assert finish_close.wait(3)
             if outcome == "close_raise":
                 raise OSError("uncertain close")
             if outcome != "still_open":
@@ -10702,8 +10706,16 @@ def test_future_manual_registered_start_inhibited_abort(
                     server, "emergency_stop", _ctx(context), expected_session_id=expected_session_id
                 )
         assert driver.inspect_inhibited_start()[0] is owner
+        release.set()
+        if outcome != "factory_raise":
+            assert close_started.wait(3)
+            with context.lifecycle_barrier:
+                assert not context.session_store.revoke_session_start(reservation)
+                with pytest.raises(SessionLifecycleError, match="progress"):
+                    context.session_store.reserve_session_start()
     finally:
         release.set()
+        finish_close.set()
         worker.join(3)
     assert not worker.is_alive()
     assert len(failures) == 1
@@ -10758,8 +10770,10 @@ def test_future_manual_registered_start_inhibited_abort(
         assert "write" not in calls
     else:
         assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.UNRESOLVED)
-        expected_error = SessionLifecycleError if outcome == "factory_raise" else RuntimeError
-        expected_message = "progress" if outcome == "factory_raise" else "staged"
+        with context.lifecycle_barrier, pytest.raises(SessionLifecycleError, match="progress"):
+            context.session_store.reserve_session_start()
+        expected_error = SessionLifecycleError
+        expected_message = "progress"
         with pytest.raises(expected_error, match=expected_message):
             _call_tool(
                 server, "start_roast_session", _ctx(context), first_crack_observer_ack="manual/v1"
