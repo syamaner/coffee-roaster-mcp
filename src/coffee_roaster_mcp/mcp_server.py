@@ -2433,9 +2433,7 @@ def create_mcp_server(
                                     session,
                                     safety_payload=safety_payload,
                                 )
-                            raise SessionLifecycleError(
-                                "Emergency stop fault recording failed; containment is unverified."
-                            ) from exc
+                            raise
                         server_context.session_store.retain_active_fault_block(
                             session,
                             safety_payload=safety_payload,
