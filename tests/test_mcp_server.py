@@ -5702,6 +5702,45 @@ def test_ordinary_torn_start_cooling_rejects_disconnected_projection(tmp_path: P
         monkeypatch.undo()
 
 
+def test_ordinary_start_cooling_clears_reservation_after_invalid_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An invalid dispatched cooling reply cannot retain a command or cooling success."""
+    context = _cold_finalisation_context(tmp_path)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    context.session_store.record_event(session, "beans_dropped")
+    driver = context.roaster_driver
+    assert isinstance(driver, MockRoasterDriver)
+    malformed_reply = driver.read_state()
+    object.__setattr__(malformed_reply, "fan_level_percent", 101)
+    object.__setattr__(malformed_reply, "cooling_on", True)
+    start_cooling_calls = 0
+
+    def return_malformed_reply() -> RoasterState:
+        nonlocal start_cooling_calls
+        start_cooling_calls += 1
+        return malformed_reply
+
+    monkeypatch.setattr(driver, "start_cooling", return_malformed_reply)
+
+    with pytest.raises(ValueError, match=r"^fan_level_percent must be between 0 and 100\.$"):
+        _call_tool(server, "start_cooling", ctx)
+
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert start_cooling_calls == 1
+    assert snapshot.pending_driver_command_token is None
+    assert snapshot.pending_driver_command_kind is None
+    assert snapshot.cooling_started_at_utc is None
+    assert snapshot.cooling_on is False
+    assert all(event.kind != "cooling_started" for event in snapshot.event_timeline)
+
+
 class _QueuedWindowAudioPipeline:
     """Fake audio pipeline exposing detector windows queued after construction.
 
