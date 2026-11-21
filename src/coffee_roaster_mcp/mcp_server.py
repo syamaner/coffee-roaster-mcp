@@ -342,6 +342,12 @@ class _FixedZeroContainmentArguments(ArgModelBase):
     containment_protocol: Literal["fixed_zero/v1"]
 
 
+class _LegacyHumanMarkArguments(ArgModelBase):
+    """Strict raw SDK-boundary arguments for the legacy human first-crack mark."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
 class FixedZeroCommandedStateResult(BaseModel):
     """Exact eight-key driver command-state evidence exposed by the tool."""
 
@@ -944,6 +950,31 @@ def _install_fixed_zero_argument_adapter(mcp: FastMCP) -> None:
         raise RuntimeError("Fixed-zero containment argument adapter is unsupported.")
     tool.fn_metadata = adapted_metadata
     tool.parameters = _FixedZeroContainmentArguments.model_json_schema(by_alias=True)
+
+
+def _install_legacy_human_mark_argument_adapter(mcp: FastMCP) -> None:
+    """Bind strict empty raw arguments to the legacy human first-crack mark only."""
+    tool = mcp._tool_manager.get_tool("mark_first_crack")  # pyright: ignore[reportPrivateUsage]
+    if tool is None:
+        raise RuntimeError("Legacy human mark tool was not registered.")
+    existing_metadata = tool.fn_metadata
+    declared_metadata_fields = getattr(type(existing_metadata), "model_fields", None)
+    if (
+        not isinstance(declared_metadata_fields, Mapping)
+        or "arg_model" not in declared_metadata_fields
+    ):
+        raise RuntimeError("Legacy human mark argument adapter is unsupported.")
+    try:
+        adapted_metadata = existing_metadata.model_copy(
+            update={"arg_model": _LegacyHumanMarkArguments}
+        )
+        binds_legacy_human_mark_arguments = adapted_metadata.arg_model is _LegacyHumanMarkArguments
+    except Exception as exc:
+        raise RuntimeError("Legacy human mark argument adapter is unsupported.") from exc
+    if not binds_legacy_human_mark_arguments:
+        raise RuntimeError("Legacy human mark argument adapter is unsupported.")
+    tool.fn_metadata = adapted_metadata
+    tool.parameters = _LegacyHumanMarkArguments.model_json_schema(by_alias=True)
 
 
 def _install_timing_evidence_argument_adapter(mcp: FastMCP) -> None:
@@ -2963,6 +2994,7 @@ def create_mcp_server(
         return SetRecordingMetadataResult(origin=stored.origin, roast_num=stored.roast_num)
 
     _install_fixed_zero_argument_adapter(mcp)
+    _install_legacy_human_mark_argument_adapter(mcp)
     _install_capture_evidence_argument_adapter(mcp)
     _install_timing_evidence_argument_adapter(mcp)
     _install_exact_normal_drop_argument_adapter(mcp)
