@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
 from types import TracebackType
-from typing import Annotated, Any, Literal, Never, cast
+from typing import Annotated, Any, Literal, cast
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
@@ -92,9 +92,8 @@ from coffee_roaster_mcp.session import (
     SessionLifecycleError,
     SessionPresence,
     SessionPurpose,
-    SessionStartReservation,
-    _is_valid_mock_drop_projection,  # pyright: ignore[reportPrivateUsage]
     StagedSessionStartPublication,
+    _is_valid_mock_drop_projection,  # pyright: ignore[reportPrivateUsage]
     compute_roast_metrics,
     default_emergency_safety_payload,
     has_verified_emergency_containment,
