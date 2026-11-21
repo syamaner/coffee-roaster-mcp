@@ -2914,6 +2914,7 @@ def _exact_normal_drop_settlement_result(
             this_request="reservation_owned",
             history="unknown",
             fence="not_established",
+            prior_transition=prior_transition,
             observer_failure=observer_failure,
             cleanup_failure=cleanup_failure,
         )
@@ -2926,6 +2927,7 @@ def _exact_normal_drop_settlement_result(
             this_request="reservation_owned",
             history="unknown",
             fence="not_established",
+            prior_transition=prior_transition,
             observer_failure=observer_failure,
             cleanup_failure=cleanup_failure,
         )
@@ -3001,11 +3003,47 @@ def _retain_exact_normal_drop_unknown(
 ) -> NormalDropSettlement | None:
     """Try once to retain an exact reservation without fabricating settlement."""
     try:
-        return server_context.session_store.retain_normal_drop_unknown(
+        settlement = server_context.session_store.retain_normal_drop_unknown(
             session, reservation=reservation
         )
+        if _is_expected_normal_drop_settlement(settlement, operation="retention"):
+            return settlement
+        return None
     except Exception:  # noqa: BLE001 - a failed fallback must not be retried.
         return None
+
+
+def _is_expected_normal_drop_settlement(
+    settlement: object,
+    *,
+    operation: Literal["cancelled", "completion", "retention"],
+) -> bool:
+    """Return whether a store reply is a complete variant for one operation."""
+    if not isinstance(settlement, NormalDropSettlement):
+        return False
+    if settlement.outcome == "stale":
+        return settlement.event is None and settlement.snapshot is None
+    if operation == "cancelled":
+        return (
+            settlement.outcome == "cancelled"
+            and settlement.event is None
+            and isinstance(settlement.snapshot, RoastSession)
+        )
+    if operation == "retention":
+        return (
+            settlement.outcome == "unknown"
+            and settlement.event is None
+            and isinstance(settlement.snapshot, RoastSession)
+        )
+    return (
+        settlement.outcome == "success"
+        and isinstance(settlement.event, RoastEvent)
+        and isinstance(settlement.snapshot, RoastSession)
+    ) or (
+        settlement.outcome == "unknown"
+        and settlement.event is None
+        and isinstance(settlement.snapshot, RoastSession)
+    )
 
 
 class _ExactNormalDropReservationGuard:
@@ -3306,8 +3344,11 @@ def _run_owned_normal_drop_exact_session(
                 with suppress(BaseException):
                     ownership.retain_once()
                 raise
-            if isinstance(settlement, NormalDropSettlement):
-                ownership.mark_settled()
+            else:
+                if _is_expected_normal_drop_settlement(settlement, operation="cancelled"):
+                    ownership.mark_settled()
+                else:
+                    settlement = ownership.retain_once()
             return _exact_normal_drop_settlement_result(
                 identity=identity,
                 settlement=settlement,
@@ -3413,17 +3454,7 @@ def _run_owned_normal_drop_exact_session(
             )
         raise
 
-    if isinstance(settlement, NormalDropSettlement):
-        ownership.mark_settled()
-
-    if (
-        not isinstance(settlement, NormalDropSettlement)
-        or settlement.outcome not in {"success", "unknown", "stale"}
-        or (
-            settlement.outcome == "success"
-            and (settlement.event is None or settlement.snapshot is None)
-        )
-    ):
+    if not _is_expected_normal_drop_settlement(settlement, operation="completion"):
         settlement = ownership.retain_once()
         freeze_failed = _freeze_exact_normal_drop_observation(
             server_context,
@@ -3438,6 +3469,9 @@ def _run_owned_normal_drop_exact_session(
             reason="observation_freeze_failed" if freeze_failed else "settlement_unavailable",
             observer_failure=freeze_failed,
         )
+
+    ownership.mark_settled()
+    assert isinstance(settlement, NormalDropSettlement)
 
     if settlement.outcome != "success":
         freeze_failed = _freeze_exact_normal_drop_observation(

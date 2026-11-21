@@ -10285,14 +10285,22 @@ def test_exact_normal_drop_retains_and_freezes_after_malformed_success_settlemen
     runtime = context.first_crack_runtime
     assert isinstance(runtime, FakeFirstCrackRuntime)
     freezes: list[str] = []
+    retain_calls = 0
+    original_retain = context.session_store.retain_normal_drop_unknown
 
-    def malformed_settlement(*_args: object, **_kwargs: object) -> None:
-        return None
+    def malformed_settlement(*_args: object, **_kwargs: object) -> NormalDropSettlement:
+        return NormalDropSettlement("success")
+
+    def count_retain(current: RoastSession, *, reservation: object) -> NormalDropSettlement:
+        nonlocal retain_calls
+        retain_calls += 1
+        return original_retain(current, reservation=reservation)
 
     def record_freeze(*_args: object, reason: str, **_kwargs: object) -> None:
         freezes.append(reason)
 
     monkeypatch.setattr(context.session_store, "complete_normal_drop_success", malformed_settlement)
+    monkeypatch.setattr(context.session_store, "retain_normal_drop_unknown", count_retain)
     monkeypatch.setattr(runtime, "freeze_observation_boundary", record_freeze)
 
     result = _exact_normal_drop(context, session)
@@ -10302,9 +10310,72 @@ def test_exact_normal_drop_retains_and_freezes_after_malformed_success_settlemen
     assert result.history == "unknown"
     assert result.fence == "retained"
     assert freezes == ["exact_drop_settlement_unresolved"]
+    assert retain_calls == 1
+    assert not context.session_store.has_pending_normal_drop_persistence(session)
     assert repeated.outcome == "ambiguous"
     driver = cast(MockRoasterDriver, context.roaster_driver)
     assert driver.drop_transition_count == 1
+
+
+@pytest.mark.parametrize(
+    (
+        "settlement_failure",
+        "retention_available",
+        "expected_fence",
+        "expected_reason",
+        "pending_after",
+    ),
+    (
+        ("malformed", True, "retained", "emergency_since_session_baseline", False),
+        ("malformed", False, "not_established", "retain_unavailable", True),
+        ("raises", True, "retained", "emergency_since_session_baseline", False),
+        ("raises", False, "not_established", "retain_unavailable", True),
+    ),
+)
+def test_exact_normal_drop_rejects_unusable_cancelled_settlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settlement_failure: str,
+    retention_available: bool,
+    expected_fence: str,
+    expected_reason: str,
+    pending_after: bool,
+) -> None:
+    """An unusable cancellation reply retains once without erasing emergency evidence."""
+    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    driver = cast(MockRoasterDriver, context.roaster_driver)
+    retain_calls = 0
+    original_retain = context.session_store.retain_normal_drop_unknown
+
+    def unusable_cancelled(*_args: object, **_kwargs: object) -> NormalDropSettlement:
+        if settlement_failure == "raises":
+            raise SessionLifecycleError("synthetic cancelled settlement failure")
+        return NormalDropSettlement("success")
+
+    def retain_or_fail(
+        current: RoastSession, *, reservation: object
+    ) -> NormalDropSettlement | None:
+        nonlocal retain_calls
+        retain_calls += 1
+        if not retention_available:
+            return None
+        return original_retain(current, reservation=reservation)
+
+    driver.emergency_stop(reason="force exact cancellation")
+    monkeypatch.setattr(context.session_store, "settle_normal_drop_cancelled", unusable_cancelled)
+    monkeypatch.setattr(context.session_store, "retain_normal_drop_unknown", retain_or_fail)
+
+    result = _exact_normal_drop(context, session)
+
+    assert result.outcome == "unknown"
+    assert result.reason == expected_reason
+    assert result.request_dispatch == "invoked_no_state_transition"
+    assert result.history == "unknown"
+    assert result.fence == expected_fence
+    assert result.prior_transition == "not_established"
+    assert retain_calls == 1
+    assert driver.drop_transition_count == 0
+    assert context.session_store.has_pending_normal_drop_persistence(session) is pending_after
 
 
 def test_exact_normal_drop_releases_the_pending_writer_before_reraising_interrupt(
