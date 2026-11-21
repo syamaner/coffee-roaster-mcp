@@ -2205,7 +2205,7 @@ def create_mcp_server(
                 reservation=reservation,
             )
             return _serialize_event_result(snapshot=snapshot, event=event)
-        _stop_runtimes_after_drop(server_context, session, snapshot)
+        _stop_runtimes_after_drop(server_context, session=session, snapshot=snapshot)
         return _serialize_event_result(snapshot=snapshot, event=event)
 
     @mcp.tool()
@@ -3366,7 +3366,7 @@ def _run_reserved_driver_control(
 
 
 def _begin_drop_observation_boundary(
-    server_context: ServerContext, session: RoastSession
+    server_context: ServerContext, *, session: RoastSession
 ) -> object | None:
     """Begin the manual recording boundary after a drop driver dispatch."""
     if server_context.config.first_crack.event_authority != "manual":
@@ -3378,6 +3378,7 @@ def _begin_drop_observation_boundary(
 
 def _resolve_drop_observation_boundary(
     server_context: ServerContext,
+    *,
     session: RoastSession,
     ticket: object | None,
     event: RoastEvent,
@@ -3393,10 +3394,10 @@ def _resolve_drop_observation_boundary(
 
 def _freeze_drop_observation_boundary(
     server_context: ServerContext,
+    *,
     session: RoastSession,
     ticket: object | None,
-    *,
-    reason: str = "drop_recording_failed",
+    reason: str,
 ) -> None:
     """Freeze an unresolved manual drop boundary after failed persistence."""
     if server_context.config.first_crack.event_authority == "manual":
@@ -3406,14 +3407,16 @@ def _freeze_drop_observation_boundary(
 
 
 def _stop_runtimes_after_drop(
-    server_context: ServerContext, session: RoastSession, snapshot: RoastSession
+    server_context: ServerContext, *, session: RoastSession, snapshot: RoastSession
 ) -> None:
     """Perform the ordinary post-drop runtime cleanup in its established order.
 
     Pending automatic windows are deliberately classified only after driver
-    dispatch and accepted Drop persistence. Their cutoff comes from the
-    session's recorded Drop event, so this never adds a first-crack event to
-    the causal session timeline. Repeated successful Drops retain this cleanup.
+    dispatch and accepted Drop persistence. Per #191, ``session`` is the live
+    session so its accepted beans-dropped cutoff bounds classification, while
+    ``snapshot`` is the saved lifecycle result used for cleanup ownership.
+    This never adds a first-crack event to the causal session timeline.
+    Repeated successful Drops retain this cleanup.
     """
     if server_context.config.first_crack.event_authority != "manual":
         server_context.first_crack_runtime.process_pending_windows_after_drop(
@@ -3440,7 +3443,7 @@ def _run_reserved_driver_drop(
     observation_ticket: object | None = None
     try:
         driver_state = server_context.roaster_driver.drop_beans()
-        observation_ticket = _begin_drop_observation_boundary(server_context, session)
+        observation_ticket = _begin_drop_observation_boundary(server_context, session=session)
         try:
             event, snapshot = server_context.session_store.complete_reserved_driver_drop_snapshot(
                 session,
@@ -3449,11 +3452,21 @@ def _run_reserved_driver_drop(
                 fan_level_percent=driver_state.fan_level_percent,
                 cooling_on=driver_state.cooling_on,
             )
-            _resolve_drop_observation_boundary(server_context, session, observation_ticket, event)
+            _resolve_drop_observation_boundary(
+                server_context,
+                session=session,
+                ticket=observation_ticket,
+                event=event,
+            )
             return event, snapshot
         except SessionLifecycleError:
             _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
-            _freeze_drop_observation_boundary(server_context, session, observation_ticket)
+            _freeze_drop_observation_boundary(
+                server_context,
+                session=session,
+                ticket=observation_ticket,
+                reason="drop_recording_failed",
+            )
             raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
@@ -3566,7 +3579,7 @@ def _run_reserved_driver_fault_recovery(
         else:
             raise SessionLifecycleError("Unsupported stopped-fault recovery command.")
         if command == "drop":
-            observation_ticket = _begin_drop_observation_boundary(server_context, session)
+            observation_ticket = _begin_drop_observation_boundary(server_context, session=session)
         try:
             event, snapshot = (
                 server_context.session_store.complete_reserved_driver_fault_recovery_snapshot(
@@ -3611,7 +3624,12 @@ def _run_reserved_driver_fault_recovery(
         except SessionLifecycleError:
             raise
         if command == "drop":
-            _resolve_drop_observation_boundary(server_context, session, observation_ticket, event)
+            _resolve_drop_observation_boundary(
+                server_context,
+                session=session,
+                ticket=observation_ticket,
+                event=event,
+            )
         return event, snapshot
     except Exception:
         if known_torn_completion:
@@ -3632,8 +3650,8 @@ def _run_reserved_driver_fault_recovery(
         if command == "drop":
             _freeze_drop_observation_boundary(
                 server_context,
-                session,
-                observation_ticket,
+                session=session,
+                ticket=observation_ticket,
                 reason="fault_recovery_incomplete",
             )
         raise
