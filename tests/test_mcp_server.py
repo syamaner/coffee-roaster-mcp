@@ -5269,6 +5269,209 @@ def test_torn_deferred_mock_fault_append_fences_log_and_rejects_later_fault_writ
     assert log_path.read_bytes() == torn_bytes
 
 
+@pytest.mark.parametrize("tear_log", [False, True])
+def test_sampler_deferred_mock_fault_row_fails_closed_without_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tear_log: bool,
+) -> None:
+    """The sampler absorbs its own deferred fault-row storage failure."""
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "roaster_driver", MockRoasterDriver())
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.timing_evidence_sequence = 1
+    endpoint_entered = Event()
+    release_endpoint = Event()
+    original_append = session_module._append_event_log_row  # pyright: ignore[reportPrivateUsage]
+    fault_append_count = 0
+    prepared_fault_count = 0
+    fault_prepared = Event()
+
+    def pause_drop_then_fail_fault(current: RoastSession, event: RoastEvent) -> None:
+        nonlocal fault_append_count
+        if event.kind == "beans_dropped":
+            endpoint_entered.set()
+            assert release_endpoint.wait(timeout=1.0)
+        if event.kind == "fault":
+            fault_append_count += 1
+            if tear_log:
+                assert current.log_writer is not None
+                with (current.log_writer.log_dir / "roast.jsonl").open("ab") as log:
+                    log.write(b'{"partial_fault":')
+                    log.flush()
+            raise OSError("sampler fault row unavailable")
+        original_append(current, event)
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", pause_drop_then_fail_fault)
+
+    def fail_telemetry_sample(**_kwargs: object) -> RoastSession:
+        raise RuntimeError("synthetic sampler failure")
+
+    monkeypatch.setattr(
+        context.session_store,
+        "record_active_telemetry_sample",
+        fail_telemetry_sample,
+    )
+    original_prepare_fault = context.session_store.prepare_mock_drop_emergency_stop
+
+    def count_prepared_fault(
+        session_to_prepare: RoastSession,
+        *,
+        reason: str,
+        safety_payload: Mapping[str, EventPayloadValue],
+        allow_stopped_latest: bool,
+    ) -> tuple[RoastEvent, MockDropPersistenceTicket]:
+        nonlocal prepared_fault_count
+        prepared_fault_count += 1
+        prepared = original_prepare_fault(
+            session_to_prepare,
+            reason=reason,
+            safety_payload=safety_payload,
+            allow_stopped_latest=allow_stopped_latest,
+        )
+        fault_prepared.set()
+        return prepared
+
+    monkeypatch.setattr(
+        context.session_store,
+        "prepare_mock_drop_emergency_stop",
+        count_prepared_fault,
+    )
+    admission = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert admission.reservation is not None
+    driver_state = context.roaster_driver.drop_beans()
+    settlements: list[NormalDropSettlement] = []
+
+    def settle_drop() -> None:
+        settlements.append(
+            context.session_store.complete_normal_drop_success(
+                session,
+                reservation=admission.reservation,
+                heat_level_percent=driver_state.heat_level_percent,
+                fan_level_percent=driver_state.fan_level_percent,
+                cooling_on=driver_state.cooling_on,
+            )
+        )
+
+    drop_thread = Thread(target=settle_drop)
+    drop_thread.start()
+    assert endpoint_entered.wait(timeout=1.0)
+    assert context.session_store.has_pending_normal_drop_persistence(session)
+    assert type(context.roaster_driver) is MockRoasterDriver
+    assert context.config.roaster.driver == "mock"
+
+    sampler_results: list[bool] = []
+    sampler_thread = Thread(
+        target=lambda: sampler_results.append(
+            _sample_active_session_telemetry(context, session_id=session.id)
+        )
+    )
+    sampler_thread.start()
+    assert fault_prepared.wait(timeout=1.0)
+    release_endpoint.set()
+    drop_thread.join(timeout=1.0)
+    sampler_thread.join(timeout=1.0)
+
+    assert not drop_thread.is_alive() and not sampler_thread.is_alive()
+    assert sampler_results == [False]
+    assert settlements[0].outcome == "unknown"
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.phase == "fault"
+    assert prepared_fault_count == 1
+    assert fault_append_count == 1
+    assert snapshot.mock_log_torn is tear_log
+    assert snapshot.unpersisted_mock_drop_fault_count == 1
+    assert session.id in context.session_store._fault_recovery_admission_blocks  # pyright: ignore[reportPrivateUsage]
+    if not tear_log:
+        assert not context.session_store.has_pending_normal_drop_persistence(session)
+    assert all(event.kind != "fault" for event in snapshot.event_timeline)
+    exported = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+    assert exported.ready is False
+    assert "recording is unavailable" in exported.note
+
+
+def test_sampler_subclassed_mock_does_not_admit_deferred_drop_fault_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mock subclass remains outside the exact-type deferred-write admission."""
+
+    class SubclassedMockDriver(MockRoasterDriver):
+        pass
+
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "roaster_driver", SubclassedMockDriver())
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.timing_evidence_sequence = 1
+    endpoint_entered = Event()
+    release_endpoint = Event()
+    original_append = session_module._append_event_log_row  # pyright: ignore[reportPrivateUsage]
+
+    def pause_drop_row(current: RoastSession, event: RoastEvent) -> None:
+        if event.kind == "beans_dropped":
+            endpoint_entered.set()
+            assert release_endpoint.wait(timeout=1.0)
+        original_append(current, event)
+
+    def fail_telemetry_sample(**_kwargs: object) -> RoastSession:
+        raise RuntimeError("synthetic sampler failure")
+
+    def forbid_deferred_admission(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a mock subclass must not receive the deferred admission")
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", pause_drop_row)
+    monkeypatch.setattr(
+        context.session_store,
+        "record_active_telemetry_sample",
+        fail_telemetry_sample,
+    )
+    monkeypatch.setattr(
+        context.session_store,
+        "prepare_mock_drop_emergency_stop",
+        forbid_deferred_admission,
+    )
+    admission = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert admission.reservation is not None
+    driver_state = context.roaster_driver.drop_beans()
+    settlements: list[NormalDropSettlement] = []
+
+    def settle_drop() -> None:
+        settlements.append(
+            context.session_store.complete_normal_drop_success(
+                session,
+                reservation=admission.reservation,
+                heat_level_percent=driver_state.heat_level_percent,
+                fan_level_percent=driver_state.fan_level_percent,
+                cooling_on=driver_state.cooling_on,
+            )
+        )
+
+    drop_thread = Thread(target=settle_drop)
+    drop_thread.start()
+    assert endpoint_entered.wait(timeout=1.0)
+    assert context.session_store.has_pending_normal_drop_persistence(session)
+    assert _sample_active_session_telemetry(context, session_id=session.id) is False
+    release_endpoint.set()
+    drop_thread.join(timeout=1.0)
+
+    assert not drop_thread.is_alive()
+    assert settlements[0].outcome == "unknown"
+
+
 def test_exact_mock_drop_first_row_failure_has_no_recorded_endpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5416,7 +5619,7 @@ def test_torn_exact_drop_cooling_row_preserves_known_cooling_without_history(
     )
     assert fixed_zero.outcome == "command_state_returned"
 
-    with pytest.raises(SessionLifecycleError, match="uncertain tail"):
+    with pytest.raises(SessionLifecycleError, match="disconnected during fault recovery"):
         _call_tool(server, "set_fan", ctx, fan_level_percent=0)
 
     with pytest.raises(SessionLifecycleError, match="fault recording failed"):
@@ -5915,6 +6118,38 @@ def test_guarded_stop_cooling_keeps_known_state_when_exact_fault_log_is_torn(
     assert state.phase == "fault" and not state.active and not state.cooling_on
     assert driver.actions.count("stop_cooling") == 1
     assert [event.kind for event in state.events].count("cooling_stopped") == 0
+    recorded_cooling_starts = [event.kind for event in state.events].count("cooling_started")
+    with pytest.raises(SessionLifecycleError, match="Cooling command completed"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    recovered_state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert recovered_state.heat_level_percent == 0 and recovered_state.cooling_on is True
+    assert [event.kind for event in recovered_state.events].count(
+        "cooling_started"
+    ) == recorded_cooling_starts
+    assert driver.actions.count("start_cooling") == 2
+
+
+def test_guarded_torn_stop_cooling_disconnect_fails_closed(tmp_path: Path) -> None:
+    """A disconnected result cannot settle the torn-log recovery as known."""
+    server, ctx, driver, session_id = _faulted_recovery_server(tmp_path, beans_added=True)
+    _call_tool(server, "drop_beans", ctx, expected_session_id=session_id)
+    _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
+    store = ctx.request_context.lifespan_context.session_store
+    session = store.get_latest_session()
+    assert session is not None
+    session.mock_log_torn = True
+    store._normal_drop_persistence_torn = True  # pyright: ignore[reportPrivateUsage]
+    driver.connected = False
+
+    with pytest.raises(SessionLifecycleError, match="disconnected during fault recovery"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session_id)
+    assert state.phase == "fault" and state.heat_level_percent == 0 and state.cooling_on is True
+    assert driver.actions.count("stop_cooling") == 1
+    assert driver.actions[-1] == "emergency_stop:guarded fault recovery stop_cooling failed"
+    with pytest.raises(ValueError, match="verified emergency-stop containment"):
+        _call_tool(server, "start_cooling", ctx, expected_session_id=session_id)
 
 
 def test_guarded_drop_second_event_log_failure_preserves_recorded_drop(

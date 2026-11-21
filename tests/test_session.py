@@ -103,6 +103,26 @@ def test_start_session_creates_active_roast_session() -> None:
     assert store.get_latest_session() is session
 
 
+def test_read_snapshot_retains_store_owned_mock_drop_facts() -> None:
+    """A point-in-time snapshot retains private persistence facts by value."""
+    store = RoastSessionStore(session_id_factory=lambda: "snapshot-session")
+    session = store.start_session()
+    session.mock_log_torn = True
+    session.unpersisted_mock_drop_fault_count = 1
+    session.torn_start_cooling_attempted = True
+
+    snapshot = session_module._copy_session_for_read(session)  # pyright: ignore[reportPrivateUsage]
+    session.unpersisted_mock_drop_fault_count = 0
+
+    assert snapshot is not session
+    assert snapshot.id == session.id
+    assert snapshot.mock_log_torn is True
+    assert snapshot.unpersisted_mock_drop_fault_count == 1
+    assert snapshot.torn_start_cooling_attempted is True
+    assert store.get_latest_session() is session
+    assert store.get_session_snapshot(session_id=snapshot.id).id == snapshot.id
+
+
 def test_start_session_rejects_second_active_session() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(

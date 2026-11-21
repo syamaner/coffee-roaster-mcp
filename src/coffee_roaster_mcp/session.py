@@ -2157,19 +2157,35 @@ class RoastSessionStore:
             if not self._normal_drop_persistence_torn:
                 return None
             try:
-                self._assert_driver_command_reservation(session, reservation)
+                self._assert_latest_session(session)
+                if (
+                    reservation.session_id != session.id
+                    or session.pending_driver_command_token != reservation.token
+                    or session.pending_driver_command_kind != reservation.kind
+                    or reservation.kind != "start_cooling"
+                    or not cooling_on
+                ):
+                    return None
+                stopped_fault_recovery = (
+                    not session.active
+                    and session.faulted_at_utc is not None
+                    and session.phase == "fault"
+                )
+                if not stopped_fault_recovery:
+                    self._assert_driver_command_reservation(session, reservation)
+                heat = validate_control_percent(heat_level_percent, label="heat_level_percent")
+                fan = validate_control_percent(fan_level_percent, label="fan_level_percent")
             except SessionLifecycleError:
                 return None
-            if reservation.kind != "start_cooling" or not cooling_on:
+            if stopped_fault_recovery and (heat != 0 or fan != 100):
                 return None
-            self.apply_driver_control_state(
-                session,
-                heat_level_percent=heat_level_percent,
-                fan_level_percent=fan_level_percent,
-                cooling_on=cooling_on,
-            )
+            session.heat_level_percent = heat
+            session.fan_level_percent = fan
+            session.cooling_on = True
             session.torn_start_cooling_attempted = True
             self._clear_driver_command_reservation_locked(session, reservation)
+            if stopped_fault_recovery:
+                self._clear_fault_recovery_in_flight_locked(session, reservation)
             return _copy_session_for_read(session)
 
     def settle_known_torn_stop_cooling_recovery(
@@ -2180,6 +2196,7 @@ class RoastSessionStore:
         heat_level_percent: int,
         fan_level_percent: int,
         cooling_on: bool,
+        connected: bool,
     ) -> RoastSession | None:
         """Retain a known stopped-fault cooling result without inventing a log row.
 
@@ -2202,6 +2219,7 @@ class RoastSessionStore:
                     or session.faulted_at_utc is None
                     or session.phase != "fault"
                     or cooling_on
+                    or connected is not True
                 ):
                     return None
                 heat = validate_control_percent(heat_level_percent, label="heat_level_percent")
@@ -2214,6 +2232,7 @@ class RoastSessionStore:
             session.fan_level_percent = fan
             session.cooling_on = False
             self._clear_driver_command_reservation_locked(session, reservation)
+            self._clear_fault_recovery_in_flight_locked(session, reservation)
             return _copy_session_for_read(session)
 
     def reserve_driver_stop_cooling(self, session: RoastSession) -> DriverCommandReservation:
@@ -2808,7 +2827,10 @@ class RoastSessionStore:
                 # qualifying stop-cooling driver result is known. Keep only
                 # that reservation for the caller's narrow known-state
                 # settlement; every other failure retains eager clearing.
-                if not (self._normal_drop_persistence_torn and reservation.kind == "stop_cooling"):
+                if not (
+                    self._normal_drop_persistence_torn
+                    and reservation.kind in {"start_cooling", "stop_cooling"}
+                ):
                     self._clear_driver_command_reservation_locked(session, reservation)
                 if completed:
                     self._clear_fault_recovery_in_flight_locked(session, reservation)
@@ -2946,9 +2968,9 @@ class RoastSessionStore:
             raise SessionLifecycleError(
                 "Beans dropped can only be recorded by the owned normal-drop settlement."
             )
+        self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
         if kind != "fault":
             self._assert_finalisation_allows_mutation(session)
-            self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
         if session.faulted_at_utc is not None and kind != "fault":
             raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
 
@@ -4194,6 +4216,7 @@ class RoastSessionStore:
             raise SessionLifecycleError(
                 "Fault history must be recorded by the owned normal-drop persistence turn."
             )
+        self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
         event = self._new_emergency_fault_event_locked(
             session, payload=payload, allow_stopped_latest=allow_stopped_latest
         )
@@ -4558,4 +4581,7 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         pending_driver_command_token=session.pending_driver_command_token,
         pending_driver_command_kind=session.pending_driver_command_kind,
         finalisation=deepcopy(session.finalisation),
+        mock_log_torn=session.mock_log_torn,
+        unpersisted_mock_drop_fault_count=session.unpersisted_mock_drop_fault_count,
+        torn_start_cooling_attempted=session.torn_start_cooling_attempted,
     )

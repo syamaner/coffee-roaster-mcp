@@ -2419,7 +2419,10 @@ def create_mcp_server(
                                 safety_payload=safety_payload,
                                 allow_stopped_latest=True,
                             )
-                        if server_context.config.first_crack.event_authority == "manual":
+                        if (
+                            server_context.config.first_crack.event_authority == "manual"
+                            and deferred_mock_fault_ticket is None
+                        ):
                             server_context.first_crack_runtime.resolve_observation_boundary(
                                 session,
                                 observation_ticket,
@@ -2482,6 +2485,13 @@ def create_mcp_server(
                     raise SessionLifecycleError(
                         "Emergency stop fault recording failed; containment is unverified."
                     ) from exc
+                if server_context.config.first_crack.event_authority == "manual":
+                    server_context.first_crack_runtime.resolve_observation_boundary(
+                        session,
+                        observation_ticket,
+                        cutoff_monotonic_seconds=session.monotonic_start
+                        + deferred_mock_fault_event.monotonic_seconds,
+                    )
             if not has_verified_containment:
                 raise SessionLifecycleError(
                     "Emergency stop did not report verified emergency containment."
@@ -2888,6 +2898,9 @@ def _process_auto_t0_for_active_session(
         return False
     if active_session.phase != "pre_roast" or active_session.beans_added_at_utc is not None:
         return False
+    # The exact Drop persistence window begins only after the session leaves
+    # pre-roast through the beans-added/drop lifecycle. It cannot overlap this
+    # pre-T0 backdating path, so the established backdating behavior remains.
     if not device_state.connected or device_state.bean_temp_c is None:
         return False
     event, _ = server_context.session_store.process_auto_t0_reading_snapshot(
@@ -3495,7 +3508,7 @@ def _run_reserved_driver_fault_recovery(
     command: Literal["drop", "start_cooling", "stop_cooling"] = "stop_cooling"
     driver_state: RoasterState | None = None
     observation_ticket: object | None = None
-    known_torn_stop_cooling = False
+    known_torn_completion = False
     try:
         if reservation.kind == "drop":
             command = "drop"
@@ -3524,8 +3537,8 @@ def _run_reserved_driver_fault_recovery(
                 )
             )
         except SessionLifecycleError as error:
-            if command == "stop_cooling":
-                settled = server_context.session_store.settle_known_torn_stop_cooling_recovery(
+            if command == "start_cooling":
+                settled = server_context.session_store.settle_known_torn_start_cooling(
                     session,
                     reservation=reservation,
                     heat_level_percent=driver_state.heat_level_percent,
@@ -3533,7 +3546,21 @@ def _run_reserved_driver_fault_recovery(
                     cooling_on=driver_state.cooling_on,
                 )
                 if settled is not None:
-                    known_torn_stop_cooling = True
+                    known_torn_completion = True
+                    raise SessionLifecycleError(
+                        "Cooling command completed, but roast log recording is unavailable."
+                    ) from error
+            elif command == "stop_cooling":
+                settled = server_context.session_store.settle_known_torn_stop_cooling_recovery(
+                    session,
+                    reservation=reservation,
+                    heat_level_percent=driver_state.heat_level_percent,
+                    fan_level_percent=driver_state.fan_level_percent,
+                    cooling_on=driver_state.cooling_on,
+                    connected=driver_state.connected,
+                )
+                if settled is not None:
+                    known_torn_completion = True
                     raise SessionLifecycleError(
                         "Cooling command completed, but roast log recording is unavailable."
                     ) from error
@@ -3546,7 +3573,7 @@ def _run_reserved_driver_fault_recovery(
             )
         return event, snapshot
     except Exception:
-        if known_torn_stop_cooling:
+        if known_torn_completion:
             raise
         if command == "drop":
             server_context.session_store.retain_fault_drop_ambiguity_if_unrecorded(session)
@@ -3583,34 +3610,34 @@ def _fail_closed_guarded_fault_recovery_command(
     store reservation fences new-session admission.
     """
     prepared_fault: tuple[RoastEvent, RoastSession, MockDropPersistenceTicket | None] | None = None
-    attempted_payload: dict[str, EventPayloadValue]
-    with server_context.lifecycle_barrier:
-        attempted_payload = run_driver_emergency_stop(
-            server_context,
-            reason=f"guarded fault recovery {command} failed",
-        )
-        try:
-            prepared_fault = _record_fault_with_owned_mock_drop_turn(
-                session,
-                server_context=server_context,
+    attempted_payload = default_emergency_safety_payload()
+    try:
+        with server_context.lifecycle_barrier:
+            attempted_payload = run_driver_emergency_stop(
+                server_context,
                 reason=f"guarded fault recovery {command} failed",
-                safety_payload=attempted_payload,
-                allow_stopped_latest=True,
             )
-        except Exception:  # noqa: BLE001 - containment must survive result-recording failure.
-            server_context.session_store.retain_fault_recovery_block(
-                session,
-                reservation=reservation,
-                safety_payload=attempted_payload,
-            )
-        else:
-            if not has_verified_emergency_containment(safety_payload=attempted_payload):
+            try:
+                prepared_fault = _record_fault_with_owned_mock_drop_turn(
+                    session,
+                    server_context=server_context,
+                    reason=f"guarded fault recovery {command} failed",
+                    safety_payload=attempted_payload,
+                    allow_stopped_latest=True,
+                )
+            except Exception:  # noqa: BLE001 - containment must survive result-recording failure.
                 server_context.session_store.retain_fault_recovery_block(
                     session,
                     reservation=reservation,
                     safety_payload=attempted_payload,
                 )
-    try:
+            else:
+                if not has_verified_emergency_containment(safety_payload=attempted_payload):
+                    server_context.session_store.retain_fault_recovery_block(
+                        session,
+                        reservation=reservation,
+                        safety_payload=attempted_payload,
+                    )
         if prepared_fault is not None:
             _commit_prepared_fault_recording(
                 server_context,
@@ -3618,11 +3645,12 @@ def _fail_closed_guarded_fault_recovery_command(
                 prepared_fault=prepared_fault,
             )
     except Exception:  # noqa: BLE001 - containment must survive result-recording failure.
-        server_context.session_store.retain_fault_recovery_block(
-            session,
-            reservation=reservation,
-            safety_payload=attempted_payload,
-        )
+        with suppress(Exception):
+            server_context.session_store.retain_fault_recovery_block(
+                session,
+                reservation=reservation,
+                safety_payload=attempted_payload,
+            )
     finally:
         with server_context.lifecycle_barrier:
             server_context.session_store.clear_driver_command_reservation(session, reservation)
@@ -4038,11 +4066,28 @@ def _fault_active_session_after_sampler_failure(
                 safety_payload=safety_payload,
                 allow_stopped_latest=True,
             )
-        event, snapshot = _commit_prepared_fault_recording(
-            server_context,
-            session=session,
-            prepared_fault=prepared_fault,
-        )
+        try:
+            event, snapshot = _commit_prepared_fault_recording(
+                server_context,
+                session=session,
+                prepared_fault=prepared_fault,
+            )
+        except Exception:  # noqa: BLE001 - a deferred mock fault row can fail after containment.
+            # This is deliberately narrower than the legacy preparation path
+            # above. Only the P2 deferred mock-turn commit may expose a
+            # storage error (including its private uncertain-tail signal).
+            # Its in-memory fault was already published, but its history was
+            # not recorded; preserve containment without replaying that row.
+            if prepared_fault[2] is None:
+                raise
+            server_context.session_store.retain_active_fault_block(
+                session, safety_payload=safety_payload
+            )
+            if server_context.config.first_crack.event_authority == "manual":
+                server_context.first_crack_runtime.freeze_observation_boundary(
+                    session, observation_ticket, reason="sampler_fault_recording_failed"
+                )
+            return
     except SessionLifecycleError:
         if server_context.session_store.has_pending_normal_drop_persistence(
             session
