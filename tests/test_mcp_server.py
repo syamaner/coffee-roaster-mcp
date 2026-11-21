@@ -6162,10 +6162,14 @@ def test_guarded_stop_cooling_keeps_known_state_when_exact_fault_log_is_torn(
     session.mock_log_torn = True
     store._normal_drop_persistence_torn = True  # pyright: ignore[reportPrivateUsage]
 
-    def fail_event_log_write(_session: RoastSession, _event: RoastEvent) -> None:
-        raise OSError("log unavailable")
+    append_attempts = 0
 
-    monkeypatch.setattr(session_module, "_append_event_log_row", fail_event_log_write)
+    def forbid_event_log_write(_session: RoastSession, _event: RoastEvent) -> None:
+        nonlocal append_attempts
+        append_attempts += 1
+        raise AssertionError("torn recovery must not append an event-log row")
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", forbid_event_log_write)
 
     with pytest.raises(SessionLifecycleError, match="Cooling command completed"):
         _call_tool(server, "stop_cooling", ctx, expected_session_id=session_id)
@@ -6183,6 +6187,7 @@ def test_guarded_stop_cooling_keeps_known_state_when_exact_fault_log_is_torn(
         "cooling_started"
     ) == recorded_cooling_starts
     assert driver.actions.count("start_cooling") == 2
+    assert append_attempts == 0
 
 
 def test_guarded_torn_stop_cooling_disconnect_fails_closed(tmp_path: Path) -> None:
