@@ -82,6 +82,7 @@ from coffee_roaster_mcp.mcp_server import (
 )
 from coffee_roaster_mcp.session import (
     DriverCommandReservation,
+    NormalDropSettlement,
     RoastEvent,
     RoastSession,
     RoastSessionStore,
@@ -4894,6 +4895,214 @@ def test_mcp_fixed_zero_and_emergency_remain_eligible_after_unknown_normal_drop(
     assert driver.fixed_zero_calls == 1
     assert emergency.event.kind == "fault"
     assert driver.emergency_stop_calls == 1
+
+
+@pytest.mark.parametrize("paused_kind", ("beans_dropped", "cooling_started"))
+def test_mock_emergency_reaches_driver_while_exact_drop_endpoint_append_is_paused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    paused_kind: str,
+) -> None:
+    """A stalled P2 endpoint cannot delay the actual MCP emergency dispatch."""
+    context = _cold_finalisation_context(tmp_path)
+    reached_driver = Event()
+    second_reached_driver = Event()
+
+    driver = MockRoasterDriver()
+    original_emergency_stop = driver.emergency_stop
+
+    def record_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        """Expose exact mock dispatch without treating a subclass as evidence."""
+        if reason == "second-paused-exact-drop":
+            second_reached_driver.set()
+        else:
+            reached_driver.set()
+        return original_emergency_stop(reason=reason)
+
+    monkeypatch.setattr(driver, "emergency_stop", record_emergency_stop)
+    object.__setattr__(context, "roaster_driver", driver)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.timing_evidence_sequence = 1
+    append_entered = Event()
+    release_append = Event()
+    first_fault_append_entered = Event()
+    release_first_fault_append = Event()
+    append_name = "_append_event_log_row"
+    original_append = getattr(session_module, append_name)
+
+    def pause_endpoint(current: RoastSession, event: RoastEvent) -> None:
+        if event.kind == paused_kind and not append_entered.is_set():
+            append_entered.set()
+            assert release_append.wait(timeout=1.0)
+        if event.kind == "fault" and not first_fault_append_entered.is_set():
+            first_fault_append_entered.set()
+            assert release_first_fault_append.wait(timeout=1.0)
+        original_append(current, event)
+
+    monkeypatch.setattr(session_module, append_name, pause_endpoint)
+    admission = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert admission.reservation is not None
+    driver_state = driver.drop_beans()
+    drop_results: list[NormalDropSettlement] = []
+    drop_errors: list[BaseException] = []
+
+    def call_drop() -> None:
+        """Settle the explicitly admitted exact mock Drop store entry."""
+        try:
+            drop_results.append(
+                context.session_store.complete_normal_drop_success(
+                    session,
+                    reservation=admission.reservation,
+                    heat_level_percent=driver_state.heat_level_percent,
+                    fan_level_percent=driver_state.fan_level_percent,
+                    cooling_on=driver_state.cooling_on,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - test captures the route result.
+            drop_errors.append(exc)
+
+    drop_thread = Thread(
+        target=call_drop,
+    )
+    emergency_results: list[object] = []
+    emergency_errors: list[BaseException] = []
+
+    def call_emergency() -> None:
+        """Keep the thread's tool exception available for the assertion."""
+        try:
+            emergency_results.append(
+                _call_tool(server, "emergency_stop", ctx, reason="paused-exact-drop")
+            )
+        except BaseException as exc:  # noqa: BLE001 - test captures the route result.
+            emergency_errors.append(exc)
+
+    emergency_thread = Thread(target=call_emergency)
+    second_emergency_results: list[object] = []
+    second_emergency_errors: list[BaseException] = []
+
+    def call_second_emergency() -> None:
+        """Run a separately admitted guarded emergency during the first save."""
+        try:
+            second_emergency_results.append(
+                _call_tool(
+                    server,
+                    "emergency_stop",
+                    ctx,
+                    reason="second-paused-exact-drop",
+                    expected_session_id=session.id,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - test captures the route result.
+            second_emergency_errors.append(exc)
+
+    second_emergency_thread = Thread(target=call_second_emergency)
+
+    drop_thread.start()
+    assert append_entered.wait(timeout=1.0)
+    with pytest.raises(SessionLifecycleError, match="normal bean-drop operation is unresolved"):
+        _call_tool(server, "mark_first_crack", ctx)
+    exported_while_paused = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+    paused_summary = json.loads(Path(exported_while_paused.summary_path).read_text())
+    assert paused_summary["beans_dropped_at_utc"] is None
+    assert paused_summary["cooling_started_at_utc"] is None
+    emergency_thread.start()
+    assert reached_driver.wait(timeout=1.0)
+    assert emergency_thread.is_alive()
+    second_emergency_thread.start()
+    assert second_reached_driver.wait(timeout=1.0)
+    assert emergency_thread.is_alive()
+    release_append.set()
+    assert first_fault_append_entered.wait(timeout=1.0)
+    release_first_fault_append.set()
+    drop_thread.join(timeout=1.0)
+    emergency_thread.join(timeout=1.0)
+    second_emergency_thread.join(timeout=1.0)
+
+    assert not drop_thread.is_alive() and not emergency_thread.is_alive()
+    assert not second_emergency_thread.is_alive()
+    assert emergency_errors == [] and len(emergency_results) == 1
+    assert second_emergency_errors == [] and len(second_emergency_results) == 1
+    assert drop_errors == [] and len(drop_results) == 1
+    assert drop_results[0].outcome == "unknown"
+    snapshot = context.session_store.get_session_snapshot()
+    assert snapshot.phase == "fault" and snapshot.faulted_at_utc is not None
+    assert snapshot.log_writer is not None
+    rows = [
+        json.loads(line)
+        for line in (snapshot.log_writer.log_dir / "roast.jsonl").read_text().splitlines()
+    ]
+    reasons = [row["payload"].get("reason") for row in rows if row.get("kind") == "fault"]
+    assert reasons == ["paused-exact-drop", "second-paused-exact-drop"]
+    endpoint_kinds = ["beans_dropped"]
+    if paused_kind == "cooling_started":
+        endpoint_kinds.append("cooling_started")
+    expected_kinds = [*endpoint_kinds, "fault", "fault"]
+    assert [row["kind"] for row in rows if row["type"] == "event"][-len(expected_kinds) :] == (
+        expected_kinds
+    )
+    assert [event.kind for event in snapshot.event_timeline][-len(expected_kinds) :] == (
+        expected_kinds
+    )
+
+
+def test_exact_mock_drop_first_row_failure_has_no_recorded_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit exact settlement never reports or exports an unwritten Drop row."""
+    context = _cold_finalisation_context(tmp_path)
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    _call_tool(server, "start_roast_session", ctx)
+    _call_tool(server, "mark_beans_added", ctx)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    session.timing_evidence_sequence = 1
+
+    def fail_drop_row(_session: RoastSession, event: RoastEvent) -> None:
+        if event.kind == "beans_dropped":
+            raise OSError("torn first Drop row")
+
+    monkeypatch.setattr(session_module, "_append_event_log_row", fail_drop_row)
+
+    admission = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert admission.reservation is not None
+    driver_state = context.roaster_driver.drop_beans()
+    settlement = context.session_store.complete_normal_drop_success(
+        session,
+        reservation=admission.reservation,
+        heat_level_percent=driver_state.heat_level_percent,
+        fan_level_percent=driver_state.fan_level_percent,
+        cooling_on=driver_state.cooling_on,
+    )
+    assert settlement.outcome == "unknown"
+
+    snapshot = context.session_store.get_session_snapshot()
+    assert snapshot.beans_dropped_at_utc is None
+    assert all(event.kind != "beans_dropped" for event in snapshot.event_timeline)
+    assert snapshot.log_writer is not None
+    rows = [
+        json.loads(line)
+        for line in (snapshot.log_writer.log_dir / "roast.jsonl").read_text().splitlines()
+    ]
+    assert all(row.get("kind") != "beans_dropped" for row in rows)
+    exported = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+    summary = json.loads(Path(exported.summary_path).read_text())
+    assert summary["beans_dropped_at_utc"] is None
+    assert summary["cooling_started_at_utc"] is None
+    repeated = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert repeated.outcome == "ambiguous"
 
 
 class _QueuedWindowAudioPipeline:

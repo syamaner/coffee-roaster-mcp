@@ -76,6 +76,7 @@ from coffee_roaster_mcp.session import (
     CaptureSubject,
     DriverCommandReservation,
     EventPayloadValue,
+    MockDropPersistenceTicket,
     RoastEvent,
     RoastPhase,
     RoastSession,
@@ -2341,6 +2342,9 @@ def create_mcp_server(
         has_verified_containment = False
         primary_error: BaseException | None = None
         observation_ticket: object | None = None
+        deferred_mock_fault_event: RoastEvent | None = None
+        deferred_mock_fault_ticket: MockDropPersistenceTicket | None = None
+        snapshot: RoastSession | None = None
         try:
             with server_context.lifecycle_barrier:
                 if expected_session_id is None:
@@ -2373,12 +2377,29 @@ def create_mcp_server(
                         _guarded_emergency_stop_failure_message(safety_payload)
                     )
                 try:
-                    event, snapshot = server_context.session_store.emergency_stop_snapshot(
-                        session,
-                        reason=reason,
-                        safety_payload=safety_payload,
-                        allow_stopped_latest=True,
-                    )
+                    if (
+                        type(server_context.roaster_driver) is MockRoasterDriver
+                        and server_context.config.roaster.driver == "mock"
+                        and server_context.session_store.has_pending_normal_drop_persistence(
+                            session
+                        )
+                    ):
+                        event, deferred_mock_fault_ticket = (
+                            server_context.session_store.prepare_mock_drop_emergency_stop(
+                                session,
+                                reason=reason,
+                                safety_payload=safety_payload,
+                                allow_stopped_latest=True,
+                            )
+                        )
+                        deferred_mock_fault_event = event
+                    else:
+                        event, snapshot = server_context.session_store.emergency_stop_snapshot(
+                            session,
+                            reason=reason,
+                            safety_payload=safety_payload,
+                            allow_stopped_latest=True,
+                        )
                     if server_context.config.first_crack.event_authority == "manual":
                         server_context.first_crack_runtime.resolve_observation_boundary(
                             session,
@@ -2401,10 +2422,34 @@ def create_mcp_server(
                     raise SessionLifecycleError(
                         "Emergency stop fault recording failed; containment is unverified."
                     ) from exc
+            if deferred_mock_fault_event is not None and deferred_mock_fault_ticket is not None:
+                try:
+                    snapshot = (
+                        server_context.session_store.commit_prepared_mock_drop_emergency_stop(
+                            session,
+                            event=deferred_mock_fault_event,
+                            ticket=deferred_mock_fault_ticket,
+                        )
+                    )
+                except Exception as exc:
+                    if expected_session_id is not None:
+                        with suppress(Exception):
+                            server_context.session_store.retain_fault_block(
+                                session, safety_payload=safety_payload
+                            )
+                        raise
+                    server_context.session_store.retain_active_fault_block(
+                        session, safety_payload=safety_payload
+                    )
+                    raise SessionLifecycleError(
+                        "Emergency stop fault recording failed; containment is unverified."
+                    ) from exc
             if not has_verified_containment:
                 raise SessionLifecycleError(
                     "Emergency stop did not report verified emergency containment."
                 )
+            if snapshot is None:
+                raise RuntimeError("Emergency stop did not produce a session snapshot.")
             return _serialize_event_result(snapshot=snapshot, event=event)
         except BaseException as exc:
             primary_error = exc
