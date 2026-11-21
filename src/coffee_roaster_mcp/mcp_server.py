@@ -3000,6 +3000,33 @@ def _retain_exact_normal_drop_unknown(
         return None
 
 
+class _ExactNormalDropReservationGuard:
+    """Retain one unsettled exact Drop reservation at most once."""
+
+    def __init__(
+        self,
+        server_context: ServerContext,
+        *,
+        session: RoastSession,
+        reservation: object,
+    ) -> None:
+        self._server_context = server_context
+        self._session = session
+        self._reservation = reservation
+        self._retention_attempted = False
+
+    def retain_once(self) -> NormalDropSettlement | None:
+        """Attempt the sole best-effort uncertainty retention for this request."""
+        if self._retention_attempted:
+            return None
+        self._retention_attempted = True
+        return _retain_exact_normal_drop_unknown(
+            self._server_context,
+            session=self._session,
+            reservation=self._reservation,
+        )
+
+
 def _freeze_exact_normal_drop_observation(
     server_context: ServerContext,
     *,
@@ -3184,6 +3211,9 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
         reservation = admission.reservation
 
     assert session is not None
+    ownership = _ExactNormalDropReservationGuard(
+        server_context, session=session, reservation=reservation
+    )
     try:
         arbitration = ExactDropArbitration(
             operation_id=reservation.token,
@@ -3193,9 +3223,7 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             expected_emergency_count=baseline.emergency_baseline,
         )
     except Exception:
-        settlement = _retain_exact_normal_drop_unknown(
-            server_context, session=session, reservation=reservation
-        )
+        settlement = ownership.retain_once()
         return _exact_normal_drop_settlement_result(
             identity=identity,
             settlement=settlement,
@@ -3204,29 +3232,23 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
         )
     except BaseException:
         with suppress(BaseException):
-            _retain_exact_normal_drop_unknown(
-                server_context, session=session, reservation=reservation
-            )
+            ownership.retain_once()
         raise
 
     try:
         driver_state = cast(object, driver.drop_beans(exact_drop=arbitration))
     except ExactDropCancelled as error:
         if error.discriminator in {"emergency_count_changed", "emergency_cancelled"}:
-            proof = NormalDropNonDispatchProof(reservation=reservation, zero_actuation=True)
             try:
+                proof = NormalDropNonDispatchProof(reservation=reservation, zero_actuation=True)
                 settlement = server_context.session_store.settle_normal_drop_cancelled(
                     session, reservation=reservation, proof=proof
                 )
             except Exception:
-                settlement = _retain_exact_normal_drop_unknown(
-                    server_context, session=session, reservation=reservation
-                )
+                settlement = ownership.retain_once()
             except BaseException:
                 with suppress(BaseException):
-                    _retain_exact_normal_drop_unknown(
-                        server_context, session=session, reservation=reservation
-                    )
+                    ownership.retain_once()
                 raise
             return _exact_normal_drop_settlement_result(
                 identity=identity,
@@ -3234,9 +3256,7 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
                 request_dispatch="invoked_no_state_transition",
                 reason="emergency_since_session_baseline",
             )
-        settlement = _retain_exact_normal_drop_unknown(
-            server_context, session=session, reservation=reservation
-        )
+        settlement = ownership.retain_once()
         return _exact_normal_drop_settlement_result(
             identity=identity,
             settlement=settlement,
@@ -3244,9 +3264,7 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             reason="prior_drop_transition_unaccounted",
         )
     except Exception:
-        settlement = _retain_exact_normal_drop_unknown(
-            server_context, session=session, reservation=reservation
-        )
+        settlement = ownership.retain_once()
         return _exact_normal_drop_settlement_result(
             identity=identity,
             settlement=settlement,
@@ -3255,33 +3273,36 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
         )
     except BaseException:
         with suppress(BaseException):
-            _retain_exact_normal_drop_unknown(
-                server_context, session=session, reservation=reservation
-            )
+            ownership.retain_once()
         raise
 
-    if not isinstance(driver_state, RoasterState) or not _is_valid_mock_drop_projection(
-        heat_level_percent=driver_state.heat_level_percent,
-        fan_level_percent=driver_state.fan_level_percent,
-        cooling_on=driver_state.cooling_on,
-    ):
-        settlement = _retain_exact_normal_drop_unknown(
-            server_context, session=session, reservation=reservation
+    try:
+        valid_projection = isinstance(
+            driver_state, RoasterState
+        ) and _is_valid_mock_drop_projection(
+            heat_level_percent=driver_state.heat_level_percent,
+            fan_level_percent=driver_state.fan_level_percent,
+            cooling_on=driver_state.cooling_on,
         )
+    except BaseException:
+        with suppress(BaseException):
+            ownership.retain_once()
+        raise
+    if not valid_projection:
+        settlement = ownership.retain_once()
         return _exact_normal_drop_settlement_result(
             identity=identity,
             settlement=settlement,
             request_dispatch="unknown",
             reason="driver_result_invalid",
         )
+    assert isinstance(driver_state, RoasterState)
 
     observation_ticket: object | None = None
     try:
         observation_ticket = _begin_drop_observation_boundary(server_context, session=session)
     except Exception:
-        settlement = _retain_exact_normal_drop_unknown(
-            server_context, session=session, reservation=reservation
-        )
+        settlement = ownership.retain_once()
         return _exact_normal_drop_settlement_result(
             identity=identity,
             settlement=settlement,
@@ -3291,9 +3312,7 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
         )
     except BaseException:
         with suppress(BaseException):
-            _retain_exact_normal_drop_unknown(
-                server_context, session=session, reservation=reservation
-            )
+            ownership.retain_once()
         raise
 
     try:
@@ -3308,9 +3327,7 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             ),
         )
     except Exception:
-        settlement = _retain_exact_normal_drop_unknown(
-            server_context, session=session, reservation=reservation
-        )
+        settlement = ownership.retain_once()
         freeze_failed = _freeze_exact_normal_drop_observation(
             server_context,
             session=session,
@@ -3326,9 +3343,7 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
         )
     except BaseException:
         with suppress(BaseException):
-            _retain_exact_normal_drop_unknown(
-                server_context, session=session, reservation=reservation
-            )
+            ownership.retain_once()
         with suppress(BaseException):
             _freeze_exact_normal_drop_observation(
                 server_context,
@@ -3346,9 +3361,7 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             and (settlement.event is None or settlement.snapshot is None)
         )
     ):
-        settlement = _retain_exact_normal_drop_unknown(
-            server_context, session=session, reservation=reservation
-        )
+        settlement = ownership.retain_once()
         freeze_failed = _freeze_exact_normal_drop_observation(
             server_context,
             session=session,

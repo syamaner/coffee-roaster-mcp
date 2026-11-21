@@ -10298,17 +10298,23 @@ def test_exact_normal_drop_retains_before_reraising_arbitration_construction_int
     assert event_kinds.count("fault") == 1
 
 
-def test_exact_normal_drop_retains_before_reraising_cancelled_settlement_interrupt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("interruption_point", "expected_transitions"),
+    (("proof", 0), ("projection", 1)),
+)
+def test_exact_normal_drop_retains_once_before_reraising_unsettled_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption_point: str,
+    expected_transitions: int,
 ) -> None:
-    """An interrupted cancellation settlement releases its writer for an explicit fault."""
+    """Proof construction and projection validation release an interrupted writer."""
     context, server, ctx, session = _exact_normal_drop_context(tmp_path)
     driver = cast(MockRoasterDriver, context.roaster_driver)
     retain_calls = 0
     original_retain = context.session_store.retain_normal_drop_unknown
-    driver.emergency_stop(reason="force exact cancellation")
 
-    def interrupt_cancelled_settlement(*_args: object, **_kwargs: object) -> NormalDropSettlement:
+    def interrupt(*_args: object, **_kwargs: object) -> None:
         raise KeyboardInterrupt()
 
     def count_retain(current: RoastSession, *, reservation: object) -> NormalDropSettlement:
@@ -10316,9 +10322,11 @@ def test_exact_normal_drop_retains_before_reraising_cancelled_settlement_interru
         retain_calls += 1
         return original_retain(current, reservation=reservation)
 
-    monkeypatch.setattr(
-        context.session_store, "settle_normal_drop_cancelled", interrupt_cancelled_settlement
-    )
+    if interruption_point == "proof":
+        driver.emergency_stop(reason="force exact cancellation")
+        monkeypatch.setattr(mcp_server, "NormalDropNonDispatchProof", interrupt)
+    else:
+        monkeypatch.setattr(mcp_server, "_is_valid_mock_drop_projection", interrupt)
     monkeypatch.setattr(context.session_store, "retain_normal_drop_unknown", count_retain)
 
     with pytest.raises(KeyboardInterrupt):
@@ -10326,9 +10334,15 @@ def test_exact_normal_drop_retains_before_reraising_cancelled_settlement_interru
 
     assert retain_calls == 1
     assert not context.session_store.has_pending_normal_drop_persistence(session)
-    emergency = _call_tool(
-        server, "emergency_stop", ctx, reason="after-cancelled-settlement-interrupt"
-    )
+    assert driver.drop_transition_count == expected_transitions
+    assert _exact_normal_drop(context, session).outcome == "ambiguous"
+    assert driver.drop_transition_count == expected_transitions
+    assert not [
+        event
+        for event in context.session_store.get_session_snapshot().event_timeline
+        if event.kind == "fault"
+    ]
+    emergency = _call_tool(server, "emergency_stop", ctx, reason="after-unsettled-interrupt")
     assert emergency.event.kind == "fault"
     snapshot = context.session_store.get_session_snapshot()
     event_kinds = [event.kind for event in snapshot.event_timeline]
