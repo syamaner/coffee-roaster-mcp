@@ -116,6 +116,7 @@ class RoasterCapabilities:
         heat_containment_version: Supported fixed-zero containment declaration.
         manual_first_crack_version: Supported manual first-crack declaration.
         timing_evidence_version: Supported synthetic timing-evidence declaration.
+        normal_drop_version: Supported exact normal-drop declaration.
     """
 
     driver: str
@@ -127,6 +128,46 @@ class RoasterCapabilities:
     heat_containment_version: int | None = None
     manual_first_crack_version: int | None = None
     timing_evidence_version: int | None = None
+    normal_drop_version: int | None = None
+
+
+@dataclass(frozen=True)
+class ExactDropArbitration:
+    """Per-call evidence required to atomically admit a mock normal drop.
+
+    The driver verifies only its own two command-history counts. Operation and
+    session identity remain store-owned, so they are carried for the caller
+    without being interpreted at this boundary.
+    """
+
+    operation_id: str
+    session_id: str
+    cancelled: Event
+    expected_drop_transition_count: int
+    expected_emergency_count: int
+    before_transition: Callable[[], None] | None = None
+
+
+ExactDropCancellationDiscriminator = Literal[
+    "emergency_cancelled",
+    "emergency_count_changed",
+    "transition_count_changed",
+]
+
+
+class ExactDropCancelled(Exception):
+    """Report that an exact mock drop was refused before it changed state."""
+
+    def __init__(self, discriminator: ExactDropCancellationDiscriminator) -> None:
+        """Initialize a refusal with one closed cancellation discriminator."""
+        if discriminator not in (
+            "emergency_cancelled",
+            "emergency_count_changed",
+            "transition_count_changed",
+        ):
+            raise ValueError("Unsupported exact-drop cancellation discriminator.")
+        self.discriminator = discriminator
+        super().__init__(discriminator)
 
 
 @dataclass(frozen=True)
@@ -684,6 +725,17 @@ class _MockThermalSample:
     env_temp_c: float
 
 
+@dataclass(frozen=True)
+class _MockCommandState:
+    """One captured mock command projection for a normalized response."""
+
+    connected: bool
+    heat_level_percent: int
+    fan_level_percent: int
+    cooling_on: bool
+    beans_dropped: bool
+
+
 class MockRoasterDriver:
     """Mock roaster driver with deterministic local-only telemetry and controls."""
 
@@ -701,6 +753,9 @@ class MockRoasterDriver:
     def __init__(self) -> None:
         """Initialize deterministic mock roaster state."""
         self._connected = False
+        self._command_lock = Lock()
+        self._drop_transition_count = 0
+        self._emergency_count = 0
         self._thermal_writer_lock = Lock()
         self._thermal_sample_lock = Lock()
         self._thermal_sample = _MockThermalSample(
@@ -737,7 +792,20 @@ class MockRoasterDriver:
             heat_containment_version=1,
             manual_first_crack_version=1,
             timing_evidence_version=1,
+            normal_drop_version=1,
         )
+
+    @property
+    def drop_transition_count(self) -> int:
+        """Return the non-telemetry count of admitted mock drop transitions."""
+        with self._command_lock:
+            return self._drop_transition_count
+
+    @property
+    def emergency_count(self) -> int:
+        """Return the non-telemetry count of attempted mock emergency stops."""
+        with self._command_lock:
+            return self._emergency_count
 
     def connect(self) -> None:
         """Mark the mock driver connected."""
@@ -778,16 +846,38 @@ class MockRoasterDriver:
         if thermal_sample is None:
             with self._thermal_sample_lock:
                 thermal_sample = self._thermal_sample
-        return RoasterState(
-            driver=self.name,
+        return self._state_snapshot_from_command(
+            thermal_sample=thermal_sample,
+            command_state=self._capture_command_state(),
+        )
+
+    def _capture_command_state(self) -> _MockCommandState:
+        """Capture mutable command fields for one normalized mock response."""
+        return _MockCommandState(
             connected=self._connected,
-            bean_temp_c=thermal_sample.bean_temp_c,
-            env_temp_c=thermal_sample.env_temp_c,
             heat_level_percent=self._heat_level_percent,
             fan_level_percent=self._fan_level_percent,
             cooling_on=self._cooling_on,
+            beans_dropped=self._beans_dropped,
+        )
+
+    def _state_snapshot_from_command(
+        self,
+        *,
+        thermal_sample: _MockThermalSample,
+        command_state: _MockCommandState,
+    ) -> RoasterState:
+        """Assemble a response from captured command and thermal observations."""
+        return RoasterState(
+            driver=self.name,
+            connected=command_state.connected,
+            bean_temp_c=thermal_sample.bean_temp_c,
+            env_temp_c=thermal_sample.env_temp_c,
+            heat_level_percent=command_state.heat_level_percent,
+            fan_level_percent=command_state.fan_level_percent,
+            cooling_on=command_state.cooling_on,
             raw_vendor_data={
-                "beans_dropped": self._beans_dropped,
+                "beans_dropped": command_state.beans_dropped,
                 "sample_index": thermal_sample.index,
                 "telemetry_model": "fixed_step_thermal_v1",
             },
@@ -825,15 +915,37 @@ class MockRoasterDriver:
         )
         return self._state_snapshot()
 
-    def drop_beans(self) -> RoasterState:
-        """Record a mock bean drop and enter cooling."""
-        self._beans_dropped = True
-        self._heat_level_percent = 0
-        self._fan_level_percent = 100
-        self._cooling_on = True
-        self._drum_motor_on = True
-        self._solenoid_open = True
-        return self._state_snapshot()
+    def drop_beans(self, *, exact_drop: ExactDropArbitration | None = None) -> RoasterState:
+        """Record a mock bean drop and enter cooling.
+
+        Exact arbitration is mock-only and proves that neither a cancellation,
+        emergency stop, nor competing drop transition intervened before this
+        transition's atomic command-state change.
+        """
+        if exact_drop is not None and exact_drop.before_transition is not None:
+            exact_drop.before_transition()
+        with self._command_lock:
+            if exact_drop is not None:
+                if exact_drop.cancelled.is_set():
+                    raise ExactDropCancelled("emergency_cancelled")
+                if self._emergency_count != exact_drop.expected_emergency_count:
+                    raise ExactDropCancelled("emergency_count_changed")
+                if self._drop_transition_count != exact_drop.expected_drop_transition_count:
+                    raise ExactDropCancelled("transition_count_changed")
+            self._drop_transition_count += 1
+            self._beans_dropped = True
+            self._heat_level_percent = 0
+            self._fan_level_percent = 100
+            self._cooling_on = True
+            self._drum_motor_on = True
+            self._solenoid_open = True
+            command_state = self._capture_command_state()
+        with self._thermal_sample_lock:
+            thermal_sample = self._thermal_sample
+        return self._state_snapshot_from_command(
+            thermal_sample=thermal_sample,
+            command_state=command_state,
+        )
 
     def start_cooling(self) -> RoasterState:
         """Start mock cooling and return normalized state."""
@@ -852,17 +964,22 @@ class MockRoasterDriver:
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
         """Return deterministic mock-safe emergency stop controls."""
         _ = reason
-        self._heat_level_percent = 0
-        self._fan_level_percent = 100
-        self._cooling_on = True
-        self._drum_motor_on = False
-        self._solenoid_open = False
+        with self._command_lock:
+            self._emergency_count += 1
+            self._heat_level_percent = 0
+            self._fan_level_percent = 100
+            self._cooling_on = True
+            self._drum_motor_on = False
+            self._solenoid_open = False
+            heat_level_percent = self._heat_level_percent
+            fan_level_percent = self._fan_level_percent
+            cooling_on = self._cooling_on
         return EmergencyStopResult(
             driver=self.name,
             safety_method="emergency_stop",
-            heat_level_percent=self._heat_level_percent,
-            fan_level_percent=self._fan_level_percent,
-            cooling_on=self._cooling_on,
+            heat_level_percent=heat_level_percent,
+            fan_level_percent=fan_level_percent,
+            cooling_on=cooling_on,
         )
 
     def _advance_telemetry(self) -> _MockThermalSample:
