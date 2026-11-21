@@ -43,6 +43,7 @@ from coffee_roaster_mcp.drivers import (
     HOTTOP_DRIVER_NAME,
     DriverLifecycleEvidence,
     EmergencyStopResult,
+    ExactDropArbitration,
     FixedZeroCommandedState,
     HottopRoasterDriver,
     HottopStartPhase,
@@ -9474,6 +9475,121 @@ def test_exact_normal_drop_retains_unknown_when_the_mock_driver_raises(
     assert driver.drop_transition_count == 0
     assert driver.emergency_count == 0
     assert runtime.stopped_sessions == []
+
+
+def test_exact_normal_drop_retains_and_freezes_after_malformed_success_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transition with no usable settlement remains unknown and freezes its ticket."""
+    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    runtime = context.first_crack_runtime
+    assert isinstance(runtime, FakeFirstCrackRuntime)
+    freezes: list[str] = []
+
+    def malformed_settlement(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    def record_freeze(*_args: object, reason: str, **_kwargs: object) -> None:
+        freezes.append(reason)
+
+    monkeypatch.setattr(context.session_store, "complete_normal_drop_success", malformed_settlement)
+    monkeypatch.setattr(runtime, "freeze_observation_boundary", record_freeze)
+
+    result = _exact_normal_drop(context, session)
+    repeated = _exact_normal_drop(context, session)
+
+    assert result.outcome == "unknown"
+    assert result.history == "unknown"
+    assert result.fence == "retained"
+    assert freezes == ["exact_drop_settlement_unresolved"]
+    assert repeated.outcome == "ambiguous"
+    driver = cast(MockRoasterDriver, context.roaster_driver)
+    assert driver.drop_transition_count == 1
+
+
+def test_exact_normal_drop_releases_the_pending_writer_before_reraising_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted returned mock dispatch settles ownership before propagating."""
+    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    original_drop = driver.drop_beans
+
+    def interrupted_drop(*, exact_drop: object = None) -> RoasterState:
+        original_drop(exact_drop=cast(ExactDropArbitration | None, exact_drop))
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(driver, "drop_beans", interrupted_drop)
+
+    with pytest.raises(KeyboardInterrupt):
+        _exact_normal_drop(context, session)
+
+    assert driver.drop_transition_count == 1
+    assert not context.session_store.has_pending_normal_drop_persistence(session)
+    assert _exact_normal_drop(context, session).outcome == "ambiguous"
+
+
+def test_exact_normal_drop_validates_projection_before_opening_observation_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An invalid returned projection cannot acquire a recording boundary."""
+    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    driver = context.roaster_driver
+    runtime = context.first_crack_runtime
+    assert type(driver) is MockRoasterDriver
+    assert isinstance(runtime, FakeFirstCrackRuntime)
+    original_drop = driver.drop_beans
+    boundaries: list[str] = []
+
+    def invalid_projection(*, exact_drop: object = None) -> RoasterState:
+        returned = original_drop(exact_drop=cast(ExactDropArbitration | None, exact_drop))
+        return dataclasses.replace(returned, heat_level_percent=1)
+
+    def record_boundary(*_args: object, **_kwargs: object) -> object:
+        boundaries.append("opened")
+        return object()
+
+    monkeypatch.setattr(driver, "drop_beans", invalid_projection)
+    monkeypatch.setattr(runtime, "begin_observation_boundary", record_boundary)
+
+    result = _exact_normal_drop(context, session)
+
+    assert result.outcome == "unknown"
+    assert result.reason == "driver_result_invalid"
+    assert result.fence == "retained"
+    assert boundaries == []
+
+
+def test_exact_normal_drop_reports_observer_freeze_and_cleanup_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Known endpoint persistence survives independent observer and cleanup failures."""
+    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    runtime = context.first_crack_runtime
+    assert isinstance(runtime, FakeFirstCrackRuntime)
+
+    def fail_resolution(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("resolution failed")
+
+    def fail_freeze(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("freeze failed")
+
+    def fail_cleanup(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(runtime, "resolve_observation_boundary", fail_resolution)
+    monkeypatch.setattr(runtime, "freeze_observation_boundary", fail_freeze)
+    monkeypatch.setattr(mcp_server, "_stop_runtimes_after_drop", fail_cleanup)
+
+    result = _exact_normal_drop(context, session)
+
+    assert result.outcome == "success"
+    assert result.history == "saved"
+    assert result.fence == "released"
+    assert result.observer_failure
+    assert result.cleanup_failure
+    assert result.reason == "observation_freeze_failed"
 
 
 def test_manual_authority_composition_refuses_before_driver_creation(

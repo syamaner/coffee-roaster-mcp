@@ -91,6 +91,7 @@ from coffee_roaster_mcp.session import (
     SessionPresence,
     SessionPurpose,
     SessionStartReservation,
+    _is_valid_mock_drop_projection,  # pyright: ignore[reportPrivateUsage]
     compute_roast_metrics,
     default_emergency_safety_payload,
     has_verified_emergency_containment,
@@ -2823,7 +2824,7 @@ def _exact_normal_drop_result(
 def _exact_normal_drop_settlement_result(
     *,
     identity: NormalDropIdentity,
-    settlement: NormalDropSettlement,
+    settlement: NormalDropSettlement | None,
     request_dispatch: Literal[
         "not_invoked", "invoked_no_state_transition", "transitioned", "unknown"
     ],
@@ -2832,6 +2833,18 @@ def _exact_normal_drop_settlement_result(
     cleanup_failure: bool = False,
 ) -> _ExactNormalDropSessionResult:
     """Map an owned exact-drop settlement without implying a physical result."""
+    if not isinstance(settlement, NormalDropSettlement):
+        return _exact_normal_drop_result(
+            identity=identity,
+            outcome="unknown",
+            reason=reason or "settlement_unavailable",
+            request_dispatch=request_dispatch,
+            this_request="reservation_owned",
+            history="unknown",
+            fence="not_established",
+            observer_failure=observer_failure,
+            cleanup_failure=cleanup_failure,
+        )
     if settlement.outcome == "success":
         return _exact_normal_drop_result(
             identity=identity,
@@ -2869,6 +2882,41 @@ def _exact_normal_drop_settlement_result(
     )
 
 
+def _retain_exact_normal_drop_unknown(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    reservation: object,
+) -> NormalDropSettlement | None:
+    """Try once to retain an exact reservation without fabricating settlement."""
+    try:
+        return server_context.session_store.retain_normal_drop_unknown(
+            session, reservation=reservation
+        )
+    except Exception:  # noqa: BLE001 - a failed fallback must not be retried.
+        return None
+
+
+def _freeze_exact_normal_drop_observation(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    ticket: object | None,
+    reason: str,
+) -> bool:
+    """Freeze a returned observation ticket and report whether freezing failed."""
+    try:
+        _freeze_drop_observation_boundary(
+            server_context,
+            session=session,
+            ticket=ticket,
+            reason=reason,
+        )
+    except Exception:  # noqa: BLE001 - the store outcome remains authoritative.
+        return True
+    return False
+
+
 def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
     server_context: ServerContext,
     *,
@@ -2899,7 +2947,7 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             fence="not_applicable",
         )
 
-    driver = server_context.roaster_driver
+    driver = cast(MockRoasterDriver, server_context.roaster_driver)
     assert type(driver) is MockRoasterDriver
     session: RoastSession | None = None
     reservation = None
@@ -2923,9 +2971,38 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             )
         try:
             latest_snapshot = server_context.session_store.get_session_snapshot()
-        except SessionLifecycleError:
-            latest_snapshot = None
-        if latest_snapshot is not None and latest_snapshot.id == identity.session_id:
+            session = server_context.session_store.get_latest_session()
+        except Exception:  # noqa: BLE001 - unavailable first-crack state cannot admit Drop.
+            return _exact_normal_drop_result(
+                identity=identity,
+                outcome="refused_precondition",
+                reason="human_first_crack_unavailable",
+                request_dispatch="not_invoked",
+                this_request="no_reservation",
+                history="not_applicable",
+                fence="not_applicable",
+            )
+        if session is None:
+            return _exact_normal_drop_result(
+                identity=identity,
+                outcome="refused_state",
+                reason="exact_live_owner_unavailable",
+                request_dispatch="not_invoked",
+                this_request="no_reservation",
+                history="not_applicable",
+                fence="not_applicable",
+            )
+        if session.id == identity.session_id:
+            if latest_snapshot.id != identity.session_id:
+                return _exact_normal_drop_result(
+                    identity=identity,
+                    outcome="refused_precondition",
+                    reason="human_first_crack_unavailable",
+                    request_dispatch="not_invoked",
+                    this_request="no_reservation",
+                    history="not_applicable",
+                    fence="not_applicable",
+                )
             human_first_crack = latest_snapshot.first_crack_source == "manual_mark" and any(
                 event.kind == "first_crack_detected" for event in latest_snapshot.event_timeline
             )
@@ -2961,11 +3038,8 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
                 fence="not_applicable",
             )
         reservation = admission.reservation
-        session = server_context.session_store.get_latest_session()
 
-    if session is None:
-        raise RuntimeError("Exact normal Drop admission did not retain its live owner.")
-
+    assert session is not None
     try:
         arbitration = ExactDropArbitration(
             operation_id=reservation.token,
@@ -2975,8 +3049,8 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             expected_emergency_count=baseline.emergency_baseline,
         )
     except Exception:
-        settlement = server_context.session_store.retain_normal_drop_unknown(
-            session, reservation=reservation
+        settlement = _retain_exact_normal_drop_unknown(
+            server_context, session=session, reservation=reservation
         )
         return _exact_normal_drop_settlement_result(
             identity=identity,
@@ -2990,17 +3064,22 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
     except ExactDropCancelled as error:
         if error.discriminator in {"emergency_count_changed", "emergency_cancelled"}:
             proof = NormalDropNonDispatchProof(reservation=reservation, zero_actuation=True)
-            settlement = server_context.session_store.settle_normal_drop_cancelled(
-                session, reservation=reservation, proof=proof
-            )
+            try:
+                settlement = server_context.session_store.settle_normal_drop_cancelled(
+                    session, reservation=reservation, proof=proof
+                )
+            except Exception:
+                settlement = _retain_exact_normal_drop_unknown(
+                    server_context, session=session, reservation=reservation
+                )
             return _exact_normal_drop_settlement_result(
                 identity=identity,
                 settlement=settlement,
                 request_dispatch="invoked_no_state_transition",
                 reason="emergency_since_session_baseline",
             )
-        settlement = server_context.session_store.retain_normal_drop_unknown(
-            session, reservation=reservation
+        settlement = _retain_exact_normal_drop_unknown(
+            server_context, session=session, reservation=reservation
         )
         return _exact_normal_drop_settlement_result(
             identity=identity,
@@ -3009,8 +3088,8 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             reason="prior_drop_transition_unaccounted",
         )
     except Exception:
-        settlement = server_context.session_store.retain_normal_drop_unknown(
-            session, reservation=reservation
+        settlement = _retain_exact_normal_drop_unknown(
+            server_context, session=session, reservation=reservation
         )
         return _exact_normal_drop_settlement_result(
             identity=identity,
@@ -3018,10 +3097,20 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             request_dispatch="unknown",
             reason="driver_result_unavailable",
         )
+    except BaseException:
+        with suppress(BaseException):
+            _retain_exact_normal_drop_unknown(
+                server_context, session=session, reservation=reservation
+            )
+        raise
 
-    if not isinstance(driver_state, RoasterState):
-        settlement = server_context.session_store.retain_normal_drop_unknown(
-            session, reservation=reservation
+    if not isinstance(driver_state, RoasterState) or not _is_valid_mock_drop_projection(
+        heat_level_percent=driver_state.heat_level_percent,
+        fan_level_percent=driver_state.fan_level_percent,
+        cooling_on=driver_state.cooling_on,
+    ):
+        settlement = _retain_exact_normal_drop_unknown(
+            server_context, session=session, reservation=reservation
         )
         return _exact_normal_drop_settlement_result(
             identity=identity,
@@ -3034,8 +3123,8 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
     try:
         observation_ticket = _begin_drop_observation_boundary(server_context, session=session)
     except Exception:
-        settlement = server_context.session_store.retain_normal_drop_unknown(
-            session, reservation=reservation
+        settlement = _retain_exact_normal_drop_unknown(
+            server_context, session=session, reservation=reservation
         )
         return _exact_normal_drop_settlement_result(
             identity=identity,
@@ -3044,79 +3133,131 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             reason="observation_boundary_unavailable",
             observer_failure=True,
         )
+    except BaseException:
+        with suppress(BaseException):
+            _retain_exact_normal_drop_unknown(
+                server_context, session=session, reservation=reservation
+            )
+        raise
 
     try:
-        settlement = server_context.session_store.complete_normal_drop_success(
-            session,
-            reservation=reservation,
-            heat_level_percent=driver_state.heat_level_percent,
-            fan_level_percent=driver_state.fan_level_percent,
-            cooling_on=driver_state.cooling_on,
+        settlement = cast(
+            object,
+            server_context.session_store.complete_normal_drop_success(
+                session,
+                reservation=reservation,
+                heat_level_percent=driver_state.heat_level_percent,
+                fan_level_percent=driver_state.fan_level_percent,
+                cooling_on=driver_state.cooling_on,
+            ),
         )
     except Exception:
-        settlement = server_context.session_store.retain_normal_drop_unknown(
-            session, reservation=reservation
+        settlement = _retain_exact_normal_drop_unknown(
+            server_context, session=session, reservation=reservation
         )
-        with suppress(Exception):
-            _freeze_drop_observation_boundary(
+        freeze_failed = _freeze_exact_normal_drop_observation(
+            server_context,
+            session=session,
+            ticket=observation_ticket,
+            reason="exact_drop_settlement_unresolved",
+        )
+        return _exact_normal_drop_settlement_result(
+            identity=identity,
+            settlement=settlement,
+            request_dispatch="transitioned",
+            reason="observation_freeze_failed" if freeze_failed else "settlement_unavailable",
+            observer_failure=freeze_failed,
+        )
+    except BaseException:
+        with suppress(BaseException):
+            _retain_exact_normal_drop_unknown(
+                server_context, session=session, reservation=reservation
+            )
+        with suppress(BaseException):
+            _freeze_exact_normal_drop_observation(
                 server_context,
                 session=session,
                 ticket=observation_ticket,
                 reason="exact_drop_settlement_unresolved",
             )
+        raise
+
+    if (
+        not isinstance(settlement, NormalDropSettlement)
+        or settlement.outcome not in {"success", "unknown", "stale"}
+        or (
+            settlement.outcome == "success"
+            and (settlement.event is None or settlement.snapshot is None)
+        )
+    ):
+        settlement = _retain_exact_normal_drop_unknown(
+            server_context, session=session, reservation=reservation
+        )
+        freeze_failed = _freeze_exact_normal_drop_observation(
+            server_context,
+            session=session,
+            ticket=observation_ticket,
+            reason="exact_drop_settlement_unresolved",
+        )
         return _exact_normal_drop_settlement_result(
             identity=identity,
             settlement=settlement,
             request_dispatch="transitioned",
-            reason="settlement_unavailable",
+            reason="observation_freeze_failed" if freeze_failed else "settlement_unavailable",
+            observer_failure=freeze_failed,
         )
 
-    if settlement.outcome != "success" or settlement.event is None or settlement.snapshot is None:
-        with suppress(Exception):
-            _freeze_drop_observation_boundary(
-                server_context,
-                session=session,
-                ticket=observation_ticket,
-                reason="exact_drop_settlement_unresolved",
-            )
+    if settlement.outcome != "success":
+        freeze_failed = _freeze_exact_normal_drop_observation(
+            server_context,
+            session=session,
+            ticket=observation_ticket,
+            reason="exact_drop_settlement_unresolved",
+        )
         return _exact_normal_drop_settlement_result(
             identity=identity,
             settlement=settlement,
             request_dispatch="transitioned",
+            reason="observation_freeze_failed" if freeze_failed else None,
+            observer_failure=freeze_failed,
         )
 
+    validated_settlement = settlement
     observer_failure = False
+    freeze_failure = False
     cleanup_failure = False
     try:
         _resolve_drop_observation_boundary(
             server_context,
             session=session,
             ticket=observation_ticket,
-            event=settlement.event,
+            event=cast(RoastEvent, validated_settlement.event),
         )
     except Exception:
         observer_failure = True
-        with suppress(Exception):
-            _freeze_drop_observation_boundary(
-                server_context,
-                session=session,
-                ticket=observation_ticket,
-                reason="exact_drop_observation_resolution_failed",
-            )
+        freeze_failure = _freeze_exact_normal_drop_observation(
+            server_context,
+            session=session,
+            ticket=observation_ticket,
+            reason="exact_drop_observation_resolution_failed",
+        )
+        observer_failure = freeze_failure or observer_failure
     try:
         _stop_runtimes_after_drop(
             server_context,
             session=session,
-            snapshot=settlement.snapshot,
+            snapshot=cast(RoastSession, validated_settlement.snapshot),
         )
     except Exception:
         cleanup_failure = True
     return _exact_normal_drop_settlement_result(
         identity=identity,
-        settlement=settlement,
+        settlement=validated_settlement,
         request_dispatch="transitioned",
         reason=(
-            "observation_resolution_failed"
+            "observation_freeze_failed"
+            if freeze_failure
+            else "observation_resolution_failed"
             if observer_failure
             else "post_drop_cleanup_failed"
             if cleanup_failure
