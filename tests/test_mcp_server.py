@@ -10720,8 +10720,20 @@ def test_exact_normal_drop_reports_an_unavailable_retain_fallback(
     assert result.fence == "not_established"
 
 
+@pytest.mark.parametrize(
+    "completion_settlement",
+    (
+        pytest.param(None, id="completion-settlement-none"),
+        pytest.param(
+            NormalDropSettlement("success"),
+            id="completion-settlement-success-without-event-or-snapshot",
+        ),
+    ),
+)
 def test_exact_normal_drop_retains_and_freezes_after_malformed_success_settlement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completion_settlement: NormalDropSettlement | None,
 ) -> None:
     """A transition with no usable settlement remains unknown and freezes its ticket."""
     context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
@@ -10731,8 +10743,8 @@ def test_exact_normal_drop_retains_and_freezes_after_malformed_success_settlemen
     retain_calls = 0
     original_retain = context.session_store.retain_normal_drop_unknown
 
-    def malformed_settlement(*_args: object, **_kwargs: object) -> NormalDropSettlement:
-        return NormalDropSettlement("success")
+    def malformed_settlement(*_args: object, **_kwargs: object) -> NormalDropSettlement | None:
+        return completion_settlement
 
     def count_retain(current: RoastSession, *, reservation: object) -> NormalDropSettlement:
         nonlocal retain_calls
