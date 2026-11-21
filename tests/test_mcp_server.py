@@ -13399,9 +13399,18 @@ def test_registered_hottop_start_emergency_after_runtime_setup_reaps_started_wor
     assert context.telemetry_sampler.active_session_id is None
 
 
-@pytest.mark.parametrize("schedule", ["start_first", "saved", "expired"])
+@pytest.mark.parametrize(
+    ("schedule", "retain_fails"),
+    [
+        ("start_first", False),
+        ("saved", False),
+        ("expired", False),
+        ("failed_save", False),
+        ("failed_save", True),
+    ],
+)
 def test_registered_hottop_start_failure_preserves_first_closer_observation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schedule: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schedule: str, retain_fails: bool
 ) -> None:
     """A held registered emergency cannot be replaced by staged-Start cleanup."""
     from coffee_roaster_mcp.first_crack_observer import load_observation_model
@@ -13520,6 +13529,8 @@ def test_registered_hottop_start_failure_preserves_first_closer_observation(
         allow_stopped_latest: bool = False,
     ) -> tuple[RoastEvent, RoastSession]:
         assert release_save.wait(1)
+        if schedule == "failed_save":
+            raise OSError("synthetic fault persistence failure")
         return original_save(
             saved_session,
             reason=reason,
@@ -13528,6 +13539,16 @@ def test_registered_hottop_start_failure_preserves_first_closer_observation(
         )
 
     monkeypatch.setattr(context.session_store, "emergency_stop_snapshot", hold_save)
+    if retain_fails:
+
+        def fail_retain_active_fault_block(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("synthetic fault-block retention failure")
+
+        monkeypatch.setattr(
+            context.session_store,
+            "retain_active_fault_block",
+            fail_retain_active_fault_block,
+        )
     monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
     monkeypatch.setattr(
         mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
@@ -13579,8 +13600,17 @@ def test_registered_hottop_start_failure_preserves_first_closer_observation(
     start.join(timeout=1)
     emergency.join(timeout=1)
     assert not start.is_alive() and not emergency.is_alive()
-    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
-    assert len(emergency_results) == 1
+    assert isinstance(errors[0], RuntimeError)
+    if schedule == "failed_save":
+        assert not emergency_results and len(errors) == 2
+        if retain_fails:
+            assert isinstance(errors[1], RuntimeError)
+            assert str(errors[1]) == "synthetic fault-block retention failure"
+        else:
+            assert isinstance(errors[1], SessionLifecycleError)
+            assert "fault recording failed" in str(errors[1])
+    else:
+        assert len(errors) == 1 and len(emergency_results) == 1
     assert observer is not None and observer.reaped.wait(1) and pipeline.stopped
     summary = runtime.observation_for_session(session.id)
     assert summary is not None and summary.frozen_summary.value is not None
@@ -13599,7 +13629,19 @@ def test_registered_hottop_start_failure_preserves_first_closer_observation(
         assert (
             frozen.drop_cutoff.value.session_relative_seconds.value == reply.event.monotonic_seconds
         )
-    assert [event.kind for event in session.event_timeline].count("fault") == 1
+    assert session.log_writer is not None
+    log_path = session.log_writer.log_dir / "roast.jsonl"
+    if schedule == "failed_save":
+        assert not log_path.exists()
+        assert [event.kind for event in session.event_timeline].count("fault") == 0
+    else:
+        rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+        fault_rows = [row for row in rows if row.get("kind") == "fault"]
+        assert len(fault_rows) == 1
+        assert [event.kind for event in session.event_timeline].count("fault") == 1
+        if schedule == "saved":
+            reply = cast(Any, emergency_results[0])
+            assert fault_rows[0]["monotonic_seconds"] == reply.event.monotonic_seconds
     assert transport.writes == [build_hottop_command_packet()]
 
 

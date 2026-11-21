@@ -2801,8 +2801,16 @@ def test_manual_runtime_lifecycle_close_has_no_synthetic_cutoff(
     assert captures[0].stopped
 
 
+@pytest.mark.parametrize(
+    ("reason", "expected_failed"),
+    [
+        ("emergency_stop", True),
+        ("beans_dropped", False),
+        ("autonomous_telemetry_sampler_failure", True),
+    ],
+)
 def test_manual_runtime_failed_start_close_yields_to_pending_boundary_owner(
-    tmp_path: Path,
+    tmp_path: Path, reason: str, expected_failed: bool
 ) -> None:
     """Staged cleanup cannot replace an admitted boundary owner's evidence."""
     clock = ClockHarness()
@@ -2817,25 +2825,28 @@ def test_manual_runtime_failed_start_close_yields_to_pending_boundary_owner(
     runtime.start_for_session(session)
     observer = runtime._observer  # pyright: ignore[reportPrivateUsage]
     assert observer is not None and len(captures) == 1
-    ticket = runtime.begin_observation_boundary(session, reason="emergency_stop")
+    ticket = runtime.begin_observation_boundary(session, reason=reason)
     assert ticket is not None
     original_deadline = observer.deadline
     assert original_deadline is not None
+    assert observer.reason == reason
+    assert observer.failed is expected_failed
 
     try:
         runtime.stop_after_failed_start(session.id, reason="staged_start_failed")
 
         assert observer.summary is None
-        assert observer.reason == "emergency_stop"
+        assert observer.reason == reason
         assert observer.deadline == original_deadline
         assert observer.cutoff is None
+        assert observer.failed is expected_failed
     finally:
         runtime.resolve_observation_boundary(
             session, ticket, cutoff_monotonic_seconds=session.monotonic_start + 1.0
         )
         assert observer.reaped.wait(2)
     assert observer.summary is not None
-    assert observer.summary.reason.value == "emergency_stop"
+    assert observer.summary.reason.value == reason
     assert observer.summary.drop_cutoff.value is not None
     assert captures[0].stopped
 
