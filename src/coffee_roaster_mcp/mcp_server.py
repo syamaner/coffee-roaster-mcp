@@ -54,6 +54,8 @@ from coffee_roaster_mcp.config import (
 )
 from coffee_roaster_mcp.drivers import (
     DriverLifecycleEvidence,
+    ExactDropArbitration,
+    ExactDropCancelled,
     FixedZeroCommandedState,
     HottopRoasterDriver,
     HottopStartSettlement,
@@ -78,6 +80,9 @@ from coffee_roaster_mcp.session import (
     EventLogRecordingError,
     EventPayloadValue,
     MockDropPersistenceTicket,
+    NormalDropIdentity,
+    NormalDropNonDispatchProof,
+    NormalDropSettlement,
     RoastEvent,
     RoastPhase,
     RoastSession,
@@ -86,6 +91,7 @@ from coffee_roaster_mcp.session import (
     SessionPresence,
     SessionPurpose,
     SessionStartReservation,
+    _is_valid_mock_drop_projection,  # pyright: ignore[reportPrivateUsage]
     compute_roast_metrics,
     default_emergency_safety_payload,
     has_verified_emergency_containment,
@@ -996,6 +1002,94 @@ def _install_capture_evidence_argument_adapter(mcp: FastMCP) -> None:
 
 
 @dataclass(frozen=True)
+class _ExactNormalDropBaseline:
+    """Bind one mock session to command-history counts captured at its start."""
+
+    session_id: str
+    driver_ref: MockRoasterDriver
+    clock_epoch_id: str
+    emergency_baseline: int
+    drop_baseline: int
+
+
+ExactNormalDropOutcome = Literal[
+    "refused_capability",
+    "refused_state",
+    "refused_precondition",
+    "already_dropped",
+    "in_progress",
+    "ambiguous",
+    "refused",
+    "cancelled",
+    "success",
+    "unknown",
+]
+ExactNormalDropReason = (
+    Literal[
+        "manual_mock_normal_drop_required",
+        "exact_baseline_unavailable",
+        "human_first_crack_unavailable",
+        "exact_live_owner_unavailable",
+        "human_first_crack_missing",
+        "endpoint_origin_not_established",
+        "dispatch_reservation_unavailable",
+        "normal_drop_in_progress",
+        "normal_drop_unresolved",
+        "store_refusal_unavailable",
+        "invalid_identity",
+        "unknown_session",
+        "not_latest_session",
+        "clock_epoch_mismatch",
+        "ownership_sequence_mismatch",
+        "session_purpose_not_eligible",
+        "session_faulted",
+        "session_not_active",
+        "timing_evidence_missing",
+        "timing_evidence_superseded",
+        "finalisation_in_progress",
+        "command_in_progress",
+        "phase_invalid",
+        "arbitration_unavailable",
+        "emergency_since_session_baseline",
+        "prior_drop_transition_unaccounted",
+        "driver_result_unavailable",
+        "driver_result_invalid",
+        "observation_boundary_unavailable",
+        "settlement_unavailable",
+        "retain_unavailable",
+        "settlement_stale",
+        "observation_freeze_failed",
+        "observation_resolution_failed",
+        "post_drop_cleanup_failed",
+    ]
+    | None
+)
+
+
+@dataclass(frozen=True)
+class _ExactNormalDropSessionResult:
+    """Private result for the unregistered exact mock-drop producer."""
+
+    session_id: str
+    clock_epoch_id: str
+    ownership_sequence: int
+    timing_evidence_sequence: int
+    outcome: ExactNormalDropOutcome
+    reason: ExactNormalDropReason
+    request_dispatch: Literal[
+        "not_invoked", "invoked_no_state_transition", "transitioned", "unknown"
+    ]
+    this_request: Literal["no_reservation", "reservation_owned"]
+    history: Literal["not_applicable", "saved", "unknown"]
+    fence: Literal["not_applicable", "released", "retained", "not_established"]
+    prior_transition: Literal["not_applicable", "not_established", "unknown"]
+    retry: Literal["forbidden"] = "forbidden"
+    physical_effect: Literal["not_established"] = "not_established"
+    observer_failure: bool = False
+    cleanup_failure: bool = False
+
+
+@dataclass(frozen=True)
 class ServerContext:
     """Server bootstrap context.
 
@@ -1021,6 +1115,7 @@ class ServerContext:
     capture_evidence_publisher: CaptureEvidencePublisher
     capture_evidence_configured: bool
     lifecycle_barrier: Lock = field(default_factory=Lock)
+    exact_normal_drop_baseline: _ExactNormalDropBaseline | None = None
 
 
 TelemetrySampleCallback = Callable[[str], bool]
@@ -1972,9 +2067,45 @@ def create_mcp_server(
         try:
             server_context.roaster_driver.connect()
             with server_context.lifecycle_barrier:
+                exact_baseline: tuple[MockRoasterDriver, int, int] | None = None
+                if _exact_normal_drop_capable(server_context):
+                    driver = server_context.roaster_driver
+                    assert type(driver) is MockRoasterDriver
+                    exact_baseline = (
+                        driver,
+                        driver.emergency_count,
+                        driver.drop_transition_count,
+                    )
                 session = server_context.session_store.complete_session_start_snapshot(
                     reservation, purpose=purpose
                 )
+                object.__setattr__(server_context, "exact_normal_drop_baseline", None)
+                if exact_baseline is not None:
+                    driver, emergency_baseline, drop_baseline = exact_baseline
+                    try:
+                        live_session = server_context.session_store.get_active_session()
+                        if live_session is None or live_session.id != session.id:
+                            raise RuntimeError(
+                                "Started session was not published as the active owner."
+                            )
+                        identity = server_context.session_store.normal_drop_identity(live_session)
+                    except Exception:
+                        # Exact Drop is optional to ordinary Start. A post-publication
+                        # lookup failure or owner mismatch leaves its holder unavailable
+                        # without rolling back the already published ordinary Start.
+                        pass
+                    else:
+                        object.__setattr__(
+                            server_context,
+                            "exact_normal_drop_baseline",
+                            _ExactNormalDropBaseline(
+                                session_id=session.id,
+                                driver_ref=driver,
+                                clock_epoch_id=identity.clock_epoch_id,
+                                emergency_baseline=emergency_baseline,
+                                drop_baseline=drop_baseline,
+                            ),
+                        )
         except Exception:
             server_context.session_store.clear_session_start_reservation(reservation)
             raise
@@ -2711,6 +2842,608 @@ def _start_first_crack_runtime(
 ) -> None:
     """Start first-crack runtime preparation for a newly created session."""
     server_context.first_crack_runtime.start_for_session(session)
+
+
+def _exact_normal_drop_capable(server_context: ServerContext) -> bool:
+    """Return whether this context is the closed manual-authority mock composition."""
+    return (
+        type(server_context.roaster_driver) is MockRoasterDriver
+        and server_context.config.roaster.driver == "mock"
+        and server_context.config.first_crack.event_authority == "manual"
+    )
+
+
+def _exact_normal_drop_result(
+    *,
+    identity: NormalDropIdentity,
+    outcome: ExactNormalDropOutcome,
+    reason: ExactNormalDropReason,
+    request_dispatch: Literal[
+        "not_invoked", "invoked_no_state_transition", "transitioned", "unknown"
+    ],
+    this_request: Literal["no_reservation", "reservation_owned"],
+    history: Literal["not_applicable", "saved", "unknown"],
+    fence: Literal["not_applicable", "released", "retained", "not_established"],
+    prior_transition: Literal["not_applicable", "not_established", "unknown"] = "not_applicable",
+    observer_failure: bool = False,
+    cleanup_failure: bool = False,
+) -> _ExactNormalDropSessionResult:
+    """Build one closed internal reply while echoing the caller's exact binding."""
+    return _ExactNormalDropSessionResult(
+        session_id=identity.session_id,
+        clock_epoch_id=identity.clock_epoch_id,
+        ownership_sequence=identity.ownership_sequence,
+        timing_evidence_sequence=identity.timing_evidence_sequence,
+        outcome=outcome,
+        reason=reason,
+        request_dispatch=request_dispatch,
+        this_request=this_request,
+        history=history,
+        fence=fence,
+        prior_transition=prior_transition,
+        observer_failure=observer_failure,
+        cleanup_failure=cleanup_failure,
+    )
+
+
+def _exact_normal_drop_settlement_result(
+    *,
+    identity: NormalDropIdentity,
+    settlement: object | None,
+    request_dispatch: Literal[
+        "not_invoked", "invoked_no_state_transition", "transitioned", "unknown"
+    ],
+    reason: ExactNormalDropReason = None,
+    observer_failure: bool = False,
+    cleanup_failure: bool = False,
+) -> _ExactNormalDropSessionResult:
+    """Map an owned exact-drop settlement without implying a physical result."""
+    if settlement is None:
+        return _exact_normal_drop_result(
+            identity=identity,
+            outcome="unknown",
+            reason="retain_unavailable",
+            request_dispatch=request_dispatch,
+            this_request="reservation_owned",
+            history="unknown",
+            fence="not_established",
+            observer_failure=observer_failure,
+            cleanup_failure=cleanup_failure,
+        )
+    if not isinstance(settlement, NormalDropSettlement):
+        return _exact_normal_drop_result(
+            identity=identity,
+            outcome="unknown",
+            reason=reason or "settlement_unavailable",
+            request_dispatch=request_dispatch,
+            this_request="reservation_owned",
+            history="unknown",
+            fence="not_established",
+            observer_failure=observer_failure,
+            cleanup_failure=cleanup_failure,
+        )
+    if settlement.outcome == "success":
+        return _exact_normal_drop_result(
+            identity=identity,
+            outcome="success",
+            reason=reason,
+            request_dispatch=request_dispatch,
+            this_request="reservation_owned",
+            history="saved",
+            fence="released",
+            observer_failure=observer_failure,
+            cleanup_failure=cleanup_failure,
+        )
+    if settlement.outcome == "cancelled":
+        return _exact_normal_drop_result(
+            identity=identity,
+            outcome="cancelled",
+            reason=reason or "emergency_since_session_baseline",
+            request_dispatch=request_dispatch,
+            this_request="reservation_owned",
+            history="not_applicable",
+            fence="released",
+            prior_transition="not_established",
+            observer_failure=observer_failure,
+            cleanup_failure=cleanup_failure,
+        )
+    return _exact_normal_drop_result(
+        identity=identity,
+        outcome="unknown",
+        reason="settlement_stale" if settlement.outcome == "stale" else reason,
+        request_dispatch=request_dispatch,
+        this_request="reservation_owned",
+        history="unknown",
+        fence="retained" if settlement.outcome == "unknown" else "not_established",
+        prior_transition="unknown" if settlement.outcome == "stale" else "not_applicable",
+        observer_failure=observer_failure,
+        cleanup_failure=cleanup_failure,
+    )
+
+
+def _exact_normal_drop_store_refusal_reason(rejection: object) -> ExactNormalDropReason:
+    """Map closed store refusals without exposing an open reason vocabulary."""
+    known_rejections: frozenset[ExactNormalDropReason] = frozenset(
+        {
+            "invalid_identity",
+            "unknown_session",
+            "not_latest_session",
+            "clock_epoch_mismatch",
+            "ownership_sequence_mismatch",
+            "session_purpose_not_eligible",
+            "session_faulted",
+            "session_not_active",
+            "timing_evidence_missing",
+            "timing_evidence_superseded",
+            "finalisation_in_progress",
+            "command_in_progress",
+            "phase_invalid",
+        }
+    )
+    if isinstance(rejection, str) and rejection in known_rejections:
+        return cast(ExactNormalDropReason, rejection)
+    return "store_refusal_unavailable"
+
+
+def _retain_exact_normal_drop_unknown(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    reservation: object,
+) -> NormalDropSettlement | None:
+    """Try once to retain an exact reservation without fabricating settlement."""
+    try:
+        return server_context.session_store.retain_normal_drop_unknown(
+            session, reservation=reservation
+        )
+    except Exception:  # noqa: BLE001 - a failed fallback must not be retried.
+        return None
+
+
+class _ExactNormalDropReservationGuard:
+    """Retain one unsettled exact Drop reservation at most once."""
+
+    def __init__(
+        self,
+        server_context: ServerContext,
+        *,
+        session: RoastSession,
+        reservation: object,
+    ) -> None:
+        self._server_context = server_context
+        self._session = session
+        self._reservation = reservation
+        self._retention_attempted = False
+
+    def retain_once(self) -> NormalDropSettlement | None:
+        """Attempt the sole best-effort uncertainty retention for this request."""
+        if self._retention_attempted:
+            return None
+        self._retention_attempted = True
+        return _retain_exact_normal_drop_unknown(
+            self._server_context,
+            session=self._session,
+            reservation=self._reservation,
+        )
+
+
+def _freeze_exact_normal_drop_observation(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    ticket: object | None,
+    reason: str,
+) -> bool:
+    """Freeze a returned observation ticket and report whether freezing failed."""
+    try:
+        _freeze_drop_observation_boundary(
+            server_context,
+            session=session,
+            ticket=ticket,
+            reason=reason,
+        )
+    except Exception:  # noqa: BLE001 - the store outcome remains authoritative.
+        return True
+    return False
+
+
+def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
+    server_context: ServerContext,
+    *,
+    session_id: str,
+    clock_epoch_id: str,
+    ownership_sequence: int,
+    timing_evidence_sequence: int,
+) -> _ExactNormalDropSessionResult:
+    """Execute one unregistered, exact, manual-authority mock normal Drop.
+
+    The session-start baseline and the store reservation deliberately fence this
+    producer without changing the existing MCP Drop or emergency routes.
+    """
+    identity = NormalDropIdentity(
+        session_id=session_id,
+        clock_epoch_id=clock_epoch_id,
+        ownership_sequence=ownership_sequence,
+        timing_evidence_sequence=timing_evidence_sequence,
+    )
+    if not _exact_normal_drop_capable(server_context):
+        return _exact_normal_drop_result(
+            identity=identity,
+            outcome="refused_capability",
+            reason="manual_mock_normal_drop_required",
+            request_dispatch="not_invoked",
+            this_request="no_reservation",
+            history="not_applicable",
+            fence="not_applicable",
+        )
+
+    driver = cast(MockRoasterDriver, server_context.roaster_driver)
+    assert type(driver) is MockRoasterDriver
+    session: RoastSession | None = None
+    reservation = None
+    baseline: _ExactNormalDropBaseline | None = None
+    with server_context.lifecycle_barrier:
+        baseline = server_context.exact_normal_drop_baseline
+        if (
+            baseline is None
+            or baseline.session_id != identity.session_id
+            or baseline.driver_ref is not driver
+            or baseline.clock_epoch_id != identity.clock_epoch_id
+        ):
+            return _exact_normal_drop_result(
+                identity=identity,
+                outcome="refused_state",
+                reason="exact_baseline_unavailable",
+                request_dispatch="not_invoked",
+                this_request="no_reservation",
+                history="not_applicable",
+                fence="not_applicable",
+            )
+        try:
+            latest_snapshot = server_context.session_store.get_session_snapshot()
+            session = server_context.session_store.get_latest_session()
+        except Exception:  # noqa: BLE001 - unavailable first-crack state cannot admit Drop.
+            return _exact_normal_drop_result(
+                identity=identity,
+                outcome="refused_precondition",
+                reason="human_first_crack_unavailable",
+                request_dispatch="not_invoked",
+                this_request="no_reservation",
+                history="not_applicable",
+                fence="not_applicable",
+            )
+        if session is None:
+            return _exact_normal_drop_result(
+                identity=identity,
+                outcome="refused_state",
+                reason="exact_live_owner_unavailable",
+                request_dispatch="not_invoked",
+                this_request="no_reservation",
+                history="not_applicable",
+                fence="not_applicable",
+            )
+        if session.id == identity.session_id:
+            if latest_snapshot.id != identity.session_id:
+                return _exact_normal_drop_result(
+                    identity=identity,
+                    outcome="refused_precondition",
+                    reason="human_first_crack_unavailable",
+                    request_dispatch="not_invoked",
+                    this_request="no_reservation",
+                    history="not_applicable",
+                    fence="not_applicable",
+                )
+            human_first_crack = latest_snapshot.first_crack_source == "manual_mark" and any(
+                event.kind == "first_crack_detected" for event in latest_snapshot.event_timeline
+            )
+            if not human_first_crack:
+                return _exact_normal_drop_result(
+                    identity=identity,
+                    outcome="refused_precondition",
+                    reason="human_first_crack_missing",
+                    request_dispatch="not_invoked",
+                    this_request="no_reservation",
+                    history="not_applicable",
+                    fence="not_applicable",
+                )
+        admission = server_context.session_store.admit_normal_drop(identity)
+        if admission.outcome == "dispatch" and admission.reservation is None:
+            return _exact_normal_drop_result(
+                identity=identity,
+                outcome="refused_state",
+                reason="dispatch_reservation_unavailable",
+                request_dispatch="not_invoked",
+                this_request="no_reservation",
+                history="not_applicable",
+                fence="not_applicable",
+            )
+        if admission.outcome != "dispatch":
+            if admission.outcome == "recorded":
+                return _exact_normal_drop_result(
+                    identity=identity,
+                    outcome="already_dropped",
+                    reason="endpoint_origin_not_established",
+                    request_dispatch="not_invoked",
+                    this_request="no_reservation",
+                    history="not_applicable",
+                    fence="not_applicable",
+                )
+            if admission.outcome == "in_progress":
+                return _exact_normal_drop_result(
+                    identity=identity,
+                    outcome="in_progress",
+                    reason="normal_drop_in_progress",
+                    request_dispatch="not_invoked",
+                    this_request="no_reservation",
+                    history="not_applicable",
+                    fence="not_applicable",
+                )
+            if admission.outcome == "ambiguous":
+                return _exact_normal_drop_result(
+                    identity=identity,
+                    outcome="ambiguous",
+                    reason="normal_drop_unresolved",
+                    request_dispatch="not_invoked",
+                    this_request="no_reservation",
+                    history="unknown",
+                    fence="retained",
+                    prior_transition="unknown",
+                )
+            return _exact_normal_drop_result(
+                identity=identity,
+                outcome=admission.outcome,
+                reason=_exact_normal_drop_store_refusal_reason(admission.rejection),
+                request_dispatch="not_invoked",
+                this_request="no_reservation",
+                history="not_applicable",
+                fence="not_applicable",
+            )
+        if admission.reservation is None:
+            return _exact_normal_drop_result(
+                identity=identity,
+                outcome="refused_state",
+                reason="dispatch_reservation_unavailable",
+                request_dispatch="not_invoked",
+                this_request="no_reservation",
+                history="not_applicable",
+                fence="not_applicable",
+            )
+        reservation = admission.reservation
+
+    assert session is not None
+    ownership = _ExactNormalDropReservationGuard(
+        server_context, session=session, reservation=reservation
+    )
+    try:
+        arbitration = ExactDropArbitration(
+            operation_id=reservation.token,
+            session_id=reservation.identity.session_id,
+            cancelled=Event(),
+            expected_drop_transition_count=baseline.drop_baseline,
+            expected_emergency_count=baseline.emergency_baseline,
+        )
+    except Exception:
+        settlement = ownership.retain_once()
+        return _exact_normal_drop_settlement_result(
+            identity=identity,
+            settlement=settlement,
+            request_dispatch="not_invoked",
+            reason="arbitration_unavailable",
+        )
+    except BaseException:
+        with suppress(BaseException):
+            ownership.retain_once()
+        raise
+
+    try:
+        driver_state = cast(object, driver.drop_beans(exact_drop=arbitration))
+    except ExactDropCancelled as error:
+        if error.discriminator in {"emergency_count_changed", "emergency_cancelled"}:
+            try:
+                proof = NormalDropNonDispatchProof(reservation=reservation, zero_actuation=True)
+                settlement = server_context.session_store.settle_normal_drop_cancelled(
+                    session, reservation=reservation, proof=proof
+                )
+            except Exception:
+                settlement = ownership.retain_once()
+            except BaseException:
+                with suppress(BaseException):
+                    ownership.retain_once()
+                raise
+            return _exact_normal_drop_settlement_result(
+                identity=identity,
+                settlement=settlement,
+                request_dispatch="invoked_no_state_transition",
+                reason="emergency_since_session_baseline",
+            )
+        settlement = ownership.retain_once()
+        return _exact_normal_drop_settlement_result(
+            identity=identity,
+            settlement=settlement,
+            request_dispatch="invoked_no_state_transition",
+            reason="prior_drop_transition_unaccounted",
+        )
+    except Exception:
+        settlement = ownership.retain_once()
+        return _exact_normal_drop_settlement_result(
+            identity=identity,
+            settlement=settlement,
+            request_dispatch="unknown",
+            reason="driver_result_unavailable",
+        )
+    except BaseException:
+        with suppress(BaseException):
+            ownership.retain_once()
+        raise
+
+    try:
+        valid_projection = isinstance(
+            driver_state, RoasterState
+        ) and _is_valid_mock_drop_projection(
+            heat_level_percent=driver_state.heat_level_percent,
+            fan_level_percent=driver_state.fan_level_percent,
+            cooling_on=driver_state.cooling_on,
+        )
+    except BaseException:
+        with suppress(BaseException):
+            ownership.retain_once()
+        raise
+    if not valid_projection:
+        settlement = ownership.retain_once()
+        return _exact_normal_drop_settlement_result(
+            identity=identity,
+            settlement=settlement,
+            request_dispatch="unknown",
+            reason="driver_result_invalid",
+        )
+    assert isinstance(driver_state, RoasterState)
+
+    observation_ticket: object | None = None
+    try:
+        observation_ticket = _begin_drop_observation_boundary(server_context, session=session)
+    except Exception:
+        settlement = ownership.retain_once()
+        return _exact_normal_drop_settlement_result(
+            identity=identity,
+            settlement=settlement,
+            request_dispatch="transitioned",
+            reason="observation_boundary_unavailable",
+            observer_failure=True,
+        )
+    except BaseException:
+        with suppress(BaseException):
+            ownership.retain_once()
+        raise
+
+    try:
+        settlement = cast(
+            object,
+            server_context.session_store.complete_normal_drop_success(
+                session,
+                reservation=reservation,
+                heat_level_percent=driver_state.heat_level_percent,
+                fan_level_percent=driver_state.fan_level_percent,
+                cooling_on=driver_state.cooling_on,
+            ),
+        )
+    except Exception:
+        settlement = ownership.retain_once()
+        freeze_failed = _freeze_exact_normal_drop_observation(
+            server_context,
+            session=session,
+            ticket=observation_ticket,
+            reason="exact_drop_settlement_unresolved",
+        )
+        return _exact_normal_drop_settlement_result(
+            identity=identity,
+            settlement=settlement,
+            request_dispatch="transitioned",
+            reason="observation_freeze_failed" if freeze_failed else "settlement_unavailable",
+            observer_failure=freeze_failed,
+        )
+    except BaseException:
+        with suppress(BaseException):
+            ownership.retain_once()
+        with suppress(BaseException):
+            _freeze_exact_normal_drop_observation(
+                server_context,
+                session=session,
+                ticket=observation_ticket,
+                reason="exact_drop_settlement_unresolved",
+            )
+        raise
+
+    if (
+        not isinstance(settlement, NormalDropSettlement)
+        or settlement.outcome not in {"success", "unknown", "stale"}
+        or (
+            settlement.outcome == "success"
+            and (settlement.event is None or settlement.snapshot is None)
+        )
+    ):
+        settlement = ownership.retain_once()
+        freeze_failed = _freeze_exact_normal_drop_observation(
+            server_context,
+            session=session,
+            ticket=observation_ticket,
+            reason="exact_drop_settlement_unresolved",
+        )
+        return _exact_normal_drop_settlement_result(
+            identity=identity,
+            settlement=settlement,
+            request_dispatch="transitioned",
+            reason="observation_freeze_failed" if freeze_failed else "settlement_unavailable",
+            observer_failure=freeze_failed,
+        )
+
+    if settlement.outcome != "success":
+        freeze_failed = _freeze_exact_normal_drop_observation(
+            server_context,
+            session=session,
+            ticket=observation_ticket,
+            reason="exact_drop_settlement_unresolved",
+        )
+        return _exact_normal_drop_settlement_result(
+            identity=identity,
+            settlement=settlement,
+            request_dispatch="transitioned",
+            reason="observation_freeze_failed" if freeze_failed else None,
+            observer_failure=freeze_failed,
+        )
+
+    validated_settlement = settlement
+    observer_failure = False
+    freeze_failure = False
+    cleanup_failure = False
+    try:
+        _resolve_drop_observation_boundary(
+            server_context,
+            session=session,
+            ticket=observation_ticket,
+            event=cast(RoastEvent, validated_settlement.event),
+        )
+    except Exception:
+        observer_failure = True
+        freeze_failure = _freeze_exact_normal_drop_observation(
+            server_context,
+            session=session,
+            ticket=observation_ticket,
+            reason="exact_drop_observation_resolution_failed",
+        )
+        observer_failure = freeze_failure or observer_failure
+    except BaseException:
+        with suppress(BaseException):
+            _freeze_exact_normal_drop_observation(
+                server_context,
+                session=session,
+                ticket=observation_ticket,
+                reason="exact_drop_observation_resolution_interrupted",
+            )
+        raise
+    try:
+        _stop_runtimes_after_drop(
+            server_context,
+            session=session,
+            snapshot=cast(RoastSession, validated_settlement.snapshot),
+        )
+    except Exception:
+        cleanup_failure = True
+    return _exact_normal_drop_settlement_result(
+        identity=identity,
+        settlement=validated_settlement,
+        request_dispatch="transitioned",
+        reason=(
+            "observation_freeze_failed"
+            if freeze_failure
+            else "observation_resolution_failed"
+            if observer_failure
+            else "post_drop_cleanup_failed"
+            if cleanup_failure
+            else None
+        ),
+        observer_failure=observer_failure,
+        cleanup_failure=cleanup_failure,
+    )
 
 
 def _read_capture_evidence(
