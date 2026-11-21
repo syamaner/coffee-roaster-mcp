@@ -371,6 +371,7 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
         assert tool_names == {
             "contain_heat_fixed_zero",
             "drop_beans",
+            "drop_beans_exact_session",
             "emergency_stop",
             "export_roast_log",
             "finalise_cold_characterisation_session",
@@ -407,6 +408,43 @@ async def _assert_stdio_server_tools(tmp_path: Path) -> None:
             },
             "required": ["expected_session_id", "containment_protocol"],
             "title": "_FixedZeroContainmentArguments",
+            "type": "object",
+        }
+        assert tool_schemas["drop_beans_exact_session"] == {
+            "additionalProperties": False,
+            "description": "Strict raw SDK-boundary arguments for exact mock-session Drop.",
+            "properties": {
+                "session_id": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "title": "Session Id",
+                    "type": "string",
+                },
+                "clock_epoch_id": {
+                    "pattern": "^[0-9a-f]{32}$",
+                    "title": "Clock Epoch Id",
+                    "type": "string",
+                },
+                "ownership_sequence": {
+                    "maximum": 9007199254740991,
+                    "minimum": 1,
+                    "title": "Ownership Sequence",
+                    "type": "integer",
+                },
+                "timing_evidence_sequence": {
+                    "maximum": 9007199254740991,
+                    "minimum": 1,
+                    "title": "Timing Evidence Sequence",
+                    "type": "integer",
+                },
+            },
+            "required": [
+                "session_id",
+                "clock_epoch_id",
+                "ownership_sequence",
+                "timing_evidence_sequence",
+            ],
+            "title": "_ExactNormalDropArguments",
             "type": "object",
         }
         assert tool_schemas["finalise_cold_characterisation_session"] == {

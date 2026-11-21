@@ -528,6 +528,19 @@ TimingEpochId = Annotated[str, Strict(), StringConstraints(pattern=_TIMING_EPOCH
 TimingExactInt = Annotated[int, Strict(), Field(ge=0, le=2**53 - 1)]
 TimingPositiveInt = Annotated[int, Strict(), Field(ge=1, le=2**53 - 1)]
 TimingFiniteFloat = Annotated[float, Strict(), Field(allow_inf_nan=False)]
+
+
+class _ExactNormalDropArguments(ArgModelBase):
+    """Strict raw SDK-boundary arguments for exact mock-session Drop."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    session_id: FixedZeroSessionId
+    clock_epoch_id: TimingEpochId
+    ownership_sequence: TimingPositiveInt
+    timing_evidence_sequence: TimingPositiveInt
+
+
 _EVENT_EVIDENCE_SCHEMA_CONDITIONALS: dict[str, Any] = {
     "allOf": [
         {
@@ -957,6 +970,31 @@ def _install_timing_evidence_argument_adapter(mcp: FastMCP) -> None:
     tool.parameters = _TimingEvidenceArguments.model_json_schema(by_alias=True)
 
 
+def _install_exact_normal_drop_argument_adapter(mcp: FastMCP) -> None:
+    """Bind strict raw argument validation to only the exact mock Drop tool."""
+    tool = mcp._tool_manager.get_tool("drop_beans_exact_session")  # pyright: ignore[reportPrivateUsage]
+    if tool is None:
+        raise RuntimeError("Exact mock Drop tool was not registered.")
+    existing_metadata = tool.fn_metadata
+    declared_metadata_fields = getattr(type(existing_metadata), "model_fields", None)
+    if (
+        not isinstance(declared_metadata_fields, Mapping)
+        or "arg_model" not in declared_metadata_fields
+    ):
+        raise RuntimeError("Exact mock Drop argument adapter is unsupported.")
+    try:
+        adapted_metadata = existing_metadata.model_copy(
+            update={"arg_model": _ExactNormalDropArguments}
+        )
+        binds_exact_drop_arguments = adapted_metadata.arg_model is _ExactNormalDropArguments
+    except Exception as exc:
+        raise RuntimeError("Exact mock Drop argument adapter is unsupported.") from exc
+    if not binds_exact_drop_arguments:
+        raise RuntimeError("Exact mock Drop argument adapter is unsupported.")
+    tool.fn_metadata = adapted_metadata
+    tool.parameters = _ExactNormalDropArguments.model_json_schema(by_alias=True)
+
+
 def _install_capture_evidence_argument_adapter(mcp: FastMCP) -> None:
     """Bind strict raw argument validation to the capture-evidence tool only."""
     tool = mcp._tool_manager.get_tool("get_capture_evidence")  # pyright: ignore[reportPrivateUsage]
@@ -1089,6 +1127,37 @@ class _ExactNormalDropSessionResult:
     physical_effect: Literal["not_established"] = "not_established"
     observer_failure: bool = False
     cleanup_failure: bool = False
+
+
+class ExactNormalDropResult(BaseModel):
+    """Closed public result for one exact mock-session Drop request."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    session_id: FixedZeroSessionId
+    clock_epoch_id: TimingEpochId
+    ownership_sequence: TimingPositiveInt
+    timing_evidence_sequence: TimingPositiveInt
+    outcome: ExactNormalDropOutcome
+    reason: ExactNormalDropReason
+    request_dispatch: Literal[
+        "not_invoked", "invoked_no_state_transition", "transitioned", "unknown"
+    ]
+    this_request: Literal["no_reservation", "reservation_owned"]
+    history: Literal["not_applicable", "saved", "unknown"]
+    fence: Literal["not_applicable", "released", "retained", "not_established"]
+    prior_transition: Literal["not_applicable", "not_established", "unaccounted", "unknown"]
+    retry: Literal["forbidden"]
+    physical_effect: Literal["not_established"]
+    observer_failure: StrictBool
+    cleanup_failure: StrictBool
+
+
+def _exact_normal_drop_public_result(
+    result: _ExactNormalDropSessionResult,
+) -> ExactNormalDropResult:
+    """Project the private producer reply onto the closed public wire result."""
+    return ExactNormalDropResult.model_validate(dataclasses.asdict(result))
 
 
 @dataclass(frozen=True)
@@ -1982,6 +2051,7 @@ def create_mcp_server(
                 "mark_beans_added",
                 "mark_first_crack",
                 "drop_beans",
+                "drop_beans_exact_session",
                 "start_cooling",
                 "stop_cooling",
                 "export_roast_log",
@@ -2254,6 +2324,24 @@ def create_mcp_server(
             ctx.request_context.lifespan_context,
             expected_session_id=expected_session_id,
         )
+
+    @mcp.tool()
+    def drop_beans_exact_session(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+        session_id: str,
+        clock_epoch_id: str,
+        ownership_sequence: int,
+        timing_evidence_sequence: int,
+    ) -> ExactNormalDropResult:
+        """Request one exact mock-only Drop for the supplied session binding."""
+        result = _run_normal_drop_exact_session(
+            ctx.request_context.lifespan_context,
+            session_id=session_id,
+            clock_epoch_id=clock_epoch_id,
+            ownership_sequence=ownership_sequence,
+            timing_evidence_sequence=timing_evidence_sequence,
+        )
+        return _exact_normal_drop_public_result(result)
 
     @mcp.tool()
     def set_fan(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -2699,6 +2787,7 @@ def create_mcp_server(
     _install_fixed_zero_argument_adapter(mcp)
     _install_capture_evidence_argument_adapter(mcp)
     _install_timing_evidence_argument_adapter(mcp)
+    _install_exact_normal_drop_argument_adapter(mcp)
     return mcp
 
 

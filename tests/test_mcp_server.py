@@ -9518,6 +9518,401 @@ def test_exact_normal_drop_private_producer_saves_one_mock_drop(
     assert [event.kind for event in snapshot.event_timeline].count("cooling_started") == 1
 
 
+def test_registered_exact_normal_drop_preserves_producer_order_and_public_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registered callback only projects the exact producer's settled result."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+    driver = context.roaster_driver
+    runtime = context.first_crack_runtime
+    assert type(driver) is MockRoasterDriver
+    assert isinstance(runtime, FakeFirstCrackRuntime)
+    order: list[str] = []
+    original_drop = driver.drop_beans
+    original_begin = runtime.begin_observation_boundary
+    original_complete = context.session_store.complete_normal_drop_success
+    original_resolve = runtime.resolve_observation_boundary
+    original_cleanup = mcp_server._stop_runtimes_after_drop  # pyright: ignore[reportPrivateUsage]
+
+    def record_drop(*, exact_drop: ExactDropArbitration | None = None) -> RoasterState:
+        order.append("driver")
+        return original_drop(exact_drop=exact_drop)
+
+    def record_begin(live_session: RoastSession, *, reason: str) -> object | None:
+        order.append("begin")
+        return original_begin(live_session, reason=reason)
+
+    def record_complete(
+        live_session: RoastSession,
+        *,
+        reservation: object,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> NormalDropSettlement:
+        order.append("complete")
+        return original_complete(
+            live_session,
+            reservation=reservation,
+            heat_level_percent=heat_level_percent,
+            fan_level_percent=fan_level_percent,
+            cooling_on=cooling_on,
+        )
+
+    def record_resolve(
+        live_session: RoastSession,
+        ticket: object | None,
+        *,
+        cutoff_monotonic_seconds: float,
+    ) -> None:
+        order.append("resolve")
+        original_resolve(
+            live_session,
+            ticket,
+            cutoff_monotonic_seconds=cutoff_monotonic_seconds,
+        )
+
+    def record_cleanup(
+        server_context: ServerContext, *, session: RoastSession, snapshot: RoastSession
+    ) -> None:
+        order.append("cleanup")
+        original_cleanup(server_context, session=session, snapshot=snapshot)
+
+    monkeypatch.setattr(driver, "drop_beans", record_drop)
+    monkeypatch.setattr(runtime, "begin_observation_boundary", record_begin)
+    monkeypatch.setattr(context.session_store, "complete_normal_drop_success", record_complete)
+    monkeypatch.setattr(runtime, "resolve_observation_boundary", record_resolve)
+    monkeypatch.setattr(mcp_server, "_stop_runtimes_after_drop", record_cleanup)
+
+    identity = context.session_store.normal_drop_identity(session)
+    result = _call_tool(
+        server,
+        "drop_beans_exact_session",
+        ctx,
+        session_id=identity.session_id,
+        clock_epoch_id=identity.clock_epoch_id,
+        ownership_sequence=identity.ownership_sequence,
+        timing_evidence_sequence=identity.timing_evidence_sequence,
+    )
+
+    assert isinstance(result, mcp_server.ExactNormalDropResult)
+    assert result.model_dump() == {
+        "session_id": identity.session_id,
+        "clock_epoch_id": identity.clock_epoch_id,
+        "ownership_sequence": identity.ownership_sequence,
+        "timing_evidence_sequence": identity.timing_evidence_sequence,
+        "outcome": "success",
+        "reason": None,
+        "request_dispatch": "transitioned",
+        "this_request": "reservation_owned",
+        "history": "saved",
+        "fence": "released",
+        "prior_transition": "not_applicable",
+        "retry": "forbidden",
+        "physical_effect": "not_established",
+        "observer_failure": False,
+        "cleanup_failure": False,
+    }
+    assert order == ["driver", "begin", "complete", "resolve", "cleanup"]
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert [event.kind for event in snapshot.event_timeline] == [
+        "beans_added",
+        "first_crack_detected",
+        "beans_dropped",
+        "cooling_started",
+    ]
+    assert driver.drop_transition_count == 1
+
+
+def test_exact_normal_drop_real_stdio_rejects_raw_inputs_before_mock_transition(
+    tmp_path: Path,
+) -> None:
+    """The actual SDK route is strict, then settles one exact mock Drop."""
+    asyncio.run(_assert_exact_normal_drop_stdio_boundary(tmp_path))
+
+
+def test_registered_exact_normal_drop_exposes_precondition_refusal(
+    tmp_path: Path,
+) -> None:
+    """The public callback preserves the producer's no-dispatch FC refusal."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    session.first_crack_source = None
+    identity = context.session_store.normal_drop_identity(session)
+
+    result = _call_tool(
+        server,
+        "drop_beans_exact_session",
+        ctx,
+        session_id=identity.session_id,
+        clock_epoch_id=identity.clock_epoch_id,
+        ownership_sequence=identity.ownership_sequence,
+        timing_evidence_sequence=identity.timing_evidence_sequence,
+    )
+
+    assert isinstance(result, mcp_server.ExactNormalDropResult)
+    assert (
+        result.session_id,
+        result.clock_epoch_id,
+        result.ownership_sequence,
+        result.timing_evidence_sequence,
+    ) == (
+        identity.session_id,
+        identity.clock_epoch_id,
+        identity.ownership_sequence,
+        identity.timing_evidence_sequence,
+    )
+    assert result.outcome == "refused_precondition"
+    assert result.reason == "human_first_crack_missing"
+    assert result.request_dispatch == "not_invoked"
+    assert result.this_request == "no_reservation"
+    assert result.history == "not_applicable"
+    assert result.fence == "not_applicable"
+    assert driver.drop_transition_count == 0
+
+
+async def _assert_exact_normal_drop_stdio_boundary(tmp_path: Path) -> None:
+    """Exercise one synthetic child using the candidate source and exact mock driver."""
+    config_path = tmp_path / "exact-drop.yaml"
+    config_path.write_text(
+        "\n".join(
+            (
+                "logging:",
+                f"  log_dir: {tmp_path / 'logs'}",
+                "first_crack:",
+                "  mode: audio",
+                "  event_authority: manual",
+                "  allow_manual_override: true",
+                "recording:",
+                "  enabled: true",
+                "  autocapture: true",
+            )
+        ),
+        encoding="utf-8",
+    )
+    imported_source = tmp_path / "imported-source.txt"
+    invocation_count = tmp_path / "mock-drop-invocations.txt"
+    child_path = tmp_path / "exact_drop_stdio_child.py"
+    child_path.write_text(
+        """
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import coffee_roaster_mcp.mcp_server as mcp_server
+from coffee_roaster_mcp.drivers import MockRoasterDriver
+from coffee_roaster_mcp.first_crack_runtime import FirstCrackRuntimeSnapshot
+
+
+config_path = Path(sys.argv[1])
+imported_source = Path(sys.argv[2])
+invocation_count = Path(sys.argv[3])
+imported_source.write_text(mcp_server.__file__, encoding="utf-8")
+invocation_count.write_text("0", encoding="utf-8")
+
+
+class FakeCaptureRuntime:
+    def __init__(self):
+        self.active_session_id = None
+
+    def set_capture_evidence_publisher(self, publisher):
+        del publisher
+
+    def snapshot(self):
+        return FirstCrackRuntimeSnapshot(
+            status="pending",
+            active_session_id=self.active_session_id,
+            active=self.active_session_id is not None,
+            reason=None,
+            audio_running=False,
+            queued_window_count=0,
+            emitted_window_count=0,
+            dropped_window_count=0,
+            processed_window_count=0,
+            mic_peak_dbfs=None,
+            mic_rms_dbfs=None,
+            overflow_count_last_minute=0,
+            estimated_lost_audio_ms_last_minute=0.0,
+            total_overflow_count=0,
+            max_consecutive_overflow_count=0,
+            last_inference_duration_ms=0.0,
+            max_inference_duration_ms=0.0,
+            inference_overrun_count=0,
+        )
+
+    def start_for_session(self, session):
+        self.active_session_id = session.id
+        return self.snapshot()
+
+    def process_available_windows(self, *, session_store, session):
+        del session_store, session
+        return self.snapshot()
+
+    def process_pending_windows_after_drop(self, *, session_store, session):
+        del session_store, session
+        return self.snapshot()
+
+    def begin_observation_boundary(self, session, *, reason):
+        del session, reason
+        return object()
+
+    def resolve_observation_boundary(self, session, ticket, *, cutoff_monotonic_seconds):
+        del session, ticket, cutoff_monotonic_seconds
+
+    def freeze_observation_boundary(self, session, ticket, *, reason):
+        del session, ticket, reason
+
+    def observation_for_session(self, session_id):
+        del session_id
+        return None
+
+    def notify_human_mark(self, session):
+        self.active_session_id = session.id
+        return self.snapshot()
+
+    def stop_for_session(self, session_id, *, reason):
+        del session_id, reason
+        self.active_session_id = None
+        return self.snapshot()
+
+    def shutdown(self):
+        return self.snapshot()
+
+
+driver = MockRoasterDriver()
+original_drop = driver.drop_beans
+
+
+def counted_drop(*, exact_drop=None):
+    count = int(invocation_count.read_text(encoding="utf-8")) + 1
+    invocation_count.write_text(str(count), encoding="utf-8")
+    return original_drop(exact_drop=exact_drop)
+
+
+driver.drop_beans = counted_drop
+mcp_server.create_roaster_driver = lambda *_args, **_kwargs: driver
+mcp_server.build_first_crack_session_runtime = lambda *_args, **_kwargs: FakeCaptureRuntime()
+mcp_server.create_mcp_server(config_path=config_path).run(transport="stdio")
+""".lstrip(),
+        encoding="utf-8",
+    )
+    root = Path(__file__).resolve().parents[1]
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=[str(child_path), str(config_path), str(imported_source), str(invocation_count)],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+    async with stdio_client(parameters) as (read, write), ClientSession(read, write) as client:
+        await _call_with_timeout(client.initialize())
+        started = cast(
+            Any,
+            await _call_with_timeout(
+                client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"})
+            ),
+        )
+        assert started.isError is False
+        session_id = started.structuredContent["session"]["session_id"]
+        marked_charge = cast(
+            Any, await _call_with_timeout(client.call_tool("mark_beans_added", {}))
+        )
+        marked_first_crack = cast(
+            Any, await _call_with_timeout(client.call_tool("mark_first_crack", {}))
+        )
+        assert marked_charge.isError is False and marked_first_crack.isError is False
+        timing = cast(
+            Any,
+            await _call_with_timeout(
+                client.call_tool(
+                    "get_timing_evidence",
+                    {"expected_session_id": session_id, "evidence_protocol": "timing_evidence/v1"},
+                )
+            ),
+        )
+        assert timing.isError is False
+        record = timing.structuredContent["record"]
+        assert record is not None
+        binding = {
+            "session_id": record["session_id"],
+            "clock_epoch_id": record["clock"]["epoch_id"],
+            "ownership_sequence": record["session_ownership_sequence"],
+            "timing_evidence_sequence": record["evidence_sequence"],
+        }
+        malformed: tuple[dict[str, object], ...] = (
+            {key: value for key, value in binding.items() if key != "session_id"},
+            {**binding, "session_id": None},
+            {**binding, "ownership_sequence": True},
+            {**binding, "ownership_sequence": 1.0},
+            {**binding, "timing_evidence_sequence": "1"},
+            {**binding, "additional": "rejected"},
+        )
+        for arguments in malformed:
+            reply = cast(
+                Any,
+                await _call_with_timeout(client.call_tool("drop_beans_exact_session", arguments)),
+            )
+            assert reply.isError is True
+            assert invocation_count.read_text(encoding="utf-8") == "0"
+
+        dropped = cast(
+            Any,
+            await _call_with_timeout(client.call_tool("drop_beans_exact_session", binding)),
+        )
+        assert dropped.isError is False
+        content = dropped.structuredContent
+        assert set(content) == {
+            "session_id",
+            "clock_epoch_id",
+            "ownership_sequence",
+            "timing_evidence_sequence",
+            "outcome",
+            "reason",
+            "request_dispatch",
+            "this_request",
+            "history",
+            "fence",
+            "prior_transition",
+            "retry",
+            "physical_effect",
+            "observer_failure",
+            "cleanup_failure",
+        }
+        assert {field: content[field] for field in binding} == binding
+        assert content["outcome"] == "success"
+        assert content["reason"] is None
+        assert content["request_dispatch"] == "transitioned"
+        assert content["history"] == "saved"
+        assert content["fence"] == "released"
+        assert content["retry"] == "forbidden"
+        assert content["physical_effect"] == "not_established"
+        assert type(content["session_id"]) is str
+        assert type(content["clock_epoch_id"]) is str
+        assert type(content["ownership_sequence"]) is int
+        assert type(content["timing_evidence_sequence"]) is int
+        assert type(content["observer_failure"]) is bool
+        assert type(content["cleanup_failure"]) is bool
+        assert invocation_count.read_text(encoding="utf-8") == "1"
+        current = cast(
+            Any,
+            await _call_with_timeout(
+                client.call_tool("get_roast_state", {"session_id": session_id})
+            ),
+        )
+        assert current.isError is False
+        assert [event["kind"] for event in current.structuredContent["events"]] == [
+            "beans_added",
+            "first_crack_detected",
+            "beans_dropped",
+            "cooling_started",
+        ]
+
+    assert imported_source.read_text(encoding="utf-8") == str(
+        root / "src" / "coffee_roaster_mcp" / "mcp_server.py"
+    )
+
+
 def test_exact_normal_drop_requires_manual_first_crack_before_store_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
