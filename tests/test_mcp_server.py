@@ -9419,7 +9419,9 @@ def test_exact_normal_drop_private_producer_saves_one_mock_drop(
     assert isinstance(runtime, FakeFirstCrackRuntime)
     calls: list[str] = []
     arbitration_seen: list[ExactDropArbitration] = []
+    admissions: list[NormalDropAdmission] = []
     original_drop = driver.drop_beans
+    original_admit = context.session_store.admit_normal_drop
     original_complete = context.session_store.complete_normal_drop_success
     original_begin = runtime.begin_observation_boundary
     original_resolve = runtime.resolve_observation_boundary
@@ -9430,6 +9432,11 @@ def test_exact_normal_drop_private_producer_saves_one_mock_drop(
         arbitration_seen.append(exact_drop)
         calls.append("driver")
         return original_drop(exact_drop=exact_drop)
+
+    def record_admission(identity: NormalDropIdentity) -> NormalDropAdmission:
+        admission = original_admit(identity)
+        admissions.append(admission)
+        return admission
 
     def record_begin(session: RoastSession, *, reason: str) -> object | None:
         calls.append("begin")
@@ -9472,6 +9479,7 @@ def test_exact_normal_drop_private_producer_saves_one_mock_drop(
         original_cleanup(server_context, session=session, snapshot=snapshot)
 
     monkeypatch.setattr(driver, "drop_beans", record_drop)
+    monkeypatch.setattr(context.session_store, "admit_normal_drop", record_admission)
     monkeypatch.setattr(runtime, "begin_observation_boundary", record_begin)
     monkeypatch.setattr(context.session_store, "complete_normal_drop_success", record_complete)
     monkeypatch.setattr(runtime, "resolve_observation_boundary", record_resolve)
@@ -9486,10 +9494,23 @@ def test_exact_normal_drop_private_producer_saves_one_mock_drop(
     assert result.fence == "released"
     assert result.retry == "forbidden"
     assert result.physical_effect == "not_established"
+    identity = context.session_store.normal_drop_identity(session)
+    assert (
+        result.session_id,
+        result.clock_epoch_id,
+        result.ownership_sequence,
+        result.timing_evidence_sequence,
+    ) == (
+        identity.session_id,
+        identity.clock_epoch_id,
+        identity.ownership_sequence,
+        identity.timing_evidence_sequence,
+    )
     assert driver.drop_transition_count == 1
     arbitration = arbitration_seen[0]
     assert arbitration.session_id == session.id
-    assert arbitration.operation_id != ""
+    assert admissions[0].reservation is not None
+    assert arbitration.operation_id == admissions[0].reservation.token
     assert arbitration.expected_emergency_count == 0
     assert arbitration.expected_drop_transition_count == 0
     assert calls == ["driver", "begin", "complete", "resolve", "cleanup"]
@@ -9521,6 +9542,32 @@ def test_exact_normal_drop_requires_manual_first_crack_before_store_admission(
         assert result.reason == "human_first_crack_missing"
         assert admissions == []
         assert driver.drop_transition_count == 0
+
+
+def test_exact_normal_drop_rejects_manual_source_without_canonical_first_crack_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A matching manual source without its canonical event cannot reach admission."""
+    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    driver = cast(MockRoasterDriver, context.roaster_driver)
+    admissions: list[object] = []
+
+    def record_admission(identity: object) -> object:
+        admissions.append(identity)
+        raise AssertionError("missing canonical first crack must precede admission")
+
+    session.first_crack_source = "manual_mark"
+    session.event_timeline = [
+        event for event in session.event_timeline if event.kind != "first_crack_detected"
+    ]
+    monkeypatch.setattr(context.session_store, "admit_normal_drop", record_admission)
+
+    result = _exact_normal_drop(context, session)
+
+    assert result.outcome == "refused_precondition"
+    assert result.reason == "human_first_crack_missing"
+    assert admissions == []
+    assert driver.drop_transition_count == 0
 
 
 def test_exact_normal_drop_rejects_automatic_authority_before_store_or_driver(
@@ -10031,6 +10078,7 @@ def test_exact_normal_drop_endpoint_append_interruption_freezes_without_cleanup(
     assert not exact_thread.is_alive() and not emergency_thread.is_alive()
     assert exact_results[0].history == "unknown"
     assert exact_results[0].fence == "retained"
+    assert exact_results[0].reason == "endpoint_history_unresolved"
     assert observation_tickets[0] is not None
     assert observation_tickets[0] in freezes
     assert cleanup_calls == []
@@ -10074,6 +10122,7 @@ def test_exact_normal_drop_retains_unknown_after_prior_unaccounted_transition(
     assert result.outcome == "unknown"
     assert result.reason == "prior_drop_transition_unaccounted"
     assert result.fence == "retained"
+    assert result.prior_transition == "unaccounted"
     assert repeated.outcome == "ambiguous"
     assert repeated.reason == "normal_drop_unresolved"
     assert repeated.request_dispatch == "not_invoked"
@@ -10101,7 +10150,7 @@ def test_exact_normal_drop_stale_cancellation_does_not_claim_a_released_fence(
     assert result.request_dispatch == "invoked_no_state_transition"
     assert result.reason == "settlement_stale"
     assert result.fence == "not_established"
-    assert result.prior_transition == "unknown"
+    assert result.prior_transition == "not_established"
     assert driver.drop_transition_count == 0
 
 
@@ -10166,7 +10215,9 @@ def test_exact_normal_drop_stale_settlement_never_claims_a_fence_in_either_prior
     assert result.request_dispatch == "invoked_no_state_transition"
     assert result.reason == "settlement_stale"
     assert result.fence == "not_established"
-    assert result.prior_transition == "unknown"
+    assert result.prior_transition == (
+        "not_established" if prior_state == "emergency" else "unaccounted"
+    )
 
 
 def test_exact_normal_drop_retains_unknown_when_the_mock_driver_raises(
@@ -10308,6 +10359,79 @@ def test_exact_normal_drop_retains_before_reraising_arbitration_construction_int
     snapshot = context.session_store.get_session_snapshot()
     event_kinds = [event.kind for event in snapshot.event_timeline]
     assert event_kinds.count("fault") == 1
+
+
+def test_exact_normal_drop_outer_ownership_boundary_settles_after_admission_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leaving admission after ownership cannot strand the next explicit emergency."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+    driver = cast(MockRoasterDriver, context.roaster_driver)
+    original_barrier = context.lifecycle_barrier
+    original_retain = context.session_store.retain_normal_drop_unknown
+    retain_calls = 0
+
+    class InterruptAfterAdmissionBarrier:
+        """Raise only after the real admission barrier has released."""
+
+        def __enter__(self) -> InterruptAfterAdmissionBarrier:
+            original_barrier.__enter__()
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> bool:
+            original_barrier.__exit__(exc_type, exc_value, traceback)
+            raise KeyboardInterrupt()
+
+    def count_retain(current: RoastSession, *, reservation: object) -> NormalDropSettlement:
+        nonlocal retain_calls
+        retain_calls += 1
+        return original_retain(current, reservation=reservation)
+
+    object.__setattr__(context, "lifecycle_barrier", InterruptAfterAdmissionBarrier())
+    monkeypatch.setattr(context.session_store, "retain_normal_drop_unknown", count_retain)
+
+    with pytest.raises(KeyboardInterrupt):
+        _exact_normal_drop(context, session)
+
+    object.__setattr__(context, "lifecycle_barrier", original_barrier)
+    assert retain_calls == 1
+    assert driver.drop_transition_count == 0
+    assert not context.session_store.has_pending_normal_drop_persistence(session)
+    assert _exact_normal_drop(context, session).outcome == "ambiguous"
+    assert driver.drop_transition_count == 0
+    emergency = _call_tool(server, "emergency_stop", ctx, reason="after-admission-interrupt")
+    assert emergency.event.kind == "fault"
+
+
+def test_exact_normal_drop_does_not_repeat_an_interrupted_retention_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The outer boundary never retries a retention whose first attempt interrupted."""
+    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    driver = cast(MockRoasterDriver, context.roaster_driver)
+    retain_calls = 0
+
+    def fail_drop(*, exact_drop: object = None) -> RoasterState:
+        del exact_drop
+        raise RuntimeError("synthetic driver failure")
+
+    def interrupt_retain(*_args: object, **_kwargs: object) -> NormalDropSettlement:
+        nonlocal retain_calls
+        retain_calls += 1
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(driver, "drop_beans", fail_drop)
+    monkeypatch.setattr(context.session_store, "retain_normal_drop_unknown", interrupt_retain)
+
+    with pytest.raises(KeyboardInterrupt):
+        _exact_normal_drop(context, session)
+
+    assert retain_calls == 1
 
 
 @pytest.mark.parametrize(
