@@ -9288,6 +9288,13 @@ async def _manual_shadow_blocked_stdio(tmp_path: Path, stage: str) -> None:
     )
     async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
         await asyncio.wait_for(client.initialize(), 5)
+        tools = cast(Any, await asyncio.wait_for(client.list_tools(), 5))
+        mark_schema = next(
+            tool.inputSchema for tool in tools.tools if tool.name == "mark_first_crack"
+        )
+        assert mark_schema["type"] == "object"
+        assert mark_schema["properties"] == {}
+        assert mark_schema["additionalProperties"] is False
         readback = await asyncio.wait_for(client.call_tool("get_runtime_config", {}), 5)
         assert readback.structuredContent is not None
         authority = readback.structuredContent
@@ -9327,6 +9334,20 @@ async def _manual_shadow_blocked_stdio(tmp_path: Path, stage: str) -> None:
         assert state["first_crack_status"]["detected_monotonic_seconds"] is None
         if stage == "loader":
             assert state["first_crack_observation"]["identity"]["status"] == "pending"
+        for malformed_arguments in (
+            {"remaining_budget_ms": 0},
+            {"timing": {"remaining_budget_ms": 0}},
+            {"timing": None},
+            {"unrelated": True},
+        ):
+            malformed = await asyncio.wait_for(
+                client.call_tool("mark_first_crack", malformed_arguments), 5
+            )
+            assert malformed.isError
+            untouched = await asyncio.wait_for(client.call_tool("get_roast_state", {}), 5)
+            assert untouched.structuredContent is not None
+            assert untouched.structuredContent["phase"] == "roasting"
+            assert untouched.structuredContent["first_crack_at_utc"] is None
         marked = await asyncio.wait_for(client.call_tool("mark_first_crack", {}), 5)
         assert not marked.isError
         assert marked.structuredContent is not None
@@ -9337,6 +9358,9 @@ async def _manual_shadow_blocked_stdio(tmp_path: Path, stage: str) -> None:
         assert after.structuredContent is not None
         assert after.structuredContent["phase"] == "development"
         assert after.structuredContent["first_crack_at_utc"] == canonical_event["recorded_at_utc"]
+        assert [event["kind"] for event in after.structuredContent["events"]].count(
+            "first_crack_detected"
+        ) == 1
         assert (
             after.structuredContent["first_crack_monotonic_seconds"]
             == canonical_event["monotonic_seconds"]
