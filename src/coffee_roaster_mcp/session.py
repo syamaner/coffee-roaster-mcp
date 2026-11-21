@@ -1354,10 +1354,7 @@ class RoastSessionStore:
             if (
                 latest is not None
                 and latest.id == expected_session_id
-                and (
-                    self._normal_drop_in_flight is not None
-                    or latest.pending_driver_command_kind == "drop"
-                )
+                and self._normal_drop_in_flight is not None
             ):
                 return TimingEvidenceAdmission(
                     latest,
@@ -1381,7 +1378,7 @@ class RoastSessionStore:
                     session.id,
                     busy_rejection="finalisation_in_progress",
                 )
-            if self._normal_drop_in_flight is not None:
+            if session.pending_driver_command_kind == "drop":
                 return TimingEvidenceAdmission(
                     session,
                     session.capture_ownership_sequence,
@@ -1428,10 +1425,10 @@ class RoastSessionStore:
                 return TimingEvidenceAssembly("refused_busy", "drop_in_progress")
             if session.faulted_at_utc is not None or session.phase == "fault" or not session.active:
                 return TimingEvidenceAssembly("refused_identity", "session_changed_during_read")
-            if session.pending_driver_command_kind == "drop":
-                return TimingEvidenceAssembly("refused_busy", "drop_in_progress")
             if self._finalisation_blocks_mutation(session):
                 return TimingEvidenceAssembly("refused_busy", "finalisation_in_progress")
+            if session.pending_driver_command_kind == "drop":
+                return TimingEvidenceAssembly("refused_busy", "drop_in_progress")
 
             lo = t0 - session.monotonic_start
             hi = t1 - session.monotonic_start

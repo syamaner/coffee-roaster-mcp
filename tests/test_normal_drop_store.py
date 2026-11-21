@@ -94,6 +94,65 @@ def test_unresolved_drop_blocks_p1_timing_after_token_cancellation() -> None:
     assert (assembled.outcome, assembled.reason_code) == ("refused_busy", "drop_in_progress")
 
 
+def test_legacy_drop_preserves_timing_admission_identity_and_finalisation_precedence() -> None:
+    """A legacy Drop does not outrank P1 identity or finalisation refusal."""
+    store = RoastSessionStore()
+    session, _ = _ready_drop(store)
+
+    with store._lock:  # pyright: ignore[reportPrivateUsage]
+        session.pending_driver_command_kind = "drop"
+        session.phase = "fault"  # type: ignore[assignment]
+    faulted = store.admit_timing_evidence(session.id)
+    assert faulted.identity_rejection == "session_faulted"
+
+    with store._lock:  # pyright: ignore[reportPrivateUsage]
+        session.phase = "roasting"  # type: ignore[assignment]
+        store._nonterminal_finalisations.add(session.id)  # pyright: ignore[reportPrivateUsage]
+    finalising = store.admit_timing_evidence(session.id)
+    assert finalising.busy_rejection == "finalisation_in_progress"
+
+
+def test_legacy_drop_preserves_timing_assembly_identity_and_finalisation_precedence() -> None:
+    """A legacy Drop does not outrank P1 assembly identity or finalisation refusal."""
+    store = RoastSessionStore()
+    session, _ = _ready_drop(store)
+    admission = TimingEvidenceAdmission(
+        session,
+        session.capture_ownership_sequence,
+        session.id,
+    )
+
+    with store._lock:  # pyright: ignore[reportPrivateUsage]
+        session.pending_driver_command_kind = "drop"
+        session.phase = "fault"  # type: ignore[assignment]
+    faulted = store.assemble_timing_evidence(
+        admission,
+        t0=100.0,
+        t1=100.0,
+        channels={},
+        finalize=lambda record: record,
+    )
+    assert (faulted.outcome, faulted.reason_code) == (
+        "refused_identity",
+        "session_changed_during_read",
+    )
+
+    with store._lock:  # pyright: ignore[reportPrivateUsage]
+        session.phase = "roasting"  # type: ignore[assignment]
+        store._nonterminal_finalisations.add(session.id)  # pyright: ignore[reportPrivateUsage]
+    finalising = store.assemble_timing_evidence(
+        admission,
+        t0=100.0,
+        t1=100.0,
+        channels={},
+        finalize=lambda record: record,
+    )
+    assert (finalising.outcome, finalising.reason_code) == (
+        "refused_busy",
+        "finalisation_in_progress",
+    )
+
+
 def test_simultaneous_normal_drop_admission_has_one_owner() -> None:
     """Two real threads receive one reservation and one non-dispatch result."""
     store = RoastSessionStore()
