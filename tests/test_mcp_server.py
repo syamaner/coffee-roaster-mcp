@@ -10890,14 +10890,18 @@ def test_registered_hottop_start_rejects_revision_changed_after_write_receipt(
     setup_entered = Event()
     release_setup = Event()
     if mutation_point == "after_setup":
-        original_start = context.telemetry_sampler.start_for_session
+        original_start = context.telemetry_sampler._start_for_session  # pyright: ignore[reportPrivateUsage]
 
-        def hold_after_setup(session_id: str) -> None:
-            original_start(session_id)
+        def hold_after_setup(
+            session_id: str,
+            *,
+            receipt: mcp_server._TelemetrySamplerStartReceipt | None,  # pyright: ignore[reportPrivateUsage]
+        ) -> None:
+            original_start(session_id, receipt=receipt)
             setup_entered.set()
             assert release_setup.wait(timeout=1.0)
 
-        monkeypatch.setattr(context.telemetry_sampler, "start_for_session", hold_after_setup)
+        monkeypatch.setattr(context.telemetry_sampler, "_start_for_session", hold_after_setup)  # pyright: ignore[reportPrivateUsage]
     monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
     monkeypatch.setattr(
         mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
@@ -11276,14 +11280,18 @@ def test_registered_hottop_start_emergency_after_runtime_setup_reaps_started_wor
         port="fake-only", serial_factory=lambda *_args, **_kwargs: transport
     )
     object.__setattr__(context, "roaster_driver", driver)
-    original_start = context.telemetry_sampler.start_for_session
+    original_start = context.telemetry_sampler._start_for_session  # pyright: ignore[reportPrivateUsage]
 
-    def hold_before_sampler(session_id: str) -> None:
+    def hold_before_sampler(
+        session_id: str,
+        *,
+        receipt: mcp_server._TelemetrySamplerStartReceipt | None,  # pyright: ignore[reportPrivateUsage]
+    ) -> None:
         setup_entered.set()
         assert release_setup.wait(timeout=1.0)
-        original_start(session_id)
+        original_start(session_id, receipt=receipt)
 
-    monkeypatch.setattr(context.telemetry_sampler, "start_for_session", hold_before_sampler)
+    monkeypatch.setattr(context.telemetry_sampler, "_start_for_session", hold_before_sampler)  # pyright: ignore[reportPrivateUsage]
     monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
     monkeypatch.setattr(
         mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
@@ -11396,3 +11404,152 @@ def test_registered_hottop_start_sampler_tick_and_unknown_cold_refusals(
     assert next_refusal.rejection_reason == "session_not_active"
     assert len(transport.writes) == 1 and transport.close_count == 0
     uncertain.telemetry_sampler.stop_for_session(session.id, reason="test_cleanup")
+
+
+def test_registered_hottop_start_failure_does_not_stop_cold_refusal_sampler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-sampler Start failure cannot clean up a finalisation restart."""
+
+    class Transport(_ObservationFakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.write_entered = Event()
+            self.release_write = Event()
+
+        def write(self, data: bytes) -> int:
+            self.write_entered.set()
+            assert self.release_write.wait(timeout=4.0)
+            return len(data)
+
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    transport = Transport()
+    object.__setattr__(
+        context,
+        "roaster_driver",
+        HottopRoasterDriver(port="fake-only", serial_factory=lambda *_args, **_kwargs: transport),
+    )
+    errors: list[BaseException] = []
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+
+    def fail_first_crack_runtime(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("synthetic setup failure")
+
+    monkeypatch.setattr(mcp_server, "_start_first_crack_runtime", fail_first_crack_runtime)
+    worker = Thread(
+        target=_record_tool_error,
+        args=(errors, create_mcp_server(), "start_roast_session", _ctx(context)),
+        kwargs={"purpose": "cold_characterisation", "first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    try:
+        assert transport.write_entered.wait(timeout=4.0)
+        session = context.session_store.get_active_session()
+        assert session is not None
+        refusal = _finalise_cold_characterisation_session(context, session.id)
+        assert refusal.rejection_reason == "driver_not_connected"
+        assert context.telemetry_sampler.active_session_id == session.id
+    finally:
+        transport.release_write.set()
+        worker.join(timeout=4.0)
+    assert not worker.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    assert context.telemetry_sampler.active_session_id == session.id
+    context.telemetry_sampler.shutdown()
+
+
+def test_registered_hottop_start_partial_sampler_failure_keeps_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Start compensation can stop only its published sampler generation."""
+
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(context, "config", _manual_authority_config())
+    object.__setattr__(
+        context,
+        "roaster_driver",
+        HottopRoasterDriver(
+            port="fake-only",
+            serial_factory=lambda *_args, **_kwargs: _ObservationFakeSerialTransport(),
+        ),
+    )
+    entered = Event()
+    release_setup = Event()
+    errors: list[BaseException] = []
+    original_start = context.telemetry_sampler._start_for_session  # pyright: ignore[reportPrivateUsage]
+
+    def start_then_fail(
+        session_id: str,
+        *,
+        receipt: mcp_server._TelemetrySamplerStartReceipt | None,  # pyright: ignore[reportPrivateUsage]
+    ) -> None:
+        original_start(session_id, receipt=receipt)
+        if receipt is None:
+            return
+        entered.set()
+        assert release_setup.wait(timeout=4.0)
+        raise RuntimeError("synthetic partial sampler setup")
+
+    monkeypatch.setattr(context.telemetry_sampler, "_start_for_session", start_then_fail)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(mcp_server, "validate_first_crack_authority", _accept_manual_hottop_policy)
+    monkeypatch.setattr(
+        mcp_server, "_validate_composed_manual_first_crack_authority", _accept_manual_hottop_policy
+    )
+    worker = Thread(
+        target=_record_tool_error,
+        args=(errors, create_mcp_server(), "start_roast_session", _ctx(context)),
+        kwargs={"purpose": "cold_characterisation", "first_crack_observer_ack": "manual/v1"},
+    )
+    worker.start()
+    try:
+        assert entered.wait(timeout=4.0)
+        session_id = context.telemetry_sampler.active_session_id
+        assert session_id is not None
+        first_thread = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+        refusal = _finalise_cold_characterisation_session(context, session_id)
+        replacement = context.telemetry_sampler._thread  # pyright: ignore[reportPrivateUsage]
+        assert refusal.rejection_reason == "driver_not_connected"
+        assert replacement is not None and replacement is not first_thread
+        assert context.telemetry_sampler.active_session_id == session_id
+    finally:
+        release_setup.set()
+        worker.join(timeout=4.0)
+    assert not worker.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    assert context.telemetry_sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
+    assert context.telemetry_sampler.active_session_id == session_id
+    context.telemetry_sampler.shutdown()
+
+
+def test_telemetry_sampler_stale_worker_cannot_clear_replacement() -> None:
+    """A displaced worker returning false leaves its replacement authoritative."""
+    entered = Event()
+    release_first = Event()
+    replacement_started = Event()
+
+    def sample(_session_id: str) -> bool:
+        if not entered.is_set():
+            entered.set()
+            assert release_first.wait(timeout=4.0)
+            return False
+        replacement_started.set()
+        return True
+
+    sampler = _TelemetrySampler(interval_seconds=0.01, sample_callback=sample)
+    sampler.start_for_session("same-session")
+    assert entered.wait(timeout=1.0)
+    replacement_worker = Thread(target=lambda: sampler.start_for_session("same-session"))
+    replacement_worker.start()
+    assert replacement_started.wait(timeout=2.0)
+    replacement = sampler._thread  # pyright: ignore[reportPrivateUsage]
+    assert replacement is not None and replacement is not replacement_worker
+    release_first.set()
+    replacement_worker.join(timeout=1.0)
+    assert not replacement_worker.is_alive()
+    assert sampler._thread is replacement  # pyright: ignore[reportPrivateUsage]
+    assert sampler.active_session_id == "same-session"
+    sampler.shutdown()

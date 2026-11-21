@@ -1027,6 +1027,14 @@ class ServerContext:
 TelemetrySampleCallback = Callable[[str], bool]
 
 
+@dataclass
+class _TelemetrySamplerStartReceipt:
+    """Identify one sampler generation started by a caller."""
+
+    stop_event: Event | None = None
+    thread: Thread | None = None
+
+
 class _TelemetrySampler:
     """Poll driver telemetry for the currently owning roast session."""
 
@@ -1047,23 +1055,53 @@ class _TelemetrySampler:
 
     def start_for_session(self, session_id: str) -> None:
         """Start autonomous sampling for one session id."""
+        self._start_for_session(session_id, receipt=None)
+
+    def _start_for_session(
+        self, session_id: str, *, receipt: _TelemetrySamplerStartReceipt | None
+    ) -> None:
+        """Start sampling and bind an optional caller-local generation receipt."""
+        generation = receipt if receipt is not None else _TelemetrySamplerStartReceipt()
         thread: Thread | None
         with self._lock:
             thread = self._stop_locked()
         self._join_thread(thread)
 
         with self._lock:
-            self._stop_event = Event()
+            stop_event = Event()
             self._active_session_id = session_id
             self._thread_session_id = session_id
             self._last_error = None
-            self._thread = Thread(
+            worker = Thread(
                 target=self._run,
-                args=(session_id, self._stop_event),
+                args=(session_id, stop_event, generation),
                 name=f"roast-telemetry-sampler-{session_id}",
                 daemon=True,
             )
-            self._thread.start()
+            self._stop_event = stop_event
+            self._thread = worker
+            generation.stop_event = stop_event
+            generation.thread = worker
+            worker.start()
+
+    def stop_started_generation(
+        self, receipt: _TelemetrySamplerStartReceipt, *, reason: str
+    ) -> None:
+        """Stop only the sampler generation captured by one Start attempt."""
+        _ = reason
+        stop_event = receipt.stop_event
+        thread = receipt.thread
+        if stop_event is None or thread is None:
+            return
+        stop_event.set()
+        self._join_thread(thread)
+        if thread.is_alive():
+            return
+        with self._lock:
+            if self._thread is thread and self._stop_event is stop_event:
+                self._active_session_id = None
+                self._thread = None
+                self._thread_session_id = None
 
     def stop_for_session(self, session_id: str, *, reason: str) -> None:
         """Stop sampling if the supplied session currently owns the sampler."""
@@ -1114,23 +1152,31 @@ class _TelemetrySampler:
         with self._lock:
             return self._last_error
 
-    def _run(self, session_id: str, stop_event: Event) -> None:
+    def _run(
+        self,
+        session_id: str,
+        stop_event: Event,
+        receipt: _TelemetrySamplerStartReceipt,
+    ) -> None:
         while not stop_event.wait(self._interval_seconds):
             try:
                 keep_sampling = self._sample_callback(session_id)
             except Exception as exc:  # noqa: BLE001 - background worker must not escape.
                 with self._lock:
-                    if self._active_session_id == session_id:
+                    if self._owns_generation(stop_event, receipt):
                         self._last_error = f"{type(exc).__name__}: {exc}"
                 keep_sampling = False
             if not keep_sampling:
                 with self._lock:
-                    if self._active_session_id == session_id:
+                    if self._owns_generation(stop_event, receipt):
                         self._active_session_id = None
-                    if self._thread_session_id == session_id:
                         self._thread = None
                         self._thread_session_id = None
                 return
+
+    def _owns_generation(self, stop_event: Event, receipt: _TelemetrySamplerStartReceipt) -> bool:
+        """Return whether the calling worker is still the current generation."""
+        return self._stop_event is stop_event and self._thread is receipt.thread
 
     def _stop_locked(self) -> Thread | None:
         thread = self._thread
@@ -2023,9 +2069,10 @@ def create_mcp_server(
                     server_context.session_store.assert_staged_start_claimable(published_session)
                     if not driver.asserted_written_start(owner, published_session):
                         raise SessionLifecycleError("Staged Hottop first-write ownership changed.")
+                sampler_receipt = _TelemetrySamplerStartReceipt()
                 started: tuple[Callable[[], object], ...] = (
-                    lambda: server_context.telemetry_sampler.stop_for_session(
-                        published_session.id, reason="staged start failed"
+                    lambda: server_context.telemetry_sampler.stop_started_generation(
+                        sampler_receipt, reason="staged start failed"
                     ),
                     lambda: server_context.ambient_runtime.stop_for_session(
                         published_session.id, reason="staged start failed"
@@ -2037,7 +2084,9 @@ def create_mcp_server(
                 try:
                     _start_first_crack_runtime(server_context, session=runtime_session)
                     server_context.ambient_runtime.start_for_session(runtime_session)
-                    server_context.telemetry_sampler.start_for_session(published_session.id)
+                    server_context.telemetry_sampler._start_for_session(  # pyright: ignore[reportPrivateUsage]
+                        published_session.id, receipt=sampler_receipt
+                    )
                     with server_context.lifecycle_barrier:
                         session = server_context.session_store.snapshot_staged_start_claimable(
                             published_session
