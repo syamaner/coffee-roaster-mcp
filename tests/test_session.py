@@ -103,6 +103,28 @@ def test_start_session_creates_active_roast_session() -> None:
     assert store.get_latest_session() is session
 
 
+def test_read_snapshot_retains_store_owned_mock_drop_facts() -> None:
+    """A point-in-time snapshot retains private persistence facts by value."""
+    store = RoastSessionStore(session_id_factory=lambda: "snapshot-session")
+    session = store.start_session()
+    session.mock_log_torn = True
+    session.unpersisted_mock_drop_fault_count = 1
+    session.torn_start_cooling_attempted = True
+    session.unconfirmed_torn_start_cooling_attempted = True
+
+    snapshot = session_module._copy_session_for_read(session)  # pyright: ignore[reportPrivateUsage]
+    session.unpersisted_mock_drop_fault_count = 0
+
+    assert snapshot is not session
+    assert snapshot.id == session.id
+    assert snapshot.mock_log_torn is True
+    assert snapshot.unpersisted_mock_drop_fault_count == 1
+    assert snapshot.torn_start_cooling_attempted is True
+    assert snapshot.unconfirmed_torn_start_cooling_attempted is True
+    assert store.get_latest_session() is session
+    assert store.get_session_snapshot(session_id=snapshot.id).id == snapshot.id
+
+
 def test_start_session_rejects_second_active_session() -> None:
     clock = ClockHarness()
     store = RoastSessionStore(
@@ -509,6 +531,26 @@ def test_event_log_write_failure_does_not_commit_event(tmp_path: Path) -> None:
     assert session.event_timeline == []
     assert session.phase == "pre_roast"
     assert session.beans_added_at_utc is None
+
+
+def test_event_log_append_preserves_legacy_storage_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-P2 event append retains the original storage failure details."""
+    clock = ClockHarness()
+    store = RoastSessionStore(utc_now=clock.utc_now, monotonic_now=clock.monotonic_now)
+    session = store.start_session()
+
+    def fail_append(_session: RoastSession, _row: object) -> None:
+        raise OSError(28, "synthetic no space")
+
+    monkeypatch.setattr(session_module, "_append_jsonl_log_row", fail_append)
+
+    with pytest.raises(OSError) as raised:
+        store.record_event(session, "beans_added")
+
+    assert raised.value.errno == 28
+    assert str(raised.value) == "[Errno 28] synthetic no space"
 
 
 def test_telemetry_log_write_failure_does_not_advance_buffer(tmp_path: Path) -> None:

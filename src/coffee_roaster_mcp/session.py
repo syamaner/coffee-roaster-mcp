@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import stat
 from collections import deque
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import RLock
-from typing import Literal
+from threading import Event, RLock
+from typing import Literal, TypeVar
 from uuid import uuid4
 
 from coffee_roaster_mcp.controls import validate_control_percent
@@ -36,6 +38,7 @@ RoastEventKind = Literal[
     "fault",
 ]
 EventPayloadValue = str | int | float | bool | None
+_AppendTurnResult = TypeVar("_AppendTurnResult")
 SessionPurpose = Literal["roast", "cold_characterisation"]
 SessionPresence = Literal["none", "starting", "active", "stopped"]
 DriverCommandKind = Literal[
@@ -70,6 +73,30 @@ TimingEvidenceAssemblyReason = Literal[
     "out_of_order_read",
     "sequence_exhausted",
     "record_invalid",
+]
+NormalDropAdmissionOutcome = Literal[
+    "dispatch",
+    "recorded",
+    "in_progress",
+    "ambiguous",
+    "refused",
+]
+NormalDropSettlementOutcome = Literal["success", "cancelled", "unknown", "stale"]
+NormalDropFenceState = Literal["pending", "unknown"]
+NormalDropRejection = Literal[
+    "invalid_identity",
+    "unknown_session",
+    "not_latest_session",
+    "session_not_active",
+    "session_faulted",
+    "session_purpose_not_eligible",
+    "clock_epoch_mismatch",
+    "ownership_sequence_mismatch",
+    "timing_evidence_missing",
+    "timing_evidence_superseded",
+    "finalisation_in_progress",
+    "command_in_progress",
+    "phase_invalid",
 ]
 
 _SINGLETON_EVENT_KINDS: frozenset[RoastEventKind] = frozenset(
@@ -187,6 +214,123 @@ def _append_event_log_row(session: RoastSession, event: RoastEvent) -> None:
             "payload": dict(event.payload),
         },
     )
+
+
+class EventLogRecordingError(OSError):
+    """An event's validated append failed before its history could be recorded."""
+
+
+_APPEND_FAILURE_TAIL_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class _AppendFailureEvidence:
+    """Bounded pre-write evidence for one mock Drop-window log append."""
+
+    path: Path | None
+    identity: tuple[int, int, int, int, int] | None
+    complete_tail: bool
+
+
+def _capture_append_failure_evidence(session: RoastSession) -> _AppendFailureEvidence:
+    """Capture bounded pre-write evidence without reading roast-log history."""
+    if session.log_writer is None:
+        return _AppendFailureEvidence(path=None, identity=None, complete_tail=True)
+    path = session.log_writer.log_dir / "roast.jsonl"
+    try:
+        file_status = path.lstat()
+    except FileNotFoundError:
+        return _AppendFailureEvidence(path=path, identity=None, complete_tail=True)
+    except OSError:
+        return _AppendFailureEvidence(path=path, identity=None, complete_tail=False)
+    if not stat.S_ISREG(file_status.st_mode) or file_status.st_size < 0:
+        return _AppendFailureEvidence(path=path, identity=None, complete_tail=False)
+    identity = (
+        file_status.st_dev,
+        file_status.st_ino,
+        file_status.st_size,
+        file_status.st_mtime_ns,
+        file_status.st_ctime_ns,
+    )
+    tail_size = min(file_status.st_size, _APPEND_FAILURE_TAIL_BYTES)
+    open_flags = os.O_RDONLY | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, open_flags)
+    except OSError:
+        return _AppendFailureEvidence(path=path, identity=identity, complete_tail=False)
+    try:
+        opened_status = os.fstat(descriptor)
+        opened_identity = (
+            opened_status.st_dev,
+            opened_status.st_ino,
+            opened_status.st_size,
+            opened_status.st_mtime_ns,
+            opened_status.st_ctime_ns,
+        )
+        if not stat.S_ISREG(opened_status.st_mode) or opened_identity != identity:
+            return _AppendFailureEvidence(path=path, identity=identity, complete_tail=False)
+        os.lseek(descriptor, opened_status.st_size - tail_size, os.SEEK_SET)
+        tail = os.read(descriptor, tail_size)
+    except (OSError, ValueError):
+        return _AppendFailureEvidence(path=path, identity=identity, complete_tail=False)
+    finally:
+        os.close(descriptor)
+    if len(tail) != tail_size or (tail and not tail.endswith(b"\n")):
+        return _AppendFailureEvidence(path=path, identity=identity, complete_tail=False)
+    if opened_status.st_size == 0:
+        return _AppendFailureEvidence(path=path, identity=identity, complete_tail=True)
+    final_line_start = tail.rfind(b"\n", 0, len(tail) - 1) + 1
+    if final_line_start == 0 and file_status.st_size > tail_size:
+        return _AppendFailureEvidence(path=path, identity=identity, complete_tail=False)
+    final_line = tail[final_line_start:-1]
+    if not final_line:
+        return _AppendFailureEvidence(path=path, identity=identity, complete_tail=False)
+    try:
+        complete_tail = isinstance(json.loads(final_line), dict)
+    except Exception:  # noqa: BLE001 - malformed nested JSON must fail closed.
+        complete_tail = False
+    return _AppendFailureEvidence(path=path, identity=identity, complete_tail=complete_tail)
+
+
+def _append_failure_may_have_damaged_log(evidence: _AppendFailureEvidence) -> bool:
+    """Fail closed unless a failed append left known-clean pre-write bytes unchanged."""
+    if evidence.path is None:
+        return False
+    if not evidence.complete_tail:
+        return True
+    try:
+        file_status = evidence.path.lstat()
+    except FileNotFoundError:
+        return evidence.identity is not None
+    except OSError:
+        return True
+    if evidence.identity is None or not stat.S_ISREG(file_status.st_mode):
+        return True
+    identity = (
+        file_status.st_dev,
+        file_status.st_ino,
+        file_status.st_size,
+        file_status.st_mtime_ns,
+        file_status.st_ctime_ns,
+    )
+    return identity != evidence.identity
+
+
+def _append_event_log_row_with_failure_evidence(session: RoastSession, event: RoastEvent) -> None:
+    """Append one protected row and expose bounded evidence if its write raises."""
+    evidence = _capture_append_failure_evidence(session)
+    try:
+        _append_event_log_row(session, event)
+    except Exception as error:
+        if _append_failure_may_have_damaged_log(evidence):
+            raise _MockDropAppendMayBeTornError from error
+        raise
+
+
+class _MockDropAppendMayBeTornError(Exception):
+    """A protected mock Drop-window append failed after ambiguous file evidence."""
 
 
 def _telemetry_log_row_if_due(
@@ -335,6 +479,73 @@ class DriverEventReservation:
 
 
 @dataclass(frozen=True)
+class NormalDropIdentity:
+    """Exact store identity required to admit one normal bean-drop operation.
+
+    A session id is intentionally insufficient: the process clock epoch,
+    session ownership sequence, and timing-evidence sequence bind this value to
+    one live store-owned command context.
+    """
+
+    session_id: str
+    clock_epoch_id: str
+    ownership_sequence: int
+    timing_evidence_sequence: int
+
+
+@dataclass(frozen=True)
+class NormalDropReservation:
+    """Owned reservation and in-flight fence for one normal bean-drop command."""
+
+    identity: NormalDropIdentity
+    token: str
+
+
+@dataclass(frozen=True)
+class NormalDropNonDispatchProof:
+    """Positive mock-driver proof that one exact Drop did not actuate.
+
+    This is intentionally narrower than an emergency, a cleared ordinary
+    token, a timeout, or a driver exception.  The mock driver's atomic
+    emergency-before-actuation transition is the only producer of this proof;
+    it binds its zero-actuation observation to the exact store reservation.
+    The store validates that binding again before releasing admission.
+    """
+
+    reservation: NormalDropReservation
+    zero_actuation: Literal[True]
+
+
+@dataclass(frozen=True)
+class NormalDropAdmission:
+    """Closed store-side result of normal bean-drop admission."""
+
+    outcome: NormalDropAdmissionOutcome
+    reservation: NormalDropReservation | None = None
+    existing_event: RoastEvent | None = None
+    snapshot: RoastSession | None = None
+    rejection: NormalDropRejection | None = None
+
+
+@dataclass(frozen=True)
+class NormalDropSettlement:
+    """Closed store-side result of settling a normal bean-drop operation."""
+
+    outcome: NormalDropSettlementOutcome
+    event: RoastEvent | None = None
+    snapshot: RoastSession | None = None
+
+
+@dataclass(frozen=True)
+class MockDropPersistenceTicket:
+    """Private ordered append turn for the exact mock Drop persistence window."""
+
+    sequence: int
+    previous_completion: Event
+    completion: Event
+
+
+@dataclass(frozen=True)
 class RoastMetrics:
     """Timestamp-derived roast metrics for the current session snapshot.
 
@@ -464,6 +675,18 @@ class RoastSession:
     # Store only a deep-copyable opaque value here to keep the lifecycle store
     # independent of the server/tool module.
     finalisation: object | None = None
+    # Store-owned persistence facts travel with retained sessions so export
+    # cannot lose a damage fence when a successor session starts.
+    mock_log_torn: bool = field(default=False, kw_only=True, compare=False, repr=False)
+    unpersisted_mock_drop_fault_count: int = field(
+        default=0, kw_only=True, compare=False, repr=False
+    )
+    torn_start_cooling_attempted: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
+    unconfirmed_torn_start_cooling_attempted: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
 
     @property
     def active(self) -> bool:
@@ -900,6 +1123,21 @@ class RoastSessionStore:
         self._session_id_order: deque[str] = deque()
         self._pending_session_start_token: str | None = None
         self._session_start_in_flight_token: str | None = None
+        # Unlike an ordinary driver token, this fence survives an emergency
+        # cancellation until the exact operation is settled. It prevents a
+        # later call from treating a cleared token as evidence of non-dispatch.
+        self._normal_drop_in_flight: NormalDropReservation | None = None
+        # UNKNOWN is terminal for one retained reservation.  A later duplicate
+        # driver completion cannot reinterpret that operation as cancellation.
+        self._normal_drop_fence_state: NormalDropFenceState | None = None
+        self._normal_drop_persistence_next = 0
+        self._normal_drop_persistence_last_completion = Event()
+        self._normal_drop_persistence_last_completion.set()
+        self._normal_drop_persistence_drop_ticket: MockDropPersistenceTicket | None = None
+        self._normal_drop_persistence_drop_started = False
+        self._normal_drop_persistence_failed = False
+        self._normal_drop_persistence_torn = False
+        self._normal_drop_unpersisted_fault_count = 0
         self._fault_recovery_in_flight_tokens: dict[str, str] = {}
         self._fault_recovery_admission_blocks: set[str] = set()
         self._fault_drop_cooling_cycle_required: set[str] = set()
@@ -1032,6 +1270,7 @@ class RoastSessionStore:
         """
         with self._lock:
             self._assert_latest_active_session(session)
+            self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
             _append_telemetry_with_limit(
                 session,
                 sample,
@@ -1068,6 +1307,7 @@ class RoastSessionStore:
         with self._lock:
             self._assert_latest_active_session(session)
             self._assert_finalisation_allows_mutation(session)
+            self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
             sample = TelemetrySample(
                 recorded_at_utc=self._utc_now(),
                 monotonic_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
@@ -1113,6 +1353,11 @@ class RoastSessionStore:
             if self._latest_session is None or not self._latest_session.active:
                 return None
             if self._finalisation_blocks_mutation(self._latest_session):
+                return None
+            if (
+                self._normal_drop_persistence_torn
+                or not self._normal_drop_persistence_last_completion.is_set()
+            ):
                 return None
             if session_id is not None and self._latest_session.id != session_id:
                 return None
@@ -1261,6 +1506,18 @@ class RoastSessionStore:
     def admit_timing_evidence(self, expected_session_id: str) -> TimingEvidenceAdmission:
         """Revalidate an exact roast session without reserving or mutating it."""
         with self._lock:
+            latest = self._latest_session
+            if (
+                latest is not None
+                and latest.id == expected_session_id
+                and self._normal_drop_in_flight is not None
+            ):
+                return TimingEvidenceAdmission(
+                    latest,
+                    latest.capture_ownership_sequence,
+                    latest.id,
+                    busy_rejection="drop_in_progress",
+                )
             identity_rejection = self._timing_evidence_identity_rejection_locked(
                 expected_session_id
             )
@@ -1320,6 +1577,8 @@ class RoastSessionStore:
                 or session.id != admission.session_id
             ):
                 return TimingEvidenceAssembly("refused_identity", "session_changed_during_read")
+            if self._normal_drop_in_flight is not None:
+                return TimingEvidenceAssembly("refused_busy", "drop_in_progress")
             if session.faulted_at_utc is not None or session.phase == "fault" or not session.active:
                 return TimingEvidenceAssembly("refused_identity", "session_changed_during_read")
             if self._finalisation_blocks_mutation(session):
@@ -1506,6 +1765,8 @@ class RoastSessionStore:
         """Reserve a driver drop command or return the existing drop event."""
         with self._lock:
             self._assert_latest_active_session(session)
+            if self._normal_drop_in_flight is not None:
+                raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
             existing_event = self._get_existing_singleton_event(session, "beans_dropped")
             if existing_event is not None:
                 return DriverDropReservation(
@@ -1518,6 +1779,361 @@ class RoastSessionStore:
                 reservation=self._reserve_driver_command_locked(session, kind="drop")
             )
 
+    def normal_drop_identity(self, session: RoastSession) -> NormalDropIdentity:
+        """Return the current exact identity for an active latest roast session.
+
+        The identity is a store-produced value for a caller that has already
+        established its exact session context. It does not itself admit a
+        command, and it becomes stale when timing evidence advances.
+        """
+        with self._lock:
+            self._assert_latest_active_session(session)
+            return NormalDropIdentity(
+                session_id=session.id,
+                clock_epoch_id=self._clock_epoch_id,
+                ownership_sequence=session.capture_ownership_sequence,
+                timing_evidence_sequence=session.timing_evidence_sequence,
+            )
+
+    def admit_normal_drop(self, identity: object) -> NormalDropAdmission:
+        """Atomically admit one exact normal bean drop or return a closed result.
+
+        A recorded event wins over timing-evidence freshness so a truthful
+        idempotent retry never reaches dispatch. An unresolved P2 operation is
+        reported as ambiguous, including when its first endpoint event was
+        recorded before a later projection write failed.
+        """
+        with self._lock:
+            if not isinstance(identity, NormalDropIdentity):
+                return NormalDropAdmission("refused", rejection="invalid_identity")
+            rejection = self._normal_drop_exact_identity_rejection_locked(identity)
+            if rejection is not None:
+                return NormalDropAdmission("refused", rejection=rejection)
+            session = self._latest_session
+            assert session is not None
+
+            existing_event = self._get_existing_singleton_event(session, "beans_dropped")
+            if self._normal_drop_in_flight is not None:
+                return NormalDropAdmission(
+                    self._normal_drop_admission_outcome_for_in_flight_locked(session),
+                    existing_event=existing_event,
+                    snapshot=_copy_session_for_read(session),
+                )
+            rejection = self._normal_drop_lifecycle_rejection_locked(session)
+            if rejection is not None:
+                return NormalDropAdmission("refused", rejection=rejection)
+            if existing_event is not None:
+                return NormalDropAdmission(
+                    "recorded",
+                    existing_event=existing_event,
+                    snapshot=_copy_session_for_read(session),
+                )
+            evidence_rejection = self._normal_drop_evidence_rejection_locked(session, identity)
+            if evidence_rejection is not None:
+                return NormalDropAdmission("refused", rejection=evidence_rejection)
+            if self._finalisation_blocks_mutation(session):
+                return NormalDropAdmission("refused", rejection="finalisation_in_progress")
+            if session.pending_driver_command_token is not None:
+                return NormalDropAdmission("refused", rejection="command_in_progress")
+            try:
+                _validate_event_transition(session, "beans_dropped")
+            except SessionLifecycleError:
+                return NormalDropAdmission("refused", rejection="phase_invalid")
+
+            reservation = NormalDropReservation(identity=identity, token=_generate_session_id())
+            session.pending_driver_command_token = reservation.token
+            session.pending_driver_command_kind = "drop"
+            self._normal_drop_in_flight = reservation
+            self._normal_drop_fence_state = "pending"
+            self._normal_drop_persistence_next = 0
+            self._normal_drop_persistence_last_completion = Event()
+            self._normal_drop_persistence_last_completion.set()
+            self._normal_drop_persistence_drop_ticket = self._reserve_mock_drop_ticket_locked()
+            self._normal_drop_persistence_drop_started = False
+            self._normal_drop_persistence_failed = False
+            self._normal_drop_persistence_torn = False
+            self._normal_drop_unpersisted_fault_count = 0
+            return NormalDropAdmission("dispatch", reservation=reservation)
+
+    def settle_normal_drop_cancelled(
+        self,
+        session: RoastSession,
+        *,
+        reservation: object,
+        proof: object,
+    ) -> NormalDropSettlement:
+        """Release one exact operation only with positive zero-actuation proof.
+
+        An emergency may already have cleared the ordinary command token and
+        faulted the session.  Neither fact is proof of non-dispatch, so this
+        settlement accepts only the matching atomic mock-driver proof while
+        the retained operation is still pending.
+        """
+        with self._lock:
+            if not isinstance(reservation, NormalDropReservation):
+                return NormalDropSettlement("stale")
+            if (
+                not isinstance(proof, NormalDropNonDispatchProof)
+                or proof.zero_actuation is not True
+                or proof.reservation != reservation
+            ):
+                return NormalDropSettlement("stale")
+            if not self._normal_drop_reservation_matches_locked(session, reservation):
+                return NormalDropSettlement("stale")
+            if self._normal_drop_fence_state != "pending":
+                return NormalDropSettlement("stale")
+            self._discharge_unused_mock_drop_turn_locked(session, reservation)
+            self._clear_normal_drop_token_locked(session, reservation)
+            self._normal_drop_in_flight = None
+            self._normal_drop_fence_state = None
+            return NormalDropSettlement("cancelled", snapshot=_copy_session_for_read(session))
+
+    def retain_normal_drop_unknown(
+        self,
+        session: RoastSession,
+        *,
+        reservation: object,
+    ) -> NormalDropSettlement:
+        """Retain the exact drop fence after driver or projection uncertainty."""
+        with self._lock:
+            if not isinstance(reservation, NormalDropReservation):
+                return NormalDropSettlement("stale")
+            if not self._normal_drop_reservation_matches_locked(session, reservation):
+                return NormalDropSettlement("stale")
+            self._discharge_unused_mock_drop_turn_locked(session, reservation)
+            self._retain_normal_drop_unknown_locked(session, reservation)
+            return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
+
+    def has_pending_normal_drop_persistence(self, session: RoastSession) -> bool:
+        """Return whether an exact mock normal-drop append window remains open.
+
+        The lifecycle fence can become ``unknown`` as soon as an intervening
+        emergency stops the session.  That does not release append ownership:
+        fault rows already admitted to the same log window must still retain
+        their turns until the last writer completes.
+        """
+        with self._lock:
+            if self._latest_session is not session:
+                return False
+            return (
+                self._normal_drop_persistence_torn
+                or not self._normal_drop_persistence_last_completion.is_set()
+            )
+
+    def normal_drop_persistence_is_torn(self, session: RoastSession) -> bool:
+        """Return whether this session's exact mock Drop log has an uncertain tail."""
+        with self._lock:
+            return (
+                self._latest_session is not None
+                and self._latest_session.id == session.id
+                and session.mock_log_torn
+            )
+
+    def has_unpersisted_mock_drop_fault(self, session: RoastSession) -> bool:
+        """Return whether this session has a dispatched but unrecorded mock fault."""
+        with self._lock:
+            return (
+                self._latest_session is not None
+                and self._latest_session.id == session.id
+                and session.unpersisted_mock_drop_fault_count > 0
+            )
+
+    def observe_export_readiness(
+        self, *, session_id: str | None = None
+    ) -> tuple[RoastSession, bool]:
+        """Capture one export snapshot and its persistence fence atomically."""
+        with self._lock:
+            if self._latest_session is None:
+                raise SessionLifecycleError("No roast session exists.")
+            session = self._latest_session
+            if session_id is not None:
+                session = self._sessions_by_id.get(session_id)
+                if session is None:
+                    raise SessionLifecycleError(f"Unknown session_id: {session_id}")
+            snapshot = _copy_session_for_read(session)
+            return snapshot, (
+                session.mock_log_torn or session.unpersisted_mock_drop_fault_count > 0
+            )
+
+    def complete_normal_drop_success(
+        self,
+        session: RoastSession,
+        *,
+        reservation: object,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> NormalDropSettlement:
+        """Record the complete normal-drop projection under its owned reservation.
+
+        Any driver-state validation or event persistence failure becomes an
+        unknown result and retains the in-flight fence. This deliberately
+        avoids inferring cancellation from a cleared ordinary command token.
+        """
+        with self._lock:
+            if not isinstance(reservation, NormalDropReservation):
+                return NormalDropSettlement("stale")
+            if not self._normal_drop_reservation_matches_locked(session, reservation):
+                return NormalDropSettlement("stale")
+            if self._normal_drop_fence_state == "unknown":
+                self._discharge_unused_mock_drop_turn_locked(session, reservation)
+                return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
+            if not session.active or session.faulted_at_utc is not None or session.phase == "fault":
+                self._discharge_unused_mock_drop_turn_locked(session, reservation)
+                self._retain_normal_drop_unknown_locked(session, reservation)
+                return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
+            if (
+                session.pending_driver_command_token != reservation.token
+                or session.pending_driver_command_kind != "drop"
+            ):
+                self._discharge_unused_mock_drop_turn_locked(session, reservation)
+                self._retain_normal_drop_unknown_locked(session, reservation)
+                return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
+            if not _is_valid_mock_drop_projection(
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=fan_level_percent,
+                cooling_on=cooling_on,
+            ):
+                self._discharge_unused_mock_drop_turn_locked(session, reservation)
+                self._retain_normal_drop_unknown_locked(session, reservation)
+                return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
+
+            payload: dict[str, EventPayloadValue] = {
+                "heat_level_percent": heat_level_percent,
+                "fan_level_percent": fan_level_percent,
+                "cooling_on": cooling_on,
+            }
+            try:
+                drop_event = self._new_event_locked(session, "beans_dropped", payload=payload)
+                planned = deepcopy(session)
+                _apply_event_timestamp(planned, drop_event)
+                _validate_event_transition(planned, "cooling_started")
+                cooling_event = self._new_event_locked(planned, "cooling_started", payload=payload)
+                persistence_ticket = self._normal_drop_persistence_drop_ticket
+                if persistence_ticket is None:
+                    raise SessionLifecycleError("Normal mock bean-drop save has no append ticket.")
+            except Exception:  # noqa: BLE001 - close an invalid projection conservatively.
+                self._discharge_unused_mock_drop_turn_locked(session, reservation)
+                self._retain_normal_drop_unknown_locked(session, reservation)
+                return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
+            self._normal_drop_persistence_drop_started = True
+
+        # No lifecycle/store lock is held while a filesystem writer is stalled.
+        # This caller owns both reserved endpoint turns; no emergency writer
+        # drains or fabricates either row on its behalf.
+        drop_row_saved = False
+        cooling_row_saved = False
+        torn_log = False
+
+        def settle_failure(_error: Exception) -> NormalDropSettlement:
+            with self._lock:
+                if self._normal_drop_reservation_matches_locked(session, reservation):
+                    if torn_log:
+                        self._normal_drop_persistence_torn = True
+                        session.mock_log_torn = True
+                    if drop_row_saved:
+                        # The first endpoint is durable evidence, not an
+                        # optimistic success: retain it without fabricating the
+                        # unwritten cooling endpoint, then fence the operation.
+                        # A queued emergency has already published the fault
+                        # projection, so retain only the Drop timestamps.
+                        session.event_timeline.append(drop_event)
+                        if session.faulted_at_utc is not None or not session.active:
+                            session.beans_dropped_at_utc = drop_event.recorded_at_utc
+                            session.beans_dropped_monotonic_seconds = drop_event.monotonic_seconds
+                        else:
+                            _apply_event_timestamp(session, drop_event)
+                            session.heat_level_percent = heat_level_percent
+                            session.fan_level_percent = fan_level_percent
+                            session.cooling_on = cooling_on
+                    self._retain_normal_drop_unknown_locked(session, reservation)
+                    return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
+            return NormalDropSettlement("stale")
+
+        def settle_success() -> NormalDropSettlement:
+            with self._lock:
+                if not self._normal_drop_reservation_matches_locked(session, reservation):
+                    return NormalDropSettlement("stale")
+                if session.faulted_at_utc is not None or not session.active:
+                    # The rows are confirmed, but an intervention won the lifecycle
+                    # race. Retain only durable timestamp evidence without reviving
+                    # phase or projected controls, and keep the operation unresolved.
+                    session.event_timeline.append(drop_event)
+                    if cooling_row_saved:
+                        session.event_timeline.append(cooling_event)
+                    session.beans_dropped_at_utc = drop_event.recorded_at_utc
+                    session.beans_dropped_monotonic_seconds = drop_event.monotonic_seconds
+                    self._retain_normal_drop_unknown_locked(session, reservation)
+                    return NormalDropSettlement("unknown", snapshot=_copy_session_for_read(session))
+
+                session.heat_level_percent = heat_level_percent
+                session.fan_level_percent = fan_level_percent
+                session.cooling_on = cooling_on
+                session.event_timeline.extend((drop_event, cooling_event))
+                _apply_event_timestamp(session, drop_event)
+                _apply_event_timestamp(session, cooling_event)
+                self._clear_normal_drop_token_locked(session, reservation)
+                self._normal_drop_in_flight = None
+                self._normal_drop_fence_state = None
+                return NormalDropSettlement(
+                    "success", event=drop_event, snapshot=_copy_session_for_read(session)
+                )
+
+        def append_endpoints() -> None:
+            nonlocal cooling_row_saved, drop_row_saved, torn_log
+            try:
+                _append_event_log_row_with_failure_evidence(session, drop_event)
+                drop_row_saved = True
+            except _MockDropAppendMayBeTornError:
+                torn_log = True
+                raise
+            # An emergency can stop the session while a stalled Drop row
+            # owns this turn.  Its fault is already admitted behind the
+            # Drop row, so never manufacture a later cooling endpoint.
+            with self._lock:
+                if (
+                    not self._normal_drop_reservation_matches_locked(session, reservation)
+                    or session.faulted_at_utc is not None
+                    or not session.active
+                ):
+                    return
+            try:
+                _append_event_log_row_with_failure_evidence(session, cooling_event)
+                cooling_row_saved = True
+            except _MockDropAppendMayBeTornError:
+                torn_log = True
+                raise
+
+        settlement = self._append_mock_drop_turn(
+            persistence_ticket,
+            append_endpoints,
+            settle_success=settle_success,
+            settle_failure=settle_failure,
+        )
+        assert settlement is not None
+        return settlement
+
+    def _new_event_locked(
+        self,
+        session: RoastSession,
+        kind: RoastEventKind,
+        *,
+        payload: dict[str, EventPayloadValue] | None = None,
+    ) -> RoastEvent:
+        """Build one validated event without writing or changing session state."""
+        recorded_at_utc = _normalize_event_recorded_at_utc(session, recorded_at_utc=self._utc_now())
+        monotonic_seconds = _normalize_event_monotonic_seconds(
+            session,
+            monotonic_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
+        )
+        _validate_event_monotonic_order(session, kind=kind, monotonic_seconds=monotonic_seconds)
+        return RoastEvent(
+            kind=kind,
+            recorded_at_utc=recorded_at_utc,
+            monotonic_seconds=monotonic_seconds,
+            payload={} if payload is None else dict(payload),
+        )
+
     def reserve_driver_start_cooling(self, session: RoastSession) -> DriverEventReservation:
         """Reserve a cooling-start command or return the existing event."""
         with self._lock:
@@ -1529,12 +2145,139 @@ class RoastSessionStore:
                     existing_event=existing_event,
                     snapshot=_copy_session_for_read(session),
                 )
+            if session.torn_start_cooling_attempted:
+                raise SessionLifecycleError(
+                    "Cooling command completed, but roast log recording is unavailable."
+                )
+            if session.unconfirmed_torn_start_cooling_attempted:
+                raise SessionLifecycleError(
+                    "Cooling could not be confirmed after roast log recording failed."
+                )
             if session.beans_dropped_at_utc is None:
                 raise SessionLifecycleError("Cooling can only start after beans are dropped.")
             _validate_event_transition(session, "cooling_started")
             return DriverEventReservation(
                 reservation=self._reserve_driver_command_locked(session, kind="start_cooling")
             )
+
+    def settle_known_torn_start_cooling(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+        connected: bool | None = None,
+    ) -> RoastSession | None:
+        """Retain a known cooling result when its exact P2 log cannot be extended.
+
+        The normal Drop's retained UNKNOWN fence remains the recovery owner.
+        This records the driver-returned control projection only: no
+        ``cooling_started`` history row can be claimed once the append-only
+        JSONL has a torn tail.
+        """
+        with self._lock:
+            if not self._normal_drop_persistence_torn:
+                return None
+            try:
+                self._assert_latest_session(session)
+                if (
+                    reservation.session_id != session.id
+                    or session.pending_driver_command_token != reservation.token
+                    or session.pending_driver_command_kind != reservation.kind
+                    or reservation.kind != "start_cooling"
+                    or not cooling_on
+                ):
+                    return None
+                stopped_fault_recovery = (
+                    not session.active
+                    and session.faulted_at_utc is not None
+                    and session.phase == "fault"
+                )
+                if not stopped_fault_recovery:
+                    self._assert_driver_command_reservation(session, reservation)
+                heat = validate_control_percent(heat_level_percent, label="heat_level_percent")
+                fan = validate_control_percent(fan_level_percent, label="fan_level_percent")
+            except SessionLifecycleError:
+                return None
+            if heat != 0 or fan != 100 or connected is not True:
+                return None
+            session.heat_level_percent = heat
+            session.fan_level_percent = fan
+            session.cooling_on = True
+            session.torn_start_cooling_attempted = True
+            self._clear_driver_command_reservation_locked(session, reservation)
+            if stopped_fault_recovery:
+                self._clear_fault_recovery_in_flight_locked(session, reservation)
+            return _copy_session_for_read(session)
+
+    def settle_unconfirmed_torn_start_cooling(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+    ) -> bool:
+        """Retain one unconfirmed torn-P2 cooling attempt without a cooling claim."""
+        with self._lock:
+            if not self._normal_drop_persistence_torn:
+                return False
+            try:
+                self._assert_driver_command_reservation(session, reservation)
+            except SessionLifecycleError:
+                return False
+            if reservation.kind != "start_cooling":
+                return False
+            session.unconfirmed_torn_start_cooling_attempted = True
+            self._clear_driver_command_reservation_locked(session, reservation)
+            return True
+
+    def settle_known_torn_stop_cooling_recovery(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+        connected: bool,
+    ) -> RoastSession | None:
+        """Retain a known stopped-fault cooling result without inventing a log row.
+
+        This narrow settlement applies only to an already-admitted exact
+        stopped-fault cooling recovery.  The normal Drop persistence fence is
+        deliberately left intact: the returned controls are known, but the
+        append-only log cannot truthfully claim ``cooling_stopped``.
+        """
+        with self._lock:
+            if not self._normal_drop_persistence_torn:
+                return None
+            try:
+                self._assert_latest_session(session)
+                if (
+                    reservation.kind != "stop_cooling"
+                    or reservation.session_id != session.id
+                    or session.pending_driver_command_token != reservation.token
+                    or session.pending_driver_command_kind != reservation.kind
+                    or session.active
+                    or session.faulted_at_utc is None
+                    or session.phase != "fault"
+                    or cooling_on
+                    or connected is not True
+                ):
+                    return None
+                heat = validate_control_percent(heat_level_percent, label="heat_level_percent")
+                fan = validate_control_percent(fan_level_percent, label="fan_level_percent")
+            except SessionLifecycleError:
+                return None
+            if heat != 0:
+                return None
+            session.heat_level_percent = heat
+            session.fan_level_percent = fan
+            session.cooling_on = False
+            self._clear_driver_command_reservation_locked(session, reservation)
+            self._clear_fault_recovery_in_flight_locked(session, reservation)
+            return _copy_session_for_read(session)
 
     def reserve_driver_stop_cooling(self, session: RoastSession) -> DriverCommandReservation:
         """Reserve a cooling-stop command for an active cooling session."""
@@ -1601,6 +2344,8 @@ class RoastSessionStore:
                 or the requested recovery action has no valid precondition.
         """
         with self._lock:
+            if kind == "drop" and self._normal_drop_in_flight is not None:
+                raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
             self._assert_guarded_fault_recovery_admission_locked(session)
             if kind == "drop":
                 if session.id in self._fault_drop_ambiguity_required:
@@ -1748,6 +2493,8 @@ class RoastSessionStore:
                 cooling_on=cooling_on,
             )
             try:
+                if self._normal_drop_persistence_torn:
+                    raise EventLogRecordingError
                 event = self.record_event(
                     session,
                     "cooling_started",
@@ -1765,7 +2512,12 @@ class RoastSessionStore:
                 ) = previous_control_state
                 raise
             finally:
-                self._clear_driver_command_reservation_locked(session, reservation)
+                # The caller may still settle a known driver result without a
+                # history row for the exact torn-P2 path.  It needs this
+                # reservation to prove ownership; all ordinary failures keep
+                # their established eager clear.
+                if not self._normal_drop_persistence_torn:
+                    self._clear_driver_command_reservation_locked(session, reservation)
             return event, _copy_session_for_read(session)
 
     def complete_reserved_driver_stop_cooling_snapshot(
@@ -2069,6 +2821,11 @@ class RoastSessionStore:
                     raise SessionLifecycleError(
                         "Fault recovery cooling requires fan 100 and cooling active."
                     )
+                if self._normal_drop_persistence_torn and reservation.kind in {
+                    "start_cooling",
+                    "stop_cooling",
+                }:
+                    raise EventLogRecordingError
 
                 payload: dict[str, EventPayloadValue] = {
                     "heat_level_percent": validated_heat,
@@ -2117,7 +2874,15 @@ class RoastSessionStore:
                 completed = True
                 return event, _copy_session_for_read(session)
             finally:
-                self._clear_driver_command_reservation_locked(session, reservation)
+                # A torn exact Drop log can reject the recovery event after a
+                # qualifying stop-cooling driver result is known. Keep only
+                # that reservation for the caller's narrow known-state
+                # settlement; every other failure retains eager clearing.
+                if not (
+                    self._normal_drop_persistence_torn
+                    and reservation.kind in {"start_cooling", "stop_cooling"}
+                ):
+                    self._clear_driver_command_reservation_locked(session, reservation)
                 if completed:
                     self._clear_fault_recovery_in_flight_locked(session, reservation)
 
@@ -2141,7 +2906,7 @@ class RoastSessionStore:
             self._fault_recovery_admission_blocks.add(session.id)
 
     def cancel_nonfinalisation_driver_command(self, session: RoastSession) -> None:
-        """Atomically cancel a pending command unless finalisation owns it."""
+        """Cancel an ordinary token without resolving a normal-drop fence."""
         with self._lock:
             self._assert_latest_session(session)
             if session.pending_driver_command_kind != "finalisation":
@@ -2216,47 +2981,99 @@ class RoastSessionStore:
                 "Manual provenance is valid only for charge or first crack."
             )
         with self._lock:
-            self._assert_latest_active_session(session)
-            if kind != "fault":
-                self._assert_finalisation_allows_mutation(session)
-            if session.faulted_at_utc is not None and kind != "fault":
-                raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
+            return self._record_event_locked(
+                session,
+                kind,
+                payload=payload,
+                provenance=provenance,
+            )
 
-            existing_event = self._get_existing_singleton_event(session, kind)
-            if existing_event is not None:
-                return existing_event
-            _validate_event_transition(session, kind)
+    def _record_event_locked(
+        self,
+        session: RoastSession,
+        kind: RoastEventKind,
+        *,
+        payload: dict[str, EventPayloadValue] | None = None,
+        provenance: Literal["manual_mark"] | None = None,
+        owned_normal_drop_reservation: NormalDropReservation | None = None,
+    ) -> RoastEvent:
+        """Record one event while holding the store lock.
 
-            recorded_at_utc = self._utc_now()
-            monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
-            monotonic_seconds = _normalize_event_monotonic_seconds(
-                session,
-                monotonic_seconds=monotonic_seconds,
+        A P2 fence closes the ordinary ``beans_dropped`` writer.  The normal
+        Drop settlement is the sole caller allowed to supply its exact owned
+        reservation, preventing a foreign event writer from turning a pending
+        or ambiguous operation into a claimed endpoint.
+        """
+        self._assert_latest_active_session(session)
+        if (
+            kind == "beans_dropped"
+            and self._normal_drop_in_flight is not None
+            and (
+                owned_normal_drop_reservation is None
+                or self._normal_drop_fence_state != "pending"
+                or not self._normal_drop_reservation_matches_locked(
+                    session, owned_normal_drop_reservation
+                )
             )
-            recorded_at_utc = _normalize_event_recorded_at_utc(
-                session,
-                recorded_at_utc=recorded_at_utc,
+        ):
+            raise SessionLifecycleError(
+                "Beans dropped can only be recorded by the owned normal-drop settlement."
             )
-            _validate_event_monotonic_order(
-                session,
-                kind=kind,
-                monotonic_seconds=monotonic_seconds,
+        self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
+        if kind != "fault":
+            self._assert_finalisation_allows_mutation(session)
+        if session.faulted_at_utc is not None and kind != "fault":
+            raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
+
+        existing_event = self._get_existing_singleton_event(session, kind)
+        if existing_event is not None:
+            return existing_event
+        _validate_event_transition(session, kind)
+
+        recorded_at_utc = self._utc_now()
+        monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
+        monotonic_seconds = _normalize_event_monotonic_seconds(
+            session,
+            monotonic_seconds=monotonic_seconds,
+        )
+        recorded_at_utc = _normalize_event_recorded_at_utc(
+            session,
+            recorded_at_utc=recorded_at_utc,
+        )
+        _validate_event_monotonic_order(
+            session,
+            kind=kind,
+            monotonic_seconds=monotonic_seconds,
+        )
+        event = RoastEvent(
+            kind=kind,
+            recorded_at_utc=recorded_at_utc,
+            monotonic_seconds=monotonic_seconds,
+            payload={} if payload is None else dict(payload),
+        )
+        _append_event_log_row(session, event)
+        session.event_timeline.append(event)
+        _apply_event_timestamp(session, event)
+        if provenance is not None:
+            if kind == "beans_added":
+                session.beans_added_source = provenance
+            else:
+                session.first_crack_source = provenance
+        return event
+
+    def _assert_normal_drop_persistence_allows_competing_writer_locked(
+        self, session: RoastSession
+    ) -> None:
+        """Refuse ordinary log writers while an exact Drop owns this log window."""
+        if (
+            session.log_writer is not None
+            and self._latest_session is session
+            and (
+                self._normal_drop_persistence_torn
+                or not self._normal_drop_persistence_last_completion.is_set()
             )
-            event = RoastEvent(
-                kind=kind,
-                recorded_at_utc=recorded_at_utc,
-                monotonic_seconds=monotonic_seconds,
-                payload={} if payload is None else dict(payload),
-            )
-            _append_event_log_row(session, event)
-            session.event_timeline.append(event)
-            _apply_event_timestamp(session, event)
-            if provenance is not None:
-                if kind == "beans_added":
-                    session.beans_added_source = provenance
-                else:
-                    session.first_crack_source = provenance
-            return event
+        ):
+            raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
 
     def record_event_snapshot(
         self,
@@ -2454,6 +3271,7 @@ class RoastSessionStore:
         with self._lock:
             self._assert_latest_active_session(session)
             self._assert_finalisation_allows_mutation(session)
+            self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
             recorded_at_utc = self._utc_now()
             monotonic_seconds = session.elapsed_monotonic_seconds(self._monotonic_now)
             session.fc_window_count += 1
@@ -2523,6 +3341,7 @@ class RoastSessionStore:
         with self._lock:
             self._assert_latest_active_session(session)
             self._assert_finalisation_allows_mutation(session)
+            self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
             if session.faulted_at_utc is not None:
                 raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
 
@@ -2651,6 +3470,144 @@ class RoastSessionStore:
                 allow_stopped_latest=allow_stopped_latest,
             )
             return event, _copy_session_for_read(session)
+
+    def _append_mock_drop_turn(
+        self,
+        ticket: MockDropPersistenceTicket,
+        append: Callable[[], None],
+        *,
+        settle_success: Callable[[], _AppendTurnResult] | None = None,
+        settle_failure: Callable[[Exception], _AppendTurnResult] | None = None,
+    ) -> _AppendTurnResult | None:
+        """Perform one exact mock persistence turn outside lifecycle/store locks."""
+        ticket.previous_completion.wait()
+        # This caller owns its ticket and writes its own row(s). Its predecessor
+        # only grants the turn; neither lifecycle mutation nor another session's
+        # work is held while its filesystem writer is stalled.
+        try:
+            with self._lock:
+                if self._normal_drop_persistence_failed:
+                    raise SessionLifecycleError("The exact normal bean-drop save is incomplete.")
+            append()
+        except Exception as error:
+            with self._lock:
+                self._normal_drop_persistence_failed = True
+            if settle_failure is not None:
+                return settle_failure(error)
+            raise
+        else:
+            if settle_success is not None:
+                return settle_success()
+        finally:
+            ticket.completion.set()
+
+    def _reserve_mock_drop_ticket_locked(self) -> MockDropPersistenceTicket:
+        """Transfer the next private mock-log append turn under store ownership."""
+        ticket = MockDropPersistenceTicket(
+            sequence=self._normal_drop_persistence_next,
+            previous_completion=self._normal_drop_persistence_last_completion,
+            completion=Event(),
+        )
+        self._normal_drop_persistence_next += 1
+        self._normal_drop_persistence_last_completion = ticket.completion
+        return ticket
+
+    def _discharge_unused_mock_drop_turn_locked(
+        self,
+        session: RoastSession,
+        reservation: NormalDropReservation,
+    ) -> bool:
+        """Complete only the exact unstarted Drop turn owned by this settlement."""
+        ticket = self._normal_drop_persistence_drop_ticket
+        if (
+            ticket is None
+            or self._normal_drop_persistence_drop_started
+            or not self._normal_drop_reservation_matches_locked(session, reservation)
+        ):
+            return False
+        ticket.completion.set()
+        self._normal_drop_persistence_drop_ticket = None
+        return True
+
+    def prepare_mock_drop_emergency_stop(
+        self,
+        session: RoastSession,
+        *,
+        reason: str,
+        safety_payload: Mapping[str, EventPayloadValue],
+        allow_stopped_latest: bool,
+    ) -> tuple[RoastEvent, MockDropPersistenceTicket]:
+        """Publish contained fault state before its private mock-log append.
+
+        This is deliberately available only while the exact normal-drop fence
+        is retained.  It lets an emergency leave the server lifecycle barrier
+        before its own append blocks, without treating the event as recorded.
+        """
+        with self._lock:
+            if not self.has_pending_normal_drop_persistence(session):
+                raise SessionLifecycleError("No exact normal bean-drop save is pending.")
+            if allow_stopped_latest:
+                self._assert_latest_session(session)
+            else:
+                self._assert_latest_active_session(session)
+            normalized_safety_payload = dict(safety_payload)
+            _apply_emergency_safety_payload(session, normalized_safety_payload)
+            event = self._new_emergency_fault_event_locked(
+                session,
+                payload=_build_emergency_fault_payload(
+                    reason=reason, safety_payload=normalized_safety_payload
+                ),
+                allow_stopped_latest=allow_stopped_latest,
+            )
+            _apply_event_timestamp(session, event)
+            self._normal_drop_unpersisted_fault_count += 1
+            session.unpersisted_mock_drop_fault_count += 1
+            if session.active:
+                session.stop(
+                    utc_now=self._utc_now,
+                    monotonic_now=self._monotonic_now,
+                    phase="fault",
+                )
+            else:
+                session.phase = "fault"
+            if has_verified_emergency_containment(safety_payload=normalized_safety_payload):
+                self._fault_recovery_admission_blocks.discard(session.id)
+            else:
+                self._fault_recovery_admission_blocks.add(session.id)
+            self._abort_finalisation_for_emergency_stop_locked(session)
+            ticket = self._reserve_mock_drop_ticket_locked()
+            return event, ticket
+
+    def commit_prepared_mock_drop_emergency_stop(
+        self, session: RoastSession, *, event: RoastEvent, ticket: MockDropPersistenceTicket
+    ) -> RoastSession:
+        """Append one previously published mock-drop emergency fault event."""
+
+        def settle_success() -> RoastSession:
+            with self._lock:
+                self._assert_latest_session(session)
+                session.event_timeline.append(event)
+                _apply_event_timestamp(session, event)
+                self._normal_drop_unpersisted_fault_count -= 1
+                session.unpersisted_mock_drop_fault_count -= 1
+                return _copy_session_for_read(session)
+
+        def settle_failure(error: Exception) -> RoastSession:
+            if isinstance(error, _MockDropAppendMayBeTornError):
+                with self._lock:
+                    if self._latest_session is session:
+                        self._normal_drop_persistence_torn = True
+                        session.mock_log_torn = True
+            raise error
+
+        result = self._append_mock_drop_turn(
+            ticket,
+            lambda: _append_event_log_row_with_failure_evidence(session, event),
+            settle_success=settle_success,
+            settle_failure=settle_failure,
+        )
+        assert result is not None
+        return result
 
     def get_active_session(self) -> RoastSession | None:
         """Return the current active session when present."""
@@ -3006,6 +3963,7 @@ class RoastSessionStore:
         payload: dict[str, EventPayloadValue],
     ) -> RoastEvent:
         """Record a narrowly allowed event for a stopped latest session."""
+        self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
         existing_event = self._get_existing_singleton_event(session, kind)
         is_post_fault_recovery = (
             kind in {"cooling_started", "cooling_stopped"}
@@ -3071,6 +4029,10 @@ class RoastSessionStore:
 
     def _assert_no_pending_fault_cooling_recovery_locked(self) -> None:
         """Reject new sessions while stopped fault cooling still needs recovery."""
+        if self._normal_drop_in_flight is not None:
+            raise SessionLifecycleError(
+                "Cannot start a roast session after an ambiguous bean drop."
+            )
         session = self._latest_session
         if session is not None and session.id in self._fault_recovery_admission_blocks:
             raise SessionLifecycleError(
@@ -3133,8 +4095,32 @@ class RoastSessionStore:
         kind: DriverCommandKind,
     ) -> DriverCommandReservation:
         """Reserve a driver command while the store lock is already held."""
+        allow_torn_stopped_fault_cooling_stop = (
+            kind == "stop_cooling"
+            and not session.active
+            and session.faulted_at_utc is not None
+            and session.phase == "fault"
+        )
+        if (
+            self._normal_drop_persistence_torn
+            and kind
+            not in {
+                "heat_containment",
+                "start_cooling",
+            }
+            and not allow_torn_stopped_fault_cooling_stop
+        ):
+            raise SessionLifecycleError("The exact normal bean-drop log has an uncertain tail.")
+        if kind == "drop" and self._normal_drop_in_flight is not None:
+            raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
         if session.pending_driver_command_token is not None:
             raise SessionLifecycleError("Another driver command is already in progress.")
+        if (
+            kind == "control"
+            and self._normal_drop_in_flight is not None
+            and self._normal_drop_reservation_matches_locked(session, self._normal_drop_in_flight)
+        ):
+            raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
         reservation = DriverCommandReservation(
             session_id=session.id,
             token=_generate_session_id(),
@@ -3143,6 +4129,107 @@ class RoastSessionStore:
         session.pending_driver_command_token = reservation.token
         session.pending_driver_command_kind = reservation.kind
         return reservation
+
+    def _normal_drop_exact_identity_rejection_locked(
+        self, identity: NormalDropIdentity
+    ) -> NormalDropRejection | None:
+        """Validate store ownership before phase, evidence, or fence inspection."""
+        if (
+            type(identity.session_id) is not str
+            or type(identity.clock_epoch_id) is not str
+            or type(identity.ownership_sequence) is not int
+            or type(identity.timing_evidence_sequence) is not int
+        ):
+            return "invalid_identity"
+        latest = self._latest_session
+        if latest is None or identity.session_id not in self._sessions_by_id:
+            return "unknown_session"
+        if latest.id != identity.session_id:
+            return "not_latest_session"
+        if identity.clock_epoch_id != self._clock_epoch_id:
+            return "clock_epoch_mismatch"
+        if identity.ownership_sequence != latest.capture_ownership_sequence:
+            return "ownership_sequence_mismatch"
+        return None
+
+    def _normal_drop_lifecycle_rejection_locked(
+        self, session: RoastSession
+    ) -> NormalDropRejection | None:
+        """Return phase-independent exact-owner admission refusal, when any."""
+        if session.purpose != "roast":
+            return "session_purpose_not_eligible"
+        if session.faulted_at_utc is not None or session.phase == "fault":
+            return "session_faulted"
+        if not session.active:
+            return "session_not_active"
+        return None
+
+    def _normal_drop_evidence_rejection_locked(
+        self,
+        session: RoastSession,
+        identity: NormalDropIdentity,
+    ) -> NormalDropRejection | None:
+        """Return the closed timing-evidence freshness result for normal drop."""
+        if identity.timing_evidence_sequence <= 0 or session.timing_evidence_sequence <= 0:
+            return "timing_evidence_missing"
+        if identity.timing_evidence_sequence != session.timing_evidence_sequence:
+            return "timing_evidence_superseded"
+        return None
+
+    def _normal_drop_reservation_matches_locked(
+        self,
+        session: RoastSession,
+        reservation: NormalDropReservation,
+    ) -> bool:
+        """Return whether one settlement owns the unresolved normal-drop fence."""
+        operation = self._normal_drop_in_flight
+        return (
+            operation == reservation
+            and self._latest_session is session
+            and reservation.identity.session_id == session.id
+            and reservation.identity.clock_epoch_id == self._clock_epoch_id
+            and reservation.identity.ownership_sequence == session.capture_ownership_sequence
+        )
+
+    def _normal_drop_admission_outcome_for_in_flight_locked(
+        self, session: RoastSession
+    ) -> Literal["in_progress", "ambiguous"]:
+        """Distinguish an owned pending dispatch from retained uncertainty."""
+        operation = self._normal_drop_in_flight
+        assert operation is not None
+        if self._normal_drop_fence_state == "pending" and (
+            session.pending_driver_command_token == operation.token
+            and session.pending_driver_command_kind == "drop"
+        ):
+            return "in_progress"
+        return "ambiguous"
+
+    def _retain_normal_drop_unknown_locked(
+        self,
+        session: RoastSession,
+        reservation: NormalDropReservation,
+    ) -> None:
+        """Make one owned normal-drop fence terminally UNKNOWN.
+
+        This is deliberately one-way.  Only an exact, still-pending operation
+        can settle as proved cancellation; any driver or persistence ambiguity
+        retains the reservation after its ordinary token is cleared.
+        """
+        self._clear_normal_drop_token_locked(session, reservation)
+        self._normal_drop_fence_state = "unknown"
+
+    def _clear_normal_drop_token_locked(
+        self,
+        session: RoastSession,
+        reservation: NormalDropReservation,
+    ) -> None:
+        """Clear only this operation's ordinary command token, when still present."""
+        if (
+            session.pending_driver_command_token == reservation.token
+            and session.pending_driver_command_kind == "drop"
+        ):
+            session.pending_driver_command_token = None
+            session.pending_driver_command_kind = None
 
     def _assert_driver_command_reservation(
         self,
@@ -3198,11 +4285,32 @@ class RoastSessionStore:
         allow_stopped_latest: bool,
     ) -> RoastEvent:
         """Record an emergency fault, including a stopped latest-session race."""
+        if self._normal_drop_persistence_torn:
+            raise SessionLifecycleError(
+                "Fault history must be recorded by the owned normal-drop persistence turn."
+            )
+        self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
+        event = self._new_emergency_fault_event_locked(
+            session, payload=payload, allow_stopped_latest=allow_stopped_latest
+        )
+        _append_event_log_row(session, event)
+        session.event_timeline.append(event)
+        _apply_event_timestamp(session, event)
+        return event
+
+    def _new_emergency_fault_event_locked(
+        self,
+        session: RoastSession,
+        *,
+        payload: dict[str, EventPayloadValue],
+        allow_stopped_latest: bool,
+    ) -> RoastEvent:
+        """Build one emergency fault event without appending it."""
         if session.active:
-            return self.record_event(session, "fault", payload=payload)
-        if not allow_stopped_latest:
+            _validate_event_transition(session, "fault")
+        elif not allow_stopped_latest:
             raise SessionLifecycleError("Stopped sessions cannot be mutated.")
-        if session.faulted_at_utc is None:
+        elif session.faulted_at_utc is None and self._normal_drop_unpersisted_fault_count == 0:
             _validate_event_transition(session, "fault")
         recorded_at_utc = self._utc_now()
         monotonic_seconds = max(0.0, self._monotonic_now() - session.monotonic_start)
@@ -3225,9 +4333,6 @@ class RoastSessionStore:
             monotonic_seconds=monotonic_seconds,
             payload=dict(payload),
         )
-        _append_event_log_row(session, event)
-        session.event_timeline.append(event)
-        _apply_event_timestamp(session, event)
         return event
 
 
@@ -3313,6 +4418,26 @@ def _validate_event_transition(session: RoastSession, kind: RoastEventKind) -> N
             f"{kind} cannot be recorded while phase is {session.phase}; "
             f"allowed phases: {allowed_phase_list}."
         )
+
+
+def _is_valid_mock_drop_projection(
+    *,
+    heat_level_percent: object,
+    fan_level_percent: object,
+    cooling_on: object,
+) -> bool:
+    """Return whether a mock Drop report is the complete expected endpoint.
+
+    P2 stores only the mock driver's internally consistent command projection:
+    zero heat, full fan, and cooling enabled.  This validates a reported
+    software state; it does not make a physical-actuation or durability claim.
+    """
+    try:
+        heat = validate_control_percent(heat_level_percent, label="heat_level_percent")
+        fan = validate_control_percent(fan_level_percent, label="fan_level_percent")
+    except (TypeError, ValueError):
+        return False
+    return heat == 0 and fan == 100 and cooling_on is True
 
 
 def _validate_event_monotonic_order(
@@ -3529,4 +4654,8 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         pending_driver_command_token=session.pending_driver_command_token,
         pending_driver_command_kind=session.pending_driver_command_kind,
         finalisation=deepcopy(session.finalisation),
+        mock_log_torn=session.mock_log_torn,
+        unpersisted_mock_drop_fault_count=session.unpersisted_mock_drop_fault_count,
+        torn_start_cooling_attempted=session.torn_start_cooling_attempted,
+        unconfirmed_torn_start_cooling_attempted=session.unconfirmed_torn_start_cooling_attempted,
     )
