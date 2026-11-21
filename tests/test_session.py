@@ -110,6 +110,7 @@ def test_read_snapshot_retains_store_owned_mock_drop_facts() -> None:
     session.mock_log_torn = True
     session.unpersisted_mock_drop_fault_count = 1
     session.torn_start_cooling_attempted = True
+    session.unconfirmed_torn_start_cooling_attempted = True
 
     snapshot = session_module._copy_session_for_read(session)  # pyright: ignore[reportPrivateUsage]
     session.unpersisted_mock_drop_fault_count = 0
@@ -119,6 +120,7 @@ def test_read_snapshot_retains_store_owned_mock_drop_facts() -> None:
     assert snapshot.mock_log_torn is True
     assert snapshot.unpersisted_mock_drop_fault_count == 1
     assert snapshot.torn_start_cooling_attempted is True
+    assert snapshot.unconfirmed_torn_start_cooling_attempted is True
     assert store.get_latest_session() is session
     assert store.get_session_snapshot(session_id=snapshot.id).id == snapshot.id
 

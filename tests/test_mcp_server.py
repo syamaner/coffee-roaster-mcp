@@ -5659,7 +5659,7 @@ def test_torn_exact_drop_cooling_row_preserves_known_cooling_without_history(
 
 
 def test_ordinary_torn_start_cooling_rejects_disconnected_projection(tmp_path: Path) -> None:
-    """A disconnected ordinary P2 result cannot be retained as known cooling."""
+    """A disconnected ordinary P2 result is contained without a cooling claim."""
     context = _cold_finalisation_context(tmp_path)
     server = create_mcp_server()
     ctx = _ctx(context)
@@ -5673,13 +5673,33 @@ def test_ordinary_torn_start_cooling_rejects_disconnected_projection(tmp_path: P
     driver = context.roaster_driver
     assert isinstance(driver, MockRoasterDriver)
     driver.disconnect()
+    emergency_stop_calls = 0
+    original_emergency_stop = driver.emergency_stop
 
-    with pytest.raises(session_module.EventLogRecordingError):
-        _call_tool(server, "start_cooling", ctx)
+    def count_emergency_stop(*, reason: str):
+        nonlocal emergency_stop_calls
+        emergency_stop_calls += 1
+        return original_emergency_stop(reason=reason)
 
-    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
-    assert snapshot.cooling_started_at_utc is None
-    assert snapshot.torn_start_cooling_attempted is False
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(driver, "emergency_stop", count_emergency_stop)
+    try:
+        with pytest.raises(SessionLifecycleError, match="Cooling could not be confirmed"):
+            _call_tool(server, "start_cooling", ctx)
+
+        snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+        assert snapshot.cooling_started_at_utc is None
+        assert snapshot.cooling_on is False
+        assert snapshot.torn_start_cooling_attempted is False
+        assert snapshot.unconfirmed_torn_start_cooling_attempted is True
+        assert snapshot.pending_driver_command_kind is None
+        assert emergency_stop_calls == 1
+
+        with pytest.raises(SessionLifecycleError, match="Cooling could not be confirmed"):
+            _call_tool(server, "start_cooling", ctx)
+        assert emergency_stop_calls == 1
+    finally:
+        monkeypatch.undo()
 
 
 class _QueuedWindowAudioPipeline:

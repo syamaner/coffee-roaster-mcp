@@ -3445,33 +3445,39 @@ def _run_reserved_driver_start_cooling(
     reservation = event_reservation.reservation
     try:
         driver_state = server_context.roaster_driver.start_cooling()
+        try:
+            return server_context.session_store.complete_reserved_driver_start_cooling_snapshot(
+                session,
+                reservation=reservation,
+                heat_level_percent=driver_state.heat_level_percent,
+                fan_level_percent=driver_state.fan_level_percent,
+                cooling_on=driver_state.cooling_on,
+            )
+        except EventLogRecordingError as error:
+            settled = server_context.session_store.settle_known_torn_start_cooling(
+                session,
+                reservation=reservation,
+                heat_level_percent=driver_state.heat_level_percent,
+                fan_level_percent=driver_state.fan_level_percent,
+                cooling_on=driver_state.cooling_on,
+                connected=driver_state.connected,
+            )
+            if settled is not None:
+                raise SessionLifecycleError(
+                    "Cooling command completed, but roast log recording is unavailable."
+                ) from error
+            server_context.session_store.settle_unconfirmed_torn_start_cooling(
+                session, reservation=reservation
+            )
+            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
+            raise SessionLifecycleError(
+                "Cooling could not be confirmed after roast log recording failed."
+            ) from error
+        except SessionLifecycleError:
+            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
+            raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
-        raise
-    try:
-        return server_context.session_store.complete_reserved_driver_start_cooling_snapshot(
-            session,
-            reservation=reservation,
-            heat_level_percent=driver_state.heat_level_percent,
-            fan_level_percent=driver_state.fan_level_percent,
-            cooling_on=driver_state.cooling_on,
-        )
-    except EventLogRecordingError as error:
-        settled = server_context.session_store.settle_known_torn_start_cooling(
-            session,
-            reservation=reservation,
-            heat_level_percent=driver_state.heat_level_percent,
-            fan_level_percent=driver_state.fan_level_percent,
-            cooling_on=driver_state.cooling_on,
-            connected=driver_state.connected,
-        )
-        if settled is not None:
-            raise SessionLifecycleError(
-                "Cooling command completed, but roast log recording is unavailable."
-            ) from error
-        raise
-    except SessionLifecycleError:
-        _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
         raise
 
 

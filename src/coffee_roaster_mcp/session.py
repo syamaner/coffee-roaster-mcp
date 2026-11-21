@@ -683,6 +683,9 @@ class RoastSession:
     torn_start_cooling_attempted: bool = field(
         default=False, kw_only=True, compare=False, repr=False
     )
+    unconfirmed_torn_start_cooling_attempted: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
 
     @property
     def active(self) -> bool:
@@ -2134,6 +2137,10 @@ class RoastSessionStore:
                 raise SessionLifecycleError(
                     "Cooling command completed, but roast log recording is unavailable."
                 )
+            if session.unconfirmed_torn_start_cooling_attempted:
+                raise SessionLifecycleError(
+                    "Cooling could not be confirmed after roast log recording failed."
+                )
             if session.beans_dropped_at_utc is None:
                 raise SessionLifecycleError("Cooling can only start after beans are dropped.")
             _validate_event_transition(session, "cooling_started")
@@ -2192,6 +2199,26 @@ class RoastSessionStore:
             if stopped_fault_recovery:
                 self._clear_fault_recovery_in_flight_locked(session, reservation)
             return _copy_session_for_read(session)
+
+    def settle_unconfirmed_torn_start_cooling(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+    ) -> bool:
+        """Retain one unconfirmed torn-P2 cooling attempt without a cooling claim."""
+        with self._lock:
+            if not self._normal_drop_persistence_torn:
+                return False
+            try:
+                self._assert_driver_command_reservation(session, reservation)
+            except SessionLifecycleError:
+                return False
+            if reservation.kind != "start_cooling":
+                return False
+            session.unconfirmed_torn_start_cooling_attempted = True
+            self._clear_driver_command_reservation_locked(session, reservation)
+            return True
 
     def settle_known_torn_stop_cooling_recovery(
         self,
@@ -4600,4 +4627,5 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         mock_log_torn=session.mock_log_torn,
         unpersisted_mock_drop_fault_count=session.unpersisted_mock_drop_fault_count,
         torn_start_cooling_attempted=session.torn_start_cooling_attempted,
+        unconfirmed_torn_start_cooling_attempted=session.unconfirmed_torn_start_cooling_attempted,
     )
