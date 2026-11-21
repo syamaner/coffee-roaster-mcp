@@ -1012,6 +1012,60 @@ class _ExactNormalDropBaseline:
     drop_baseline: int
 
 
+ExactNormalDropOutcome = Literal[
+    "refused_capability",
+    "refused_state",
+    "refused_precondition",
+    "already_dropped",
+    "in_progress",
+    "ambiguous",
+    "refused",
+    "cancelled",
+    "success",
+    "unknown",
+]
+ExactNormalDropReason = (
+    Literal[
+        "manual_mock_normal_drop_required",
+        "exact_baseline_unavailable",
+        "human_first_crack_unavailable",
+        "exact_live_owner_unavailable",
+        "human_first_crack_missing",
+        "endpoint_origin_not_established",
+        "dispatch_reservation_unavailable",
+        "normal_drop_in_progress",
+        "normal_drop_unresolved",
+        "store_refusal_unavailable",
+        "invalid_identity",
+        "unknown_session",
+        "not_latest_session",
+        "clock_epoch_mismatch",
+        "ownership_sequence_mismatch",
+        "session_purpose_not_eligible",
+        "session_faulted",
+        "session_not_active",
+        "timing_evidence_missing",
+        "timing_evidence_superseded",
+        "finalisation_in_progress",
+        "command_in_progress",
+        "phase_invalid",
+        "arbitration_unavailable",
+        "emergency_since_session_baseline",
+        "prior_drop_transition_unaccounted",
+        "driver_result_unavailable",
+        "driver_result_invalid",
+        "observation_boundary_unavailable",
+        "settlement_unavailable",
+        "retain_unavailable",
+        "settlement_stale",
+        "observation_freeze_failed",
+        "observation_resolution_failed",
+        "post_drop_cleanup_failed",
+    ]
+    | None
+)
+
+
 @dataclass(frozen=True)
 class _ExactNormalDropSessionResult:
     """Private result for the unregistered exact mock-drop producer."""
@@ -1020,14 +1074,15 @@ class _ExactNormalDropSessionResult:
     clock_epoch_id: str
     ownership_sequence: int
     timing_evidence_sequence: int
-    outcome: str
-    reason: str | None
+    outcome: ExactNormalDropOutcome
+    reason: ExactNormalDropReason
     request_dispatch: Literal[
         "not_invoked", "invoked_no_state_transition", "transitioned", "unknown"
     ]
     this_request: Literal["no_reservation", "reservation_owned"]
     history: Literal["not_applicable", "saved", "unknown"]
     fence: Literal["not_applicable", "released", "retained", "not_established"]
+    prior_transition: Literal["not_applicable", "not_established", "unknown"]
     retry: Literal["forbidden"] = "forbidden"
     physical_effect: Literal["not_established"] = "not_established"
     observer_failure: bool = False
@@ -2034,9 +2089,10 @@ def create_mcp_server(
                                 "Started session was not published as the active owner."
                             )
                         identity = server_context.session_store.normal_drop_identity(live_session)
-                    except SessionLifecycleError:
-                        # Exact Drop is optional to ordinary Start. A missing post-publication
-                        # identity leaves its holder unavailable for this session.
+                    except Exception:
+                        # Exact Drop is optional to ordinary Start. A post-publication
+                        # lookup failure or owner mismatch leaves its holder unavailable
+                        # without rolling back the already published ordinary Start.
                         pass
                     else:
                         object.__setattr__(
@@ -2800,14 +2856,15 @@ def _exact_normal_drop_capable(server_context: ServerContext) -> bool:
 def _exact_normal_drop_result(
     *,
     identity: NormalDropIdentity,
-    outcome: str,
-    reason: str | None,
+    outcome: ExactNormalDropOutcome,
+    reason: ExactNormalDropReason,
     request_dispatch: Literal[
         "not_invoked", "invoked_no_state_transition", "transitioned", "unknown"
     ],
     this_request: Literal["no_reservation", "reservation_owned"],
     history: Literal["not_applicable", "saved", "unknown"],
     fence: Literal["not_applicable", "released", "retained", "not_established"],
+    prior_transition: Literal["not_applicable", "not_established", "unknown"] = "not_applicable",
     observer_failure: bool = False,
     cleanup_failure: bool = False,
 ) -> _ExactNormalDropSessionResult:
@@ -2823,6 +2880,7 @@ def _exact_normal_drop_result(
         this_request=this_request,
         history=history,
         fence=fence,
+        prior_transition=prior_transition,
         observer_failure=observer_failure,
         cleanup_failure=cleanup_failure,
     )
@@ -2831,15 +2889,27 @@ def _exact_normal_drop_result(
 def _exact_normal_drop_settlement_result(
     *,
     identity: NormalDropIdentity,
-    settlement: NormalDropSettlement | None,
+    settlement: object | None,
     request_dispatch: Literal[
         "not_invoked", "invoked_no_state_transition", "transitioned", "unknown"
     ],
-    reason: str | None = None,
+    reason: ExactNormalDropReason = None,
     observer_failure: bool = False,
     cleanup_failure: bool = False,
 ) -> _ExactNormalDropSessionResult:
     """Map an owned exact-drop settlement without implying a physical result."""
+    if settlement is None:
+        return _exact_normal_drop_result(
+            identity=identity,
+            outcome="unknown",
+            reason="retain_unavailable",
+            request_dispatch=request_dispatch,
+            this_request="reservation_owned",
+            history="unknown",
+            fence="not_established",
+            observer_failure=observer_failure,
+            cleanup_failure=cleanup_failure,
+        )
     if not isinstance(settlement, NormalDropSettlement):
         return _exact_normal_drop_result(
             identity=identity,
@@ -2873,20 +2943,46 @@ def _exact_normal_drop_settlement_result(
             this_request="reservation_owned",
             history="not_applicable",
             fence="released",
+            prior_transition="not_established",
             observer_failure=observer_failure,
             cleanup_failure=cleanup_failure,
         )
     return _exact_normal_drop_result(
         identity=identity,
         outcome="unknown",
-        reason=reason,
+        reason="settlement_stale" if settlement.outcome == "stale" else reason,
         request_dispatch=request_dispatch,
         this_request="reservation_owned",
         history="unknown",
         fence="retained" if settlement.outcome == "unknown" else "not_established",
+        prior_transition="unknown" if settlement.outcome == "stale" else "not_applicable",
         observer_failure=observer_failure,
         cleanup_failure=cleanup_failure,
     )
+
+
+def _exact_normal_drop_store_refusal_reason(rejection: object) -> ExactNormalDropReason:
+    """Map closed store refusals without exposing an open reason vocabulary."""
+    known_rejections: frozenset[ExactNormalDropReason] = frozenset(
+        {
+            "invalid_identity",
+            "unknown_session",
+            "not_latest_session",
+            "clock_epoch_mismatch",
+            "ownership_sequence_mismatch",
+            "session_purpose_not_eligible",
+            "session_faulted",
+            "session_not_active",
+            "timing_evidence_missing",
+            "timing_evidence_superseded",
+            "finalisation_in_progress",
+            "command_in_progress",
+            "phase_invalid",
+        }
+    )
+    if isinstance(rejection, str) and rejection in known_rejections:
+        return cast(ExactNormalDropReason, rejection)
+    return "store_refusal_unavailable"
 
 
 def _retain_exact_normal_drop_unknown(
@@ -3024,7 +3120,17 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
                     fence="not_applicable",
                 )
         admission = server_context.session_store.admit_normal_drop(identity)
-        if admission.outcome != "dispatch" or admission.reservation is None:
+        if admission.outcome == "dispatch" and admission.reservation is None:
+            return _exact_normal_drop_result(
+                identity=identity,
+                outcome="refused_state",
+                reason="dispatch_reservation_unavailable",
+                request_dispatch="not_invoked",
+                this_request="no_reservation",
+                history="not_applicable",
+                fence="not_applicable",
+            )
+        if admission.outcome != "dispatch":
             if admission.outcome == "recorded":
                 return _exact_normal_drop_result(
                     identity=identity,
@@ -3035,10 +3141,41 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
                     history="not_applicable",
                     fence="not_applicable",
                 )
+            if admission.outcome == "in_progress":
+                return _exact_normal_drop_result(
+                    identity=identity,
+                    outcome="in_progress",
+                    reason="normal_drop_in_progress",
+                    request_dispatch="not_invoked",
+                    this_request="no_reservation",
+                    history="not_applicable",
+                    fence="not_applicable",
+                )
+            if admission.outcome == "ambiguous":
+                return _exact_normal_drop_result(
+                    identity=identity,
+                    outcome="ambiguous",
+                    reason="normal_drop_unresolved",
+                    request_dispatch="not_invoked",
+                    this_request="no_reservation",
+                    history="unknown",
+                    fence="retained",
+                    prior_transition="unknown",
+                )
             return _exact_normal_drop_result(
                 identity=identity,
                 outcome=admission.outcome,
-                reason=admission.rejection,
+                reason=_exact_normal_drop_store_refusal_reason(admission.rejection),
+                request_dispatch="not_invoked",
+                this_request="no_reservation",
+                history="not_applicable",
+                fence="not_applicable",
+            )
+        if admission.reservation is None:
+            return _exact_normal_drop_result(
+                identity=identity,
+                outcome="refused_state",
+                reason="dispatch_reservation_unavailable",
                 request_dispatch="not_invoked",
                 this_request="no_reservation",
                 history="not_applicable",
@@ -3249,6 +3386,15 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             reason="exact_drop_observation_resolution_failed",
         )
         observer_failure = freeze_failure or observer_failure
+    except BaseException:
+        with suppress(BaseException):
+            _freeze_exact_normal_drop_observation(
+                server_context,
+                session=session,
+                ticket=observation_ticket,
+                reason="exact_drop_observation_resolution_interrupted",
+            )
+        raise
     try:
         _stop_runtimes_after_drop(
             server_context,

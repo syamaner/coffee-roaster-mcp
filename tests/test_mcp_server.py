@@ -86,6 +86,7 @@ from coffee_roaster_mcp.session import (
     DriverCommandReservation,
     EventPayloadValue,
     MockDropPersistenceTicket,
+    NormalDropAdmission,
     NormalDropIdentity,
     NormalDropSettlement,
     RoastEvent,
@@ -9330,10 +9331,11 @@ def _exact_normal_drop(
     )
 
 
-def test_manual_mock_start_preserves_ordinary_start_when_exact_identity_is_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("binding_failure", ("identity", "owner_mismatch"))
+def test_manual_mock_start_preserves_ordinary_start_when_exact_binding_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, binding_failure: str
 ) -> None:
-    """A missing optional exact identity cannot roll back a published manual mock Start."""
+    """An optional exact binding failure cannot roll back a published manual mock Start."""
     context = _cold_finalisation_context(tmp_path)
     driver = context.roaster_driver
     assert type(driver) is MockRoasterDriver
@@ -9355,17 +9357,27 @@ def test_manual_mock_start_preserves_ordinary_start_when_exact_identity_is_missi
             drop_baseline=0,
         ),
     )
-    original_identity = context.session_store.normal_drop_identity
-    identity_reads = 0
+    if binding_failure == "identity":
+        original_identity = context.session_store.normal_drop_identity
+        identity_reads = 0
 
-    def missing_start_identity(session: RoastSession) -> NormalDropIdentity:
-        nonlocal identity_reads
-        identity_reads += 1
-        if identity_reads == 1:
-            raise SessionLifecycleError("synthetic missing exact identity")
-        return original_identity(session)
+        def missing_start_identity(session: RoastSession) -> NormalDropIdentity:
+            nonlocal identity_reads
+            identity_reads += 1
+            if identity_reads == 1:
+                raise SessionLifecycleError("synthetic missing exact identity")
+            return original_identity(session)
 
-    monkeypatch.setattr(context.session_store, "normal_drop_identity", missing_start_identity)
+        monkeypatch.setattr(context.session_store, "normal_drop_identity", missing_start_identity)
+    else:
+        original_active = context.session_store.get_active_session
+
+        def mismatched_active_session() -> RoastSession | None:
+            active = original_active()
+            assert active is not None
+            return dataclasses.replace(active, id="synthetic-other-owner")
+
+        monkeypatch.setattr(context.session_store, "get_active_session", mismatched_active_session)
     started = _call_tool(
         create_mcp_server(),
         "start_roast_session",
@@ -9374,7 +9386,7 @@ def test_manual_mock_start_preserves_ordinary_start_when_exact_identity_is_missi
     )
 
     session_id = started.session.session_id
-    session = context.session_store.get_active_session()
+    session = context.session_store.get_latest_session()
     assert session is not None and session.id == session_id
     assert context.exact_normal_drop_baseline is None
     assert runtime.started_sessions == [session_id]
@@ -9774,7 +9786,27 @@ def test_exact_normal_drop_refuses_while_registered_legacy_drop_is_in_flight(
     assert driver.drop_transition_count == 1
 
 
-def test_exact_normal_drop_cancels_after_failed_legacy_drop_and_explicit_emergency(
+def test_exact_normal_drop_reports_the_existing_pending_store_fence(
+    tmp_path: Path,
+) -> None:
+    """A prior exact reservation remains the authoritative in-flight outcome."""
+    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    driver = cast(MockRoasterDriver, context.roaster_driver)
+    identity = context.session_store.normal_drop_identity(session)
+    admission = context.session_store.admit_normal_drop(identity)
+    assert admission.outcome == "dispatch" and admission.reservation is not None
+
+    result = _exact_normal_drop(context, session)
+
+    assert result.outcome == "in_progress"
+    assert result.reason == "normal_drop_in_progress"
+    assert result.request_dispatch == "not_invoked"
+    assert result.this_request == "no_reservation"
+    assert result.history == "not_applicable"
+    assert driver.drop_transition_count == 0
+
+
+def test_exact_normal_drop_cancels_after_failed_legacy_drop_stale_emergency(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """P3: a transitioned but unrecorded legacy Drop cannot license an exact retry."""
@@ -9792,8 +9824,6 @@ def test_exact_normal_drop_cancels_after_failed_legacy_drop_and_explicit_emergen
     )
     with pytest.raises(SessionLifecycleError, match="synthetic legacy recording failure"):
         _call_tool(server, "drop_beans", ctx)
-    _call_tool(server, "emergency_stop", ctx, reason="after-failed-legacy-drop")
-
     result = _run_normal_drop_exact_session(
         context,
         session_id=identity.session_id,
@@ -9802,9 +9832,23 @@ def test_exact_normal_drop_cancels_after_failed_legacy_drop_and_explicit_emergen
         timing_evidence_sequence=identity.timing_evidence_sequence,
     )
 
-    assert result.outcome == "refused"
-    assert result.reason == "session_faulted"
+    repeated = _run_normal_drop_exact_session(
+        context,
+        session_id=identity.session_id,
+        clock_epoch_id=identity.clock_epoch_id,
+        ownership_sequence=identity.ownership_sequence,
+        timing_evidence_sequence=identity.timing_evidence_sequence,
+    )
+
+    assert result.outcome == "cancelled"
+    assert result.reason == "emergency_since_session_baseline"
+    assert result.request_dispatch == "invoked_no_state_transition"
+    assert result.this_request == "reservation_owned"
+    assert result.fence == "released"
+    assert result.prior_transition == "not_established"
+    assert repeated.outcome == "cancelled"
     assert driver.drop_transition_count == 1
+    assert driver.emergency_count == 1
 
 
 @pytest.mark.parametrize(
@@ -9951,7 +9995,9 @@ def test_exact_normal_drop_retains_unknown_after_prior_unaccounted_transition(
     assert result.reason == "prior_drop_transition_unaccounted"
     assert result.fence == "retained"
     assert repeated.outcome == "ambiguous"
+    assert repeated.reason == "normal_drop_unresolved"
     assert repeated.request_dispatch == "not_invoked"
+    assert repeated.history == "unknown"
     assert driver.drop_transition_count == 1
     assert driver.emergency_count == 0
 
@@ -9973,22 +10019,48 @@ def test_exact_normal_drop_stale_cancellation_does_not_claim_a_released_fence(
 
     assert result.outcome == "unknown"
     assert result.request_dispatch == "invoked_no_state_transition"
+    assert result.reason == "settlement_stale"
     assert result.fence == "not_established"
+    assert result.prior_transition == "unknown"
+    assert driver.drop_transition_count == 0
+
+
+def test_exact_normal_drop_refuses_a_dispatch_admission_without_a_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed dispatch outcome cannot reach the mock driver without ownership."""
+    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    driver = cast(MockRoasterDriver, context.roaster_driver)
+
+    def dispatch_without_reservation(_identity: NormalDropIdentity) -> NormalDropAdmission:
+        return NormalDropAdmission("dispatch")
+
+    monkeypatch.setattr(
+        context.session_store,
+        "admit_normal_drop",
+        dispatch_without_reservation,
+    )
+
+    result = _exact_normal_drop(context, session)
+
+    assert result.outcome == "refused_state"
+    assert result.reason == "dispatch_reservation_unavailable"
+    assert result.request_dispatch == "not_invoked"
+    assert result.this_request == "no_reservation"
     assert driver.drop_transition_count == 0
 
 
 @pytest.mark.parametrize(
-    ("prior_state", "expected_reason"),
+    ("prior_state",),
     (
-        ("emergency", "emergency_since_session_baseline"),
-        ("transition", "prior_drop_transition_unaccounted"),
+        ("emergency",),
+        ("transition",),
     ),
 )
 def test_exact_normal_drop_stale_settlement_never_claims_a_fence_in_either_prior_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     prior_state: str,
-    expected_reason: str,
 ) -> None:
     """S1: both cancellation discriminators preserve an unestablished stale fence."""
     context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
@@ -10012,8 +10084,9 @@ def test_exact_normal_drop_stale_settlement_never_claims_a_fence_in_either_prior
 
     assert result.outcome == "unknown"
     assert result.request_dispatch == "invoked_no_state_transition"
-    assert result.reason == expected_reason
+    assert result.reason == "settlement_stale"
     assert result.fence == "not_established"
+    assert result.prior_transition == "unknown"
 
 
 def test_exact_normal_drop_retains_unknown_when_the_mock_driver_raises(
@@ -10040,6 +10113,31 @@ def test_exact_normal_drop_retains_unknown_when_the_mock_driver_raises(
     assert driver.drop_transition_count == 0
     assert driver.emergency_count == 0
     assert runtime.stopped_sessions == []
+
+
+def test_exact_normal_drop_reports_an_unavailable_retain_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed uncertainty retain does not masquerade as a stale settlement."""
+    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    driver = cast(MockRoasterDriver, context.roaster_driver)
+
+    def fail_drop(*, exact_drop: object = None) -> RoasterState:
+        del exact_drop
+        raise RuntimeError("synthetic mock driver failure")
+
+    def fail_retain(*_args: object, **_kwargs: object) -> NormalDropSettlement:
+        raise SessionLifecycleError("synthetic retain failure")
+
+    monkeypatch.setattr(driver, "drop_beans", fail_drop)
+    monkeypatch.setattr(context.session_store, "retain_normal_drop_unknown", fail_retain)
+
+    result = _exact_normal_drop(context, session)
+
+    assert result.outcome == "unknown"
+    assert result.reason == "retain_unavailable"
+    assert result.request_dispatch == "unknown"
+    assert result.fence == "not_established"
 
 
 def test_exact_normal_drop_retains_and_freezes_after_malformed_success_settlement(
@@ -10155,6 +10253,56 @@ def test_exact_normal_drop_reports_observer_freeze_and_cleanup_failures(
     assert result.observer_failure
     assert result.cleanup_failure
     assert result.reason == "observation_freeze_failed"
+
+
+def test_exact_normal_drop_freezes_committed_observation_before_reraising_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resolution interrupt preserves the saved endpoint and requests one freeze."""
+    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    runtime = context.first_crack_runtime
+    assert isinstance(runtime, FakeFirstCrackRuntime)
+    completion_calls = 0
+    freezes: list[str] = []
+    original_complete = context.session_store.complete_normal_drop_success
+
+    def count_completion(
+        current: RoastSession,
+        *,
+        reservation: object,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+    ) -> NormalDropSettlement:
+        nonlocal completion_calls
+        completion_calls += 1
+        return original_complete(
+            current,
+            reservation=reservation,
+            heat_level_percent=heat_level_percent,
+            fan_level_percent=fan_level_percent,
+            cooling_on=cooling_on,
+        )
+
+    def interrupt_resolution(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt()
+
+    def record_freeze(*_args: object, reason: str, **_kwargs: object) -> None:
+        freezes.append(reason)
+
+    monkeypatch.setattr(context.session_store, "complete_normal_drop_success", count_completion)
+    monkeypatch.setattr(runtime, "resolve_observation_boundary", interrupt_resolution)
+    monkeypatch.setattr(runtime, "freeze_observation_boundary", record_freeze)
+
+    with pytest.raises(KeyboardInterrupt):
+        _exact_normal_drop(context, session)
+
+    snapshot = context.session_store.get_session_snapshot()
+    assert snapshot.beans_dropped_at_utc is not None
+    assert completion_calls == 1
+    assert freezes == ["exact_drop_observation_resolution_interrupted"]
+    assert _exact_normal_drop(context, session).outcome == "already_dropped"
+    assert completion_calls == 1
 
 
 def test_manual_authority_composition_refuses_before_driver_creation(
