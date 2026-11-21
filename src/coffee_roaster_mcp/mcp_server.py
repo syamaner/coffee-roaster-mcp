@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
+from types import TracebackType
 from typing import Annotated, Any, Literal, Never, cast
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -527,6 +528,19 @@ TimingEpochId = Annotated[str, Strict(), StringConstraints(pattern=_TIMING_EPOCH
 TimingExactInt = Annotated[int, Strict(), Field(ge=0, le=2**53 - 1)]
 TimingPositiveInt = Annotated[int, Strict(), Field(ge=1, le=2**53 - 1)]
 TimingFiniteFloat = Annotated[float, Strict(), Field(allow_inf_nan=False)]
+
+
+class _ExactNormalDropArguments(ArgModelBase):
+    """Strict raw SDK-boundary arguments for exact mock-session Drop."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    session_id: FixedZeroSessionId
+    clock_epoch_id: TimingEpochId
+    ownership_sequence: TimingPositiveInt
+    timing_evidence_sequence: TimingPositiveInt
+
+
 _EVENT_EVIDENCE_SCHEMA_CONDITIONALS: dict[str, Any] = {
     "allOf": [
         {
@@ -956,6 +970,31 @@ def _install_timing_evidence_argument_adapter(mcp: FastMCP) -> None:
     tool.parameters = _TimingEvidenceArguments.model_json_schema(by_alias=True)
 
 
+def _install_exact_normal_drop_argument_adapter(mcp: FastMCP) -> None:
+    """Bind strict raw argument validation to only the exact mock Drop tool."""
+    tool = mcp._tool_manager.get_tool("drop_beans_exact_session")  # pyright: ignore[reportPrivateUsage]
+    if tool is None:
+        raise RuntimeError("Exact mock Drop tool was not registered.")
+    existing_metadata = tool.fn_metadata
+    declared_metadata_fields = getattr(type(existing_metadata), "model_fields", None)
+    if (
+        not isinstance(declared_metadata_fields, Mapping)
+        or "arg_model" not in declared_metadata_fields
+    ):
+        raise RuntimeError("Exact mock Drop argument adapter is unsupported.")
+    try:
+        adapted_metadata = existing_metadata.model_copy(
+            update={"arg_model": _ExactNormalDropArguments}
+        )
+        binds_exact_drop_arguments = adapted_metadata.arg_model is _ExactNormalDropArguments
+    except Exception as exc:
+        raise RuntimeError("Exact mock Drop argument adapter is unsupported.") from exc
+    if not binds_exact_drop_arguments:
+        raise RuntimeError("Exact mock Drop argument adapter is unsupported.")
+    tool.fn_metadata = adapted_metadata
+    tool.parameters = _ExactNormalDropArguments.model_json_schema(by_alias=True)
+
+
 def _install_capture_evidence_argument_adapter(mcp: FastMCP) -> None:
     """Bind strict raw argument validation to the capture-evidence tool only."""
     tool = mcp._tool_manager.get_tool("get_capture_evidence")  # pyright: ignore[reportPrivateUsage]
@@ -1061,6 +1100,7 @@ ExactNormalDropReason = (
         "observation_freeze_failed",
         "observation_resolution_failed",
         "post_drop_cleanup_failed",
+        "endpoint_history_unresolved",
     ]
     | None
 )
@@ -1082,11 +1122,42 @@ class _ExactNormalDropSessionResult:
     this_request: Literal["no_reservation", "reservation_owned"]
     history: Literal["not_applicable", "saved", "unknown"]
     fence: Literal["not_applicable", "released", "retained", "not_established"]
-    prior_transition: Literal["not_applicable", "not_established", "unknown"]
+    prior_transition: Literal["not_applicable", "not_established", "unaccounted", "unknown"]
     retry: Literal["forbidden"] = "forbidden"
     physical_effect: Literal["not_established"] = "not_established"
     observer_failure: bool = False
     cleanup_failure: bool = False
+
+
+class ExactNormalDropResult(BaseModel):
+    """Closed public result for one exact mock-session Drop request."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    session_id: FixedZeroSessionId
+    clock_epoch_id: TimingEpochId
+    ownership_sequence: TimingPositiveInt
+    timing_evidence_sequence: TimingPositiveInt
+    outcome: ExactNormalDropOutcome
+    reason: ExactNormalDropReason
+    request_dispatch: Literal[
+        "not_invoked", "invoked_no_state_transition", "transitioned", "unknown"
+    ]
+    this_request: Literal["no_reservation", "reservation_owned"]
+    history: Literal["not_applicable", "saved", "unknown"]
+    fence: Literal["not_applicable", "released", "retained", "not_established"]
+    prior_transition: Literal["not_applicable", "not_established", "unaccounted", "unknown"]
+    retry: Literal["forbidden"]
+    physical_effect: Literal["not_established"]
+    observer_failure: StrictBool
+    cleanup_failure: StrictBool
+
+
+def _exact_normal_drop_public_result(
+    result: _ExactNormalDropSessionResult,
+) -> ExactNormalDropResult:
+    """Project the private producer reply onto the closed public wire result."""
+    return ExactNormalDropResult.model_validate(dataclasses.asdict(result))
 
 
 @dataclass(frozen=True)
@@ -1980,6 +2051,7 @@ def create_mcp_server(
                 "mark_beans_added",
                 "mark_first_crack",
                 "drop_beans",
+                "drop_beans_exact_session",
                 "start_cooling",
                 "stop_cooling",
                 "export_roast_log",
@@ -2252,6 +2324,24 @@ def create_mcp_server(
             ctx.request_context.lifespan_context,
             expected_session_id=expected_session_id,
         )
+
+    @mcp.tool()
+    def drop_beans_exact_session(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+        ctx: Context[ServerSession, ServerContext],
+        session_id: str,
+        clock_epoch_id: str,
+        ownership_sequence: int,
+        timing_evidence_sequence: int,
+    ) -> ExactNormalDropResult:
+        """Request one exact mock-only Drop for the supplied session binding."""
+        result = _run_normal_drop_exact_session(
+            ctx.request_context.lifespan_context,
+            session_id=session_id,
+            clock_epoch_id=clock_epoch_id,
+            ownership_sequence=ownership_sequence,
+            timing_evidence_sequence=timing_evidence_sequence,
+        )
+        return _exact_normal_drop_public_result(result)
 
     @mcp.tool()
     def set_fan(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
@@ -2697,6 +2787,7 @@ def create_mcp_server(
     _install_fixed_zero_argument_adapter(mcp)
     _install_capture_evidence_argument_adapter(mcp)
     _install_timing_evidence_argument_adapter(mcp)
+    _install_exact_normal_drop_argument_adapter(mcp)
     return mcp
 
 
@@ -2864,7 +2955,9 @@ def _exact_normal_drop_result(
     this_request: Literal["no_reservation", "reservation_owned"],
     history: Literal["not_applicable", "saved", "unknown"],
     fence: Literal["not_applicable", "released", "retained", "not_established"],
-    prior_transition: Literal["not_applicable", "not_established", "unknown"] = "not_applicable",
+    prior_transition: Literal[
+        "not_applicable", "not_established", "unaccounted", "unknown"
+    ] = "not_applicable",
     observer_failure: bool = False,
     cleanup_failure: bool = False,
 ) -> _ExactNormalDropSessionResult:
@@ -2894,6 +2987,9 @@ def _exact_normal_drop_settlement_result(
         "not_invoked", "invoked_no_state_transition", "transitioned", "unknown"
     ],
     reason: ExactNormalDropReason = None,
+    prior_transition: Literal[
+        "not_applicable", "not_established", "unaccounted", "unknown"
+    ] = "not_applicable",
     observer_failure: bool = False,
     cleanup_failure: bool = False,
 ) -> _ExactNormalDropSessionResult:
@@ -2907,6 +3003,7 @@ def _exact_normal_drop_settlement_result(
             this_request="reservation_owned",
             history="unknown",
             fence="not_established",
+            prior_transition=prior_transition,
             observer_failure=observer_failure,
             cleanup_failure=cleanup_failure,
         )
@@ -2919,6 +3016,7 @@ def _exact_normal_drop_settlement_result(
             this_request="reservation_owned",
             history="unknown",
             fence="not_established",
+            prior_transition=prior_transition,
             observer_failure=observer_failure,
             cleanup_failure=cleanup_failure,
         )
@@ -2931,6 +3029,7 @@ def _exact_normal_drop_settlement_result(
             this_request="reservation_owned",
             history="saved",
             fence="released",
+            prior_transition=prior_transition,
             observer_failure=observer_failure,
             cleanup_failure=cleanup_failure,
         )
@@ -2955,7 +3054,7 @@ def _exact_normal_drop_settlement_result(
         this_request="reservation_owned",
         history="unknown",
         fence="retained" if settlement.outcome == "unknown" else "not_established",
-        prior_transition="unknown" if settlement.outcome == "stale" else "not_applicable",
+        prior_transition=("unknown" if settlement.outcome == "stale" else prior_transition),
         observer_failure=observer_failure,
         cleanup_failure=cleanup_failure,
     )
@@ -2993,31 +3092,96 @@ def _retain_exact_normal_drop_unknown(
 ) -> NormalDropSettlement | None:
     """Try once to retain an exact reservation without fabricating settlement."""
     try:
-        return server_context.session_store.retain_normal_drop_unknown(
+        settlement = server_context.session_store.retain_normal_drop_unknown(
             session, reservation=reservation
         )
+        if _is_expected_normal_drop_settlement(settlement, operation="retention"):
+            return settlement
+        return None
     except Exception:  # noqa: BLE001 - a failed fallback must not be retried.
         return None
 
 
+def _is_expected_normal_drop_settlement(
+    settlement: object,
+    *,
+    operation: Literal["cancelled", "completion", "retention"],
+) -> bool:
+    """Return whether a store reply is a complete variant for one operation."""
+    if not isinstance(settlement, NormalDropSettlement):
+        return False
+    if settlement.outcome == "stale":
+        return settlement.event is None and settlement.snapshot is None
+    if operation == "cancelled":
+        return (
+            settlement.outcome == "cancelled"
+            and settlement.event is None
+            and isinstance(settlement.snapshot, RoastSession)
+        )
+    if operation == "retention":
+        return (
+            settlement.outcome == "unknown"
+            and settlement.event is None
+            and isinstance(settlement.snapshot, RoastSession)
+        )
+    return (
+        settlement.outcome == "success"
+        and isinstance(settlement.event, RoastEvent)
+        and isinstance(settlement.snapshot, RoastSession)
+    ) or (
+        settlement.outcome == "unknown"
+        and settlement.event is None
+        and isinstance(settlement.snapshot, RoastSession)
+    )
+
+
 class _ExactNormalDropReservationGuard:
-    """Retain one unsettled exact Drop reservation at most once."""
+    """Own and retain one exact Drop reservation across the whole operation."""
 
     def __init__(
         self,
         server_context: ServerContext,
-        *,
-        session: RoastSession,
-        reservation: object,
     ) -> None:
         self._server_context = server_context
+        self._session: RoastSession | None = None
+        self._reservation: object | None = None
+        self._retention_attempted = False
+        self._settled = False
+
+    def __enter__(self) -> _ExactNormalDropReservationGuard:
+        """Start the one ownership interval before admission."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        """Best-effort retain an owned unsettled reservation on interruption."""
+        del exc_value, traceback
+        if exc_type is not None:
+            with suppress(BaseException):
+                self.retain_once()
+        return False
+
+    def acquire(self, *, session: RoastSession, reservation: object) -> None:
+        """Record ownership only after a successful dispatch admission."""
         self._session = session
         self._reservation = reservation
-        self._retention_attempted = False
+
+    def mark_settled(self) -> None:
+        """Record that terminal store settlement transferred ownership."""
+        self._settled = True
 
     def retain_once(self) -> NormalDropSettlement | None:
         """Attempt the sole best-effort uncertainty retention for this request."""
-        if self._retention_attempted:
+        if (
+            self._settled
+            or self._retention_attempted
+            or self._session is None
+            or self._reservation is None
+        ):
             return None
         self._retention_attempted = True
         return _retain_exact_normal_drop_unknown(
@@ -3054,6 +3218,27 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
     clock_epoch_id: str,
     ownership_sequence: int,
     timing_evidence_sequence: int,
+) -> _ExactNormalDropSessionResult:
+    """Run one exact Drop beneath its single admission-to-settlement boundary."""
+    with _ExactNormalDropReservationGuard(server_context) as ownership:
+        return _run_owned_normal_drop_exact_session(
+            server_context,
+            session_id=session_id,
+            clock_epoch_id=clock_epoch_id,
+            ownership_sequence=ownership_sequence,
+            timing_evidence_sequence=timing_evidence_sequence,
+            ownership=ownership,
+        )
+
+
+def _run_owned_normal_drop_exact_session(
+    server_context: ServerContext,
+    *,
+    session_id: str,
+    clock_epoch_id: str,
+    ownership_sequence: int,
+    timing_evidence_sequence: int,
+    ownership: _ExactNormalDropReservationGuard,
 ) -> _ExactNormalDropSessionResult:
     """Execute one unregistered, exact, manual-authority mock normal Drop.
 
@@ -3209,11 +3394,9 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
                 fence="not_applicable",
             )
         reservation = admission.reservation
+        ownership.acquire(session=session, reservation=reservation)
 
     assert session is not None
-    ownership = _ExactNormalDropReservationGuard(
-        server_context, session=session, reservation=reservation
-    )
     try:
         arbitration = ExactDropArbitration(
             operation_id=reservation.token,
@@ -3250,11 +3433,17 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
                 with suppress(BaseException):
                     ownership.retain_once()
                 raise
+            else:
+                if _is_expected_normal_drop_settlement(settlement, operation="cancelled"):
+                    ownership.mark_settled()
+                else:
+                    settlement = ownership.retain_once()
             return _exact_normal_drop_settlement_result(
                 identity=identity,
                 settlement=settlement,
                 request_dispatch="invoked_no_state_transition",
                 reason="emergency_since_session_baseline",
+                prior_transition="not_established",
             )
         settlement = ownership.retain_once()
         return _exact_normal_drop_settlement_result(
@@ -3262,6 +3451,7 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             settlement=settlement,
             request_dispatch="invoked_no_state_transition",
             reason="prior_drop_transition_unaccounted",
+            prior_transition="unaccounted",
         )
     except Exception:
         settlement = ownership.retain_once()
@@ -3353,14 +3543,7 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             )
         raise
 
-    if (
-        not isinstance(settlement, NormalDropSettlement)
-        or settlement.outcome not in {"success", "unknown", "stale"}
-        or (
-            settlement.outcome == "success"
-            and (settlement.event is None or settlement.snapshot is None)
-        )
-    ):
+    if not _is_expected_normal_drop_settlement(settlement, operation="completion"):
         settlement = ownership.retain_once()
         freeze_failed = _freeze_exact_normal_drop_observation(
             server_context,
@@ -3376,6 +3559,9 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             observer_failure=freeze_failed,
         )
 
+    ownership.mark_settled()
+    assert isinstance(settlement, NormalDropSettlement)
+
     if settlement.outcome != "success":
         freeze_failed = _freeze_exact_normal_drop_observation(
             server_context,
@@ -3387,7 +3573,7 @@ def _run_normal_drop_exact_session(  # pyright: ignore[reportUnusedFunction]
             identity=identity,
             settlement=settlement,
             request_dispatch="transitioned",
-            reason="observation_freeze_failed" if freeze_failed else None,
+            reason="observation_freeze_failed" if freeze_failed else "endpoint_history_unresolved",
             observer_failure=freeze_failed,
         )
 
