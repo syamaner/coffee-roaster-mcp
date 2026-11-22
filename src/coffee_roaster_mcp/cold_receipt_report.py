@@ -69,7 +69,7 @@ def project_cold_receipt_report(observation: HottopReceiptObservation) -> ColdRe
         receipt = observation.receipt
         if receipt is None:
             return _report(
-                outcome="no_receipt",
+                outcome="receipt_unusable" if "clock_regression" in defects else "no_receipt",
                 defects=defects,
                 same_handle_epoch=None,
                 receipt_sequence=observation.receipt_sequence,
@@ -126,8 +126,10 @@ def project_cold_receipt_report(observation: HottopReceiptObservation) -> ColdRe
         )
 
 
-def _age_if_nonnegative(now: float, then: float) -> float | None:
+def _age_if_nonnegative(now: float | None, then: float) -> float | None:
     """Return a finite non-negative host-clock age, or ``None`` on regression."""
+    if now is None:
+        return None
     age = now - then
     if not isfinite(age) or age < 0:
         return None

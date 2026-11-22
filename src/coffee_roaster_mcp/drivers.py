@@ -516,6 +516,25 @@ HottopReceiptReason = Literal[
     "receipt_age_bound_unset",
     "receipt_age_exceeds_bound",
 ]
+_HOTTOP_RECEIPT_REASON_ORDER: tuple[HottopReceiptReason, ...] = (
+    "candidate_not_configured",
+    "no_receipt",
+    "epoch_or_handle_changed",
+    "superseded",
+    "unit_not_explicit_celsius",
+    "queue_unreadable",
+    "read_size_contradiction",
+    "read_truncated",
+    "misaligned_or_skipped",
+    "parser_remainder",
+    "backlog_visible",
+    "latest_pair_rejected",
+    "invalid_packet_history",
+    "no_drained_floor",
+    "clock_regression",
+    "receipt_age_bound_unset",
+    "receipt_age_exceeds_bound",
+)
 HottopReceptionMode = Literal["off", "candidate/v1"]
 HottopReceiptReportMode = Literal["off", "observe/v1"]
 HottopWriteResult = Literal["entering", "accepted_by_host", "unknown"]
@@ -908,7 +927,8 @@ class HottopReceiptObservation:
     """One cached observer snapshot paired with a normalized driver state.
 
     This is host-side receipt evidence only.  Its ``observed_at`` value is a
-    host clock reading, not a sensor timestamp or a hardware freshness claim.
+    host clock reading, when one is available, not a sensor timestamp or a
+    hardware freshness claim.
     """
 
     receipt: HottopReceivedPacket | None
@@ -917,7 +937,7 @@ class HottopReceiptObservation:
     handle_token: int
     receipt_sequence: int
     observer_discard_count: int
-    observed_at: float
+    observed_at: float | None
 
     def __post_init__(self) -> None:
         """Validate scalar observer facts without accessing a transport."""
@@ -928,7 +948,8 @@ class HottopReceiptObservation:
             "observer_discard_count",
         ):
             _validate_nonnegative_exact_int(getattr(self, label), label=label)
-        _validate_finite_time(self.observed_at, label="observed_at")
+        if self.observed_at is not None:
+            _validate_finite_time(self.observed_at, label="observed_at")
 
 
 @runtime_checkable
@@ -2529,25 +2550,9 @@ class HottopRoasterDriver:
         with self._state_lock:
             observed_at = self._receipt_report_clock_sample()
             if observed_at is None:
-                record = self._receipt_report_record
-                self._receipt_report_record = None
-                if self._connected:
-                    self._receipt_report_discard_count += 1
-                observed_at = self._receipt_report_last_observed_at
-                if observed_at is None and record is not None:
-                    observed_at = record.read_returned_at
+                classification = self._unusable_receipt_report_classification_locked()
             else:
-                self._receipt_report_last_observed_at = observed_at
-            # A receipt is only ever built after a finite clock sample, so this
-            # fallback can only be its real read-returned host observation.
-            if observed_at is None:
-                # No receipt can exist without a finite sampled clock.  Keep the
-                # public snapshot constructible without claiming that zero is a
-                # sampled time; it is paired with an explicitly unusable receipt.
-                observed_at = 0.0
-            observation = HottopReceiptObservation(
-                receipt=self._receipt_report_record,
-                classification=classify_hottop_received_packet(
+                classification = classify_hottop_received_packet(
                     self._receipt_report_record,
                     candidate_configured=False,
                     current_epoch=self._receipt_report_epoch,
@@ -2555,7 +2560,10 @@ class HottopRoasterDriver:
                     current_sequence=self._receipt_report_sequence,
                     now=observed_at,
                     receipt_age_bound_seconds=None,
-                ),
+                )
+            observation = HottopReceiptObservation(
+                receipt=self._receipt_report_record,
+                classification=classification,
                 epoch=self._receipt_report_epoch,
                 handle_token=self._receipt_report_handle_token,
                 receipt_sequence=self._receipt_report_sequence,
@@ -2563,6 +2571,45 @@ class HottopRoasterDriver:
                 observed_at=observed_at,
             )
             return self._state_snapshot_locked(), observation
+
+    def _unusable_receipt_report_classification_locked(self) -> HottopReceiptClassification:
+        """Classify a snapshot with no usable query-time host clock sample."""
+        receipt = self._receipt_report_record
+        if receipt is None:
+            return HottopReceiptClassification(
+                eligible=False,
+                reasons=(
+                    "candidate_not_configured",
+                    "no_receipt",
+                    "clock_regression",
+                    "receipt_age_bound_unset",
+                ),
+                drained_floor_age_seconds=None,
+                read_returned_age_seconds=None,
+            )
+        baseline = classify_hottop_received_packet(
+            receipt,
+            candidate_configured=False,
+            current_epoch=self._receipt_report_epoch,
+            current_handle_identity=self._receipt_report_handle_token,
+            current_sequence=self._receipt_report_sequence,
+            now=receipt.read_returned_at,
+            receipt_age_bound_seconds=None,
+        )
+        reasons = cast(
+            tuple[HottopReceiptReason, ...],
+            tuple(
+                reason
+                for reason in _HOTTOP_RECEIPT_REASON_ORDER
+                if reason == "clock_regression" or reason in baseline.reasons
+            ),
+        )
+        return HottopReceiptClassification(
+            eligible=False,
+            reasons=reasons,
+            drained_floor_age_seconds=None,
+            read_returned_age_seconds=None,
+        )
 
     def _state_snapshot_locked(self) -> RoasterState:
         """Build one normalized state while the caller holds ``_state_lock``."""
@@ -3219,17 +3266,24 @@ class HottopRoasterDriver:
             read_generation = self._receipt_report_read_generation
 
         started_at = self._receipt_report_clock_sample()
+        missing_queue = object()
         try:
-            queued_before = cast(object, getattr(serial_transport, "in_waiting", 0))  # noqa: B009
+            queued_before = cast(object, getattr(serial_transport, "in_waiting", missing_queue))  # noqa: B009
         except Exception:
+            self._invalidate_receipt_report_floor(serial_transport, epoch, handle_token)
             self._discard_receipt_report_record(
                 serial_transport, epoch, handle_token, count_read_error=True
             )
             return
         # Keep the legacy pre-read admission intact.  Receipt diagnostics are
         # deliberately stricter and only use exact integer queue observations.
+        if queued_before is missing_queue:
+            self._invalidate_receipt_report_floor(serial_transport, epoch, handle_token)
+            self._discard_receipt_report_record(serial_transport, epoch, handle_token)
+            return
         if not isinstance(queued_before, int) or queued_before <= 0:
             if not _is_nonnegative_exact_int(queued_before):
+                self._invalidate_receipt_report_floor(serial_transport, epoch, handle_token)
                 self._discard_receipt_report_record(serial_transport, epoch, handle_token)
                 return
             if not prior_tail and started_at is not None:
@@ -3474,6 +3528,17 @@ class HottopRoasterDriver:
                     sequence=self._receipt_report_sequence,
                     observed_at=observed_at,
                 )
+
+    def _invalidate_receipt_report_floor(
+        self,
+        serial_transport: SerialTransport,
+        epoch: int,
+        handle_token: int,
+    ) -> None:
+        """Clear floor evidence contradicted by an unreadable pre-read queue."""
+        with self._state_lock:
+            if self._receipt_report_binding_is_active_locked(serial_transport, epoch, handle_token):
+                self._receipt_report_floor = None
 
     def _discard_receipt_report_record(
         self,
