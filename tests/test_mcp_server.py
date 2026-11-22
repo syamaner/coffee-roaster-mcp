@@ -4083,6 +4083,7 @@ def test_registered_manual_mock_implicit_poll_does_not_seed_successor_auto_t0(
     responses: list[object] = []
     errors: list[BaseException] = []
     original_process = mcp_server._process_auto_t0_for_active_session  # pyright: ignore[reportPrivateUsage]
+    hold_armed = False
 
     def hold_predecessor_observation(
         server_context: ServerContext,
@@ -4091,7 +4092,9 @@ def test_registered_manual_mock_implicit_poll_does_not_seed_successor_auto_t0(
         device_state: RoasterDeviceState,
         defer_canonical_settlement: bool = False,
     ) -> bool:
-        if session_id == predecessor.session_id:
+        nonlocal hold_armed
+        if not hold_armed:
+            hold_armed = True
             entered.set()
             assert release.wait(timeout=1.0)
         return original_process(
