@@ -51,11 +51,15 @@ from coffee_roaster_mcp.drivers import (
     EmergencyStopResult,
     ExactDropArbitration,
     FixedZeroCommandedState,
+    HottopReceptionMode,
     HottopRoasterDriver,
     HottopStartPhase,
+    HottopTemperatureUnit,
     MockRoasterDriver,
     RoasterCapabilities,
+    RoasterDriver,
     RoasterState,
+    SerialTransportFactory,
     build_hottop_command_packet,
 )
 from coffee_roaster_mcp.first_crack_runtime import (
@@ -11411,15 +11415,32 @@ def test_build_server_context_forwards_candidate_and_refuses_physical_compositio
             hottop_reception="candidate/v1",
         )
     )
-    received: list[object] = []
+    received: list[HottopReceptionMode] = []
     original_factory = mcp_server.create_roaster_driver
 
     def load(**_kwargs: object) -> AppConfig:
         return config
 
-    def factory(*args: object, **kwargs: object):
-        received.append(kwargs["hottop_reception"])
-        return original_factory(*args, **kwargs)
+    def factory(
+        driver_name: str,
+        *,
+        port: str | None = None,
+        baudrate: int = 115_200,
+        temperature_unit: HottopTemperatureUnit = "celsius",
+        command_interval_seconds: float = 0.3,
+        hottop_reception: HottopReceptionMode = "off",
+        serial_factory: SerialTransportFactory | None = None,
+    ) -> RoasterDriver:
+        received.append(hottop_reception)
+        return original_factory(
+            driver_name,
+            port=port,
+            baudrate=baudrate,
+            temperature_unit=temperature_unit,
+            command_interval_seconds=command_interval_seconds,
+            hottop_reception=hottop_reception,
+            serial_factory=serial_factory,
+        )
 
     monkeypatch.setattr(mcp_server, "load_config", load)
     monkeypatch.setattr(mcp_server, "create_roaster_driver", factory)
