@@ -2259,6 +2259,12 @@ class HottopRoasterDriver:
             return False
         if self._solenoid_open:
             return True
+        # Exact-Drop ownership is only enabled for the bounded simulated
+        # receipt path.  Preserve ordinary candidate reconnect compatibility
+        # when that opt-in is absent: a disconnected Stop must not acquire
+        # replacement-stream credit or prevent its normal lifecycle recovery.
+        if self._simulation_receipt_age_bound_seconds is None:
+            return False
         settlements = (
             (self._drop_settlement, *self._emergency_settlements)
             if self._drop_settlement is not None

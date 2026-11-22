@@ -1867,7 +1867,7 @@ def test_candidate_reconnect_refuses_unknown_closed_drop_before_factory_open() -
 
 
 def test_candidate_clean_reconnect_streams_a_new_closed_frame() -> None:
-    """An ordinary clean candidate reconnect still owns and streams its new transport."""
+    """A disconnected ordinary Stop does not take replacement-stream credit."""
     first_transport = FakeSerialTransport()
     replacement_transport = FakeSerialTransport()
     factory = SequentialSerialFactory([first_transport, replacement_transport])
@@ -1881,6 +1881,12 @@ def test_candidate_clean_reconnect_streams_a_new_closed_frame() -> None:
     driver.connect()
     _wait_for_hottop_write(first_transport, lambda frame: frame[16] == 0)
     driver.disconnect()
+    stopped = driver.emergency_stop(reason="test")
+    assert stopped.safety_method == "emergency_stop"
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        prior_stop = driver._emergency_settlement  # pyright: ignore[reportPrivateUsage]
+    assert prior_stop is not None
+    assert prior_stop.attempt_epoch is None
     driver.connect()
     replacement_first_frame = _wait_for_hottop_write(
         replacement_transport,
@@ -1891,6 +1897,11 @@ def test_candidate_clean_reconnect_streams_a_new_closed_frame() -> None:
     assert len(factory.calls) == 2
     assert replacement_transport.writes_snapshot()[0][16] == 0
     assert replacement_first_frame[16] == 0
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        assert driver._emergency_settlement is prior_stop  # pyright: ignore[reportPrivateUsage]
+        replacement_stop = driver._emergency_settlement  # pyright: ignore[reportPrivateUsage]
+    assert replacement_stop is not None
+    assert replacement_stop.attempt_epoch is None
 
 
 def test_candidate_reconnect_preserves_fan_only_preconnect_compatibility() -> None:
