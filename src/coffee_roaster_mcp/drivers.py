@@ -564,6 +564,9 @@ HottopExactDropRefusalReason = Literal[
     "receipt_ineligible",
     "receipt_expired",
     "prior_unresolved",
+    "prior_drop_open",
+    "prior_drop_transition_unaccounted",
+    "emergency_since_session_baseline",
 ]
 
 
@@ -572,7 +575,7 @@ class HottopExactDropRefusalEvidence:
     """Closed driver evidence for one refused candidate exact-Drop invocation.
 
     `retained_prior_drop` is separate from the invocation reason: it identifies
-    a prior unsettled Drop without inferring that its commanded or physical
+    a prior Drop settlement without inferring that its commanded or physical
     effect is absent.
     """
 
@@ -2616,10 +2619,21 @@ class HottopRoasterDriver:
         candidate = exact_drop.candidate
         if not candidate.receipt_classification.eligible:
             self._raise_exact_drop_refused("receipt_ineligible")
-        if self._drop_is_unresolved_locked():
+        prior_drop = self._drop_settlement
+        if prior_drop is not None and prior_drop.result in {"pending", "entering", "unknown"}:
             self._raise_exact_drop_refused("prior_unresolved")
-        if candidate.emergency_count != self._emergency_count:
-            self._raise_exact_drop_refused("stop_first")
+        if self._solenoid_open:
+            self._raise_exact_drop_refused("prior_drop_open")
+        if (
+            candidate.drop_transition_count != self._drop_transition_count
+            or candidate.drop_settlement != self._drop_settlement
+        ):
+            self._raise_exact_drop_refused("prior_drop_transition_unaccounted")
+        if (
+            candidate.emergency_count != self._emergency_count
+            or candidate.emergency_settlements != tuple(self._emergency_settlements)
+        ):
+            self._raise_exact_drop_refused("emergency_since_session_baseline")
         if not candidate.streaming or not self._candidate_streaming_owner_locked():
             self._raise_exact_drop_refused("stream_lost")
         if (
@@ -2632,12 +2646,6 @@ class HottopRoasterDriver:
                 "receipt_missing" if self._reception_record is None else "receipt_replaced"
             )
         if candidate.receipt_sequence != self._reception_sequence:
-            self._raise_exact_drop_refused("receipt_replaced")
-        if (
-            candidate.drop_transition_count != self._drop_transition_count
-            or candidate.drop_settlement != self._drop_settlement
-            or candidate.emergency_settlements != tuple(self._emergency_settlements)
-        ):
             self._raise_exact_drop_refused("receipt_replaced")
         classification = self._classify_current_receipt_locked()
         if not classification.eligible:
@@ -2653,8 +2661,13 @@ class HottopRoasterDriver:
         prior_drop = self._drop_settlement
         retained_prior_drop = (
             prior_drop
-            if prior_drop is not None and prior_drop.result in {"pending", "entering", "unknown"}
-            else None
+            if reason == "prior_drop_open"
+            else (
+                prior_drop
+                if prior_drop is not None
+                and prior_drop.result in {"pending", "entering", "unknown"}
+                else None
+            )
         )
         raise HottopExactDropRefused(HottopExactDropRefusalEvidence(reason, retained_prior_drop))
 
