@@ -11,7 +11,7 @@ import struct
 import sys
 import wave
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, Thread, get_ident, local
 from types import SimpleNamespace
@@ -742,8 +742,16 @@ def test_registered_simulated_lever_rejected_submission_releases_reservation(
 
 
 @pytest.mark.parametrize("tool_name", ("set_heat", "set_fan"))
+@pytest.mark.parametrize(
+    "submission_error",
+    (RuntimeError, KeyboardInterrupt),
+    ids=("exception", "keyboard-interrupt"),
+)
 def test_registered_simulated_lever_queued_submission_failure_never_enters_driver(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    submission_error: type[BaseException],
 ) -> None:
     """A queued worker rejected during thread creation cannot affect a newer owner."""
     server = create_hottop_simulation_mcp_server(
@@ -755,8 +763,19 @@ def test_registered_simulated_lever_queued_submission_failure_never_enters_drive
     checked_name = f"_{tool_name}_unless_superseded"
     checked_calls: list[int] = []
     emergency_calls: list[str] = []
+    admissions: list[Future[bool]] = []
     original_checked = getattr(HottopRoasterDriver, checked_name)
     original_emergency = HottopRoasterDriver.emergency_stop
+
+    class RecordingAdmission(Future[bool]):
+        """Retain the private admission future for bounded pre-fix teardown."""
+
+        def __init__(self) -> None:
+            """Record one simulated-lever admission future."""
+            super().__init__()
+            admissions.append(self)
+
+    monkeypatch.setattr(mcp_server, "Future", RecordingAdmission)
 
     def record_checked(driver: HottopRoasterDriver, token: object, **kwargs: object) -> object:
         """Record only workers that reach the existing checked driver route."""
@@ -803,15 +822,18 @@ def test_registered_simulated_lever_queued_submission_failure_never_enters_drive
 
                 def reject_second_worker_start(_thread: Thread) -> None:
                     """Raise only after the occupied executor has queued the lever worker."""
-                    raise RuntimeError("synthetic thread creation failure")
+                    raise submission_error("synthetic thread creation failure")
 
                 with monkeypatch.context() as thread_patch:
                     thread_patch.setattr(Thread, "start", reject_second_worker_start)
-                    with pytest.raises(RuntimeError, match="synthetic thread creation failure"):
+                    with pytest.raises(submission_error, match="synthetic thread creation failure"):
                         await _call(
                             server, tool_name, context, **{f"{tool_name[4:]}_level_percent": 37}
                         )
 
+                assert len(admissions) == 1
+                assert admissions[0].done()
+                assert admissions[0].result() is False
                 latest = context.session_store.get_latest_session()
                 assert latest is not None
                 assert latest.pending_driver_command_kind is None
@@ -831,6 +853,9 @@ def test_registered_simulated_lever_queued_submission_failure_never_enters_drive
                 assert latest.pending_driver_command_kind is None
             finally:
                 worker_release.set()
+                for admission in admissions:
+                    if not admission.done():
+                        admission.set_result(False)
                 executor.shutdown(wait=True)
 
     asyncio.run(exercise())

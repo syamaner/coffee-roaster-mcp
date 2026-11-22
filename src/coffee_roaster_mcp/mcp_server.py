@@ -6704,9 +6704,16 @@ async def _submit_admitted_hottop_control(
                 driver_command=driver_command,
             ),
         )
-    except Exception:
-        server_context.session_store.clear_driver_command_reservation(session, reservation)
+    except BaseException as submission_error:
+        # ``ThreadPoolExecutor.submit`` may have queued this callable before
+        # thread creation is interrupted. Refuse that exact worker before any
+        # cleanup which could itself fail, so it cannot wait indefinitely or
+        # enter the driver route after the caller receives the interruption.
         admission.set_result(False)
+        try:
+            server_context.session_store.clear_driver_command_reservation(session, reservation)
+        except BaseException as cleanup_error:
+            raise submission_error from cleanup_error
         raise
     admission.set_result(True)
     try:
