@@ -2633,7 +2633,9 @@ class HottopRoasterDriver:
                         self._settle_attempt(attempt, "unknown")
                     raise
                 with self._state_lock:
-                    self._last_command_write_size = receipt if type(receipt) is int else 0
+                    self._last_command_write_size = (
+                        receipt if type(receipt) is int and receipt >= 0 else 0
+                    )
                     result: HottopWriteResult = (
                         "accepted_by_host"
                         if type(receipt) is int and receipt == len(frame) == HOTTOP_PACKET_LENGTH
