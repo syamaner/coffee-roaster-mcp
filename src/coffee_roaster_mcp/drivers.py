@@ -13,7 +13,7 @@ from time import monotonic
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 from coffee_roaster_mcp.controls import validate_control_percent
-from coffee_roaster_mcp.session import EventPayloadValue
+from coffee_roaster_mcp.session import EventPayloadValue, SessionPurpose
 
 ReportedTemperatureUnit = Literal["celsius", "unknown"]
 HottopTemperatureUnit = Literal["celsius", "fahrenheit", "auto"]
@@ -1600,6 +1600,7 @@ class HottopStartOwner:
 
     server_token: str
     generation: int
+    purpose: SessionPurpose | None = None
 
 
 @dataclass
@@ -1689,6 +1690,7 @@ class HottopRoasterDriver:
         self._start_generation = 0
         self._start_session: object | None = None
         self._start_claim: _HottopFirstWriteClaim | None = None
+        self._start_stream_admission: Event | None = None
         self._start_write_disposition = HottopFirstWriteDisposition.NOT_CLAIMED
         self._stop_event = Event()
         self._disconnect_requested = Event()
@@ -1771,10 +1773,14 @@ class HottopRoasterDriver:
         with self._state_lock:
             return self._start_owner, self._start_phase
 
-    def reserve_inhibited_start(self, server_token: str) -> HottopStartOwner:
+    def reserve_inhibited_start(
+        self, server_token: str, *, purpose: SessionPurpose | None = None
+    ) -> HottopStartOwner:
         """Allocate exact ownership before any native factory entry."""
         self._refuse_staged_connect()
         with self._lifecycle_lock, self._state_lock:
+            if self._hottop_reception == "candidate/v1" and purpose != "roast":
+                raise ValueError("candidate/v1 requires an explicit roast Start purpose.")
             if (
                 self._hottop_reception == "candidate/v1"
                 and not self._candidate_prestart_clear_locked()
@@ -1787,7 +1793,7 @@ class HottopRoasterDriver:
             if self._connected or self._serial is not None or self._command_thread is not None:
                 raise RuntimeError("Legacy Hottop lifecycle must be absent before staging.")
             self._start_generation += 1
-            owner = HottopStartOwner(server_token, self._start_generation)
+            owner = HottopStartOwner(server_token, self._start_generation, purpose)
             self._start_owner = owner
             self._start_phase = HottopStartPhase.RESERVED
             self._stop_event.set()
@@ -1835,6 +1841,7 @@ class HottopRoasterDriver:
                     self._start_phase = None
                     self._start_session = None
                     self._start_claim = None
+                    self._start_stream_admission = None
                     return HottopStartSettlement.NOT_ENTERED
                 if self._start_phase is not HottopStartPhase.OPEN_INHIBITED:
                     return HottopStartSettlement.UNRESOLVED
@@ -1859,6 +1866,7 @@ class HottopRoasterDriver:
                     self._start_handle = None
                     self._start_session = None
                     self._start_claim = None
+                    self._start_stream_admission = None
                     return HottopStartSettlement.CLEAN_CLOSED
                 self._start_phase = HottopStartPhase.UNRESOLVED
                 return HottopStartSettlement.UNRESOLVED
@@ -2089,31 +2097,34 @@ class HottopRoasterDriver:
                 or self._serial is not None
                 or self._command_thread is not None
                 or self._connected
+                or self._start_stream_admission is not None
             ):
                 raise RuntimeError("Staged Hottop first write cannot hand off to streaming.")
             self._serial = claim.handle
             self._stop_event.clear()
             self._disconnect_requested.clear()
             self._connected = True
+            admission = Event()
+            self._start_stream_admission = admission
             command_thread = Thread(
                 target=self._command_loop,
+                args=(admission,),
                 daemon=True,
                 name="HottopCommandLoop",
             )
             try:
                 command_thread.start()
             except BaseException:
-                if command_thread.is_alive():
-                    self._command_thread = command_thread
-                    self._start_phase = HottopStartPhase.STREAMING
-                else:
-                    self._serial = None
-                    self._connected = False
-                    self._stop_event.set()
-                    self._start_phase = HottopStartPhase.WRITTEN
+                # A native launch may have occurred even when start() raises.  Keep
+                # the exact owner and closed gate rather than infer safe rollback.
+                self._command_thread = command_thread
+                self._connected = False
+                self._stop_event.set()
+                self._start_phase = HottopStartPhase.UNRESOLVED
                 raise
             self._command_thread = command_thread
             self._start_phase = HottopStartPhase.STREAMING
+            admission.set()
 
     def _candidate_prestart_clear_locked(self) -> bool:
         """Return whether candidate Start retains only known-clear command state."""
@@ -2193,7 +2204,8 @@ class HottopRoasterDriver:
 
             with self._state_lock:
                 staged_stream_owner = (
-                    self._start_phase is HottopStartPhase.STREAMING
+                    self._hottop_reception == "candidate/v1"
+                    and self._start_owner is not None
                     and self._start_handle is serial_transport
                     and self._serial is serial_transport
                 )
@@ -2222,6 +2234,7 @@ class HottopRoasterDriver:
                     self._start_handle = None
                     self._start_session = None
                     self._start_claim = None
+                    self._start_stream_admission = None
                     self._start_write_disposition = HottopFirstWriteDisposition.NOT_CLAIMED
                 elif staged_stream_owner:
                     self._start_phase = HottopStartPhase.UNRESOLVED
@@ -2495,8 +2508,12 @@ class HottopRoasterDriver:
             cooling_on=cooling_on,
         )
 
-    def _command_loop(self) -> None:
+    def _command_loop(self, admission: Event | None = None) -> None:
         """Stream current Hottop command frames until disconnect requests shutdown."""
+        if admission is not None:
+            while not admission.is_set():
+                if self._stop_event.wait(self._command_interval_seconds):
+                    return
         while not self._stop_event.wait(self._command_interval_seconds):
             self._send_command_frame()
             self._run_command_loop_iteration_hook()

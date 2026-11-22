@@ -2249,7 +2249,7 @@ def create_mcp_server(
         driver = server_context.roaster_driver
         if manual and isinstance(driver, HottopRoasterDriver):
             try:
-                owner = driver.reserve_inhibited_start(reservation.token)
+                owner = driver.reserve_inhibited_start(reservation.token, purpose=purpose)
             except BaseException:
                 with server_context.lifecycle_barrier:
                     server_context.session_store.clear_session_start_reservation(reservation)
