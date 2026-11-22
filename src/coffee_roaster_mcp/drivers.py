@@ -1658,7 +1658,9 @@ class HottopRoasterDriver:
         normalized_temperature_unit = _validate_hottop_temperature_unit(temperature_unit)
         if hottop_reception not in {"off", "candidate/v1"}:
             raise ValueError("hottop_reception must be exactly 'off' or 'candidate/v1'.")
-        if hottop_reception == "candidate/v1" and serial_factory is None:
+        if hottop_reception == "candidate/v1" and (
+            serial_factory is None or serial_factory is _create_pyserial_transport
+        ):
             raise ValueError(
                 "candidate/v1 requires an injected simulated transport; "
                 "physical transport not qualified"
@@ -1671,7 +1673,9 @@ class HottopRoasterDriver:
         self._baudrate = baudrate
         self._temperature_unit: HottopTemperatureUnit = normalized_temperature_unit
         self._command_interval_seconds = command_interval_seconds
-        self._serial_factory = serial_factory or _create_pyserial_transport
+        self._serial_factory = (
+            _create_pyserial_transport if serial_factory is None else serial_factory
+        )
         self._hottop_reception: HottopReceptionMode = hottop_reception
         self._reception_clock = reception_clock or monotonic
         self._join_timeout_seconds = join_timeout_seconds
@@ -1716,6 +1720,7 @@ class HottopRoasterDriver:
         self._status_read_error_count = 0
         self._status_buffer = b""
         self._reception_epoch = 0
+        self._reception_handle_token = 0
         self._reception_sequence = 0
         self._reception_floor: HottopDrainedFloor | None = None
         self._reception_record: HottopReceivedPacket | None = None
@@ -1726,6 +1731,8 @@ class HottopRoasterDriver:
         self._emergency_count = 0
         self._drop_settlement: HottopCommandSettlement | None = None
         self._emergency_settlement: HottopCommandSettlement | None = None
+        self._emergency_settlements: list[HottopCommandSettlement] = []
+        self._emergency_transition_frames: list[tuple[int, int, int, bytes]] = []
 
     @property
     def capabilities(self) -> RoasterCapabilities:
@@ -2051,6 +2058,15 @@ class HottopRoasterDriver:
         """Publish stop state while coordinating with the command write path."""
         with self._state_lock:
             serial_transport = self._serial
+            self._disconnect_requested.set()
+            self._connected = False
+            self._stop_event.set()
+            if self._hottop_reception == "candidate/v1":
+                self._reception_epoch += 1
+                self._reception_handle_token = self._reception_epoch
+                self._status_buffer = b""
+                self._reception_floor = None
+                self._reception_record = None
 
         close_failed = False
         write_lock_acquired = self._command_write_lock.acquire(timeout=self._write_timeout_seconds)
@@ -2067,9 +2083,6 @@ class HottopRoasterDriver:
 
         try:
             with self._state_lock:
-                self._disconnect_requested.set()
-                self._connected = False
-                self._stop_event.set()
                 if close_failed:
                     self._last_command_write_size = 0
                 return self._command_thread, self._serial
@@ -2261,13 +2274,30 @@ class HottopRoasterDriver:
             self._command_state_revision += 1
             if self._hottop_reception == "candidate/v1":
                 self._emergency_count += 1
-                self._emergency_settlement = HottopCommandSettlement(
+                settlement = HottopCommandSettlement(
                     transition="emergency",
                     transition_seq=self._emergency_count,
                     transition_revision=self._command_state_revision,
                     transition_epoch=self._reception_epoch,
                     result="pending",
                 )
+                self._emergency_settlement = settlement
+                self._emergency_settlements.append(settlement)
+                self._emergency_transition_frames.append(
+                    (
+                        settlement.transition_seq,
+                        settlement.transition_epoch,
+                        settlement.transition_revision,
+                        self._current_command_frame_locked(),
+                    )
+                )
+                if len(self._emergency_settlements) > 64:
+                    retired = self._emergency_settlements.pop(0)
+                    self._emergency_transition_frames = [
+                        frame
+                        for frame in self._emergency_transition_frames
+                        if frame[0] != retired.transition_seq
+                    ]
                 self._close_unattempted_drop_settlement()
             heat_level_percent = self._heat_level_percent
             fan_level_percent = self._main_fan_level_percent
@@ -2358,20 +2388,13 @@ class HottopRoasterDriver:
                     ):
                         return
                     revision = self._command_state_revision
-                    frame = build_hottop_command_packet(
-                        heat_level_percent=self._heat_level_percent,
-                        fan_level_percent=self._roast_fan_level_percent,
-                        main_fan_level_percent=self._main_fan_level_percent,
-                        solenoid_open=self._solenoid_open,
-                        drum_motor_on=self._drum_motor_on,
-                        cooling_motor_on=self._cooling_motor_on,
-                    )
+                    frame = self._current_command_frame_locked()
                     self._command_send_attempts += 1
                     self._attempt_sequence += 1
-                    role = self._candidate_attempt_role(frame)
+                    role = self._candidate_attempt_role(frame, revision)
                     attempt = HottopWriteAttempt(
                         epoch=self._reception_epoch,
-                        handle_identity=id(serial_transport),
+                        handle_identity=self._reception_handle_token,
                         attempt_seq=self._attempt_sequence,
                         revision=revision,
                         frame=frame,
@@ -2405,18 +2428,43 @@ class HottopRoasterDriver:
             with self._state_lock:
                 self._command_loop_error_count += 1
 
-    def _candidate_attempt_role(self, frame: bytes) -> HottopAttemptRole:
+    def _candidate_attempt_role(self, frame: bytes, revision: int) -> HottopAttemptRole:
         """Classify a candidate attempt without treating repeated frames as evidence."""
         if frame[_HOTTOP_COMMAND_SOLENOID_INDEX] == 1:
             if self._drop_settlement is not None and self._drop_settlement.result == "pending":
                 return "drop"
             return "repeat"
-        if (
-            self._emergency_settlement is not None
-            and self._emergency_settlement.result == "pending"
-        ):
+        if self._pending_emergency_settlement(frame, revision) is not None:
             return "emergency"
         return "ordinary"
+
+    def _pending_emergency_settlement(
+        self, frame: bytes, revision: int
+    ) -> HottopCommandSettlement | None:
+        """Return only the exact pending emergency transition for this frame."""
+        for settlement in reversed(self._emergency_settlements):
+            expected_frame = next(
+                (
+                    stored_frame
+                    for sequence, epoch, stored_revision, stored_frame in (
+                        self._emergency_transition_frames
+                    )
+                    if (
+                        sequence == settlement.transition_seq
+                        and epoch == settlement.transition_epoch
+                        and stored_revision == settlement.transition_revision
+                    )
+                ),
+                None,
+            )
+            if (
+                settlement.result == "pending"
+                and settlement.transition_epoch == self._reception_epoch
+                and settlement.transition_revision == revision
+                and expected_frame == frame
+            ):
+                return settlement
+        return None
 
     def _append_write_attempt(self, attempt: HottopWriteAttempt) -> None:
         """Retain a bounded current-operation attempt history."""
@@ -2435,27 +2483,49 @@ class HottopRoasterDriver:
                 attempt_seq=attempt.attempt_seq,
                 attempt_revision=attempt.revision,
             )
-        elif attempt.role == "emergency" and self._emergency_settlement is not None:
-            self._emergency_settlement = replace(
-                self._emergency_settlement,
-                result="entering",
-                attempt_epoch=attempt.epoch,
-                attempt_handle_identity=attempt.handle_identity,
-                attempt_seq=attempt.attempt_seq,
-                attempt_revision=attempt.revision,
-            )
+        elif attempt.role == "emergency":
+            settlement = self._pending_emergency_settlement(attempt.frame, attempt.revision)
+            if settlement is not None:
+                self._replace_emergency_settlement(
+                    settlement.transition_seq,
+                    replace(
+                        settlement,
+                        result="entering",
+                        attempt_epoch=attempt.epoch,
+                        attempt_handle_identity=attempt.handle_identity,
+                        attempt_seq=attempt.attempt_seq,
+                        attempt_revision=attempt.revision,
+                    ),
+                )
 
     def _settle_attempt(self, attempt: HottopWriteAttempt, result: HottopWriteResult) -> None:
         """Finalize only the attempt that fixed a settlement's entry identity."""
-        for attribute in ("_drop_settlement", "_emergency_settlement"):
+        for attribute in ("_drop_settlement",):
             settlement = cast(HottopCommandSettlement | None, getattr(self, attribute))
             if settlement is None or settlement.attempt_seq != attempt.attempt_seq:
                 continue
             setattr(self, attribute, replace(settlement, result=result))
+        for settlement in self._emergency_settlements:
+            if settlement.attempt_seq == attempt.attempt_seq:
+                self._replace_emergency_settlement(
+                    settlement.transition_seq, replace(settlement, result=result)
+                )
+                break
         for index, recorded in enumerate(self._attempt_history):
             if recorded.attempt_seq == attempt.attempt_seq:
                 self._attempt_history[index] = replace(recorded, result=result)
                 break
+
+    def _replace_emergency_settlement(
+        self, transition_seq: int, replacement: HottopCommandSettlement
+    ) -> None:
+        """Replace one bounded emergency settlement without relabelling another."""
+        for index, settlement in enumerate(self._emergency_settlements):
+            if settlement.transition_seq == transition_seq:
+                self._emergency_settlements[index] = replacement
+                if self._emergency_settlement is settlement:
+                    self._emergency_settlement = replacement
+                return
 
     def _close_unattempted_drop_settlement(self) -> None:
         """Finalize a pending Drop only while closing its commanded solenoid state."""
@@ -2503,16 +2573,29 @@ class HottopRoasterDriver:
     def _begin_reception_epoch(self, handle: SerialTransport) -> None:
         """Start a receive epoch while the new handle is atomically published."""
         self._reception_epoch += 1
+        self._reception_handle_token = self._reception_epoch
         self._status_buffer = b""
         self._reception_floor = None
         self._reception_record = None
         _ = handle
 
+    def _invalidate_candidate_receipt(self, serial_transport: SerialTransport, epoch: int) -> None:
+        """Discard receipt continuity only if this remains the active receive owner."""
+        with self._state_lock:
+            if self._serial is serial_transport and self._reception_epoch == epoch:
+                self._status_buffer = b""
+                self._reception_floor = None
+                self._reception_record = None
+
     def _read_status_packet_candidate(self, serial_transport: SerialTransport) -> None:
         """Read one bounded simulated candidate chunk with host-receipt provenance."""
         with self._state_lock:
             epoch = self._reception_epoch
-            if self._serial is not serial_transport:
+            if (
+                self._serial is not serial_transport
+                or self._disconnect_requested.is_set()
+                or not self._connected
+            ):
                 self._reception_discard_count += 1
                 return
             prior_tail = self._status_buffer
@@ -2526,29 +2609,27 @@ class HottopRoasterDriver:
             if self._candidate_queue_probe(serial_transport) == 0:
                 self._publish_drained_floor(serial_transport, epoch, post_probe_time)
             return
+        if queued_before is None:
+            self._invalidate_candidate_receipt(serial_transport, epoch)
+            return
         read = getattr(serial_transport, "read", None)
         if not callable(read):
-            _ = self._reception_clock()
-            self._candidate_queue_probe(serial_transport)
+            self._invalidate_candidate_receipt(serial_transport, epoch)
             return
-        requested = (
-            min(queued_before, _HOTTOP_STATUS_READ_MAX_BYTES)
-            if queued_before is not None and queued_before > 0
-            else _HOTTOP_STATUS_READ_MAX_BYTES
-        )
+        requested = min(queued_before, _HOTTOP_STATUS_READ_MAX_BYTES)
         try:
             chunk = read(requested)
         except Exception:
             with self._state_lock:
                 self._status_read_error_count += 1
-            _ = self._reception_clock()
-            self._candidate_queue_probe(serial_transport)
+            self._invalidate_candidate_receipt(serial_transport, epoch)
             return
         returned_at = self._reception_clock()
         post_probe_time = self._reception_clock()
         queued_after = self._candidate_queue_probe(serial_transport)
-        if not isinstance(chunk, bytes):
-            chunk = b""
+        if not isinstance(chunk, bytes) or not chunk:
+            self._invalidate_candidate_receipt(serial_transport, epoch)
+            return
         scan = scan_hottop_status_read(
             chunk,
             prior_tail=prior_tail,
@@ -2557,13 +2638,18 @@ class HottopRoasterDriver:
             temperature_unit=temperature_unit,
         )
         with self._state_lock:
-            if self._serial is not serial_transport or self._reception_epoch != epoch:
+            if (
+                self._serial is not serial_transport
+                or self._reception_epoch != epoch
+                or self._disconnect_requested.is_set()
+                or not self._connected
+            ):
                 self._reception_discard_count += 1
                 return
             self._reception_sequence += 1
             receipt = build_hottop_received_packet(
                 epoch=epoch,
-                handle_identity=id(serial_transport),
+                handle_identity=self._reception_handle_token,
                 sequence=self._reception_sequence,
                 read_started_at=started_at,
                 read_returned_at=returned_at,
@@ -2573,9 +2659,7 @@ class HottopRoasterDriver:
                 scan=scan,
                 drained_floor=self._reception_floor,
             )
-            self._status_buffer = (
-                (prior_tail + chunk)[-scan.tail_length :] if scan.tail_length else b""
-            )
+            self._status_buffer = scan.tail_bytes
             self._reception_record = receipt
             for status in scan.packets:
                 self._status_packet_count += 1
@@ -2607,10 +2691,12 @@ class HottopRoasterDriver:
                 self._serial is serial_transport
                 and self._reception_epoch == epoch
                 and not self._status_buffer
+                and not self._disconnect_requested.is_set()
+                and self._connected
             ):
                 self._reception_floor = HottopDrainedFloor(
                     epoch=epoch,
-                    handle_identity=id(serial_transport),
+                    handle_identity=self._reception_handle_token,
                     sequence=self._reception_sequence,
                     observed_at=observed_at,
                 )
@@ -2618,14 +2704,18 @@ class HottopRoasterDriver:
     def _current_command_frame(self) -> bytes:
         """Return the current Hottop command-state packet."""
         with self._state_lock:
-            return build_hottop_command_packet(
-                heat_level_percent=self._heat_level_percent,
-                fan_level_percent=self._roast_fan_level_percent,
-                main_fan_level_percent=self._main_fan_level_percent,
-                solenoid_open=self._solenoid_open,
-                drum_motor_on=self._drum_motor_on,
-                cooling_motor_on=self._cooling_motor_on,
-            )
+            return self._current_command_frame_locked()
+
+    def _current_command_frame_locked(self) -> bytes:
+        """Build the current command packet while the state lock is held."""
+        return build_hottop_command_packet(
+            heat_level_percent=self._heat_level_percent,
+            fan_level_percent=self._roast_fan_level_percent,
+            main_fan_level_percent=self._main_fan_level_percent,
+            solenoid_open=self._solenoid_open,
+            drum_motor_on=self._drum_motor_on,
+            cooling_motor_on=self._cooling_motor_on,
+        )
 
 
 def _percent_to_hottop_fan_scale(value: int) -> int:
