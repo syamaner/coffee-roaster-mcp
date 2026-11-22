@@ -118,8 +118,21 @@ class ClockMapping(Closed):
             raise ValueError("Session clock origin must be explicit UTC.")
         return self
 
-    def at(self, instant: float) -> Time:
+    def at(self, instant: float, *, event_domain_mapped: bool = True) -> Time:
+        """Project a capture-clock instant without exporting its raw epoch."""
         elapsed = instant - self.session_origin
+        if not event_domain_mapped:
+            return Time(
+                session_relative_seconds=absent("clock_unavailable"),
+                recording_relative_seconds=(
+                    absent(
+                        "not_yet_observed" if self.recording_pending else "recorder_never_started"
+                    )
+                    if self.recording_origin is None
+                    else present(instant - self.recording_origin)
+                ),
+                utc=absent("clock_unavailable"),
+            )
         return Time(
             session_relative_seconds=present(elapsed),
             recording_relative_seconds=(
@@ -129,6 +142,17 @@ class ClockMapping(Closed):
             ),
             utc=present((self.session_utc + timedelta(seconds=elapsed)).isoformat()),
         )
+
+    def event_at(self, instant: float, *, event_domain_mapped: bool = True) -> Time:
+        """Project an accepted session event without assuming a capture mapping."""
+        elapsed = instant - self.session_origin
+        if not event_domain_mapped:
+            return Time(
+                session_relative_seconds=present(elapsed),
+                recording_relative_seconds=absent("clock_unavailable"),
+                utc=present((self.session_utc + timedelta(seconds=elapsed)).isoformat()),
+            )
+        return self.at(instant)
 
 
 class ModelIdentity(Closed):

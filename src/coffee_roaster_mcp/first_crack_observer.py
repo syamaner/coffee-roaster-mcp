@@ -378,6 +378,7 @@ class FirstCrackObserver:
         monotonic_now: Callable[[], float] = time.monotonic,
         stop_timeout_seconds: float = 1.0,
         recording_origin_reader: Callable[[], float | None] | None = None,
+        event_domain_mapped: bool = True,
     ) -> None:
         self.config = config
         self.session_id = session_id
@@ -390,6 +391,7 @@ class FirstCrackObserver:
         )
         self.pipeline = pipeline
         self._recording_origin_reader = recording_origin_reader
+        self._event_domain_mapped = event_domain_mapped
         self._capture_stop_attempted = False
         self._capture_stop_returned_normally = False
         self._capture_stop_lock = threading.Lock()
@@ -637,6 +639,8 @@ class FirstCrackObserver:
         coordinator().wake.set()
 
     def _mapped_now_locked(self) -> float:
+        if not self._event_domain_mapped:
+            return float("-inf")
         return self.clock.session_origin + max(0.0, self.now() - self.clock.session_origin)
 
     def _freeze_if_due_locked(self) -> None:
@@ -723,7 +727,7 @@ class FirstCrackObserver:
             session_id=self.session_id,
             generation=self.generation,
             record_key=key,
-            accepted_at=self.clock.at(self.now()),
+            accepted_at=self.clock.at(self.now(), event_domain_mapped=self._event_domain_mapped),
         )
 
     def _append(self, sink: ObservationSink, record: Record) -> bool:
@@ -750,7 +754,9 @@ class FirstCrackObserver:
                 **self._common_locked(register=False),
                 payload=ReceiptPayload(
                     persisted_record_key=record.record_key,
-                    append_completed_at=self.clock.at(completed),
+                    append_completed_at=self.clock.at(
+                        completed, event_domain_mapped=self._event_domain_mapped
+                    ),
                 ),
             )
         try:
@@ -796,7 +802,9 @@ class FirstCrackObserver:
                         payload=IdentityPayload(
                             identity=self.identity,
                             settings=self.settings,
-                            load_available_at=self.clock.at(self.now()),
+                            load_available_at=self.clock.at(
+                                self.now(), event_domain_mapped=self._event_domain_mapped
+                            ),
                         ),
                     )
                 self._append(sink, record)
@@ -813,7 +821,9 @@ class FirstCrackObserver:
                     payload=IdentityPayload(
                         identity=identity,
                         settings=self.settings,
-                        load_available_at=self.clock.at(self.now()),
+                        load_available_at=self.clock.at(
+                            self.now(), event_domain_mapped=self._event_domain_mapped
+                        ),
                     ),
                 )
             self._append(sink, record)
@@ -894,6 +904,11 @@ class FirstCrackObserver:
                         window = self._owned_windows.pop(0) if self._owned_windows else None
                     if window is None:
                         pass
+                    elif not self._event_domain_mapped:
+                        # Capture timestamps cannot be compared to canonical
+                        # session boundaries. Preserve the raw recorder output,
+                        # but do not publish a model coverage claim.
+                        window = None
                     elif window.sequence_number in self._seen_windows:
                         if (
                             self.confirmation is not None
@@ -1055,7 +1070,9 @@ class FirstCrackObserver:
             record = HumanRecord(
                 **self._common_locked(),
                 payload=HumanPayload(
-                    human_mark=self.clock.at(self.human_at),
+                    human_mark=self.clock.event_at(
+                        self.human_at, event_domain_mapped=self._event_domain_mapped
+                    ),
                     first_confirmation_key_seen_at_acceptance=absent("no_confirmation")
                     if self.confirmation is None
                     else present(self.confirmation.first_confirmation_key),
@@ -1094,8 +1111,11 @@ class FirstCrackObserver:
                     probability=absent("not_applicable"),
                     positive_window_count=0,
                     window_status="not_inferred",
-                    window_start=self.clock.at(window.started_at_monotonic_seconds),
-                    window_end=self.clock.at(end),
+                    window_start=self.clock.at(
+                        window.started_at_monotonic_seconds,
+                        event_domain_mapped=self._event_domain_mapped,
+                    ),
+                    window_end=self.clock.at(end, event_domain_mapped=self._event_domain_mapped),
                     decision_available_at=missing_time,
                     inference_duration_ms=0,
                     queue_depth=capture.queued_window_count,
@@ -1177,15 +1197,26 @@ class FirstCrackObserver:
                     self.confirmation = ConfirmationPayload(
                         first_confirmation_key=f"{self.session_id}:{self.generation}:{window.sequence_number}",
                         confirming_window_sequence=window.sequence_number,
-                        model_onset=self.clock.at(event.detected_at_monotonic_seconds),
+                        model_onset=self.clock.at(
+                            event.detected_at_monotonic_seconds,
+                            event_domain_mapped=self._event_domain_mapped,
+                        ),
                         model_onset_inferred=event.detected_at_inferred,
-                        confirming_window_end=self.clock.at(end),
-                        decision_available_at=self.clock.at(available),
+                        confirming_window_end=self.clock.at(
+                            end, event_domain_mapped=self._event_domain_mapped
+                        ),
+                        decision_available_at=self.clock.at(
+                            available, event_domain_mapped=self._event_domain_mapped
+                        ),
                         confirming_probability=confidence,
                         positive_window_count=observation.positive_window_count,
                         human_mark_at_acceptance=absent()
                         if self.human_at is None
-                        else present(self.clock.at(self.human_at)),
+                        else present(
+                            self.clock.event_at(
+                                self.human_at, event_domain_mapped=self._event_domain_mapped
+                            )
+                        ),
                     )
                     self.state = "confirmed" if self.deadline is None else "closing"
                     confirmation_record = ConfirmationRecord(
@@ -1206,9 +1237,14 @@ class FirstCrackObserver:
                 else "candidate"
                 if observation.fc_status == "candidate"
                 else "negative",
-                window_start=self.clock.at(window.started_at_monotonic_seconds),
-                window_end=self.clock.at(end),
-                decision_available_at=self.clock.at(available),
+                window_start=self.clock.at(
+                    window.started_at_monotonic_seconds,
+                    event_domain_mapped=self._event_domain_mapped,
+                ),
+                window_end=self.clock.at(end, event_domain_mapped=self._event_domain_mapped),
+                decision_available_at=self.clock.at(
+                    available, event_domain_mapped=self._event_domain_mapped
+                ),
                 inference_duration_ms=duration,
                 queue_depth=capture.queued_window_count,
                 capture_dropped_windows=self.counts.capture_dropped_windows,
@@ -1231,7 +1267,7 @@ class FirstCrackObserver:
         if self.summary is not None:
             return
         confirmation = self.confirmation
-        coverage = (
+        coverage = self._event_domain_mapped and (
             not self._pending_boundaries
             and not self.failed
             and not self._coverage_loss
@@ -1273,10 +1309,16 @@ class FirstCrackObserver:
             if coverage
             else "incomplete"
         )
+        if not self._event_domain_mapped:
+            outcome = "unavailable"
+            coverage = False
+            self.reason = "clock_domain_unmapped"
         if confirmation is None:
             order = "both_absent" if self.human_at is None else "model_absent"
         elif self.human_at is None:
             order = "human_absent"
+        elif not self._event_domain_mapped:
+            order = "model_absent"
         else:
             model_time = confirmation.decision_available_at.session_relative_seconds.value
             if model_time is None:
@@ -1304,7 +1346,11 @@ class FirstCrackObserver:
             first_confirmation_key=absent("no_confirmation")
             if confirmation is None
             else present(confirmation.first_confirmation_key),
-            human_mark=absent() if self.human_at is None else present(self.clock.at(self.human_at)),
+            human_mark=absent()
+            if self.human_at is None
+            else present(
+                self.clock.event_at(self.human_at, event_domain_mapped=self._event_domain_mapped)
+            ),
             model_onset=absent("no_confirmation")
             if confirmation is None
             else present(confirmation.model_onset),
@@ -1318,8 +1364,10 @@ class FirstCrackObserver:
             if self._pending_boundaries
             else absent()
             if self.cutoff is None
-            else present(self.clock.at(self.cutoff)),
-            frozen_at=self.clock.at(self.now()),
+            else present(
+                self.clock.event_at(self.cutoff, event_domain_mapped=self._event_domain_mapped)
+            ),
+            frozen_at=self.clock.at(self.now(), event_domain_mapped=self._event_domain_mapped),
             max_probability=absent(
                 "load_not_completed"
                 if self.identity.status == "pending"

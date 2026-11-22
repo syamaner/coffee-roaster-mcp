@@ -16,6 +16,7 @@ from coffee_roaster_mcp.detector import (
 from coffee_roaster_mcp.first_crack_observation import (
     ConfirmationRecord,
     Record,
+    SummaryRecord,
     WindowRecord,
 )
 from coffee_roaster_mcp.first_crack_observer import (
@@ -174,6 +175,37 @@ def test_confirmation_is_diagnostic_durable_and_clock_mapped(tmp_path: Path) -> 
     )
     assert snapshot.first_confirmation.value is not None
     assert snapshot.first_confirmation.value.human_mark_at_acceptance.value is None
+
+
+def test_unmapped_event_clock_withholds_capture_mapping(tmp_path: Path) -> None:
+    """A stepped session clock cannot establish audio-boundary coverage."""
+    observer, capture, sink, _backend = setup_observer(tmp_path, now=[1544654.0])
+    observer.clock = observer.clock.model_copy(
+        update=dict(session_origin=100.0, recording_origin=1544653.0)
+    )
+    observer._event_domain_mapped = False
+    observer.update_boundaries(charge_at=110.0, human_at=170.0)
+    capture.windows.append(window(start=1544653.0))
+    assert observer.start()
+    assert sink.appended.wait(2)
+    observer.close(cutoff=181.1, reason="beans_dropped")
+    assert observer.reaped.wait(2)
+
+    summary_record = next(row for row in sink.rows if isinstance(row, SummaryRecord))
+    summary = summary_record.payload
+    assert summary.outcome == "unavailable"
+    assert summary.coverage_complete is False
+    assert summary.reason.value == "clock_domain_unmapped"
+    assert summary.drop_cutoff.value is not None
+    assert summary.drop_cutoff.value.session_relative_seconds.value == 81.1
+    assert summary.drop_cutoff.value.recording_relative_seconds.value is None
+    assert summary.drop_cutoff.value.recording_relative_seconds.null_reason == "clock_unavailable"
+    assert summary.human_mark.value is not None
+    assert summary.human_mark.value.recording_relative_seconds.value is None
+    assert not [row for row in sink.rows if isinstance(row, WindowRecord)]
+    for row in sink.rows:
+        accepted = row.accepted_at.session_relative_seconds.value
+        assert accepted is None or abs(accepted) <= 1000
 
 
 def test_deadline_is_enforced_at_acceptance_without_supervisor_poll(tmp_path: Path) -> None:
