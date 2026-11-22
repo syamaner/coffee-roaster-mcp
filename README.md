@@ -644,8 +644,11 @@ start audio capture or detector runtime.
 RoastPilot supports snapshot export through `export_roast_log` for selected
 in-process sessions. While a roast-purpose session is active on the configured
 manual-authority mock composition, the tool returns `ready=false` without
-writing export artefacts; normally completed inactive selections follow the
-normal export path. An inactive selection does not by itself prove closure.
+writing export artefacts. Its returned paths use a deliberately unavailable
+marker and must not be retried as usable exports. A completed eligible
+manual-authority mock session returns one verified `replay-v1` bundle; repeated
+requests return that same sealed bundle. An inactive selection does not by
+itself prove closure.
 
 Current export files:
 

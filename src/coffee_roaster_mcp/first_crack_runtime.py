@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Literal, Protocol
 
 from pydantic import ValidationError
@@ -227,6 +227,10 @@ class FirstCrackSessionRuntime:
         self._stop_timeout_seconds = stop_timeout_seconds
         self._monotonic_now = monotonic_now or time.monotonic
         self._lock = RLock()
+        # This fence owns only manual live-publication identity. It never
+        # guards capture, model, device or filesystem work.
+        self._human_mark_publication_lock = Lock()
+        self._human_mark_publications: dict[object, tuple[FirstCrackObserver, str, int]] = {}
         self._active_session_id: str | None = None
         self._pipeline: FirstCrackAudioPipeline | None = None
         self._pipeline_session_id: str | None = None
@@ -539,6 +543,8 @@ class FirstCrackSessionRuntime:
         # No model load or inference occurs under this runtime lock.
         retained = self._prune_observation_history(session.id)
         with self._lock:
+            with self._human_mark_publication_lock:
+                self._human_mark_publications.clear()
             self._remember_observation_locked(retained)
             if self._observer is not None and self._observer.session_id != session.id:
                 self._observer.invalidate()
@@ -824,8 +830,65 @@ class FirstCrackSessionRuntime:
             return self._observer.snapshot()
         return self._completed_observation or self._refused_observation
 
-    def notify_human_mark(self, session: RoastSession) -> None:
+    def capture_human_mark_publication(self, session: RoastSession) -> object | None:
+        """Capture one inert observer/session/generation publication claim."""
+        with self._human_mark_publication_lock:
+            observer = self._observer
+            if (
+                observer is None
+                or observer.session_id != session.id
+                or self._admitted_observer != (session.id, observer.generation)
+            ):
+                return None
+            token = object()
+            self._human_mark_publications[token] = (observer, session.id, observer.generation)
+            return token
+
+    def revoke_human_mark_publication(self, session: RoastSession) -> None:
+        """Revoke pending manual claims before a lifecycle endpoint can win."""
+        with self._human_mark_publication_lock:
+            self._human_mark_publications = {
+                token: claim
+                for token, claim in self._human_mark_publications.items()
+                if claim[1] != session.id
+            }
+
+    def discard_human_mark_publication(self, publication_token: object | None) -> None:
+        """Discard one unused captured claim without touching another attempt."""
+        if publication_token is None:
+            return
+        with self._human_mark_publication_lock:
+            self._human_mark_publications.pop(publication_token, None)
+
+    def notify_human_mark(
+        self,
+        session: RoastSession,
+        *,
+        publication_token: object | None = None,
+        allow_human: bool = True,
+    ) -> None:
         """Publish accepted canonical boundaries without waiting for the model."""
+        if publication_token is not None:
+            with self._human_mark_publication_lock:
+                claim = self._human_mark_publications.pop(publication_token, None)
+                if claim is None:
+                    return
+                observer, session_id, generation = claim
+                if (
+                    observer is not self._observer
+                    or session_id != session.id
+                    or generation != observer.generation
+                ):
+                    return
+                observer.update_boundaries(
+                    charge_at=None
+                    if session.beans_added_monotonic_seconds is None
+                    else session.monotonic_start + session.beans_added_monotonic_seconds,
+                    human_at=None
+                    if session.first_crack_monotonic_seconds is None
+                    else session.monotonic_start + session.first_crack_monotonic_seconds,
+                )
+            return
         observer = self._observer
         if observer is not None and observer.session_id == session.id:
             observer.update_boundaries(
@@ -833,7 +896,7 @@ class FirstCrackSessionRuntime:
                 if session.beans_added_monotonic_seconds is None
                 else session.monotonic_start + session.beans_added_monotonic_seconds,
                 human_at=None
-                if session.first_crack_monotonic_seconds is None
+                if not allow_human or session.first_crack_monotonic_seconds is None
                 else session.monotonic_start + session.first_crack_monotonic_seconds,
             )
 
@@ -845,6 +908,7 @@ class FirstCrackSessionRuntime:
         cutoff_monotonic_seconds: float | None = None,
     ) -> None:
         """Close observation with an accepted event cutoff, when one exists."""
+        self.revoke_human_mark_publication(session)
         observer = self._observer
         if observer is not None and observer.session_id == session.id:
             cutoff = cutoff_monotonic_seconds
@@ -869,9 +933,19 @@ class FirstCrackSessionRuntime:
         self, session: RoastSession, ticket: object | None, *, cutoff_monotonic_seconds: float
     ) -> None:
         """Resolve a manual boundary using its own accepted canonical event."""
-        observer = self._observer
-        if ticket is not None and observer is not None and observer.session_id == session.id:
-            observer.resolve_boundary(ticket, cutoff=cutoff_monotonic_seconds)
+        # A resolved Drop is the endpoint for a not-yet-notified manual mark.
+        # Serialize its claim revocation with notification itself: notification
+        # may win only when it consumed the claim before this endpoint, while a
+        # held notification cannot latch the observer after the cutoff.
+        with self._human_mark_publication_lock:
+            self._human_mark_publications = {
+                token: claim
+                for token, claim in self._human_mark_publications.items()
+                if claim[1] != session.id
+            }
+            observer = self._observer
+            if ticket is not None and observer is not None and observer.session_id == session.id:
+                observer.resolve_boundary(ticket, cutoff=cutoff_monotonic_seconds)
 
     def freeze_observation_boundary(
         self, session: RoastSession, ticket: object | None, *, reason: str
@@ -889,7 +963,9 @@ class FirstCrackSessionRuntime:
     ) -> FirstCrackRuntimeSnapshot:
         """Process queued detector windows for the owning active roast session."""
         if self._config.first_crack.event_authority == "manual":
-            self.notify_human_mark(session)
+            # Periodic foreground processing may propagate charge, but cannot
+            # bypass the exact one-shot human-mark publication claim.
+            self.notify_human_mark(session, allow_human=False)
             return self.snapshot()
         with self._lock:
             if not self._can_process_locked(session):
@@ -1133,6 +1209,12 @@ class FirstCrackSessionRuntime:
         if self._config.first_crack.event_authority == "manual":
             observer = self._observer
             if observer is not None and observer.session_id == session_id:
+                with self._human_mark_publication_lock:
+                    self._human_mark_publications = {
+                        token: claim
+                        for token, claim in self._human_mark_publications.items()
+                        if claim[1] != session_id
+                    }
                 observer.close(cutoff=None, reason=reason.replace(" ", "_"))
             return self.snapshot()
         with self._lock:

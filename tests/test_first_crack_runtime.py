@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import asyncio
+import inspect
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Thread
@@ -44,6 +46,11 @@ class ClockHarness:
 
     def monotonic_now(self) -> float:
         return self.monotonic_value
+
+
+async def _await_direct_tool_result(result: Awaitable[Any]) -> Any:
+    """Adapt one SDK tool awaitable for a synchronous in-process test call."""
+    return await result
 
 
 class MockDetectorBackend:
@@ -3036,6 +3043,37 @@ def test_manual_runtime_lifecycle_close_preserves_resolved_cutoff_deadline(
     assert observer.confirmation is not None
 
 
+def test_manual_runtime_drop_cutoff_revokes_held_mark_notification(tmp_path: Path) -> None:
+    """A Drop cutoff prevents a stale accepted mark from latching the observer."""
+    runtime, captures, _ = _manual_runtime_fixture(tmp_path)
+    store = RoastSessionStore(default_log_dir=tmp_path / "drop-publication-race")
+    session = store.start_session()
+    runtime.start_for_session(session)
+    observer = runtime._observer  # pyright: ignore[reportPrivateUsage] - race witness
+    assert observer is not None and len(captures) == 1
+
+    store.record_event(session, "beans_added")
+    accepted_mark = store.record_event(session, "first_crack_detected")
+    publication_token = runtime.capture_human_mark_publication(session)
+    assert publication_token is not None
+
+    ticket = runtime.begin_observation_boundary(session, reason="beans_dropped")
+    assert ticket is not None
+    dropped = store.record_event(session, "beans_dropped")
+    cutoff = session.monotonic_start + dropped.monotonic_seconds
+    runtime.resolve_observation_boundary(session, ticket, cutoff_monotonic_seconds=cutoff)
+
+    # The canonical mark remains live chronology, but its held observer claim
+    # cannot cross the accepted Drop endpoint.
+    assert session.first_crack_monotonic_seconds == accepted_mark.monotonic_seconds
+    assert observer.cutoff == cutoff
+    assert observer.human_at is None
+    runtime.notify_human_mark(session, publication_token=publication_token)
+    assert observer.human_at is None
+    runtime.stop_for_session(session.id, reason="test_cleanup")
+    assert observer.reaped.wait(2)
+
+
 @pytest.mark.parametrize("lifecycle", ["stop", "finalise"])
 def test_manual_runtime_lifecycle_close_rejects_blocked_result_at_original_deadline(
     tmp_path: Path, lifecycle: str
@@ -3494,10 +3532,13 @@ def test_late_release_keeps_tools_sampler_and_finalise_live_then_admits_successo
     server = create_mcp_server(config_path=config_file)
     ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=context))
 
-    def call(name: str):
+    def call(name: str) -> Any:
         tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
         assert tool is not None
-        return tool.fn(ctx)
+        result = tool.fn(ctx)
+        if inspect.isawaitable(result):
+            return asyncio.run(_await_direct_tool_result(result))
+        return result
 
     session = context.session_store.start_session()
     runtime.start_for_session(session)
@@ -4418,7 +4459,10 @@ def _public_boundary_matrix_context(
     def call(name: str, **arguments: object) -> Any:
         tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
         assert tool is not None
-        return tool.fn(ctx, **arguments)
+        result = tool.fn(ctx, **arguments)
+        if inspect.isawaitable(result):
+            return asyncio.run(_await_direct_tool_result(result))
+        return result
 
     started = call(
         "start_roast_session",

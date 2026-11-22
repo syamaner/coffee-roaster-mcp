@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import dataclasses
+import errno
 import inspect
 import json
 import logging
@@ -94,6 +95,8 @@ from coffee_roaster_mcp.mcp_server import (
 )
 from coffee_roaster_mcp.session import (
     DriverCommandReservation,
+    DriverDropReservation,
+    EventLogRecordingError,
     EventPayloadValue,
     MockDropPersistenceTicket,
     NormalDropAdmission,
@@ -1749,10 +1752,8 @@ def test_registered_finalisation_tool_runs_in_process_wrapper(tmp_path: Path) ->
     session = context.session_store.start_session(purpose="cold_characterisation")
     context.roaster_driver.connect()
     server = create_mcp_server()
-    result = asyncio.run(
-        _call_tool(
-            server, "finalise_cold_characterisation_session", _ctx(context), session_id=session.id
-        )
+    result = _call_tool(
+        server, "finalise_cold_characterisation_session", _ctx(context), session_id=session.id
     )
     assert result.status == "clean"
 
@@ -2733,13 +2734,11 @@ def test_registered_finalisation_keeps_replacement_sampler_until_its_callback_ex
     assert first is not None and first_entered.wait(timeout=4.0)
     server = create_mcp_server()
     try:
-        refusal = asyncio.run(
-            _call_tool(
-                server,
-                "finalise_cold_characterisation_session",
-                _ctx(context),
-                session_id=session.id,
-            )
+        refusal = _call_tool(
+            server,
+            "finalise_cold_characterisation_session",
+            _ctx(context),
+            session_id=session.id,
         )
         assert refusal.rejection_reason == "driver_not_connected"
         assert replacement_entered.wait(timeout=4.0)
@@ -2753,13 +2752,11 @@ def test_registered_finalisation_keeps_replacement_sampler_until_its_callback_ex
 
         driver.connect()
         driver.actions.clear()
-        partial = asyncio.run(
-            _call_tool(
-                server,
-                "finalise_cold_characterisation_session",
-                _ctx(context),
-                session_id=session.id,
-            )
+        partial = _call_tool(
+            server,
+            "finalise_cold_characterisation_session",
+            _ctx(context),
+            session_id=session.id,
         )
         assert partial.status == "partial"
         assert partial.stages[0].status == "incomplete"
@@ -2770,13 +2767,11 @@ def test_registered_finalisation_keeps_replacement_sampler_until_its_callback_ex
         release_replacement.set()
         replacement.join(timeout=4.0)
         assert not replacement.is_alive()
-        completed = asyncio.run(
-            _call_tool(
-                server,
-                "finalise_cold_characterisation_session",
-                _ctx(context),
-                session_id=session.id,
-            )
+        completed = _call_tool(
+            server,
+            "finalise_cold_characterisation_session",
+            _ctx(context),
+            session_id=session.id,
         )
         assert completed.status == "clean"
         assert completed.clean is True
@@ -2814,13 +2809,11 @@ def test_registered_finalisation_retry_reports_owned_dead_sampler_after_callback
     server = create_mcp_server()
     original_join = context.telemetry_sampler._join_thread  # pyright: ignore[reportPrivateUsage]
     try:
-        partial = asyncio.run(
-            _call_tool(
-                server,
-                "finalise_cold_characterisation_session",
-                _ctx(context),
-                session_id=session.id,
-            )
+        partial = _call_tool(
+            server,
+            "finalise_cold_characterisation_session",
+            _ctx(context),
+            session_id=session.id,
         )
         assert partial.status == "partial"
 
@@ -2837,13 +2830,11 @@ def test_registered_finalisation_retry_reports_owned_dead_sampler_after_callback
         def retry() -> None:
             try:
                 results.append(
-                    asyncio.run(
-                        _call_tool(
-                            server,
-                            "finalise_cold_characterisation_session",
-                            _ctx(context),
-                            session_id=session.id,
-                        )
+                    _call_tool(
+                        server,
+                        "finalise_cold_characterisation_session",
+                        _ctx(context),
+                        session_id=session.id,
                     )
                 )
             except BaseException as exc:  # noqa: BLE001 - report thread failure exactly.
@@ -3415,6 +3406,7 @@ def test_registered_manual_drop_freezes_same_ticket_after_rejected_persistence(
     freeze_reason: str,
 ) -> None:
     """Each registered manual Drop route contains rejected persistence with its ticket."""
+    runtime = FakeFirstCrackRuntime()
     if route == "ordinary":
         config_path = tmp_path / "manual.yaml"
         config_path.write_text(
@@ -3425,6 +3417,7 @@ def test_registered_manual_drop_freezes_same_ticket_after_rejected_persistence(
             encoding="utf-8",
         )
         context = build_server_context(config_path=config_path)
+        _set_first_crack_runtime(context, runtime)
         server = create_mcp_server()
         ctx = _ctx(context)
         _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
@@ -3445,8 +3438,7 @@ def test_registered_manual_drop_freezes_same_ticket_after_rejected_persistence(
         )
         expected_session_id = recovered_session_id
 
-    runtime = FakeFirstCrackRuntime()
-    _set_first_crack_runtime(context, runtime)
+        _set_first_crack_runtime(context, runtime)
     driver = RecordingRoasterDriver()
     object.__setattr__(context, "roaster_driver", driver)
     trace: list[str] = []
@@ -3508,6 +3500,84 @@ def test_registered_manual_drop_freezes_same_ticket_after_rejected_persistence(
         "recording.freeze",
     ]
     assert frozen == [(ticket, freeze_reason)]
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        pytest.param("before_driver_return", id="emergency-before-driver-result"),
+        pytest.param("after_driver_return", id="emergency-after-verified-driver-result"),
+    ],
+)
+def test_ordinary_mock_drop_distinguishes_driver_interruption_from_superseded_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, order: str
+) -> None:
+    """Only a post-return, durable Drop avoids a redundant protective dispatch."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    entered = Event()
+    release = Event()
+    emergency_reached = Event()
+    errors: list[BaseException] = []
+    original_drop = driver.drop_beans
+    original_emergency = driver.emergency_stop
+
+    def record_emergency(*, reason: str) -> EmergencyStopResult:
+        emergency_reached.set()
+        return original_emergency(reason=reason)
+
+    monkeypatch.setattr(driver, "emergency_stop", record_emergency)
+    if order == "before_driver_return":
+
+        def held_drop(*, exact_drop: ExactDropArbitration | None = None) -> RoasterState:
+            entered.set()
+            assert release.wait(timeout=1.0)
+            return original_drop(exact_drop=exact_drop)
+
+        monkeypatch.setattr(driver, "drop_beans", held_drop)
+    else:
+        writer = session.canonical_writer
+        assert writer is not None
+        original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+
+        def held_drop_row(frame: bytes) -> None:
+            if b'"beans_dropped"' in frame and not entered.is_set():
+                entered.set()
+                assert release.wait(timeout=1.0)
+            original_append(frame)
+
+        monkeypatch.setattr(writer, "_append_verified", held_drop_row)
+
+    drop_thread = Thread(target=_record_tool_error, args=(errors, server, "drop_beans", ctx))
+    drop_thread.start()
+    assert entered.wait(timeout=1.0)
+
+    emergency_errors: list[BaseException] = []
+    emergency_thread = Thread(
+        target=_record_tool_error,
+        args=(emergency_errors, server, "emergency_stop", ctx),
+        kwargs={"reason": order},
+    )
+    emergency_thread.start()
+    assert emergency_reached.wait(timeout=1.0)
+    release.set()
+    drop_thread.join(timeout=1.0)
+    emergency_thread.join(timeout=1.0)
+
+    assert not drop_thread.is_alive() and not emergency_thread.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], SessionLifecycleError)
+    if order == "after_driver_return":
+        assert str(errors[0]) == (
+            "Drop command was accepted by the driver, but roast log history is incomplete "
+            "or unsettled."
+        )
+    assert emergency_errors == []
+    assert driver.drop_transition_count == 1
+    assert driver.emergency_count == (2 if order == "before_driver_return" else 1)
+    with pytest.raises((SessionLifecycleError, ValueError)):
+        _call_tool(server, "drop_beans", ctx)
+    assert driver.drop_transition_count == 1
 
 
 def test_get_roast_state_exposes_current_driver_state_and_event_timestamps(
@@ -6377,6 +6447,13 @@ def test_torn_exact_drop_cooling_row_preserves_known_cooling_without_history(
     assert session.beans_dropped_at_utc is not None
     assert session.cooling_started_at_utc is None
 
+    repeated = context.session_store.admit_normal_drop(
+        context.session_store.normal_drop_identity(session)
+    )
+    assert repeated.outcome == "ambiguous"
+    assert repeated.existing_event is not None
+    assert repeated.existing_event.kind == "beans_dropped"
+
     exported = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
     assert exported.ready is False
     assert "recording is unavailable" in exported.note
@@ -7004,6 +7081,613 @@ def test_guarded_stop_cooling_keeps_known_state_when_exact_fault_log_is_torn(
     ) == recorded_cooling_starts
     assert driver.actions.count("start_cooling") == 2
     assert append_attempts == 0
+
+
+def _manual_mock_incomplete_generation_context(
+    tmp_path: Path,
+) -> tuple[ServerContext, FastMCP, Any, RoastSession]:
+    """Start the composed manual/mock route with a bound canonical generation."""
+    return _manual_mock_incomplete_generation_context_without_charge(tmp_path, charge=True)
+
+
+def _manual_mock_incomplete_generation_context_without_charge(
+    tmp_path: Path,
+    *,
+    charge: bool = False,
+) -> tuple[ServerContext, FastMCP, Any, RoastSession]:
+    """Start the composed manual/mock route, optionally through its charge producer."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    context = build_server_context(config_path=config_path)
+    _set_first_crack_runtime(context, FakeFirstCrackRuntime())
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    started = _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+    if charge:
+        _call_tool(server, "mark_beans_added", ctx)
+    context.telemetry_sampler.stop_for_session(started.session.session_id, reason="test setup")
+    session = context.session_store.get_active_session()
+    assert session is not None and session.canonical_writer is not None
+    return context, server, ctx, session
+
+
+def _fail_manual_mock_telemetry_generation(
+    session: RoastSession,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failure_mode: str,
+) -> Event:
+    """Make the next telemetry frame fail after the canonical identity is bound."""
+    writer = session.canonical_writer
+    log_writer = session.log_writer
+    assert writer is not None and log_writer is not None
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+    failed = Event()
+
+    def fail_next_telemetry(frame: bytes) -> None:
+        if not failed.is_set():
+            failed.set()
+            if failure_mode == "enospc":
+                raise OSError(errno.ENOSPC, "synthetic no space")
+            log_path = log_writer.log_dir / "roast.jsonl"
+            log_path.rename(log_path.with_name("old-canonical-generation.jsonl"))
+            log_path.touch()
+        original_append(frame)
+
+    monkeypatch.setattr(writer, "_append_verified", fail_next_telemetry)
+    return failed
+
+
+def _wait_for_incomplete_generation(session: RoastSession, failed: Event) -> None:
+    """Wait for the owned telemetry turn to expose its incomplete-generation fact."""
+    assert failed.wait(timeout=1.0)
+    deadline = time.monotonic() + 1.0
+    while not session.mock_log_torn and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert session.mock_log_torn
+
+
+def test_manual_mock_async_telemetry_enospc_keeps_live_samples_without_emergency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settled canonical ENOSPC is incomplete recording, not sampler failure."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    failed = _fail_manual_mock_telemetry_generation(session, monkeypatch, failure_mode="enospc")
+
+    first = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    _wait_for_incomplete_generation(session, failed)
+    second = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    sampled = _sample_active_session_telemetry(context, session_id=session.id)
+
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert first.device_state is not None and second.device_state is not None
+    assert sampled is True
+    assert snapshot.phase == "roasting" and snapshot.active
+    assert len(snapshot.telemetry_buffer) == 3
+    assert [sample.bean_temp_c for sample in snapshot.telemetry_buffer] == [20.0, 20.0, 20.0]
+    assert [sample.env_temp_c for sample in snapshot.telemetry_buffer] == [20.0, 20.0, 20.0]
+    assert session.mock_log_torn
+    assert driver.emergency_count == 0
+
+
+def test_manual_mock_telemetry_queue_overflow_keeps_live_samples_without_emergency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full canonical telemetry lane preserves live observation and driver state."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    writer = session.canonical_writer
+    assert writer is not None
+    append_entered, release_append = Event(), Event()
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+
+    def hold_first_append(frame: bytes) -> None:
+        append_entered.set()
+        assert release_append.wait(timeout=1.0)
+        original_append(frame)
+
+    monkeypatch.setattr(writer, "_append_verified", hold_first_append)
+    try:
+        for index in range(64):
+            writer.append_later({"type": "telemetry", "index": index}, lane="telemetry")
+        assert append_entered.wait(timeout=1.0)
+        with pytest.raises(EventLogRecordingError, match="capacity is exhausted"):
+            writer.append_later({"type": "telemetry", "index": 64}, lane="telemetry")
+
+        state = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+        snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+        assert state.device_state is not None
+        assert snapshot.phase == "roasting" and snapshot.active
+        assert len(snapshot.telemetry_buffer) == 1
+        assert snapshot.telemetry_buffer[-1].bean_temp_c == 20.0
+        assert snapshot.telemetry_buffer[-1].env_temp_c == 20.0
+        assert session.mock_log_torn
+        assert driver.emergency_count == 0
+    finally:
+        release_append.set()
+        assert writer.wait_for_idle(timeout_seconds=1.0) is False
+
+
+def test_manual_mock_telemetry_driver_read_error_still_dispatches_emergency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real telemetry driver-read error retains the autonomous fail-closed path."""
+    context, _server, _ctx_value, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+
+    def fail_read() -> RoasterState:
+        raise RuntimeError("synthetic driver read failure")
+
+    monkeypatch.setattr(driver, "read_state", fail_read)
+    assert _sample_active_session_telemetry(context, session_id=session.id) is False
+
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.phase == "fault" and not snapshot.active
+    assert driver.emergency_count == 1
+
+
+def test_manual_mock_sampler_emergency_contains_after_fault_admission_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full writer cannot reopen control after a verified sampler stop."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    failed = _fail_manual_mock_telemetry_generation(session, monkeypatch, failure_mode="enospc")
+    _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    _wait_for_incomplete_generation(session, failed)
+    original_read = driver.read_state
+
+    def fail_read() -> RoasterState:
+        raise RuntimeError("synthetic driver read failure")
+
+    monkeypatch.setattr(driver, "read_state", fail_read)
+    assert _sample_active_session_telemetry(context, session_id=session.id) is False
+    monkeypatch.setattr(driver, "read_state", original_read)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    assert state.phase == "fault" and state.active is False
+    assert driver.emergency_count == 1
+    assert driver.read_state().heat_level_percent == 0
+    with pytest.raises(ValueError, match="No active roast session"):
+        _call_tool(server, "set_heat", ctx, heat_level_percent=80)
+    assert driver.read_state().heat_level_percent == 0
+
+
+def test_manual_mock_sampler_emergency_revokes_held_first_crack_mark(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sampler containment revokes a pending mark before its driver stop enters."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    writer = session.canonical_writer
+    assert writer is not None
+    append_entered, release_append, emergency_entered = Event(), Event(), Event()
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+    original_emergency = driver.emergency_stop
+
+    def hold_first_crack(frame: bytes) -> None:
+        append_entered.set()
+        assert release_append.wait(timeout=1.0)
+        original_append(frame)
+
+    def record_emergency(*, reason: str) -> EmergencyStopResult:
+        emergency_entered.set()
+        return original_emergency(reason=reason)
+
+    def fail_read() -> RoasterState:
+        raise RuntimeError("synthetic driver read failure")
+
+    monkeypatch.setattr(writer, "_append_verified", hold_first_crack)
+    monkeypatch.setattr(driver, "emergency_stop", record_emergency)
+    monkeypatch.setattr(driver, "read_state", fail_read)
+    mark_errors: list[BaseException] = []
+    mark = Thread(
+        target=_record_tool_error,
+        args=(mark_errors, server, "mark_first_crack", ctx),
+    )
+    sampler = Thread(
+        target=lambda: _sample_active_session_telemetry(context, session_id=session.id)
+    )
+    mark.start()
+    assert append_entered.wait(timeout=1.0)
+    sampler.start()
+    assert emergency_entered.wait(timeout=1.0)
+    assert driver.emergency_count == 1
+    release_append.set()
+    mark.join(timeout=1.0)
+    sampler.join(timeout=1.0)
+
+    assert not mark.is_alive() and not sampler.is_alive()
+    assert len(mark_errors) == 1 and isinstance(mark_errors[0], ValueError)
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.phase == "fault" and snapshot.first_crack_at_utc is None
+    assert [event.kind for event in snapshot.event_timeline] == ["beans_added", "fault"]
+
+
+def test_manual_mock_sampler_fault_after_registered_stop_cooling_reaches_driver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A captured sampler fault retains its emergency after the batch stops."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    _call_tool(server, "mark_first_crack", ctx)
+    _call_tool(server, "drop_beans", ctx)
+    sampler_entered, release_sampler = Event(), Event()
+
+    def hold_then_fail_read() -> RoasterState:
+        sampler_entered.set()
+        assert release_sampler.wait(timeout=1.0)
+        raise RuntimeError("synthetic delayed driver read failure")
+
+    monkeypatch.setattr(driver, "read_state", hold_then_fail_read)
+    sampler_result: list[bool] = []
+    sampler = Thread(
+        target=lambda: sampler_result.append(
+            _sample_active_session_telemetry(context, session_id=session.id)
+        )
+    )
+    sampler.start()
+    assert sampler_entered.wait(timeout=1.0)
+    _call_tool(server, "stop_cooling", ctx)
+    premature = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+    assert premature.ready is False
+    assert premature.log_dir == str(context.unavailable_export_marker)
+    release_sampler.set()
+    sampler.join(timeout=1.0)
+
+    assert not sampler.is_alive() and sampler_result == [False]
+    assert driver.emergency_count == 1
+    writer = session.canonical_writer
+    assert writer is not None and writer.wait_for_idle(timeout_seconds=1.0)
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.phase == "fault" and snapshot.active is False
+    refused = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+    assert refused.ready is False
+    assert [event.kind for event in snapshot.event_timeline] == [
+        "beans_added",
+        "first_crack_detected",
+        "beans_dropped",
+        "cooling_started",
+        "cooling_stopped",
+        "fault",
+    ]
+
+
+def test_manual_mock_held_sampler_settles_before_healthy_complete_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held admitted sampler blocks sealing, then releases a healthy complete bundle."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    _call_tool(server, "drop_beans", ctx)
+    sampler_entered, release_sampler = Event(), Event()
+    original_read = driver.read_state
+
+    def hold_read() -> RoasterState:
+        sampler_entered.set()
+        assert release_sampler.wait(timeout=1.0)
+        return original_read()
+
+    monkeypatch.setattr(driver, "read_state", hold_read)
+    sampler_result: list[bool] = []
+    sampler = Thread(
+        target=lambda: sampler_result.append(
+            _sample_active_session_telemetry(context, session_id=session.id)
+        )
+    )
+    sampler.start()
+    assert sampler_entered.wait(timeout=1.0)
+    _call_tool(server, "stop_cooling", ctx)
+    premature = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+    assert premature.ready is False
+    assert premature.log_dir == str(context.unavailable_export_marker)
+    before = context.session_store.get_session_snapshot(session_id=session.id)
+
+    release_sampler.set()
+    sampler.join(timeout=1.0)
+    exported = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+    after = context.session_store.get_session_snapshot(session_id=session.id)
+
+    assert not sampler.is_alive() and sampler_result == [False]
+    assert driver.emergency_count == 0
+    assert exported.ready is True
+    assert Path(exported.summary_path).is_file()
+    assert after.event_timeline == before.event_timeline
+
+
+def test_manual_mock_held_mark_survives_refused_exact_drop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A precondition refusal cannot displace a valid pending human mark."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path, include_first_crack=False)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    writer = session.canonical_writer
+    assert writer is not None
+    append_entered, release_append = Event(), Event()
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+
+    def hold_mark(frame: bytes) -> None:
+        append_entered.set()
+        assert release_append.wait(timeout=1.0)
+        original_append(frame)
+
+    monkeypatch.setattr(writer, "_append_verified", hold_mark)
+    mark_errors: list[BaseException] = []
+    mark = Thread(target=_record_tool_error, args=(mark_errors, server, "mark_first_crack", ctx))
+    mark.start()
+    assert append_entered.wait(timeout=1.0)
+    session.timing_evidence_sequence = 1
+    identity = context.session_store.normal_drop_identity(session)
+
+    refused = _call_tool(
+        server,
+        "drop_beans_exact_session",
+        ctx,
+        session_id=identity.session_id,
+        clock_epoch_id=identity.clock_epoch_id,
+        ownership_sequence=identity.ownership_sequence,
+        timing_evidence_sequence=identity.timing_evidence_sequence,
+    )
+
+    assert refused.outcome == "refused_precondition"
+    assert refused.reason == "human_first_crack_missing"
+    assert driver.drop_transition_count == 0
+    release_append.set()
+    mark.join(timeout=1.0)
+
+    assert not mark.is_alive() and mark_errors == []
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.first_crack_source == "manual_mark"
+    assert [event.kind for event in snapshot.event_timeline] == [
+        "beans_added",
+        "first_crack_detected",
+    ]
+
+
+@pytest.mark.parametrize("endpoint", ["drop_beans", "emergency_stop"])
+def test_manual_mock_new_mark_cannot_enter_during_admitted_endpoint_driver_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+) -> None:
+    """Endpoint admission closes new human marks before its driver call returns."""
+    context, server, ctx, _session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    driver_entered, release_driver = Event(), Event()
+
+    if endpoint == "drop_beans":
+        original_drop = driver.drop_beans
+
+        def hold_drop() -> RoasterState:
+            driver_entered.set()
+            assert release_driver.wait(timeout=1.0)
+            return original_drop()
+
+        monkeypatch.setattr(driver, "drop_beans", hold_drop)
+    else:
+        original_emergency = driver.emergency_stop
+
+        def hold_emergency(*, reason: str) -> EmergencyStopResult:
+            driver_entered.set()
+            assert release_driver.wait(timeout=1.0)
+            return original_emergency(reason=reason)
+
+        monkeypatch.setattr(driver, "emergency_stop", hold_emergency)
+
+    endpoint_errors: list[BaseException] = []
+    endpoint_call = Thread(
+        target=_record_tool_error,
+        args=(endpoint_errors, server, endpoint, ctx),
+    )
+    endpoint_call.start()
+    assert driver_entered.wait(timeout=1.0)
+    with pytest.raises(SessionLifecycleError, match="lifecycle endpoint"):
+        _call_tool(server, "mark_first_crack", ctx)
+    release_driver.set()
+    endpoint_call.join(timeout=1.0)
+
+    assert not endpoint_call.is_alive() and endpoint_errors == []
+
+
+@pytest.mark.parametrize("failure_mode", ("enospc", "replaced", "healthy"))
+def test_manual_mock_verified_recovery_after_incomplete_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    """Verified commands retain their actual result without inventing old-log rows."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    calls: list[str] = []
+    emergency_stop = driver.emergency_stop
+    drop_beans = driver.drop_beans
+    stop_cooling = driver.stop_cooling
+
+    def count_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        calls.append("emergency_stop")
+        return emergency_stop(reason=reason)
+
+    def count_drop_beans() -> RoasterState:
+        calls.append("drop_beans")
+        return drop_beans()
+
+    def count_stop_cooling() -> RoasterState:
+        calls.append("stop_cooling")
+        return stop_cooling()
+
+    monkeypatch.setattr(driver, "emergency_stop", count_emergency_stop)
+    monkeypatch.setattr(driver, "drop_beans", count_drop_beans)
+    monkeypatch.setattr(driver, "stop_cooling", count_stop_cooling)
+
+    if failure_mode != "healthy":
+        failed = _fail_manual_mock_telemetry_generation(
+            session, monkeypatch, failure_mode=failure_mode
+        )
+        _call_tool(server, "get_roast_state", ctx)
+        _wait_for_incomplete_generation(session, failed)
+
+        with pytest.raises(SessionLifecycleError, match="Emergency stop command was accepted"):
+            _call_tool(server, "emergency_stop", ctx, reason="incomplete generation")
+        after_emergency = context.session_store.get_session_snapshot(session_id=session.id)
+        assert after_emergency.phase == "fault" and not after_emergency.active
+        assert after_emergency.mock_log_torn
+        assert [event.kind for event in after_emergency.event_timeline] == ["beans_added"]
+
+        with pytest.raises(SessionLifecycleError, match="Bean drop command was accepted"):
+            _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+        after_drop = context.session_store.get_session_snapshot(session_id=session.id)
+        assert after_drop.cooling_on and after_drop.unrecorded_fault_recovery_drop_accepted
+        assert all(event.kind != "beans_dropped" for event in after_drop.event_timeline)
+
+        with pytest.raises(SessionLifecycleError, match="only allowed before beans are dropped"):
+            _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+
+        with pytest.raises(SessionLifecycleError, match="Cooling stop command was accepted"):
+            _call_tool(server, "stop_cooling", ctx, expected_session_id=session.id)
+        after_stop = context.session_store.get_session_snapshot(session_id=session.id)
+        assert not after_stop.cooling_on
+        assert all(event.kind != "cooling_stopped" for event in after_stop.event_timeline)
+    else:
+        _call_tool(server, "get_roast_state", ctx)
+        _call_tool(server, "emergency_stop", ctx, reason="incomplete generation")
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session.id)
+
+    replacement = _call_tool(
+        server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1"
+    )
+    assert replacement.session.session_id != session.id
+    assert replacement.session.beans_added_at_utc is None
+    assert replacement.session.beans_dropped_at_utc is None
+    assert replacement.session.cooling_started_at_utc is None
+    assert replacement.session.cooling_stopped_at_utc is None
+    assert replacement.session.faulted_at_utc is None
+    assert calls == ["emergency_stop", "drop_beans", "stop_cooling"]
+    context.telemetry_sampler.stop_for_session(
+        replacement.session.session_id, reason="test cleanup"
+    )
+
+
+def test_manual_mock_incomplete_generation_keeps_unverified_containment_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A writer failure never turns an unverified emergency result into recovery authority."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    failed = _fail_manual_mock_telemetry_generation(session, monkeypatch, failure_mode="enospc")
+    _call_tool(server, "get_roast_state", ctx)
+    _wait_for_incomplete_generation(session, failed)
+    drop_calls = 0
+
+    def fail_emergency_stop(*, reason: str) -> EmergencyStopResult:
+        del reason
+        raise RuntimeError("synthetic unverified containment")
+
+    def record_drop_beans() -> RoasterState:
+        nonlocal drop_calls
+        drop_calls += 1
+        return MockRoasterDriver.drop_beans(driver)
+
+    monkeypatch.setattr(driver, "emergency_stop", fail_emergency_stop)
+    monkeypatch.setattr(driver, "drop_beans", record_drop_beans)
+
+    with pytest.raises(SessionLifecycleError, match="containment is unverified"):
+        _call_tool(server, "emergency_stop", ctx, reason="unverified incomplete generation")
+    with pytest.raises(ValueError, match="verified emergency-stop containment"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+    assert drop_calls == 0
+
+
+def test_manual_mock_observer_failure_after_saved_fault_keeps_recovery_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An observer failure cannot reclassify a saved fault as incomplete recording."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    drop_calls = 0
+    fault_append_entered, release_fault_append, fault_timeline_settled = Event(), Event(), Event()
+    writer = session.canonical_writer
+    assert writer is not None
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+
+    class _FaultTimeline(list[RoastEvent]):
+        """Signal only when the deferred fault writer publishes its event."""
+
+        def append(self, event: RoastEvent) -> None:
+            super().append(event)
+            if event.kind == "fault":
+                fault_timeline_settled.set()
+
+    session.event_timeline = _FaultTimeline(session.event_timeline)
+
+    def hold_fault_append(frame: bytes) -> None:
+        fault_append_entered.set()
+        assert release_fault_append.wait(timeout=1.0)
+        original_append(frame)
+
+    def fail_resolution(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("synthetic observer failure")
+
+    def count_drop_beans() -> RoasterState:
+        nonlocal drop_calls
+        drop_calls += 1
+        return MockRoasterDriver.drop_beans(driver)
+
+    monkeypatch.setattr(
+        context.first_crack_runtime,
+        "resolve_observation_boundary",
+        fail_resolution,
+    )
+    monkeypatch.setattr(driver, "drop_beans", count_drop_beans)
+    monkeypatch.setattr(writer, "_append_verified", hold_fault_append)
+
+    with pytest.raises(SessionLifecycleError, match="fault recording failed"):
+        _call_tool(server, "emergency_stop", ctx, reason="observer failure")
+
+    assert fault_append_entered.wait(timeout=1.0)
+    with pytest.raises(ValueError, match="verified emergency-stop containment"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+    assert drop_calls == 0
+
+    release_fault_append.set()
+    # This signals the deferred callback after its exact writer turn has
+    # verified and published the fault row, rather than assuming writer idleness.
+    assert fault_timeline_settled.wait(timeout=1.0)
+    saved = context.session_store.get_session_snapshot(session_id=session.id)
+    assert [event.kind for event in saved.event_timeline] == ["beans_added", "fault"]
+    with pytest.raises(ValueError, match="verified emergency-stop containment"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+    assert drop_calls == 0
 
 
 def test_guarded_torn_stop_cooling_disconnect_fails_closed(tmp_path: Path) -> None:
@@ -8310,6 +8994,8 @@ class FakeFirstCrackRuntime:
         self.max_inference_duration_ms = max_inference_duration_ms
         self.inference_overrun_count = inference_overrun_count
         self.active_session_id: str | None = None
+        self.human_mark_session_ids: list[str] = []
+        self._human_mark_publications: dict[object, str] = {}
         self.started_sessions: list[str] = []
         self.started_session_objects: list[RoastSession] = []
         self.processed_sessions: list[str] = []
@@ -8376,9 +9062,38 @@ class FakeFirstCrackRuntime:
         """Automatic-path double has no manual observations to retain."""
         return None
 
-    def notify_human_mark(self, session: RoastSession) -> FirstCrackRuntimeSnapshot:
+    def capture_human_mark_publication(self, session: RoastSession) -> object | None:
+        """Capture the fake runtime's exact manual publication claim."""
+        if self.active_session_id != session.id:
+            return None
+        token = object()
+        self._human_mark_publications[token] = session.id
+        return token
+
+    def discard_human_mark_publication(self, publication_token: object | None) -> None:
+        """Discard one unused fake publication claim."""
+        if publication_token is not None:
+            self._human_mark_publications.pop(publication_token, None)
+
+    def revoke_human_mark_publication(self, session: RoastSession) -> None:
+        """Revoke pending fake claims for an accepted lifecycle endpoint."""
+        self._human_mark_publications = {
+            token: session_id
+            for token, session_id in self._human_mark_publications.items()
+            if session_id != session.id
+        }
+
+    def notify_human_mark(
+        self, session: RoastSession, *, publication_token: object | None = None
+    ) -> FirstCrackRuntimeSnapshot:
         """Accept the registered manual mark without starting an audio capture."""
+        if (
+            publication_token is not None
+            and self._human_mark_publications.pop(publication_token, None) != session.id
+        ):
+            return self.snapshot()
         self.active_session_id = session.id
+        self.human_mark_session_ids.append(session.id)
         return self.snapshot()
 
     def stop_for_session(self, session_id: str, *, reason: str) -> FirstCrackRuntimeSnapshot:
@@ -8547,7 +9262,15 @@ def _call_tool(server: FastMCP, tool_name: str, ctx: Any, **kwargs: object) -> A
     tool_manager = server._tool_manager  # pyright: ignore[reportPrivateUsage]
     tool = tool_manager.get_tool(tool_name)
     assert tool is not None
-    return tool.fn(ctx, **kwargs)
+    result = tool.fn(ctx, **kwargs)
+    if inspect.isawaitable(result):
+        return asyncio.run(_await_direct_tool_result(result))
+    return result
+
+
+async def _await_direct_tool_result(result: Awaitable[Any]) -> Any:
+    """Adapt an SDK tool awaitable for synchronous in-process test calls."""
+    return await result
 
 
 def _cold_finalisation_context(tmp_path: Path) -> ServerContext:
@@ -9506,6 +10229,1446 @@ async def _manual_shadow_blocked_stdio(tmp_path: Path, stage: str) -> None:
         assert summary["order"] == expected_order
 
 
+def test_manual_mock_charge_settlement_yields_sdk_loop_to_emergency_stop(tmp_path: Path) -> None:
+    """A held charge row cannot delay an independent mock emergency dispatch."""
+    asyncio.run(_manual_mock_charge_settlement_yields_sdk_loop(tmp_path))
+
+
+async def _manual_mock_charge_settlement_yields_sdk_loop(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = tmp_path / "charge-settlement.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "charge",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert not started.isError and started.structuredContent is not None
+        session_id = started.structuredContent["session"]["session_id"]
+
+        async def until_exists(name: str) -> None:
+            while not (tmp_path / name).exists():
+                await asyncio.sleep(0)
+
+        charge = asyncio.create_task(client.call_tool("mark_beans_added", {}))
+        await asyncio.wait_for(until_exists("charge-entered"), 5)
+
+        conflict = await asyncio.wait_for(client.call_tool("mark_beans_added", {}), 5)
+        assert conflict.isError
+
+        emergency = asyncio.create_task(client.call_tool("emergency_stop", {}))
+        await asyncio.wait_for(until_exists("emergency-entered"), 5)
+        assert not (tmp_path / "release").exists()
+
+        held_state = await asyncio.wait_for(client.call_tool("get_roast_state", {}), 5)
+        assert held_state.structuredContent is not None
+        assert held_state.structuredContent["phase"] == "fault"
+        assert held_state.structuredContent["beans_added_at_utc"] is None
+        blocked_start = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}),
+            5,
+        )
+        assert blocked_start.isError
+
+        (tmp_path / "release").write_text("release", encoding="utf-8")
+        stopped = await asyncio.wait_for(emergency, 5)
+        assert not stopped.isError
+        late_charge = await asyncio.wait_for(charge, 5)
+        assert not late_charge.isError
+
+        state = await asyncio.wait_for(client.call_tool("get_roast_state", {}), 5)
+        assert state.structuredContent is not None
+        assert state.structuredContent["phase"] == "fault"
+        assert state.structuredContent["beans_added_at_utc"] is not None
+        assert [event["kind"] for event in state.structuredContent["events"]] == [
+            "beans_added",
+            "fault",
+        ]
+
+        dropped = await asyncio.wait_for(
+            client.call_tool("drop_beans", {"expected_session_id": session_id}), 5
+        )
+        assert not dropped.isError
+        stopped_cooling = await asyncio.wait_for(
+            client.call_tool("stop_cooling", {"expected_session_id": session_id}), 5
+        )
+        assert not stopped_cooling.isError
+        successor = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}),
+            5,
+        )
+        assert not successor.isError and successor.structuredContent is not None
+        successor_id = successor.structuredContent["session"]["session_id"]
+        assert successor_id != session_id
+
+    rows = [
+        row["kind"]
+        for line in (tmp_path / "logs" / "roasts" / session_id / "roast.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if (row := json.loads(line))["type"] == "event"
+    ]
+    assert rows == [
+        "beans_added",
+        "fault",
+        "beans_dropped",
+        "cooling_started",
+        "cooling_stopped",
+    ]
+
+
+@pytest.mark.parametrize("human_mark_first", [True, False])
+def test_manual_mock_human_first_crack_and_emergency_share_canonical_order(
+    tmp_path: Path, human_mark_first: bool
+) -> None:
+    """A held canonical turn preserves FC/fault order without blocking emergency entry."""
+    asyncio.run(_manual_mock_human_first_crack_and_emergency_order(tmp_path, human_mark_first))
+
+
+async def _manual_mock_human_first_crack_and_emergency_order(
+    tmp_path: Path, human_mark_first: bool
+) -> None:
+    """Exercise both accepted-FC and prior-emergency orderings through stdio."""
+    root = Path(__file__).resolve().parents[1]
+    blocked_stage = "first-crack" if human_mark_first else "fault"
+    config = tmp_path / "human-first-crack-order.yaml"
+    logs = tmp_path / "logs"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {logs}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            blocked_stage,
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert not started.isError and started.structuredContent is not None
+        session_id = started.structuredContent["session"]["session_id"]
+        charged = await asyncio.wait_for(client.call_tool("mark_beans_added", {}), 5)
+        assert not charged.isError
+
+        async def until_exists(name: str) -> None:
+            while not (tmp_path / name).exists():
+                await asyncio.sleep(0)
+
+        if human_mark_first:
+            mark = asyncio.create_task(client.call_tool("mark_first_crack", {}))
+            await asyncio.wait_for(until_exists("first-crack-entered"), 5)
+            emergency = asyncio.create_task(client.call_tool("emergency_stop", {}))
+            await asyncio.wait_for(until_exists("emergency-entered"), 5)
+            late_mark = mark
+            expected_rows = ["beans_added", "first_crack_detected", "fault"]
+        else:
+            emergency = asyncio.create_task(client.call_tool("emergency_stop", {}))
+            await asyncio.wait_for(until_exists("fault-entered"), 5)
+            await asyncio.wait_for(until_exists("emergency-entered"), 5)
+            late_mark = asyncio.create_task(client.call_tool("mark_first_crack", {}))
+            expected_rows = ["beans_added", "fault"]
+
+        # The marker is written only after the mock emergency driver returns,
+        # while the selected writer I/O turn remains held.
+        assert not (tmp_path / "release").exists()
+        if not human_mark_first:
+            # The ordinary fault-only turn must not hold the store lock or the
+            # registered SDK loop while its canonical append is blocked.
+            held_state = await asyncio.wait_for(client.call_tool("get_roast_state", {}), 0.6)
+            assert held_state.structuredContent is not None
+            assert held_state.structuredContent["phase"] == "fault"
+        (tmp_path / "release").write_text("release", encoding="utf-8")
+        stopped = await asyncio.wait_for(emergency, 5)
+        assert not stopped.isError
+        mark_result = await asyncio.wait_for(late_mark, 5)
+        assert mark_result.isError
+
+        state = await asyncio.wait_for(client.call_tool("get_roast_state", {}), 5)
+        assert state.structuredContent is not None
+        assert state.structuredContent["phase"] == "fault"
+        assert state.structuredContent["first_crack_at_utc"] is None
+        assert [event["kind"] for event in state.structuredContent["events"]] == [
+            "beans_added",
+            "fault",
+        ]
+
+    rows = [
+        json.loads(line)["kind"]
+        for line in (logs / "roasts" / session_id / "roast.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert rows == expected_rows
+
+
+def test_registered_manual_mock_recovery_drop_held_append_keeps_state_and_emergency_live(
+    tmp_path: Path,
+) -> None:
+    """A held recovery Drop row cannot retain the SDK or store admission lock."""
+    asyncio.run(_registered_manual_mock_recovery_drop_held_append(tmp_path))
+
+
+def test_registered_manual_mock_superseded_ordinary_drop_cannot_repeat_dispatch(
+    tmp_path: Path,
+) -> None:
+    """An emergency-superseded ordinary Drop retains ownership before driver return."""
+    asyncio.run(_registered_manual_mock_superseded_ordinary_drop(tmp_path))
+
+
+def test_registered_manual_mock_exact_drop_held_append_keeps_sdk_serving(
+    tmp_path: Path,
+) -> None:
+    """A prepared emergency fault append cannot block the registered SDK loop."""
+    asyncio.run(_registered_manual_mock_exact_drop_held_append(tmp_path))
+
+
+def test_registered_manual_mock_lost_ordinary_return_refuses_exact_redispatch(
+    tmp_path: Path,
+) -> None:
+    """An ordinary Drop with a lost return blocks exact driver re-entry."""
+    asyncio.run(_registered_manual_mock_lost_ordinary_return(tmp_path))
+
+
+async def _registered_manual_mock_lost_ordinary_return(tmp_path: Path) -> None:
+    """Exercise ordinary-return uncertainty and exact refusal through stdio routes."""
+    root = Path(__file__).resolve().parents[1]
+    config = tmp_path / "lost-ordinary-return.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "lost-ordinary-return",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert started.structuredContent is not None
+        session_id = started.structuredContent["session"]["session_id"]
+        heated = await asyncio.wait_for(client.call_tool("set_heat", {"heat_level_percent": 42}), 5)
+        fanned = await asyncio.wait_for(client.call_tool("set_fan", {"fan_level_percent": 34}), 5)
+        assert not heated.isError and not fanned.isError
+        assert not (await asyncio.wait_for(client.call_tool("mark_beans_added", {}), 5)).isError
+        assert not (await asyncio.wait_for(client.call_tool("mark_first_crack", {}), 5)).isError
+        timing = await asyncio.wait_for(
+            client.call_tool(
+                "get_timing_evidence",
+                {"expected_session_id": session_id, "evidence_protocol": "timing_evidence/v1"},
+            ),
+            5,
+        )
+        assert timing.structuredContent is not None
+        record = timing.structuredContent["record"]
+        assert record is not None
+        binding = {
+            "session_id": record["session_id"],
+            "clock_epoch_id": record["clock"]["epoch_id"],
+            "ownership_sequence": record["session_ownership_sequence"],
+            "timing_evidence_sequence": record["evidence_sequence"],
+        }
+
+        ordinary = await asyncio.wait_for(client.call_tool("drop_beans", {}), 5)
+        assert ordinary.isError
+        before_refused_controls = await asyncio.wait_for(
+            client.call_tool("get_roast_state", {"session_id": session_id}), 5
+        )
+        assert before_refused_controls.structuredContent is not None
+        refused_heat = await asyncio.wait_for(
+            client.call_tool("set_heat", {"heat_level_percent": 42}), 5
+        )
+        refused_fan = await asyncio.wait_for(
+            client.call_tool("set_fan", {"fan_level_percent": 34}), 5
+        )
+        assert refused_heat.isError and refused_fan.isError
+        after_refused_controls = await asyncio.wait_for(
+            client.call_tool("get_roast_state", {"session_id": session_id}), 5
+        )
+        assert after_refused_controls.structuredContent is not None
+        assert (
+            after_refused_controls.structuredContent["heat_level_percent"],
+            after_refused_controls.structuredContent["fan_level_percent"],
+            after_refused_controls.structuredContent["cooling_on"],
+        ) == (
+            before_refused_controls.structuredContent["heat_level_percent"],
+            before_refused_controls.structuredContent["fan_level_percent"],
+            before_refused_controls.structuredContent["cooling_on"],
+        )
+        emergency = await asyncio.wait_for(client.call_tool("emergency_stop", {}), 5)
+        assert not emergency.isError
+        exact = await asyncio.wait_for(client.call_tool("drop_beans_exact_session", binding), 5)
+        assert exact.structuredContent is not None
+        assert exact.structuredContent["outcome"] == "refused"
+        assert exact.structuredContent["reason"] == "prior_drop_transition_unaccounted"
+        assert exact.structuredContent["request_dispatch"] == "not_invoked"
+        assert exact.structuredContent["this_request"] == "no_reservation"
+        assert exact.structuredContent["prior_transition"] == "unaccounted"
+        assert exact.structuredContent["retry"] == "forbidden"
+        assert exact.structuredContent["fence"] == "not_applicable"
+
+    assert (tmp_path / "lost-ordinary-return-driver-calls").read_text(
+        encoding="utf-8"
+    ).splitlines() == ["heat", "fan", "ordinary"]
+
+
+async def _registered_manual_mock_exact_drop_held_append(tmp_path: Path) -> None:
+    """Hold exact Drop persistence while one client observes emergency priority."""
+    root = Path(__file__).resolve().parents[1]
+    logs = tmp_path / "logs"
+    config = tmp_path / "held-exact-drop.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {logs}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "exact-drop",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+
+    async def until_exists(name: str) -> None:
+        while not (tmp_path / name).exists():
+            await asyncio.sleep(0)
+
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert started.structuredContent is not None
+        session_id = started.structuredContent["session"]["session_id"]
+        assert not (await asyncio.wait_for(client.call_tool("mark_beans_added", {}), 5)).isError
+        assert not (await asyncio.wait_for(client.call_tool("mark_first_crack", {}), 5)).isError
+        timing = await asyncio.wait_for(
+            client.call_tool(
+                "get_timing_evidence",
+                {"expected_session_id": session_id, "evidence_protocol": "timing_evidence/v1"},
+            ),
+            5,
+        )
+        assert timing.structuredContent is not None
+        record = timing.structuredContent["record"]
+        assert record is not None
+        binding = {
+            "session_id": record["session_id"],
+            "clock_epoch_id": record["clock"]["epoch_id"],
+            "ownership_sequence": record["session_ownership_sequence"],
+            "timing_evidence_sequence": record["evidence_sequence"],
+        }
+
+        exact = asyncio.create_task(client.call_tool("drop_beans_exact_session", binding))
+        await asyncio.wait_for(until_exists("exact-drop-entered"), 5)
+        emergency = asyncio.create_task(client.call_tool("emergency_stop", {}))
+        await asyncio.wait_for(until_exists("emergency-entered"), 5)
+        assert (tmp_path / "exact-drop-driver-calls").read_text(encoding="utf-8").splitlines() == [
+            "drop",
+            "emergency",
+        ]
+
+        # The held append still owns both request results, but neither it nor
+        # the prepared emergency turn occupies the SDK dispatch loop.
+        state = await asyncio.wait_for(client.call_tool("get_roast_state", {}), 0.6)
+        tools = await asyncio.wait_for(client.list_tools(), 0.6)
+        assert state.structuredContent is not None
+        assert state.structuredContent["phase"] == "fault"
+        assert any(tool.name == "get_roast_state" for tool in tools.tools)
+        assert not exact.done()
+        assert not emergency.done()
+
+        (tmp_path / "release").write_text("release", encoding="utf-8")
+        exact_result = await asyncio.wait_for(exact, 5)
+        emergency_result = await asyncio.wait_for(emergency, 5)
+        assert exact_result.structuredContent is not None
+        assert exact_result.structuredContent["outcome"] == "unknown"
+        assert exact_result.structuredContent["fence"] == "retained"
+        assert not emergency_result.isError
+
+        state = await asyncio.wait_for(
+            client.call_tool("get_roast_state", {"session_id": session_id}), 5
+        )
+        assert state.structuredContent is not None
+        assert state.structuredContent["phase"] == "fault"
+
+    assert (tmp_path / "exact-drop-driver-calls").read_text(encoding="utf-8").splitlines() == [
+        "drop",
+        "emergency",
+    ]
+
+
+async def _registered_manual_mock_superseded_ordinary_drop(tmp_path: Path) -> None:
+    """Hold a registered ordinary Drop through emergency and recovery admission."""
+    root = Path(__file__).resolve().parents[1]
+    logs = tmp_path / "logs"
+    config = tmp_path / "superseded-ordinary-drop.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {logs}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "ordinary-drop-driver",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+
+    async def until_exists(name: str) -> None:
+        while not (tmp_path / name).exists():
+            await asyncio.sleep(0)
+
+    driver_calls_path = tmp_path / "ordinary-drop-driver-calls"
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert started.structuredContent is not None
+        session_id = started.structuredContent["session"]["session_id"]
+        charged = await asyncio.wait_for(client.call_tool("mark_beans_added", {}), 5)
+        assert not charged.isError
+
+        ordinary = asyncio.create_task(client.call_tool("drop_beans", {}))
+        await asyncio.wait_for(until_exists("ordinary-drop-driver-entered"), 5)
+        assert driver_calls_path.read_text(encoding="utf-8").splitlines() == ["drop"]
+
+        emergency = await asyncio.wait_for(client.call_tool("emergency_stop", {}), 5)
+        assert not emergency.isError
+        recovery = await asyncio.wait_for(
+            client.call_tool("drop_beans", {"expected_session_id": session_id}), 5
+        )
+        assert recovery.isError
+        assert driver_calls_path.read_text(encoding="utf-8").splitlines() == ["drop"]
+
+        (tmp_path / "release").write_text("release", encoding="utf-8")
+        ordinary_result = await asyncio.wait_for(ordinary, 5)
+        assert ordinary_result.isError
+        assert driver_calls_path.read_text(encoding="utf-8").splitlines() == ["drop"]
+
+        state = await asyncio.wait_for(
+            client.call_tool("get_roast_state", {"session_id": session_id}), 5
+        )
+        assert state.structuredContent is not None
+        assert state.structuredContent["phase"] == "fault"
+        assert [event["kind"] for event in state.structuredContent["events"]] == [
+            "beans_added",
+            "fault",
+        ]
+        replacement = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert replacement.isError
+
+
+def test_registered_manual_mock_capacity_refusal_blocks_ordinary_drop_retry(tmp_path: Path) -> None:
+    """A returned ordinary Drop with no coupled row cannot be replayed."""
+    asyncio.run(
+        _registered_manual_mock_capacity_refusal_blocks_drop_retry(tmp_path, recovery=False)
+    )
+
+
+def test_registered_manual_mock_capacity_refusal_blocks_recovery_drop_retry(tmp_path: Path) -> None:
+    """A returned ordinary Drop also fences exact stopped-fault recovery."""
+    asyncio.run(_registered_manual_mock_capacity_refusal_blocks_drop_retry(tmp_path, recovery=True))
+
+
+def test_registered_manual_mock_known_zero_drop_allows_settled_cooling_and_fresh_start(
+    tmp_path: Path,
+) -> None:
+    """Only the settled known-zero Drop path can discharge a faulted mock batch."""
+    asyncio.run(_registered_manual_mock_known_zero_drop_discharge(tmp_path))
+
+
+def test_ordinary_drop_return_fence_survives_executing_canonical_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed owned Drop write cannot clear the returned-driver containment fact."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    writer = session.canonical_writer
+    driver = context.roaster_driver
+    assert writer is not None and type(driver) is MockRoasterDriver
+    original_write = session_module.os.write
+
+    def fail_drop_write(descriptor: int, frame: bytes) -> int:
+        if b'"kind":"beans_dropped"' in frame:
+            raise OSError(errno.ENOSPC, "synthetic no space")
+        return original_write(descriptor, frame)
+
+    monkeypatch.setattr(session_module.os, "write", fail_drop_write)
+    with pytest.raises(
+        SessionLifecycleError,
+        match=(
+            "^Drop command was accepted by the driver, but roast log history "
+            "is incomplete or unsettled\\.$"
+        ),
+    ) as raised:
+        _call_tool(server, "drop_beans", ctx)
+    assert isinstance(raised.value.__cause__, EventLogRecordingError)
+    assert isinstance(raised.value.__cause__.__cause__, OSError)
+    assert raised.value.__cause__.__cause__.errno == errno.ENOSPC
+    assert driver.drop_transition_count == 1
+    assert driver.emergency_count == 0
+    dropped_state = driver.read_state()
+    assert dropped_state.heat_level_percent == 0
+    assert dropped_state.fan_level_percent == 100
+    assert dropped_state.cooling_on is True
+
+    with pytest.raises(SessionLifecycleError):
+        _call_tool(server, "emergency_stop", ctx)
+    assert driver.emergency_count == 1
+    with pytest.raises(SessionLifecycleError):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+    assert driver.drop_transition_count == 1
+    assert not session.ordinary_drop_persistence_zero
+
+
+def test_ordinary_drop_stale_reservation_cannot_dispatch_after_emergency_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reservation cancelled before dispatch cannot replay after recovery."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    reserved = Event()
+    release = Event()
+    original_reserve = context.session_store.reserve_driver_drop
+
+    def pause_after_reserve(current: RoastSession) -> DriverDropReservation:
+        result = original_reserve(current)
+        reserved.set()
+        assert release.wait(timeout=1.0)
+        return result
+
+    monkeypatch.setattr(context.session_store, "reserve_driver_drop", pause_after_reserve)
+    ordinary_results: list[object] = []
+    ordinary_errors: list[BaseException] = []
+    ordinary = Thread(
+        target=_record_tool_result,
+        args=(ordinary_results, ordinary_errors, server, "drop_beans", ctx),
+    )
+
+    ordinary.start()
+    assert reserved.wait(timeout=1.0)
+    emergency = _call_tool(server, "emergency_stop", ctx, reason="stale-ordinary-reservation")
+    recovered = _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+    release.set()
+    ordinary.join(timeout=1.0)
+
+    assert not ordinary.is_alive()
+    assert ordinary_results == []
+    assert len(ordinary_errors) == 1
+    assert isinstance(ordinary_errors[0], SessionLifecycleError)
+    assert emergency.event.kind == "fault"
+    assert recovered.event.kind == "beans_dropped"
+    assert driver.drop_transition_count == 1
+
+
+def test_ordinary_drop_dispatch_owner_blocks_recovery_while_driver_has_entered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An entered ordinary Drop retains exclusive recovery admission until it returns."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    entered = Event()
+    release = Event()
+    original_drop = driver.drop_beans
+
+    def pause_driver_drop() -> RoasterState:
+        entered.set()
+        assert release.wait(timeout=1.0)
+        return original_drop()
+
+    monkeypatch.setattr(driver, "drop_beans", pause_driver_drop)
+    ordinary_results: list[object] = []
+    ordinary_errors: list[BaseException] = []
+    ordinary = Thread(
+        target=_record_tool_result,
+        args=(ordinary_results, ordinary_errors, server, "drop_beans", ctx),
+    )
+
+    ordinary.start()
+    assert entered.wait(timeout=1.0)
+    emergency = _call_tool(server, "emergency_stop", ctx, reason="entered-ordinary-drop")
+    with pytest.raises(SessionLifecycleError, match="prior bean-drop outcome is unresolved"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+    release.set()
+    ordinary.join(timeout=1.0)
+
+    assert not ordinary.is_alive()
+    assert ordinary_results == []
+    assert len(ordinary_errors) == 1
+    assert isinstance(ordinary_errors[0], SessionLifecycleError)
+    assert emergency.event.kind == "fault"
+    assert driver.drop_transition_count == 1
+
+
+def test_ordinary_drop_lost_driver_return_retains_recovery_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A thrown ordinary Drop result cannot license a recovery retry."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+
+    def lose_driver_return() -> RoasterState:
+        raise RuntimeError("synthetic lost ordinary Drop return")
+
+    monkeypatch.setattr(driver, "drop_beans", lose_driver_return)
+    with pytest.raises(RuntimeError, match="synthetic lost ordinary Drop return"):
+        _call_tool(server, "drop_beans", ctx)
+
+    emergency = _call_tool(server, "emergency_stop", ctx, reason="lost-ordinary-return")
+    with pytest.raises(SessionLifecycleError, match="prior bean-drop outcome is unresolved"):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+
+    assert emergency.event.kind == "fault"
+    assert session.unrecorded_driver_drop
+    assert not session.verified_ordinary_driver_drop
+    assert driver.drop_transition_count == 0
+
+
+def test_manual_mock_prefailed_telemetry_writer_drop_allows_settled_discharge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prefailed writer refuses Drop before submission but retains exact discharge."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    failed = _fail_manual_mock_telemetry_generation(session, monkeypatch, failure_mode="enospc")
+
+    _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    _wait_for_incomplete_generation(session, failed)
+    with pytest.raises(
+        SessionLifecycleError,
+        match=(
+            "^Drop command was accepted by the driver, but roast log history "
+            "is incomplete or unsettled\\.$"
+        ),
+    ) as raised:
+        _call_tool(server, "drop_beans", ctx)
+
+    assert driver.drop_transition_count == 1
+    assert isinstance(raised.value.__cause__, EventLogRecordingError)
+    assert session.verified_ordinary_driver_drop
+    assert session.ordinary_drop_persistence_zero
+    assert not session.unrecorded_driver_drop
+    assert driver.emergency_count == 0
+    dropped_state = driver.read_state()
+    assert dropped_state.heat_level_percent == 0
+    assert dropped_state.fan_level_percent == 100
+    assert dropped_state.cooling_on is True
+
+    with pytest.raises(SessionLifecycleError):
+        _call_tool(server, "emergency_stop", ctx)
+    assert driver.emergency_count == 1
+    with pytest.raises(SessionLifecycleError):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session.id)
+
+    successor = _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+    assert successor.session.session_id != session.id
+    assert successor.session.first_crack_at_utc is None
+    assert driver.drop_transition_count == 1
+
+
+def test_registered_manual_mock_recovery_drop_second_cooling_frame_enospc_is_recorder_only(
+    tmp_path: Path,
+) -> None:
+    """A persisted recovery Drop with failed derived cooling stays recorder-only."""
+    asyncio.run(_registered_manual_mock_recovery_drop_fsync_failure(tmp_path))
+
+
+async def _registered_manual_mock_recovery_drop_fsync_failure(tmp_path: Path) -> None:
+    """Run a real recovery-Drop write followed by a failed sync through stdio."""
+    root = Path(__file__).resolve().parents[1]
+    logs = tmp_path / "logs"
+    config = tmp_path / "recovery-drop-fsync-enospc.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {logs}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "recovery-drop-fsync-enospc",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert started.structuredContent is not None
+        session_id = started.structuredContent["session"]["session_id"]
+        charged = await asyncio.wait_for(client.call_tool("mark_beans_added", {}), 5)
+        assert not charged.isError
+        stopped = await asyncio.wait_for(client.call_tool("emergency_stop", {}), 5)
+        assert not stopped.isError
+
+        recovery = await asyncio.wait_for(
+            client.call_tool("drop_beans", {"expected_session_id": session_id}), 5
+        )
+        assert recovery.isError
+        state = await asyncio.wait_for(
+            client.call_tool("get_roast_state", {"session_id": session_id}), 5
+        )
+        assert state.structuredContent is not None
+        assert state.structuredContent["phase"] == "fault"
+        exported = await asyncio.wait_for(
+            client.call_tool("export_roast_log", {"session_id": session_id}), 5
+        )
+        assert exported.structuredContent is not None
+        assert exported.structuredContent["ready"] is False
+
+    assert (tmp_path / "recovery-drop-driver-calls").read_text(encoding="utf-8").splitlines() == [
+        "emergency",
+        "drop",
+    ]
+
+
+def _automatic_charge_raw_write_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ServerContext, FastMCP, Any, MockRoasterDriver, RoastSession]:
+    """Prepare one automatic-charge threshold crossing with a raw write failure."""
+    config_path = tmp_path / "automatic-charge-enospc.yaml"
+    config_path.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        "session:\n  auto_t0_detection_enabled: true\n  auto_t0_drop_threshold_c: 25\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    context = build_server_context(config_path=config_path)
+    _set_first_crack_runtime(context, FakeFirstCrackRuntime())
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(context)
+    started = _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+    context.telemetry_sampler.stop_for_session(started.session.session_id, reason="test setup")
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    driver._thermal_sample = dataclasses.replace(  # pyright: ignore[reportPrivateUsage]
+        driver._thermal_sample,  # pyright: ignore[reportPrivateUsage]
+        bean_temp_c=170.0,
+        env_temp_c=170.0,
+    )
+    _call_tool(server, "get_roast_state", ctx, session_id=started.session.session_id)
+    driver._thermal_sample = dataclasses.replace(  # pyright: ignore[reportPrivateUsage]
+        driver._thermal_sample,  # pyright: ignore[reportPrivateUsage]
+        bean_temp_c=145.0,
+        env_temp_c=145.0,
+    )
+    original_write = session_module.os.write
+
+    def fail_auto_charge_write(descriptor: int, frame: bytes) -> int:
+        if b'"kind":"beans_added"' in frame and b'"source":"auto_t0"' in frame:
+            raise OSError(errno.ENOSPC, "synthetic no space")
+        return original_write(descriptor, frame)
+
+    monkeypatch.setattr(session_module.os, "write", fail_auto_charge_write)
+    session = context.session_store.get_active_session()
+    assert session is not None
+    return context, server, ctx, driver, session
+
+
+def test_get_roast_state_survives_raw_automatic_charge_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A public state read keeps its valid driver observation after ENOSPC."""
+    _context, server, ctx, driver, session = _automatic_charge_raw_write_context(
+        tmp_path, monkeypatch
+    )
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+
+    assert state.device_state is not None
+    assert state.phase == "pre_roast" and state.events == ()
+    assert session.mock_log_torn
+    assert session.manual_charge_persistence_uncertain
+    assert not session.manual_charge_persistence_zero
+    assert driver.emergency_count == 0
+
+
+def test_automatic_charge_write_uncertainty_is_not_retried_or_reclassified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second state read observes temperature without resubmitting failed T0."""
+    _context, server, ctx, driver, session = _automatic_charge_raw_write_context(
+        tmp_path, monkeypatch
+    )
+    write_count = 0
+    original_write = session_module.os.write
+
+    def count_failed_auto_charge_write(descriptor: int, frame: bytes) -> int:
+        nonlocal write_count
+        if b'"kind":"beans_added"' in frame and b'"source":"auto_t0"' in frame:
+            write_count += 1
+            raise OSError(errno.ENOSPC, "synthetic no space")
+        return original_write(descriptor, frame)
+
+    monkeypatch.setattr(session_module.os, "write", count_failed_auto_charge_write)
+    first = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    second = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+
+    assert first.device_state is not None and second.device_state is not None
+    assert write_count == 1
+    assert session.manual_charge_persistence_uncertain
+    assert not session.manual_charge_persistence_zero
+    assert driver.emergency_count == 0
+
+
+def test_sampler_survives_raw_automatic_charge_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sampler keeps its valid driver observation after automatic-charge ENOSPC."""
+    context, _server, _ctx_value, driver, session = _automatic_charge_raw_write_context(
+        tmp_path, monkeypatch
+    )
+
+    assert _sample_active_session_telemetry(context, session_id=session.id) is True
+
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert snapshot.phase == "pre_roast" and snapshot.active
+    assert snapshot.event_timeline == []
+    writer = session.canonical_writer
+    assert writer is not None and writer.wait_for_idle(timeout_seconds=1.0) is False
+    assert session.mock_log_torn
+    assert session.manual_charge_persistence_uncertain
+    assert not session.manual_charge_persistence_zero
+    assert driver.emergency_count == 0
+
+
+def test_real_sampler_keeps_fault_detection_live_while_automatic_charge_saves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held automatic charge does not suppress the sampler's next emergency."""
+    config_path = tmp_path / "held-automatic-charge.yaml"
+    config_path.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        "session:\n  auto_t0_detection_enabled: true\n  auto_t0_drop_threshold_c: 25\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n  sample_interval_seconds: 0.025\n",
+        encoding="utf-8",
+    )
+    context = build_server_context(config_path=config_path)
+    _set_first_crack_runtime(context, FakeFirstCrackRuntime())
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(context)
+    started = _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+    session = context.session_store.get_active_session()
+    driver = context.roaster_driver
+    assert session is not None and type(driver) is MockRoasterDriver
+    context.telemetry_sampler.stop_for_session(started.session.session_id, reason="test setup")
+    driver._thermal_sample = dataclasses.replace(  # pyright: ignore[reportPrivateUsage]
+        driver._thermal_sample,  # pyright: ignore[reportPrivateUsage]
+        bean_temp_c=170.0,
+        env_temp_c=170.0,
+    )
+    writer = session.canonical_writer
+    assert writer is not None
+    append_entered, release_append = Event(), Event()
+    failed_read, emergency_entered = Event(), Event()
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+    original_read = driver.read_state
+    original_emergency = driver.emergency_stop
+    read_count = 0
+
+    def hold_automatic_charge(frame: bytes) -> None:
+        if b'"kind":"beans_added"' in frame and b'"source":"auto_t0"' in frame:
+            append_entered.set()
+            assert release_append.wait(timeout=1.0)
+        original_append(frame)
+
+    def read_until_failure() -> RoasterState:
+        nonlocal read_count
+        read_count += 1
+        if read_count == 3:
+            failed_read.set()
+            raise RuntimeError("synthetic read failure after automatic charge admission")
+        state = original_read()
+        if read_count == 1:
+            driver._thermal_sample = dataclasses.replace(  # pyright: ignore[reportPrivateUsage]
+                driver._thermal_sample,  # pyright: ignore[reportPrivateUsage]
+                bean_temp_c=145.0,
+                env_temp_c=145.0,
+            )
+        return state
+
+    def record_emergency(*, reason: str) -> EmergencyStopResult:
+        emergency_entered.set()
+        return original_emergency(reason=reason)
+
+    monkeypatch.setattr(writer, "_append_verified", hold_automatic_charge)
+    monkeypatch.setattr(driver, "read_state", read_until_failure)
+    monkeypatch.setattr(driver, "emergency_stop", record_emergency)
+    context.telemetry_sampler.start_for_session(session.id)
+    assert append_entered.wait(timeout=1.0)
+    assert failed_read.wait(timeout=0.4)
+    assert emergency_entered.wait(timeout=0.4)
+    assert read_count == 3 and driver.emergency_count == 1
+
+    release_append.set()
+    deadline = time.monotonic() + 1.0
+    while context.telemetry_sampler.active_session_id is not None and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert context.telemetry_sampler.active_session_id is None
+    assert writer.wait_for_idle(timeout_seconds=1.0)
+    snapshot = context.session_store.get_session_snapshot(session_id=session.id)
+    assert [event.kind for event in snapshot.event_timeline] == ["beans_added", "fault"]
+    assert snapshot.beans_added_source == "auto_t0"
+    assert snapshot.phase == "fault" and not snapshot.active
+    assert driver.emergency_count == 1
+
+
+def test_automatic_charge_refused_before_writer_start_is_known_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused auto-charge turn blocks recovery without inventing a charge row."""
+    _context, server, ctx, driver, session = _automatic_charge_raw_write_context(
+        tmp_path, monkeypatch
+    )
+    writer = session.canonical_writer
+    assert writer is not None
+    writer._latch_incomplete()  # pyright: ignore[reportPrivateUsage]
+    stop_cooling_calls = 0
+    original_stop_cooling = driver.stop_cooling
+
+    def count_stop_cooling() -> RoasterState:
+        nonlocal stop_cooling_calls
+        stop_cooling_calls += 1
+        return original_stop_cooling()
+
+    monkeypatch.setattr(driver, "stop_cooling", count_stop_cooling)
+
+    state = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+
+    assert state.phase == "pre_roast" and state.events == ()
+    assert session.manual_charge_persistence_zero
+    assert not session.manual_charge_persistence_uncertain
+
+    # Known-zero is evidence about canonical bytes, not an empty drum. The
+    # actual automatic producer attempted charge, so its exact stopped batch
+    # cannot dispatch a recovery Drop or early cooling stop, or be retired.
+    with pytest.raises(SessionLifecycleError, match="Emergency stop command was accepted"):
+        _call_tool(server, "emergency_stop", ctx)
+    with pytest.raises(SessionLifecycleError):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+    with pytest.raises(SessionLifecycleError):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session.id)
+    with pytest.raises(SessionLifecycleError):
+        _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+
+    retained = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    assert retained.first_crack_at_utc is None
+    assert driver.emergency_count == 1
+    assert driver.drop_transition_count == 0
+    assert stop_cooling_calls == 0
+
+
+def test_manual_charge_refused_before_writer_start_blocks_fault_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public human producer retains the same zero-byte containment fence."""
+    context, server, ctx, session = _manual_mock_incomplete_generation_context_without_charge(
+        tmp_path
+    )
+    writer = session.canonical_writer
+    driver = context.roaster_driver
+    assert writer is not None and type(driver) is MockRoasterDriver
+    writer._latch_incomplete()  # pyright: ignore[reportPrivateUsage]
+    stop_cooling_calls = 0
+    original_stop_cooling = driver.stop_cooling
+
+    def count_stop_cooling() -> RoasterState:
+        nonlocal stop_cooling_calls
+        stop_cooling_calls += 1
+        return original_stop_cooling()
+
+    monkeypatch.setattr(driver, "stop_cooling", count_stop_cooling)
+
+    with pytest.raises(EventLogRecordingError, match="generation is incomplete"):
+        _call_tool(server, "mark_beans_added", ctx)
+    assert session.manual_charge_persistence_zero
+    assert not session.manual_charge_persistence_uncertain
+
+    with pytest.raises(SessionLifecycleError, match="Emergency stop command was accepted"):
+        _call_tool(server, "emergency_stop", ctx)
+    with pytest.raises(SessionLifecycleError):
+        _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+    with pytest.raises(SessionLifecycleError):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session.id)
+    with pytest.raises(SessionLifecycleError):
+        _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+
+    retained = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+    assert retained.first_crack_at_utc is None
+    assert driver.emergency_count == 1
+    assert driver.drop_transition_count == 0
+    assert stop_cooling_calls == 0
+
+
+def test_unattempted_charge_with_refused_writer_retains_empty_batch_recovery(
+    tmp_path: Path,
+) -> None:
+    """A failed writer alone does not recast an uncharged batch as charged."""
+    _context, server, ctx, session = _manual_mock_incomplete_generation_context_without_charge(
+        tmp_path
+    )
+    writer = session.canonical_writer
+    assert writer is not None
+    writer._latch_incomplete()  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(SessionLifecycleError, match="Emergency stop command was accepted"):
+        _call_tool(server, "emergency_stop", ctx)
+    with pytest.raises(SessionLifecycleError, match="roast log recording"):
+        _call_tool(server, "stop_cooling", ctx, expected_session_id=session.id)
+
+    successor = _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+    assert successor.session.session_id != session.id
+    assert successor.session.first_crack_at_utc is None
+    assert not session.manual_charge_persistence_zero
+    assert not session.manual_charge_persistence_uncertain
+
+
+async def _registered_manual_mock_capacity_refusal_blocks_drop_retry(
+    tmp_path: Path, *, recovery: bool
+) -> None:
+    """Exercise both Drop entry routes through one composed stdio client."""
+    root = Path(__file__).resolve().parents[1]
+    logs = tmp_path / "logs"
+    config = tmp_path / "drop-capacity-one.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {logs}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "drop-capacity-one",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert started.structuredContent is not None
+        session_id = started.structuredContent["session"]["session_id"]
+        charged = await asyncio.wait_for(client.call_tool("mark_beans_added", {}), 5)
+        assert not charged.isError
+
+        first_drop = await asyncio.wait_for(client.call_tool("drop_beans", {}), 5)
+        assert first_drop.isError
+        assert (tmp_path / "drop-driver-calls").read_text(encoding="utf-8").splitlines() == ["drop"]
+
+        # The returned ordinary Drop may already have moved beans. Both
+        # registered control overrides use the shared reservation path and
+        # must therefore refuse before their raw driver methods enter.
+        heat = await asyncio.wait_for(client.call_tool("set_heat", {"heat_level_percent": 40}), 5)
+        fan = await asyncio.wait_for(client.call_tool("set_fan", {"fan_level_percent": 30}), 5)
+        assert heat.isError and fan.isError
+        assert (tmp_path / "drop-driver-calls").read_text(encoding="utf-8").splitlines() == ["drop"]
+
+        if recovery:
+            await asyncio.wait_for(client.call_tool("emergency_stop", {}), 5)
+            retry = await asyncio.wait_for(
+                client.call_tool("drop_beans", {"expected_session_id": session_id}), 5
+            )
+        else:
+            retry = await asyncio.wait_for(client.call_tool("drop_beans", {}), 5)
+        assert retry.isError
+        assert (tmp_path / "drop-driver-calls").read_text(encoding="utf-8").splitlines() == ["drop"]
+
+        state = await asyncio.wait_for(
+            client.call_tool("get_roast_state", {"session_id": session_id}), 5
+        )
+        assert state.structuredContent is not None
+        assert [event["kind"] for event in state.structuredContent["events"]] == ["beans_added"]
+        incomplete = await asyncio.wait_for(
+            client.call_tool("export_roast_log", {"session_id": session_id}), 5
+        )
+        assert incomplete.structuredContent is not None
+        assert incomplete.structuredContent["ready"] is False
+        assert incomplete.structuredContent["note"] == (
+            "Roast log recording is unavailable: JSONL persistence is incomplete."
+        )
+
+    assert [
+        json.loads(line)["kind"]
+        for line in (logs / "roasts" / session_id / "roast.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ] == ["beans_added"]
+
+
+async def _registered_manual_mock_known_zero_drop_discharge(tmp_path: Path) -> None:
+    """Prove the exact capacity refusal, cooling settlement, and successor order."""
+    root = Path(__file__).resolve().parents[1]
+    logs = tmp_path / "logs"
+    config = tmp_path / "drop-capacity-discharge.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {logs}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "drop-capacity-discharge",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert started.structuredContent is not None
+        session_id = started.structuredContent["session"]["session_id"]
+        assert not (await asyncio.wait_for(client.call_tool("mark_beans_added", {}), 5)).isError
+        assert (await asyncio.wait_for(client.call_tool("drop_beans", {}), 5)).isError
+        # The full canonical generation may report fault-recording failure,
+        # but the independently admitted mock emergency still reaches driver.
+        emergency = await asyncio.wait_for(client.call_tool("emergency_stop", {}), 5)
+        assert emergency.isError
+
+        # Cooling has not yet settled, so a successor cannot retire this exact
+        # failed generation or inherit its first-crack clock.
+        early_start = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert early_start.isError
+        contained = await asyncio.wait_for(
+            client.call_tool("get_roast_state", {"session_id": session_id}), 5
+        )
+        assert contained.structuredContent is not None
+        assert contained.structuredContent["device_state"] is not None
+        assert contained.structuredContent["device_state"]["heat_level_percent"] == 0
+        assert contained.structuredContent["device_state"]["fan_level_percent"] == 100
+        assert contained.structuredContent["device_state"]["cooling_on"] is True
+        cooling = await asyncio.wait_for(
+            client.call_tool("stop_cooling", {"expected_session_id": session_id}), 5
+        )
+        assert cooling.isError
+        state = await asyncio.wait_for(
+            client.call_tool("get_roast_state", {"session_id": session_id}), 5
+        )
+        assert state.structuredContent is not None
+        assert state.structuredContent["phase"] == "fault"
+        assert state.structuredContent["device_state"] is not None
+        assert state.structuredContent["device_state"]["heat_level_percent"] == 0
+        assert state.structuredContent["device_state"]["fan_level_percent"] == 0
+        assert state.structuredContent["device_state"]["cooling_on"] is False
+
+        successor = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert successor.structuredContent is not None
+        assert not successor.isError
+        successor_id = successor.structuredContent["session"]["session_id"]
+        assert successor_id != session_id
+        successor_state = await asyncio.wait_for(
+            client.call_tool("get_roast_state", {"session_id": successor_id}), 5
+        )
+        assert successor_state.structuredContent is not None
+        assert successor_state.structuredContent["first_crack_at_utc"] is None
+        replay = await asyncio.wait_for(
+            client.call_tool("export_roast_log", {"session_id": session_id}), 5
+        )
+        assert replay.structuredContent is not None
+        assert replay.structuredContent["ready"] is False
+
+    assert (tmp_path / "drop-driver-calls").read_text(encoding="utf-8").splitlines() == [
+        "drop",
+        "emergency",
+        "stop_cooling",
+    ]
+    assert [
+        json.loads(line)["kind"]
+        for line in (logs / "roasts" / session_id / "roast.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ] == ["beans_added"]
+
+
+async def _registered_manual_mock_recovery_drop_held_append(tmp_path: Path) -> None:
+    """Exercise the documented operator recovery route through one SDK client."""
+    root = Path(__file__).resolve().parents[1]
+    config = tmp_path / "held-recovery-drop.yaml"
+    logs = tmp_path / "logs"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {logs}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "recovery-drop",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+
+    async def until_exists(name: str) -> None:
+        while not (tmp_path / name).exists():
+            await asyncio.sleep(0)
+
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert started.structuredContent is not None
+        session_id = started.structuredContent["session"]["session_id"]
+        charged = await asyncio.wait_for(client.call_tool("mark_beans_added", {}), 5)
+        assert not charged.isError
+        stopped = await asyncio.wait_for(client.call_tool("emergency_stop", {}), 5)
+        assert not stopped.isError
+        (tmp_path / "emergency-entered").unlink()
+
+        recovery = asyncio.create_task(
+            client.call_tool("drop_beans", {"expected_session_id": session_id})
+        )
+        await asyncio.wait_for(until_exists("recovery-drop-entered"), 5)
+
+        # Both requests use this same registered client.  The read must finish
+        # while the exact recovery frame is still owned by the writer.
+        held_state = await asyncio.wait_for(
+            client.call_tool("get_roast_state", {"session_id": session_id}), 0.6
+        )
+        assert held_state.structuredContent is not None
+        assert held_state.structuredContent["phase"] == "fault"
+
+        superseding_stop = asyncio.create_task(
+            client.call_tool("emergency_stop", {"expected_session_id": session_id})
+        )
+        await asyncio.wait_for(until_exists("emergency-entered"), 0.6)
+        assert not (tmp_path / "release").exists()
+        (tmp_path / "release").write_text("release", encoding="utf-8")
+
+        superseding = await asyncio.wait_for(superseding_stop, 5)
+        assert not superseding.isError
+        recovery_result = await asyncio.wait_for(recovery, 5)
+        assert recovery_result.isError
+
+        state = await asyncio.wait_for(
+            client.call_tool("get_roast_state", {"session_id": session_id}), 5
+        )
+        assert state.structuredContent is not None
+        assert state.structuredContent["phase"] == "fault"
+        assert [event["kind"] for event in state.structuredContent["events"]] == [
+            "beans_added",
+            "fault",
+            "beans_dropped",
+            "fault",
+        ]
+
+        # The verified stale row is historical evidence: it blocks a repeat
+        # exact discharge without projecting cooling or retiring the stopped
+        # session for Start.
+        repeated_drop = await asyncio.wait_for(
+            client.call_tool("drop_beans", {"expected_session_id": session_id}), 5
+        )
+        assert repeated_drop.isError
+        stopped_cooling = await asyncio.wait_for(
+            client.call_tool("stop_cooling", {"expected_session_id": session_id}), 5
+        )
+        assert not stopped_cooling.isError
+        replacement = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert replacement.isError
+
+    # The verified pre-supersession Drop remains one exact historical fact,
+    # while the refused duplicate makes no second driver/canonical Drop.  The
+    # later cooling stop is independently verified recovery, not stale Drop
+    # projection.
+    assert [
+        json.loads(line)["kind"]
+        for line in (logs / "roasts" / session_id / "roast.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ] == ["beans_added", "fault", "beans_dropped", "fault", "cooling_stopped"]
+    assert (tmp_path / "recovery-drop-driver-calls").read_text(encoding="utf-8").splitlines() == [
+        "drop"
+    ]
+
+
+def test_registered_manual_mock_emergency_reports_failed_queued_fault_append(
+    tmp_path: Path,
+) -> None:
+    """A confirmed mock stop never reports a durable fault when its turn fails."""
+    asyncio.run(_registered_manual_mock_emergency_reports_failed_queued_fault_append(tmp_path))
+
+
+async def _registered_manual_mock_emergency_reports_failed_queued_fault_append(
+    tmp_path: Path,
+) -> None:
+    """Exercise the accepted-FC/failed-fault ordering through one stdio client."""
+    root = Path(__file__).resolve().parents[1]
+    config = tmp_path / "failed-queued-fault.yaml"
+    logs = tmp_path / "logs"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {tmp_path / 'recordings'}\n"
+        f"logging:\n  log_dir: {logs}\n",
+        encoding="utf-8",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(tmp_path),
+            "first-crack-fault-fail",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=tmp_path,
+    )
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert started.structuredContent is not None
+        session_id = started.structuredContent["session"]["session_id"]
+        assert not (await asyncio.wait_for(client.call_tool("mark_beans_added", {}), 5)).isError
+
+        async def until_exists(name: str) -> None:
+            while not (tmp_path / name).exists():
+                await asyncio.sleep(0)
+
+        mark = asyncio.create_task(client.call_tool("mark_first_crack", {}))
+        await asyncio.wait_for(until_exists("first-crack-entered"), 5)
+        emergency = asyncio.create_task(client.call_tool("emergency_stop", {}))
+        await asyncio.wait_for(until_exists("emergency-entered"), 5)
+        (tmp_path / "release").write_text("release", encoding="utf-8")
+
+        stopped = await asyncio.wait_for(emergency, 5)
+        assert stopped.isError
+        assert "confirmed mock driver response" in str(stopped.content)
+        assert (await asyncio.wait_for(mark, 5)).isError
+
+        state = await asyncio.wait_for(client.call_tool("get_roast_state", {}), 5)
+        assert state.structuredContent is not None
+        assert state.structuredContent["phase"] == "fault"
+        assert [event["kind"] for event in state.structuredContent["events"]] == ["beans_added"]
+
+    rows = [
+        json.loads(line)["kind"]
+        for line in (logs / "roasts" / session_id / "roast.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert rows == ["beans_added", "first_crack_detected"]
+
+
 class _ManualAuthorityMockDriver(MockRoasterDriver):
     """Mock-family double with a selectable static manual declaration."""
 
@@ -9577,6 +11740,8 @@ def _manual_authority_config() -> AppConfig:
 
 def _exact_normal_drop_context(
     tmp_path: Path,
+    *,
+    include_first_crack: bool = True,
 ) -> tuple[ServerContext, FastMCP, Any, RoastSession]:
     """Create one manual-authority mock session ready for exact-drop admission."""
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
@@ -9604,16 +11769,150 @@ def _exact_normal_drop_context(
     _call_tool(server, "mark_beans_added", ctx)
     session = context.session_store.get_active_session()
     assert session is not None
-    _call_tool(server, "mark_first_crack", ctx)
-    evidence = _call_tool(
-        server,
-        "get_timing_evidence",
-        ctx,
-        expected_session_id=session.id,
-        evidence_protocol="timing_evidence/v1",
-    )
-    assert evidence.outcome == "evidence"
+    if include_first_crack:
+        _call_tool(server, "mark_first_crack", ctx)
+        evidence = _call_tool(
+            server,
+            "get_timing_evidence",
+            ctx,
+            expected_session_id=session.id,
+            evidence_protocol="timing_evidence/v1",
+        )
+        assert evidence.outcome == "evidence"
     return context, server, ctx, session
+
+
+def test_manual_first_crack_duplicate_notifies_the_observer_once(tmp_path: Path) -> None:
+    """The idempotent direct request returns its receipt without a second notification."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+    runtime = context.first_crack_runtime
+    assert isinstance(runtime, FakeFirstCrackRuntime)
+
+    duplicate = _call_tool(server, "mark_first_crack", ctx)
+
+    assert duplicate.event.kind == "first_crack_detected"
+    assert runtime.human_mark_session_ids == [session.id]
+
+
+def test_manual_first_crack_live_settlement_survives_delayed_notification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timely live mark keeps its observer claim while notification is held."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path, include_first_crack=False)
+    runtime = context.first_crack_runtime
+    assert isinstance(runtime, FakeFirstCrackRuntime)
+    entered, release, delivered = Event(), Event(), Event()
+    original_notify = runtime.notify_human_mark
+
+    def hold_notification(
+        notified_session: RoastSession, *, publication_token: object | None = None
+    ) -> FirstCrackRuntimeSnapshot:
+        entered.set()
+        assert release.wait(timeout=1.0)
+        result = cast(
+            FirstCrackRuntimeSnapshot,
+            original_notify(notified_session, publication_token=publication_token),
+        )
+        delivered.set()
+        return result
+
+    monkeypatch.setattr(runtime, "notify_human_mark", hold_notification)
+    object.__setattr__(
+        context.session_store,
+        "_manual_first_crack_budget_seconds",
+        0.05,
+    )
+    try:
+        marked = _call_tool(server, "mark_first_crack", ctx)
+        assert marked.phase == "development"
+        assert marked.event.kind == "first_crack_detected"
+        assert entered.wait(timeout=1.0)
+        assert len(runtime._human_mark_publications) == 1  # pyright: ignore[reportPrivateUsage]
+        state = _call_tool(server, "get_roast_state", ctx, session_id=session.id)
+        assert [event.kind for event in state.events].count("first_crack_detected") == 1
+    finally:
+        release.set()
+    assert delivered.wait(timeout=1.0)
+    assert runtime.human_mark_session_ids == [session.id]
+
+
+@pytest.mark.parametrize("drop_route", ("ordinary", "exact"))
+def test_registered_drop_revokes_held_manual_mark_publication_before_driver_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drop_route: str,
+) -> None:
+    """A pre-Drop accepted mark cannot publish through a delayed old callback."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path, include_first_crack=False)
+    runtime = context.first_crack_runtime
+    driver = cast(MockRoasterDriver, context.roaster_driver)
+    assert isinstance(runtime, FakeFirstCrackRuntime)
+    entered, release, delivered = Event(), Event(), Event()
+    original_notify = runtime.notify_human_mark
+    original_drop = driver.drop_beans
+
+    def hold_notification(
+        notified_session: RoastSession, *, publication_token: object | None = None
+    ) -> FirstCrackRuntimeSnapshot:
+        entered.set()
+        assert release.wait(timeout=1.0)
+        result = cast(
+            FirstCrackRuntimeSnapshot,
+            original_notify(notified_session, publication_token=publication_token),
+        )
+        delivered.set()
+        return result
+
+    def require_revoked_claim(*, exact_drop: ExactDropArbitration | None = None) -> RoasterState:
+        assert runtime._human_mark_publications == {}  # pyright: ignore[reportPrivateUsage]
+        return original_drop(exact_drop=exact_drop)
+
+    monkeypatch.setattr(runtime, "notify_human_mark", hold_notification)
+    monkeypatch.setattr(driver, "drop_beans", require_revoked_claim)
+    try:
+        marked = _call_tool(server, "mark_first_crack", ctx)
+        assert marked.event.kind == "first_crack_detected"
+        assert entered.wait(timeout=1.0)
+        saved_clock = context.session_store.get_session_snapshot(
+            session_id=session.id
+        ).first_crack_monotonic_seconds
+        assert saved_clock is not None
+
+        if drop_route == "ordinary":
+            dropped = _call_tool(server, "drop_beans", ctx)
+            assert dropped.event.kind == "beans_dropped"
+        else:
+            evidence = _call_tool(
+                server,
+                "get_timing_evidence",
+                ctx,
+                expected_session_id=session.id,
+                evidence_protocol="timing_evidence/v1",
+            )
+            assert evidence.outcome == "evidence"
+            assert evidence.record is not None
+            exact = _call_tool(
+                server,
+                "drop_beans_exact_session",
+                ctx,
+                session_id=evidence.record.session_id,
+                clock_epoch_id=evidence.record.clock.epoch_id,
+                ownership_sequence=evidence.record.session_ownership_sequence,
+                timing_evidence_sequence=evidence.record.evidence_sequence,
+            )
+            assert exact.outcome == "success"
+        assert driver.drop_transition_count == 1
+    finally:
+        release.set()
+    assert delivered.wait(timeout=1.0)
+    assert runtime.human_mark_session_ids == []
+    assert (
+        context.session_store.get_session_snapshot(
+            session_id=session.id
+        ).first_crack_monotonic_seconds
+        == saved_clock
+    )
 
 
 def _exact_normal_drop(
@@ -10642,13 +12941,14 @@ def test_exact_normal_drop_cancels_after_failed_legacy_drop_stale_emergency(
         timing_evidence_sequence=identity.timing_evidence_sequence,
     )
 
-    assert result.outcome == "cancelled"
-    assert result.reason == "emergency_since_session_baseline"
-    assert result.request_dispatch == "invoked_no_state_transition"
-    assert result.this_request == "reservation_owned"
-    assert result.fence == "released"
-    assert result.prior_transition == "not_established"
-    assert repeated.outcome == "cancelled"
+    for refusal in (result, repeated):
+        assert refusal.outcome == "refused"
+        assert refusal.reason == "prior_drop_transition_unaccounted"
+        assert refusal.request_dispatch == "not_invoked"
+        assert refusal.this_request == "no_reservation"
+        assert refusal.prior_transition == "unaccounted"
+        assert refusal.retry == "forbidden"
+        assert refusal.fence == "not_applicable"
     assert driver.drop_transition_count == 1
     assert driver.emergency_count == 1
 
@@ -10847,6 +13147,65 @@ def test_exact_normal_drop_retains_unknown_after_prior_unaccounted_transition(
     assert repeated.history == "unknown"
     assert driver.drop_transition_count == 1
     assert driver.emergency_count == 0
+
+
+def test_exact_normal_drop_refuses_verified_ordinary_drop_without_canonical_rows(
+    tmp_path: Path,
+) -> None:
+    """Recipe eligibility cannot replay a returned ordinary Drop."""
+    context, _server, _ctx_value, session = _exact_normal_drop_context(tmp_path)
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    reserved = context.session_store.reserve_driver_drop(session)
+    assert reserved.reservation is not None
+    context.session_store.admit_ordinary_driver_drop_dispatch(
+        session, reservation=reserved.reservation
+    )
+    context.session_store.record_verified_ordinary_driver_drop(
+        session, reservation=reserved.reservation
+    )
+    context.session_store.clear_driver_command_reservation(session, reserved.reservation)
+
+    result = _exact_normal_drop(context, session)
+
+    assert result.outcome == "refused"
+    assert result.reason == "prior_drop_transition_unaccounted"
+    assert result.request_dispatch == "not_invoked"
+    assert driver.drop_transition_count == 0
+
+
+def test_registered_exact_drop_refusal_reports_unaccounted_prior_transition(
+    tmp_path: Path,
+) -> None:
+    """The public exact-Drop reply preserves its closed prior-transition fact."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+    reserved = context.session_store.reserve_driver_drop(session)
+    assert reserved.reservation is not None
+    context.session_store.admit_ordinary_driver_drop_dispatch(
+        session, reservation=reserved.reservation
+    )
+    context.session_store.record_verified_ordinary_driver_drop(
+        session, reservation=reserved.reservation
+    )
+    context.session_store.clear_driver_command_reservation(session, reserved.reservation)
+    identity = context.session_store.normal_drop_identity(session)
+
+    result = _call_tool(
+        server,
+        "drop_beans_exact_session",
+        ctx,
+        session_id=identity.session_id,
+        clock_epoch_id=identity.clock_epoch_id,
+        ownership_sequence=identity.ownership_sequence,
+        timing_evidence_sequence=identity.timing_evidence_sequence,
+    )
+
+    assert result.outcome == "refused"
+    assert result.reason == "prior_drop_transition_unaccounted"
+    assert result.prior_transition == "unaccounted"
+    assert result.this_request == "no_reservation"
+    assert result.request_dispatch == "not_invoked"
+    assert result.retry == "forbidden"
 
 
 def test_exact_normal_drop_stale_cancellation_does_not_claim_a_released_fence(
@@ -11771,6 +14130,79 @@ def test_capture_bootstrap_capability_is_closed_to_manual_mock_composition(
     )
 
 
+def test_hottop_simulation_keeps_the_manual_writer_and_export_marker_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The protected simulation never acquires M1's mock-only export path."""
+    from coffee_roaster_mcp.config import AudioConfig
+    from coffee_roaster_mcp.hottop_simulation import SYNTHETIC_HOTTOP_PORT
+
+    class Runtime:
+        """Minimal runtime double for server composition inspection."""
+
+        def set_event_domain_mapped(self, *, event_domain_mapped: bool) -> None:
+            """Accept the protected synthetic-clock configuration."""
+            del event_domain_mapped
+
+        def admit_trusted_manual_driver(self, *, admission: object) -> None:
+            """Accept the protected manual simulation admission."""
+            del admission
+
+        def set_capture_evidence_publisher(self, publisher: object) -> None:
+            """Accept the protected capture-evidence publisher."""
+            del publisher
+
+    config = AppConfig(
+        roaster=RoasterConfig(
+            driver=HOTTOP_DRIVER_NAME,
+            port=SYNTHETIC_HOTTOP_PORT,
+            temperature_unit="celsius",
+            temperature_unit_explicit=True,
+            hottop_reception="candidate/v1",
+        ),
+        first_crack=FirstCrackConfig(
+            mode="audio",
+            event_authority="manual",
+            local_model_dir=tmp_path / "model",
+        ),
+        audio=AudioConfig(source="wav", wav_path=tmp_path / "capture.wav"),
+        recording=RecordingConfig(enabled=True, autocapture=True),
+    )
+
+    def load(**_kwargs: object) -> AppConfig:
+        """Return the fixed trusted-simulation configuration."""
+        return config
+
+    def build_runtime(*_args: object, **_kwargs: object) -> Runtime:
+        """Return the minimal runtime needed during context assembly."""
+        return Runtime()
+
+    monkeypatch.setattr(mcp_server, "load_config", load)
+    monkeypatch.setattr(
+        mcp_server,
+        "build_first_crack_session_runtime",
+        build_runtime,
+    )
+    composition = HottopSimulationComposition(clock=lambda: 0.0, receipt_age_bound_seconds=1.0)
+
+    context = build_server_context(
+        config_path=tmp_path / "not-read.yaml",
+        simulation_composition=composition,
+    )
+
+    assert context.capture_evidence_configured is True
+    assert context.unavailable_export_marker is None
+    assert not context.session_store._manual_first_crack_writer_enabled  # pyright: ignore[reportPrivateUsage]
+
+
+def test_server_context_requires_m1_marker_and_publisher_fields() -> None:
+    """The M1 state fields remain required before protected defaulted fields."""
+    fields = {field.name: field for field in dataclasses.fields(ServerContext)}
+
+    assert fields["unavailable_export_marker"].default is dataclasses.MISSING
+    assert fields["mock_replay_publisher"].default is dataclasses.MISSING
+
+
 def test_manual_start_refuses_spoofed_capability_family_before_reservation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -11989,6 +14421,230 @@ def test_manual_mock_active_roast_export_is_unready_without_artifact_writes(
     ) == controls_before
     assert tuple(session.event_timeline) == events_before
     context.telemetry_sampler.stop_for_session(session_id, reason="test_cleanup")
+
+
+def test_configured_manual_mock_unready_export_uses_the_absent_marker(tmp_path: Path) -> None:
+    """An active configured composition exposes only the inert refusal namespace."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+    assert context.unavailable_export_marker is not None
+
+    exported = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+
+    marker = context.unavailable_export_marker
+    assert exported.ready is False
+    assert exported.note == "Roast log export is unavailable while this roast session is active."
+    assert exported.log_dir == str(marker)
+    assert exported.jsonl_path == str(marker / "roast.jsonl")
+    assert exported.csv_path == str(marker / "roast.csv")
+    assert exported.summary_path == str(marker / "summary.json")
+    assert not marker.exists()
+    context.telemetry_sampler.stop_for_session(session.id, reason="test_cleanup")
+
+
+def test_configured_manual_mock_export_refuses_if_marker_is_occupied(tmp_path: Path) -> None:
+    """An occupied marker never leaks an alternate usable export path."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / ".roastpilot-export-unavailable").write_text("occupied", encoding="utf-8")
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "logging:",
+                f"  log_dir: {log_dir}",
+                "first_crack:",
+                "  mode: audio",
+                "  event_authority: manual",
+                "  allow_manual_override: true",
+                "recording:",
+                "  enabled: true",
+                "  autocapture: true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    context = build_server_context(config_path=config_path)
+    assert context.unavailable_export_marker is None
+    _set_first_crack_runtime(context, FakeFirstCrackRuntime())
+    server = create_mcp_server()
+    ctx = _ctx(context)
+    started = _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+
+    with pytest.raises(ValueError, match="^Roast export is unavailable\\.$"):
+        _call_tool(server, "export_roast_log", ctx, session_id=started.session.session_id)
+    context.telemetry_sampler.stop_for_session(started.session.session_id, reason="test_cleanup")
+
+
+def test_configured_manual_mock_complete_export_seals_and_reuses_replay_bundle(
+    tmp_path: Path,
+) -> None:
+    """A healthy configured manual/mock generation exposes one verified replay bundle."""
+    _context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+    _call_tool(server, "drop_beans", ctx)
+    _call_tool(server, "stop_cooling", ctx)
+    raw_path = session.log_writer.log_dir / "roast.jsonl" if session.log_writer else None
+    assert raw_path is not None
+    raw_before = raw_path.read_bytes()
+
+    first = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+    second = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+
+    assert first.ready is True and second.ready is True
+    assert first.log_dir == second.log_dir
+    assert Path(first.jsonl_path).read_bytes() == raw_before
+    assert Path(first.log_dir).name == "replay-v1"
+    assert raw_path.read_bytes() == raw_before
+
+
+def test_registered_manual_mock_relative_log_root_export_paths_are_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client outside the producer cwd opens each sealed relative-root path."""
+    asyncio.run(
+        _registered_manual_mock_export_path_projection(tmp_path, monkeypatch, relative=True)
+    )
+
+
+def test_registered_manual_mock_absolute_log_root_export_paths_remain_compatible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The established absolute-root replay projection remains directly usable."""
+    asyncio.run(
+        _registered_manual_mock_export_path_projection(tmp_path, monkeypatch, relative=False)
+    )
+
+
+async def _registered_manual_mock_export_path_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, relative: bool
+) -> None:
+    """Complete one registered mock roast across separate producer and client roots."""
+    root = Path(__file__).resolve().parents[1]
+    producer_root = tmp_path / "producer"
+    client_root = tmp_path / "client"
+    producer_root.mkdir()
+    client_root.mkdir()
+    configured_log_root = "logs" if relative else str(producer_root / "logs")
+    config = tmp_path / "path-projection.yaml"
+    config.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        f"  export_location: {producer_root / 'recordings'}\n"
+        f"logging:\n  log_dir: {configured_log_root}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(client_root)
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(root / "tests/support/observation_mcp_child.py"),
+            str(config),
+            str(producer_root),
+            "none",
+        ],
+        env={"PYTHONPATH": str(root / "src")},
+        cwd=producer_root,
+    )
+
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+        await asyncio.wait_for(client.initialize(), 5)
+        started = await asyncio.wait_for(
+            client.call_tool("start_roast_session", {"first_crack_observer_ack": "manual/v1"}), 5
+        )
+        assert started.structuredContent is not None
+        session_id = started.structuredContent["session"]["session_id"]
+        for name in ("mark_beans_added", "drop_beans", "stop_cooling"):
+            result = await asyncio.wait_for(client.call_tool(name, {}), 5)
+            assert not result.isError, result
+        exported = await asyncio.wait_for(
+            client.call_tool("export_roast_log", {"session_id": session_id}), 5
+        )
+        assert exported.structuredContent is not None
+        payload = exported.structuredContent
+
+    assert payload["ready"] is True
+    exported_paths = (
+        Path(payload["log_dir"]),
+        Path(payload["jsonl_path"]),
+        Path(payload["csv_path"]),
+        Path(payload["summary_path"]),
+    )
+    assert all(path.is_absolute() for path in exported_paths)
+    assert exported_paths[0] == producer_root / "logs" / "roasts" / session_id / "replay-v1"
+    assert exported_paths[0].is_dir()
+    assert all(path.is_file() for path in exported_paths[1:])
+
+
+def test_manual_mock_export_reuses_a_rename_that_settles_after_the_caller_cutoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late reply with a successful owned rename is reconciled, not republished."""
+    _context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+    _call_tool(server, "drop_beans", ctx)
+    _call_tool(server, "stop_cooling", ctx)
+    original_clock = mcp_server.time.monotonic
+    original_seal = mcp_server.seal_mock_replay_bundle
+    rename_settled_late = False
+
+    def clock() -> float:
+        return original_clock() + (2.0 if rename_settled_late else 0.0)
+
+    def seal_after_cutoff(*args: Any, **kwargs: Any) -> mcp_server.SealedMockReplayExport:
+        nonlocal rename_settled_late
+        sealed = original_seal(*args, **kwargs)
+        rename_settled_late = True
+        return sealed
+
+    monkeypatch.setattr(mcp_server.time, "monotonic", clock)
+    monkeypatch.setattr(mcp_server, "seal_mock_replay_bundle", seal_after_cutoff)
+
+    expired = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+    reused = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+
+    assert expired.ready is False
+    assert reused.ready is True
+    assert Path(reused.log_dir).is_dir()
+    assert list(session.log_writer.log_dir.glob(".replay-v1-stage-*")) == []  # type: ignore[union-attr]
+
+
+def test_configured_manual_mock_live_first_crack_then_fault_stays_unready(tmp_path: Path) -> None:
+    """A live manual FC followed by a mock emergency never exposes replay paths."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path)
+
+    _call_tool(server, "emergency_stop", ctx, reason="test fault")
+    exported = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+
+    assert exported.ready is False
+    assert exported.log_dir == str(context.unavailable_export_marker)
+    assert not Path(exported.log_dir).exists()
+
+
+def test_configured_manual_mock_fault_only_export_waits_for_closed_recovery_right(
+    tmp_path: Path,
+) -> None:
+    """A clean fault-only generation becomes exportable only after recovery closes."""
+    context, server, ctx, session = _exact_normal_drop_context(tmp_path, include_first_crack=False)
+
+    _call_tool(server, "emergency_stop", ctx, reason="fault-only")
+    pending = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+    assert pending.ready is False
+
+    _call_tool(server, "drop_beans", ctx, expected_session_id=session.id)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session.id)
+    still_open = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+    assert still_open.ready is False
+    assert still_open.log_dir == str(context.unavailable_export_marker)
+
+    # The old ID retains its guarded recovery authority until a successor
+    # actually retires it, so it cannot be sealed before this point.
+    _call_tool(server, "start_cooling", ctx, expected_session_id=session.id)
+    _call_tool(server, "stop_cooling", ctx, expected_session_id=session.id)
+    successor = _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+    exported = _call_tool(server, "export_roast_log", ctx, session_id=session.id)
+
+    assert successor.session.session_id != session.id
+    assert exported.ready is True
+    context.telemetry_sampler.stop_for_session(successor.session.session_id, reason="test_cleanup")
 
 
 def test_manual_mock_export_uses_selected_session_activity(tmp_path: Path) -> None:
@@ -12287,6 +14943,11 @@ async def _manual_shadow_stdio_successor(tmp_path: Path, *, seed_projection: boo
             completed = await call("get_roast_state", {})
             assert not completed["active"]
             assert not completed["first_crack_observation"]["worker_reaped"]
+            admitted_unreaped_export = await call(
+                "export_roast_log", {"session_id": first["session"]["session_id"]}
+            )
+            assert admitted_unreaped_export["ready"] is False
+            assert not Path(admitted_unreaped_export["summary_path"]).exists()
             if seed_projection:
                 previous_capture = completed["first_crack_status"]
                 assert previous_capture["audio_running"]

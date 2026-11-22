@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import csv
+import ctypes
 import json
+import os
+import platform
+import stat
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -65,6 +69,245 @@ class RoastLogExport:
     summary_path: Path
     ready: bool
     note: str
+
+
+@dataclass(frozen=True)
+class SealedMockReplayExport:
+    """One verified immutable mock replay bundle owned by this server process."""
+
+    export: RoastLogExport
+    files: tuple[tuple[Path, bytes, tuple[int, int]], ...]
+
+
+class MockReplayPublicationError(OSError):
+    """A mock replay bundle could not be safely sealed or reused."""
+
+
+def seal_mock_replay_bundle(
+    session: RoastSession,
+    *,
+    raw_jsonl: bytes,
+    ror_window_seconds: float,
+    ror_min_sample_seconds: float,
+    first_crack_observation: ObservationSnapshot | None,
+    deadline_monotonic_seconds: float,
+) -> SealedMockReplayExport:
+    """Stage and atomically publish a mock-only replay-v1 export directory.
+
+    The source JSONL is provided by the generation-owned writer after it has
+    verified the exact raw bytes.  The final directory is never replaced: a
+    successful call owns one previously absent ``replay-v1`` destination.
+    """
+    if session.log_writer is None:
+        raise MockReplayPublicationError("Session log target is unavailable.")
+    if time_monotonic() >= deadline_monotonic_seconds:
+        raise MockReplayPublicationError("Replay publication deadline expired.")
+    parent = session.log_writer.log_dir
+    parent_stat = _owned_directory_identity(parent)
+    final_dir = parent / "replay-v1"
+    stage_dir = parent / f".replay-v1-stage-{os.urandom(16).hex()}"
+    try:
+        os.mkdir(stage_dir, 0o700)
+        stage_stat = _owned_directory_identity(stage_dir)
+        jsonl_path = stage_dir / "roast.jsonl"
+        _write_private_bytes(jsonl_path, raw_jsonl)
+        _write_event_csv(
+            stage_dir / "roast.csv",
+            session=session,
+            ror_window_seconds=ror_window_seconds,
+            ror_min_sample_seconds=ror_min_sample_seconds,
+        )
+        _write_summary_json(
+            stage_dir / "summary.json",
+            session=session,
+            roaster_driver="mock",
+            first_crack_observation=first_crack_observation,
+            ror_window_seconds=ror_window_seconds,
+            ror_min_sample_seconds=ror_min_sample_seconds,
+        )
+        for filename in ("roast.csv", "summary.json"):
+            _fsync_staged_file(stage_dir / filename)
+        expected = _bundle_file_evidence(stage_dir)
+        if time_monotonic() >= deadline_monotonic_seconds:
+            raise MockReplayPublicationError("Replay publication deadline expired.")
+        if _owned_directory_identity(parent) != parent_stat:
+            raise MockReplayPublicationError("Replay parent identity changed.")
+        _atomic_noreplace_directory(stage_dir, final_dir)
+        if _owned_directory_identity(final_dir) != stage_stat:
+            raise MockReplayPublicationError("Replay final identity changed.")
+        files = _bundle_file_evidence(final_dir)
+        if tuple((name, contents) for name, contents, _identity in files) != tuple(
+            (name, contents) for name, contents, _identity in expected
+        ):
+            raise MockReplayPublicationError("Replay final bytes were not verified.")
+        # Keep every ownership and byte check above on the producer-owned path.
+        # The MCP reply, however, crosses a stdio working-directory boundary:
+        # project only the already-verified final location to an absolute path.
+        # ``absolute()`` deliberately does not resolve symlinks, so it cannot
+        # conceal a replacement before the identity checks above.
+        projected_final_dir = final_dir.absolute()
+        export = RoastLogExport(
+            session_id=session.id,
+            log_dir=projected_final_dir,
+            jsonl_path=projected_final_dir / "roast.jsonl",
+            csv_path=projected_final_dir / "roast.csv",
+            summary_path=projected_final_dir / "summary.json",
+            ready=True,
+            note="Verified mock replay bundle published.",
+        )
+        return SealedMockReplayExport(
+            export=export,
+            files=tuple(
+                (final_dir / name, contents, identity) for name, contents, identity in files
+            ),
+        )
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, MockReplayPublicationError):
+            raise
+        raise MockReplayPublicationError("Mock replay publication was not verified.") from exc
+
+
+def verify_sealed_mock_replay_bundle(bundle: SealedMockReplayExport) -> bool:
+    """Return whether a prior same-process replay publication remains exact."""
+    try:
+        for path, expected, identity in bundle.files:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, flags)
+            try:
+                checked = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(checked.st_mode)
+                    or (checked.st_dev, checked.st_ino) != identity
+                ):
+                    return False
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(descriptor, 64 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                if b"".join(chunks) != expected:
+                    return False
+            finally:
+                os.close(descriptor)
+        return True
+    except OSError:
+        return False
+
+
+def time_monotonic() -> float:
+    """Read the export deadline clock through a small test seam."""
+    import time
+
+    return time.monotonic()
+
+
+def _owned_directory_identity(path: Path) -> tuple[int, int]:
+    """Return the identity of a service-owned real directory without traversal."""
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise MockReplayPublicationError("Replay directory identity is unsafe.")
+    return info.st_dev, info.st_ino
+
+
+def _write_private_bytes(path: Path, contents: bytes) -> None:
+    """Write and fsync one private staged regular file."""
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        written = 0
+        while written < len(contents):
+            count = os.write(descriptor, contents[written:])
+            if count <= 0:
+                raise MockReplayPublicationError("Replay staging write was incomplete.")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_staged_file(path: Path) -> None:
+    """Flush one already-created private stage file before it is sealed."""
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise MockReplayPublicationError("Replay staged target is not a regular file.")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _bundle_file_evidence(directory: Path) -> tuple[tuple[str, bytes, tuple[int, int]], ...]:
+    """Read exactly the three conventional replay files with identities."""
+    rows: list[tuple[str, bytes, tuple[int, int]]] = []
+    for name in ("roast.jsonl", "roast.csv", "summary.json"):
+        path = directory / name
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise MockReplayPublicationError("Replay staged target is not a regular file.")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            rows.append((name, b"".join(chunks), (info.st_dev, info.st_ino)))
+        finally:
+            os.close(descriptor)
+    return tuple(rows)
+
+
+def _atomic_noreplace_directory(source: Path, destination: Path) -> None:
+    """Atomically rename a directory only when the final name is absent."""
+    system = platform.system()
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if system == "Darwin":
+        library = ctypes.CDLL(None, use_errno=True)
+        renamex_np = getattr(library, "renamex_np", None)
+        if renamex_np is None:
+            raise MockReplayPublicationError("Atomic no-replace publication is unsupported.")
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        if renamex_np(source_bytes, destination_bytes, 0x00000004) != 0:  # RENAME_EXCL
+            error = ctypes.get_errno()
+            raise MockReplayPublicationError("Atomic replay publication failed.") from OSError(
+                error, os.strerror(error)
+            )
+        return
+    if system == "Linux":
+        syscall_number = {"x86_64": 316, "aarch64": 276}.get(platform.machine().lower())
+        if syscall_number is None:
+            raise MockReplayPublicationError("Atomic no-replace publication is unsupported.")
+        library = ctypes.CDLL(None, use_errno=True)
+        result = library.syscall(
+            syscall_number,
+            -100,
+            ctypes.c_char_p(source_bytes),
+            -100,
+            ctypes.c_char_p(destination_bytes),
+            1,  # RENAME_NOREPLACE
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            raise MockReplayPublicationError("Atomic replay publication failed.") from OSError(
+                error, os.strerror(error)
+            )
+        return
+    raise MockReplayPublicationError("Atomic no-replace publication is unsupported.")
 
 
 def export_roast_snapshot(

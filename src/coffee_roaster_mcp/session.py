@@ -7,13 +7,16 @@ import math
 import os
 import re
 import stat
+import time
 from collections import deque
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Event, RLock
+from threading import Event, Lock, RLock, current_thread
 from typing import Literal, TypeVar
 from uuid import uuid4
 
@@ -97,6 +100,7 @@ NormalDropRejection = Literal[
     "finalisation_in_progress",
     "command_in_progress",
     "phase_invalid",
+    "prior_drop_transition_unaccounted",
 ]
 
 _SINGLETON_EVENT_KINDS: frozenset[RoastEventKind] = frozenset(
@@ -181,7 +185,20 @@ def _append_telemetry_with_limit(
         log_interval_seconds=log_interval_seconds,
     )
     if telemetry_row is not None:
-        _append_jsonl_log_row(session, telemetry_row)
+        # Polling and sampler observers must not occupy the store lock while
+        # an older canonical turn is stalled. The reservation is still ordered
+        # and capacity-bounded; completion failure latches incomplete evidence.
+        # A rejected canonical telemetry turn is recording evidence only.  It
+        # must not suppress the live sample or turn a healthy driver read into
+        # an emergency dispatch on the next polling tick.
+        if session.canonical_writer is not None:
+            with suppress(EventLogRecordingError):
+                # The writer has already latched a bounded omission/incomplete
+                # generation.  Keep the independently observed telemetry in
+                # memory; standard export remains unavailable from that latch.
+                session.canonical_writer.append_later(telemetry_row, lane="telemetry")
+        else:
+            _append_jsonl_log_row(session, telemetry_row)
 
     session.telemetry_buffer.append(sample)
     if telemetry_row is not None:
@@ -194,6 +211,11 @@ def _append_jsonl_log_row(session: RoastSession, row: Mapping[str, object]) -> N
     """Append one JSON row to the session's durable roast log."""
     if session.log_writer is None:
         return
+    writer = session.canonical_writer
+    if writer is not None and not session.canonical_writer_bypass:
+        row_type = row.get("type")
+        writer.append(row, lane="telemetry" if row_type == "telemetry" else "event")
+        return
     path = session.log_writer.log_dir / "roast.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as output:
@@ -203,24 +225,313 @@ def _append_jsonl_log_row(session: RoastSession, row: Mapping[str, object]) -> N
 
 def _append_event_log_row(session: RoastSession, event: RoastEvent) -> None:
     """Append one event row to the session's durable roast log."""
-    _append_jsonl_log_row(
-        session,
-        {
-            "session_id": session.id,
-            "type": "event",
-            "kind": event.kind,
-            "recorded_at_utc": event.recorded_at_utc.isoformat(),
-            "monotonic_seconds": event.monotonic_seconds,
-            "payload": dict(event.payload),
-        },
-    )
+    _append_jsonl_log_row(session, _event_log_row(session, event))
+
+
+def _event_log_row(session: RoastSession, event: RoastEvent) -> dict[str, object]:
+    """Return the exact canonical JSONL row for one lifecycle event."""
+    return {
+        "session_id": session.id,
+        "type": "event",
+        "kind": event.kind,
+        "recorded_at_utc": event.recorded_at_utc.isoformat(),
+        "monotonic_seconds": event.monotonic_seconds,
+        "payload": dict(event.payload),
+    }
 
 
 class EventLogRecordingError(OSError):
     """An event's validated append failed before its history could be recorded."""
 
 
+class _CanonicalAdmissionRefusedError(EventLogRecordingError):
+    """A canonical row was refused before its writer was dispatched."""
+
+    def __init__(self, message: str, *, known_zero: bool = False) -> None:
+        """Create refusal evidence for one unsubmitted canonical row group."""
+        super().__init__(message)
+        self.known_zero = known_zero
+
+
 _APPEND_FAILURE_TAIL_BYTES = 4096
+_CANONICAL_TELEMETRY_ROW_LIMIT = 64
+_CANONICAL_EVENT_ROW_LIMIT = 16
+_CANONICAL_LANE_BYTE_LIMIT = 64 * 1024
+
+
+class _CanonicalGenerationWriter:
+    """One bounded, ordered JSONL writer for one configured mock generation.
+
+    The writer deliberately owns filesystem identity and completion evidence.
+    Store callers may reserve work while holding the store lock, but filesystem
+    work is always performed by this worker.  Capacity includes a running turn
+    so a held append cannot manufacture unbounded queued work.
+    """
+
+    def __init__(self, *, session: RoastSession) -> None:
+        self._session = session
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="canonical-log")
+        self._lock = Lock()
+        self._identity: tuple[int, int] | None = None
+        self._incomplete = False
+        self._telemetry_rows = 0
+        self._telemetry_bytes = 0
+        self._event_rows = 0
+        self._event_bytes = 0
+
+    def append(self, row: Mapping[str, object], *, lane: Literal["telemetry", "event"]) -> None:
+        """Append and verify one framed row in canonical admission order."""
+        future = self.submit(row, lane=lane)
+        future.result()
+
+    def submit(
+        self, row: Mapping[str, object], *, lane: Literal["telemetry", "event"]
+    ) -> Future[None]:
+        """Reserve and submit one ordered turn without waiting for storage.
+
+        The returned future remains owned by this writer until it settles.  A
+        caller that needs a durable result must wait only after releasing its
+        store or lifecycle admission lock.
+        """
+        frame = (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        if current_thread().name.startswith("canonical-log"):
+            completed: Future[None] = Future()
+            try:
+                self._append_verified(frame)
+            except Exception as error:
+                self._latch_incomplete()
+                completed.set_exception(error)
+            else:
+                completed.set_result(None)
+            return completed
+        return self.submit_group((row,), lane=lane)[0]
+
+    def submit_group(
+        self,
+        rows: tuple[Mapping[str, object], ...],
+        *,
+        lane: Literal["telemetry", "event"],
+    ) -> tuple[Future[None], ...]:
+        """Atomically reserve and submit one ordered same-lane row group.
+
+        Coupled canonical facts must obtain their whole bounded capacity before
+        any member reaches the worker.  This is admission, not a filesystem
+        transaction: each returned future still owns its individual I/O turn.
+        """
+        if not rows:
+            return ()
+        frames = tuple(
+            (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+            for row in rows
+        )
+        self._reserve_group(lane=lane, sizes=tuple(len(frame) for frame in frames))
+        futures = tuple(self._executor.submit(self._run_turn, frame) for frame in frames)
+        for future, frame in zip(futures, frames, strict=True):
+
+            def settled(completion: Future[None], *, size: int = len(frame)) -> None:
+                try:
+                    completion.result()
+                except Exception:
+                    self._latch_incomplete()
+                finally:
+                    self._release(lane=lane, size=size)
+
+            future.add_done_callback(settled)
+        return futures
+
+    def _run_turn(self, frame: bytes) -> None:
+        """Run one admitted turn unless an earlier turn made this generation incomplete."""
+        with self._lock:
+            if self._incomplete:
+                raise _CanonicalAdmissionRefusedError("Canonical writer generation is incomplete.")
+        try:
+            self._append_verified(frame)
+        except BaseException:
+            # This runs on the single ordered worker, before it can take a
+            # following queued turn.  Completion callbacks are bookkeeping
+            # only: installing them after a submitted group must not leave a
+            # window in which a later row can append behind a torn one.
+            self._latch_incomplete()
+            raise
+
+    def _latch_incomplete(self) -> None:
+        """Permanently reject the generation after a failed admitted turn."""
+        with self._lock:
+            self._incomplete = True
+        # The session carries an explicit incomplete fact. It is consulted by
+        # export and never authorises a driver operation.
+        self._session.mock_log_torn = True
+
+    def _reserve_group(
+        self, *, lane: Literal["telemetry", "event"], sizes: tuple[int, ...]
+    ) -> None:
+        """Claim capacity for an inseparable same-lane canonical group."""
+        count = len(sizes)
+        total_size = sum(sizes)
+        with self._lock:
+            if self._incomplete:
+                # This refusal happens before this group reserves capacity or
+                # reaches the executor. It proves zero bytes for this exact
+                # group, unlike an already-submitted turn rejected in
+                # ``_run_turn``.
+                raise _CanonicalAdmissionRefusedError(
+                    "Canonical writer generation is incomplete.", known_zero=True
+                )
+            rows = self._telemetry_rows if lane == "telemetry" else self._event_rows
+            used = self._telemetry_bytes if lane == "telemetry" else self._event_bytes
+            row_limit = (
+                _CANONICAL_TELEMETRY_ROW_LIMIT
+                if lane == "telemetry"
+                else _CANONICAL_EVENT_ROW_LIMIT
+            )
+            if rows + count > row_limit or used + total_size > _CANONICAL_LANE_BYTE_LIMIT:
+                self._incomplete = True
+                self._session.mock_log_torn = True
+                raise _CanonicalAdmissionRefusedError(
+                    "Canonical writer capacity is exhausted.", known_zero=True
+                )
+            if lane == "telemetry":
+                self._telemetry_rows += count
+                self._telemetry_bytes += total_size
+            else:
+                self._event_rows += count
+                self._event_bytes += total_size
+
+    def append_later(
+        self, row: Mapping[str, object], *, lane: Literal["telemetry", "event"]
+    ) -> None:
+        """Reserve an ordered turn without making an observer wait for storage."""
+        self.submit(row, lane=lane)
+
+    def _reserve(self, *, lane: Literal["telemetry", "event"], size: int) -> None:
+        """Claim bounded queued-plus-running capacity for one exact frame."""
+        self._reserve_group(lane=lane, sizes=(size,))
+
+    def _release(self, *, lane: Literal["telemetry", "event"], size: int) -> None:
+        """Release one settled capacity claim."""
+        with self._lock:
+            if lane == "telemetry":
+                self._telemetry_rows -= 1
+                self._telemetry_bytes -= size
+            else:
+                self._event_rows -= 1
+                self._event_bytes -= size
+
+    def _append_verified(self, frame: bytes) -> None:
+        """Append one complete frame and prove its identity and exact bytes."""
+        try:
+            if self._session.log_writer is None:
+                raise EventLogRecordingError("Canonical record has no log target.")
+            path = self._session.log_writer.log_dir / "roast.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            flags = os.O_APPEND | os.O_WRONLY
+            with self._lock:
+                first_creation = self._identity is None
+            if first_creation:
+                # A generation owns its canonical target only by creating it.
+                # Never adopt an occupied target, even one containing valid JSONL:
+                # its bytes and identity belong to somebody else.
+                flags |= os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, flags, 0o600)
+            try:
+                before = os.fstat(descriptor)
+                if not stat.S_ISREG(before.st_mode):
+                    raise EventLogRecordingError("Canonical log target is not a regular file.")
+                identity = (before.st_dev, before.st_ino)
+                with self._lock:
+                    if self._identity is None:
+                        self._identity = identity
+                    elif self._identity != identity:
+                        raise EventLogRecordingError("Canonical log identity changed.")
+                offset = before.st_size
+                written = 0
+                while written < len(frame):
+                    count = os.write(descriptor, frame[written:])
+                    if count <= 0:
+                        raise EventLogRecordingError("Canonical log write was incomplete.")
+                    written += count
+                os.fsync(descriptor)
+                after = os.fstat(descriptor)
+                if (after.st_dev, after.st_ino) != identity or after.st_size != offset + len(frame):
+                    raise EventLogRecordingError("Canonical log identity or size changed.")
+            finally:
+                os.close(descriptor)
+            read_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                read_flags |= os.O_NOFOLLOW
+            reader = os.open(path, read_flags)
+            try:
+                checked = os.fstat(reader)
+                if (checked.st_dev, checked.st_ino) != identity:
+                    raise EventLogRecordingError(
+                        "Canonical log identity changed during verification."
+                    )
+                os.lseek(reader, offset, os.SEEK_SET)
+                if os.read(reader, len(frame)) != frame:
+                    raise EventLogRecordingError("Canonical log frame verification failed.")
+            finally:
+                os.close(reader)
+        except EventLogRecordingError:
+            raise
+        except OSError as error:
+            # The writer owns every syscall from target establishment through
+            # read-back verification. Driver OSErrors never enter this boundary.
+            raise EventLogRecordingError("Canonical log storage or verification failed.") from error
+
+    def shutdown(self) -> None:
+        """Stop accepting new turns without cancelling filesystem ownership."""
+        self._executor.shutdown(wait=False, cancel_futures=False)
+
+    def wait_for_idle(self, *, timeout_seconds: float) -> bool:
+        """Wait for every admitted turn to settle without cancelling it.
+
+        This is deliberately a writer-owned settlement observation.  It is
+        used only by the mock replay publisher after lifecycle admission has
+        finished; it has no driver or lifecycle side effects.
+        """
+        if timeout_seconds < 0:
+            return False
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            with self._lock:
+                if self._telemetry_rows == 0 and self._event_rows == 0:
+                    return not self._incomplete
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(remaining, 0.005))
+
+    def read_sealed_bytes(self) -> bytes:
+        """Return the verified raw JSONL bytes for an idle owned generation."""
+        if self._session.log_writer is None:
+            raise EventLogRecordingError("Canonical record has no log target.")
+        path = self._session.log_writer.log_dir / "roast.jsonl"
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            checked = os.fstat(descriptor)
+            identity = (checked.st_dev, checked.st_ino)
+            if not stat.S_ISREG(checked.st_mode):
+                raise EventLogRecordingError("Canonical log target is not a regular file.")
+            with self._lock:
+                if self._identity != identity or self._incomplete:
+                    raise EventLogRecordingError("Canonical log identity is not sealable.")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+            if (after.st_dev, after.st_ino) != identity:
+                raise EventLogRecordingError("Canonical log identity changed during sealing.")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
 
 
 @dataclass(frozen=True)
@@ -320,13 +631,33 @@ def _append_failure_may_have_damaged_log(evidence: _AppendFailureEvidence) -> bo
 
 def _append_event_log_row_with_failure_evidence(session: RoastSession, event: RoastEvent) -> None:
     """Append one protected row and expose bounded evidence if its write raises."""
+    if session.canonical_writer is not None:
+        # Exact Drop, its paired cooling row, and a queued emergency share the
+        # configured generation's ordered worker.  These callers already run
+        # their turn outside the store lock; bypassing that worker would let a
+        # later protected row overtake an admitted canonical row.
+        try:
+            _append_event_log_row(session, event)
+        except Exception as error:
+            # A bounded-lane refusal occurs before the executor receives this
+            # row. It makes the generation incomplete, but proves this exact
+            # endpoint append wrote zero bytes. Keep its unknown command fence
+            # without relabelling the raw log as torn.
+            if isinstance(error, _CanonicalAdmissionRefusedError):
+                raise
+            raise _MockDropAppendMayBeTornError from error
+        return
+
     evidence = _capture_append_failure_evidence(session)
+    session.canonical_writer_bypass = True
     try:
         _append_event_log_row(session, event)
     except Exception as error:
         if _append_failure_may_have_damaged_log(evidence):
             raise _MockDropAppendMayBeTornError from error
         raise
+    finally:
+        session.canonical_writer_bypass = False
 
 
 class _MockDropAppendMayBeTornError(Exception):
@@ -553,6 +884,42 @@ class MockDropPersistenceTicket:
 
 
 @dataclass(frozen=True)
+class ManualFirstCrackAttempt:
+    """One owned manual-first-crack write attempt.
+
+    The attempt is deliberately narrower than a session event: until its
+    writer verifies the canonical row, it cannot change the live roast phase.
+    """
+
+    token: str
+    started_monotonic_seconds: float
+    deadline_monotonic_seconds: float
+    completion: Future[ManualFirstCrackSettlement]
+    observer_publication_token: object | None = None
+    on_live: Callable[[RoastSession, object], None] | None = None
+
+
+@dataclass(frozen=True)
+class _ManualFirstCrackAuditIdentity:
+    """Immutable identity carried by every private audit row for one mark."""
+
+    recorded_at_utc: datetime
+    monotonic_seconds: float
+    capture_ownership_sequence: int
+    session_id: str
+    writer_generation: int
+
+
+@dataclass(frozen=True)
+class ManualFirstCrackSettlement:
+    """Closed result of one manual first-crack writer turn."""
+
+    outcome: Literal["live", "historical", "failed", "duplicate"]
+    event: RoastEvent | None = None
+    snapshot: RoastSession | None = None
+
+
+@dataclass(frozen=True)
 class RoastMetrics:
     """Timestamp-derived roast metrics for the current session snapshot.
 
@@ -678,6 +1045,12 @@ class RoastSession:
     event_timeline: list[RoastEvent] = field(default_factory=_event_timeline_default)
     telemetry_buffer: deque[TelemetrySample] = field(default_factory=_telemetry_buffer_default)
     log_writer: LogWriterReference | None = None
+    # Private mock-composition ownership. Read snapshots deliberately omit this
+    # non-copyable worker; it never grants lifecycle or driver authority.
+    canonical_writer: _CanonicalGenerationWriter | None = field(
+        default=None, kw_only=True, compare=False, repr=False
+    )
+    canonical_writer_bypass: bool = field(default=False, kw_only=True, compare=False, repr=False)
     last_logged_telemetry_monotonic_seconds: float | None = None
     fc_window_count: int = 0
     fc_max_confidence: float | None = None
@@ -687,6 +1060,20 @@ class RoastSession:
     monotonic_stop: float | None = None
     pending_driver_command_token: str | None = None
     pending_driver_command_kind: DriverCommandKind | None = None
+    # This is pre-dispatch ownership only. It deliberately says nothing about
+    # whether the driver returned or changed physical state.
+    ordinary_driver_drop_dispatch_owned: bool = False
+    verified_ordinary_driver_drop: bool = False
+    unrecorded_driver_drop: bool = False
+    # This narrow evidence exists only when the coupled ordinary-Drop group
+    # was refused before submission after its driver return was verified. It
+    # never projects a canonical Drop row or grants another Drop attempt.
+    ordinary_drop_persistence_zero: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
+    ordinary_drop_persistence_zero_cooling_settled: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
     # The concrete finalisation result is deliberately owned by mcp_server.
     # Store only a deep-copyable opaque value here to keep the lifecycle store
     # independent of the server/tool module.
@@ -701,6 +1088,52 @@ class RoastSession:
         default=False, kw_only=True, compare=False, repr=False
     )
     unconfirmed_torn_start_cooling_attempted: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
+    unrecorded_fault_recovery_drop_accepted: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
+    # These facts are intentionally local to the configured manual/mock
+    # writer. They never grant a driver action or make a historical row live.
+    manual_first_crack_pending: bool = field(default=False, kw_only=True, compare=False, repr=False)
+    manual_first_crack_export_disqualified: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
+    # A timed-out or uncertain singleton receipt is terminal for this exact
+    # session.  It is deliberately separate from the durable-row evidence:
+    # an expiry before append proves zero canonical bytes, while a later
+    # expiry may preserve a verified historical row.
+    manual_first_crack_admission_expired: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
+    manual_first_crack_canonical_evidence: Literal["none", "verified", "zero", "uncertain"] = field(
+        default="none", kw_only=True, compare=False, repr=False
+    )
+    # This is private audit evidence, not canonical persistence evidence.  It
+    # makes a spent mark visibly incomplete without treating an unsubmitted
+    # canonical row as a torn canonical generation.
+    manual_first_crack_audit_unresolved: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
+    # An admitted lifecycle endpoint closes new manual-mark admission before
+    # its driver result is published.  This is composition-local evidence: it
+    # never grants a command or changes an already-live mark.
+    manual_first_crack_endpoint_admitted: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
+    # A manual charge accepted by the composed canonical writer cannot be
+    # treated as an empty batch until its exact turn has either been verified
+    # or visibly latched incomplete.  These facts never grant an action.
+    manual_charge_persistence_pending: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
+    manual_charge_persistence_uncertain: bool = field(
+        default=False, kw_only=True, compare=False, repr=False
+    )
+    # An admission refusal before an auto-charge turn reaches the writer is
+    # known not to have produced canonical bytes. It remains distinct from an
+    # executing turn whose bytes cannot be proved either way.
+    manual_charge_persistence_zero: bool = field(
         default=False, kw_only=True, compare=False, repr=False
     )
 
@@ -1075,6 +1508,10 @@ class SessionLifecycleError(RuntimeError):
     """Raised when a roast session lifecycle transition is invalid."""
 
 
+class RecoveryPersistenceSupersededError(SessionLifecycleError):
+    """A later emergency revoked a recovery reservation during its owned write."""
+
+
 class RoastSessionStore:
     """Single-owner in-process roast session registry.
 
@@ -1097,6 +1534,8 @@ class RoastSessionStore:
         session_id_factory: Callable[[], str] | None = None,
         default_log_dir: Path = Path("./logs/roasts"),
         telemetry_log_interval_seconds: float = 1.0,
+        manual_first_crack_writer_enabled: bool = False,
+        manual_first_crack_budget_seconds: float = 1.0,
     ) -> None:
         """Initialize the single-session store.
 
@@ -1109,6 +1548,10 @@ class RoastSessionStore:
             default_log_dir: Base directory for future log writer references.
             telemetry_log_interval_seconds: Minimum seconds between telemetry
                 rows in the append-only JSONL log.
+            manual_first_crack_writer_enabled: Enable the bounded, private
+                writer used only by the composed manual/mock recording route.
+            manual_first_crack_budget_seconds: Injected producer budget for
+                that private writer; production composition fixes it at one.
         """
         import time
 
@@ -1118,6 +1561,11 @@ class RoastSessionStore:
             raise ValueError("session_history_limit must be >= 1.")
         if not math.isfinite(telemetry_log_interval_seconds) or telemetry_log_interval_seconds <= 0:
             raise ValueError("telemetry_log_interval_seconds must be greater than 0.")
+        if (
+            not math.isfinite(manual_first_crack_budget_seconds)
+            or manual_first_crack_budget_seconds <= 0
+        ):
+            raise ValueError("manual_first_crack_budget_seconds must be greater than 0.")
 
         self._telemetry_buffer_limit = telemetry_buffer_limit
         self._telemetry_log_interval_seconds = telemetry_log_interval_seconds
@@ -1127,6 +1575,28 @@ class RoastSessionStore:
         self._session_id_factory = session_id_factory or _generate_session_id
         self._default_log_dir = default_log_dir
         self._lock = RLock()
+        self._manual_first_crack_writer_enabled = manual_first_crack_writer_enabled
+        self._manual_first_crack_budget_seconds = manual_first_crack_budget_seconds
+        # A stuck audit from a retired generation must not occupy the fresh
+        # generation's lane.  Two owned lanes cover the live/recovery overlap;
+        # further unavailable lanes fail closed instead of spawning work.
+        self._manual_first_crack_writers: dict[str, ThreadPoolExecutor] = {}
+        self._manual_first_crack_writer_capacity = 2
+        self._manual_first_crack_attempt: ManualFirstCrackAttempt | None = None
+        self._manual_first_crack_attempt_session_id: str | None = None
+        self._manual_first_crack_audit_identities: dict[str, _ManualFirstCrackAuditIdentity] = {}
+        self._manual_first_crack_live_revoked_tokens: set[str] = set()
+        self._emergency_fault_completions: dict[int, tuple[RoastEvent, Future[None]]] = {}
+        # Ordinary canonical-event admission is distinct from writer
+        # completion.  The exact key prevents a concurrent caller from
+        # queueing a duplicate singleton while the first durable turn is
+        # unresolved; it is never shared with a successor generation.
+        self._canonical_event_admissions: set[tuple[str, RoastEventKind]] = set()
+        # A sampler that was admitted for the current manual/mock generation
+        # owns a read-to-settlement turn. It may still append telemetry or
+        # enter containment after Stop retired live sampling, so a replay seal
+        # must not snapshot around it.
+        self._manual_mock_sampler_admissions: dict[str, int] = {}
         self._clock_epoch_id = _generate_clock_epoch_id()
         if (
             type(self._clock_epoch_id) is not str
@@ -1159,6 +1629,11 @@ class RoastSessionStore:
         self._fault_recovery_in_flight_tokens: dict[str, str] = {}
         self._fault_recovery_admission_blocks: set[str] = set()
         self._fault_drop_cooling_cycle_required: set[str] = set()
+        # A recovery Drop whose verified row was superseded before it could
+        # project state remains historical evidence only.  In particular it is
+        # not the policy decision that can retire this stopped session for a
+        # fresh Start.
+        self._historical_fault_drop_start_blocks: set[str] = set()
         self._fault_drop_ambiguity_required: set[str] = set()
         self._finalisation_generation = 0
         self._finalisation_tokens: dict[str, str] = {}
@@ -1453,6 +1928,30 @@ class RoastSessionStore:
             )
             return _copy_session_for_read(self._latest_session)
 
+    def admit_manual_mock_sampler(self, session_id: str) -> RoastSession | None:
+        """Admit one exact active-session sampler turn for manual/mock recording.
+
+        The caller settles a returned session only after its driver read,
+        telemetry handling, and any resulting containment have finished.
+        """
+        with self._lock:
+            session = self._latest_session
+            if session is None or session.id != session_id or not session.active:
+                return None
+            self._manual_mock_sampler_admissions[session_id] = (
+                self._manual_mock_sampler_admissions.get(session_id, 0) + 1
+            )
+            return session
+
+    def settle_manual_mock_sampler(self, session: RoastSession) -> None:
+        """Release one previously admitted manual/mock sampler turn."""
+        with self._lock:
+            count = self._manual_mock_sampler_admissions.get(session.id, 0)
+            if count <= 1:
+                self._manual_mock_sampler_admissions.pop(session.id, None)
+            else:
+                self._manual_mock_sampler_admissions[session.id] = count - 1
+
     def set_heat(
         self,
         session: RoastSession,
@@ -1560,6 +2059,12 @@ class RoastSessionStore:
         """Reserve one non-emergency driver command for an active session."""
         with self._lock:
             self._assert_latest_active_session(session)
+            # Lever adjustments neither own a lifecycle endpoint nor replace
+            # the session.  A pending human mark remains eligible across an
+            # admitted control turn; endpoint paths retain their explicit
+            # revocation at their existing admission points.
+            if kind != "control":
+                self._revoke_unconsumed_manual_first_crack_live_locked(session)
             return self._reserve_driver_command_locked(session, kind=kind)
 
     def inspect_fixed_zero_containment_identity(
@@ -2006,6 +2511,12 @@ class RoastSessionStore:
         """Reserve a driver drop command or return the existing drop event."""
         with self._lock:
             self._assert_latest_active_session(session)
+            if (
+                session.ordinary_driver_drop_dispatch_owned
+                or session.verified_ordinary_driver_drop
+                or session.unrecorded_driver_drop
+            ):
+                raise SessionLifecycleError("A prior bean-drop outcome is unresolved.")
             if self._normal_drop_in_flight is not None:
                 raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
             existing_event = self._get_existing_singleton_event(session, "beans_dropped")
@@ -2016,9 +2527,13 @@ class RoastSessionStore:
                     snapshot=_copy_session_for_read(session),
                 )
             _validate_event_transition(session, "beans_dropped")
-            return DriverDropReservation(
-                reservation=self._reserve_driver_command_locked(session, kind="drop")
-            )
+            # An ineligible Drop must not displace an otherwise valid mark.
+            # Once the exact endpoint reservation wins, it closes both an
+            # existing pending mark and admission of a new one before driver
+            # entry.
+            reservation = self._reserve_driver_command_locked(session, kind="drop")
+            self._admit_manual_first_crack_endpoint_locked(session)
+            return DriverDropReservation(reservation=reservation)
 
     def normal_drop_identity(self, session: RoastSession) -> NormalDropIdentity:
         """Return the current exact identity for an active latest roast session.
@@ -2035,6 +2550,79 @@ class RoastSessionStore:
                 ownership_sequence=session.capture_ownership_sequence,
                 timing_evidence_sequence=session.timing_evidence_sequence,
             )
+
+    def record_verified_ordinary_driver_drop(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+    ) -> None:
+        """Record one returned ordinary mock Drop before persistence.
+
+        The fact is exact-session containment evidence only. It cannot project
+        a canonical event or grant lifecycle authority, but it prevents every
+        later Drop route from replaying a returned command after emergency
+        supersession. It is independent of the cancelable ordinary command
+        reservation and remains until verified canonical completion discharges
+        it. Pre-dispatch ownership is represented separately so this method
+        never claims a driver return before one exists.
+
+        Args:
+            session: Session that owned the ordinary Drop reservation.
+            reservation: Exact ordinary Drop reservation whose driver call returned.
+
+        Raises:
+            SessionLifecycleError: If the supplied reservation is not an exact
+                ordinary Drop reservation for this retained session.
+        """
+        with self._lock:
+            if (
+                reservation.kind != "drop"
+                or reservation.session_id != session.id
+                or self._sessions_by_id.get(session.id) is not session
+                or not session.ordinary_driver_drop_dispatch_owned
+            ):
+                raise SessionLifecycleError("Driver drop return does not match its session.")
+            session.ordinary_driver_drop_dispatch_owned = False
+            session.verified_ordinary_driver_drop = True
+
+    def admit_ordinary_driver_drop_dispatch(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+    ) -> None:
+        """Atomically establish exact ordinary-Drop ownership before dispatch.
+
+        This is admission evidence only, not evidence of a driver return. It
+        survives cancellation of the ordinary command token so stopped-fault
+        recovery cannot replay a Drop whose first call may still be entering.
+        """
+        with self._lock:
+            self._assert_driver_command_reservation(session, reservation)
+            if session.ordinary_driver_drop_dispatch_owned:
+                raise SessionLifecycleError("A prior bean-drop outcome is unresolved.")
+            if session.verified_ordinary_driver_drop or session.unrecorded_driver_drop:
+                raise SessionLifecycleError("A prior bean-drop outcome is unresolved.")
+            session.ordinary_driver_drop_dispatch_owned = True
+
+    def retain_ordinary_driver_drop_unknown(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+    ) -> None:
+        """Retain a dispatched ordinary Drop whose driver result is unavailable."""
+        with self._lock:
+            if (
+                reservation.kind != "drop"
+                or reservation.session_id != session.id
+                or self._sessions_by_id.get(session.id) is not session
+                or not session.ordinary_driver_drop_dispatch_owned
+            ):
+                return
+            session.ordinary_driver_drop_dispatch_owned = False
+            session.unrecorded_driver_drop = True
 
     def admit_normal_drop(self, identity: object) -> NormalDropAdmission:
         """Atomically admit one exact normal bean drop or return a closed result.
@@ -2054,21 +2642,25 @@ class RoastSessionStore:
             assert session is not None
 
             existing_event = self._get_existing_singleton_event(session, "beans_dropped")
+            if session.ordinary_driver_drop_dispatch_owned:
+                return NormalDropAdmission("refused", rejection="command_in_progress")
+            if session.verified_ordinary_driver_drop or session.unrecorded_driver_drop:
+                return NormalDropAdmission("refused", rejection="prior_drop_transition_unaccounted")
             if self._normal_drop_in_flight is not None:
                 return NormalDropAdmission(
                     self._normal_drop_admission_outcome_for_in_flight_locked(session),
                     existing_event=existing_event,
                     snapshot=_copy_session_for_read(session),
                 )
-            rejection = self._normal_drop_lifecycle_rejection_locked(session)
-            if rejection is not None:
-                return NormalDropAdmission("refused", rejection=rejection)
             if existing_event is not None:
                 return NormalDropAdmission(
                     "recorded",
                     existing_event=existing_event,
                     snapshot=_copy_session_for_read(session),
                 )
+            rejection = self._normal_drop_lifecycle_rejection_locked(session)
+            if rejection is not None:
+                return NormalDropAdmission("refused", rejection=rejection)
             evidence_rejection = self._normal_drop_evidence_rejection_locked(session, identity)
             if evidence_rejection is not None:
                 return NormalDropAdmission("refused", rejection=evidence_rejection)
@@ -2193,8 +2785,78 @@ class RoastSessionStore:
                     raise SessionLifecycleError(f"Unknown session_id: {session_id}")
             snapshot = _copy_session_for_read(session)
             return snapshot, (
-                session.mock_log_torn or session.unpersisted_mock_drop_fault_count > 0
+                session.mock_log_torn
+                or session.unpersisted_mock_drop_fault_count > 0
+                or self._manual_mock_sampler_admissions.get(session.id, 0) > 0
+                or session.manual_first_crack_pending
+                or session.manual_first_crack_export_disqualified
             )
+
+    def prepare_manual_mock_replay_export(
+        self, *, session_id: str, timeout_seconds: float
+    ) -> tuple[RoastSession, _CanonicalGenerationWriter] | None:
+        """Return one terminal, settled manual/mock generation for replay sealing.
+
+        The short lock sections establish eligibility before and after the
+        writer-owned wait.  No filesystem work occurs here, and a timeout
+        leaves the executing writer entirely untouched.
+        """
+        deadline = self._monotonic_now() + timeout_seconds
+        with self._lock:
+            session = self._sessions_by_id.get(session_id)
+            if session is None or not self._manual_mock_replay_eligible_locked(session):
+                return None
+            writer = session.canonical_writer
+            if writer is None:
+                return None
+        remaining = deadline - self._monotonic_now()
+        if remaining <= 0 or not writer.wait_for_idle(timeout_seconds=remaining):
+            return None
+        with self._lock:
+            if self._sessions_by_id.get(session_id) is not session:
+                return None
+            if not self._manual_mock_replay_eligible_locked(session):
+                return None
+            return _copy_session_for_read(session), writer
+
+    def _manual_mock_replay_eligible_locked(self, session: RoastSession) -> bool:
+        """Return whether one retained generation can be sealed for mock replay."""
+        # A fault-only generation has no replay marker to disqualify.  Once its
+        # exact recovery right is closed and cooling is verified stopped it is
+        # immutable evidence just like a normally completed generation.  A
+        # fault after any human FC remains permanently ineligible below.
+        fault_only_closed = (
+            session.phase == "fault"
+            and not session.cooling_on
+            and session.first_crack_at_utc is None
+            and session.first_crack_source is None
+            # While it remains the latest stopped session, its exact guarded
+            # recovery commands are still available.  A successor closes
+            # those mutation rights; only then is a fault-only record sealed.
+            and self._latest_session is not session
+        )
+        if session.active or (session.phase != "complete" and not fault_only_closed):
+            return False
+        if (
+            session.mock_log_torn
+            or session.unpersisted_mock_drop_fault_count > 0
+            or session.manual_first_crack_pending
+            or session.manual_first_crack_export_disqualified
+            or session.manual_charge_persistence_pending
+            or session.manual_charge_persistence_uncertain
+            or self._manual_mock_sampler_admissions.get(session.id, 0) > 0
+            or session.pending_driver_command_token is not None
+            or session.id in self._fault_recovery_admission_blocks
+            or session.id in self._fault_recovery_in_flight_tokens
+        ):
+            return False
+        return not (
+            self._latest_session is session
+            and (
+                self._normal_drop_persistence_torn
+                or not self._normal_drop_persistence_last_completion.is_set()
+            )
+        )
 
     def complete_normal_drop_success(
         self,
@@ -2246,7 +2908,10 @@ class RoastSessionStore:
             }
             try:
                 drop_event = self._new_event_locked(session, "beans_dropped", payload=payload)
-                planned = deepcopy(session)
+                # The read snapshot intentionally excludes the generation-owned
+                # writer, which is not part of lifecycle planning and cannot be
+                # deep-copied while it owns an executing filesystem turn.
+                planned = _copy_session_for_read(session)
                 _apply_event_timestamp(planned, drop_event)
                 _validate_event_transition(planned, "cooling_started")
                 cooling_event = self._new_event_locked(planned, "cooling_started", payload=payload)
@@ -2397,6 +3062,7 @@ class RoastSessionStore:
             if session.beans_dropped_at_utc is None:
                 raise SessionLifecycleError("Cooling can only start after beans are dropped.")
             _validate_event_transition(session, "cooling_started")
+            self._revoke_unconsumed_manual_first_crack_live_locked(session)
             return DriverEventReservation(
                 reservation=self._reserve_driver_command_locked(session, kind="start_cooling")
             )
@@ -2524,10 +3190,15 @@ class RoastSessionStore:
         """Reserve a cooling-stop command for an active cooling session."""
         with self._lock:
             self._assert_latest_active_session(session)
+            if _has_unrecorded_charge_attempt(session):
+                raise SessionLifecycleError(
+                    "Cooling cannot stop while a charge attempt has no canonical record."
+                )
             if session.beans_dropped_at_utc is None:
                 raise SessionLifecycleError("Cooling cannot stop before beans are dropped.")
             if session.cooling_started_at_utc is None or not session.cooling_on:
                 raise SessionLifecycleError("Cooling must be started before it can be stopped.")
+            self._revoke_unconsumed_manual_first_crack_live_locked(session)
             return self._reserve_driver_command_locked(session, kind="stop_cooling")
 
     def reserve_driver_stop_cooling_recovery(
@@ -2559,6 +3230,10 @@ class RoastSessionStore:
             self._assert_guarded_fault_recovery_admission_locked(session)
             if not session.cooling_on:
                 raise SessionLifecycleError("Cooling must be active before it can be stopped.")
+            if _has_unrecorded_charge_attempt(session):
+                raise SessionLifecycleError(
+                    "Cooling cannot stop while a charge attempt has no canonical record."
+                )
             if session.beans_added_at_utc is not None and not _has_recorded_beans_dropped(session):
                 raise SessionLifecycleError("Cooling cannot stop before beans are dropped.")
             return self._reserve_driver_command_locked(session, kind="stop_cooling")
@@ -2589,24 +3264,41 @@ class RoastSessionStore:
                 raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
             self._assert_guarded_fault_recovery_admission_locked(session)
             if kind == "drop":
+                if (
+                    session.ordinary_driver_drop_dispatch_owned
+                    or session.verified_ordinary_driver_drop
+                    or session.unrecorded_driver_drop
+                ):
+                    raise SessionLifecycleError("A prior bean-drop outcome is unresolved.")
                 if session.id in self._fault_drop_ambiguity_required:
                     raise SessionLifecycleError(
                         "Recovery bean drop is ambiguous and cannot be retried."
                     )
                 if session.beans_added_at_utc is None:
                     raise SessionLifecycleError("Recovery bean drop requires beans to be added.")
-                if _has_recorded_beans_dropped(session):
+                if (
+                    _has_recorded_beans_dropped(session)
+                    or session.unrecorded_fault_recovery_drop_accepted
+                ):
                     raise SessionLifecycleError(
                         "Recovery bean drop is only allowed before beans are dropped."
                     )
             elif kind == "stop_cooling":
                 if not session.cooling_on:
                     raise SessionLifecycleError("Cooling must be active before it can be stopped.")
-                if session.beans_added_at_utc is not None and not _has_recorded_beans_dropped(
-                    session
+                if _has_unrecorded_charge_attempt(session):
+                    raise SessionLifecycleError(
+                        "Cooling cannot stop while a charge attempt has no canonical record."
+                    )
+                if (
+                    session.beans_added_at_utc is not None
+                    and not _has_recorded_beans_dropped(session)
+                    and not session.unrecorded_fault_recovery_drop_accepted
+                    and not self._has_verified_known_zero_ordinary_discharge_locked(session)
                 ):
                     raise SessionLifecycleError("Cooling cannot stop before beans are dropped.")
             reservation = self._reserve_driver_command_locked(session, kind=kind)
+            self._revoke_unconsumed_manual_first_crack_live_locked(session)
             self._fault_recovery_in_flight_tokens[session.id] = reservation.token
             return reservation
 
@@ -2651,6 +3343,104 @@ class RoastSessionStore:
             self._clear_driver_command_reservation_locked(session, reservation)
             return _copy_session_for_read(session)
 
+    def _complete_reserved_canonical_driver_events(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        events: tuple[tuple[RoastEventKind, dict[str, EventPayloadValue]], ...],
+        apply_verified: Callable[[], None],
+    ) -> tuple[RoastEvent, RoastSession]:
+        """Persist a returned mock-driver transition without retaining the store lock.
+
+        The driver reservation remains the owner until the exact canonical rows
+        verify.  Submitting the rows is admission only; waiting for the owned
+        writer must occur outside ``_lock`` so a state read and the independent
+        emergency driver path retain their established admission priority.
+        """
+        with self._lock:
+            self._assert_driver_command_reservation(session, reservation)
+            writer = session.canonical_writer
+            if writer is None:  # pragma: no cover - callers select this path.
+                raise SessionLifecycleError("Canonical driver completion has no writer.")
+            planned = _copy_session_for_read(session)
+            recorded: list[RoastEvent] = []
+            for kind, payload in events:
+                event = self._new_event_locked(planned, kind, payload=payload)
+                _apply_event_timestamp(planned, event)
+                recorded.append(event)
+            try:
+                completions = writer.submit_group(
+                    tuple(_event_log_row(session, event) for event in recorded), lane="event"
+                )
+            except Exception as error:
+                if reservation.kind == "drop":
+                    if (
+                        isinstance(error, _CanonicalAdmissionRefusedError)
+                        and error.known_zero
+                        and session.verified_ordinary_driver_drop
+                    ):
+                        # Record this before releasing the exact reservation,
+                        # while no later emergency can have displaced it.
+                        session.ordinary_drop_persistence_zero = True
+                    else:
+                        session.unrecorded_driver_drop = True
+                self._clear_driver_command_reservation_locked(session, reservation)
+                raise
+
+        try:
+            for completion in completions:
+                completion.result()
+        except Exception:
+            with self._lock:
+                if reservation.kind == "drop":
+                    session.unrecorded_driver_drop = True
+                self._clear_driver_command_reservation_locked(session, reservation)
+            raise
+
+        with self._lock:
+            reservation_current = (
+                self._latest_session is session
+                and session.active
+                and session.faulted_at_utc is None
+                and session.pending_driver_command_token == reservation.token
+                and session.pending_driver_command_kind == reservation.kind
+            )
+            if not reservation_current:
+                # The driver result is already verified and its rows are now
+                # durable.  An emergency may have displaced live projection
+                # while storage was held, but it cannot turn that accepted
+                # driver effect into a repeatable command or revive its phase.
+                for event in recorded:
+                    insert_at = next(
+                        (
+                            index
+                            for index, existing in enumerate(session.event_timeline)
+                            if existing.recorded_at_utc > event.recorded_at_utc
+                        ),
+                        len(session.event_timeline),
+                    )
+                    session.event_timeline.insert(insert_at, event)
+                    if event.kind == "beans_dropped":
+                        session.beans_dropped_at_utc = event.recorded_at_utc
+                        session.beans_dropped_monotonic_seconds = event.monotonic_seconds
+                    elif event.kind == "cooling_started":
+                        session.cooling_started_at_utc = event.recorded_at_utc
+                        session.cooling_started_monotonic_seconds = event.monotonic_seconds
+                    elif event.kind == "cooling_stopped":
+                        session.cooling_stopped_at_utc = event.recorded_at_utc
+                        session.cooling_stopped_monotonic_seconds = event.monotonic_seconds
+                self._clear_driver_command_reservation_locked(session, reservation)
+                raise RecoveryPersistenceSupersededError(
+                    "Driver command completed after its live session authority changed."
+                )
+            apply_verified()
+            session.event_timeline.extend(recorded)
+            for event in recorded:
+                _apply_event_timestamp(session, event)
+            self._clear_driver_command_reservation_locked(session, reservation)
+            return recorded[0], _copy_session_for_read(session)
+
     def complete_reserved_driver_drop_snapshot(
         self,
         session: RoastSession,
@@ -2672,6 +3462,36 @@ class RoastSessionStore:
         Returns:
             The bean-drop event plus an atomic lightweight session snapshot.
         """
+        if session.canonical_writer is not None:
+            event_payload: dict[str, EventPayloadValue] = {
+                "heat_level_percent": heat_level_percent,
+                "fan_level_percent": fan_level_percent,
+                "cooling_on": cooling_on,
+            }
+            events: list[tuple[RoastEventKind, dict[str, EventPayloadValue]]] = [
+                ("beans_dropped", event_payload)
+            ]
+            if cooling_on:
+                events.append(("cooling_started", event_payload))
+
+            def apply_verified() -> None:
+                self.apply_driver_control_state(
+                    session,
+                    heat_level_percent=heat_level_percent,
+                    fan_level_percent=fan_level_percent,
+                    cooling_on=cooling_on,
+                )
+                # A complete coupled projection accounts for the returned
+                # ordinary Drop.  Only an unrecorded or partial projection
+                # retains the control fence.
+                session.verified_ordinary_driver_drop = False
+
+            return self._complete_reserved_canonical_driver_events(
+                session,
+                reservation=reservation,
+                events=tuple(events),
+                apply_verified=apply_verified,
+            )
         with self._lock:
             self._assert_driver_command_reservation(session, reservation)
             previous_control_state = (
@@ -2694,6 +3514,7 @@ class RoastSessionStore:
                 event = self.record_event(session, "beans_dropped", payload=event_payload)
                 if cooling_on:
                     self.record_event(session, "cooling_started", payload=event_payload)
+                session.verified_ordinary_driver_drop = False
             except Exception:
                 (
                     session.heat_level_percent,
@@ -2715,6 +3536,38 @@ class RoastSessionStore:
         cooling_on: bool,
     ) -> tuple[RoastEvent, RoastSession]:
         """Complete a reserved cooling-start command and record the event."""
+        if session.canonical_writer is not None:
+            if not cooling_on:
+                with self._lock:
+                    self._assert_driver_command_reservation(session, reservation)
+                    self._clear_driver_command_reservation_locked(session, reservation)
+                raise SessionLifecycleError(
+                    "Driver still reports cooling inactive after start_cooling."
+                )
+
+            def apply_verified() -> None:
+                self.apply_driver_control_state(
+                    session,
+                    heat_level_percent=heat_level_percent,
+                    fan_level_percent=fan_level_percent,
+                    cooling_on=cooling_on,
+                )
+
+            return self._complete_reserved_canonical_driver_events(
+                session,
+                reservation=reservation,
+                events=(
+                    (
+                        "cooling_started",
+                        {
+                            "heat_level_percent": heat_level_percent,
+                            "fan_level_percent": fan_level_percent,
+                            "cooling_on": cooling_on,
+                        },
+                    ),
+                ),
+                apply_verified=apply_verified,
+            )
         with self._lock:
             self._assert_driver_command_reservation(session, reservation)
             if not cooling_on:
@@ -2771,6 +3624,45 @@ class RoastSessionStore:
         cooling_on: bool,
     ) -> tuple[RoastEvent, RoastSession]:
         """Complete a reserved cooling-stop command and record the event."""
+        if session.canonical_writer is not None:
+            if cooling_on:
+                raise SessionLifecycleError(
+                    "Driver still reports cooling active after stop_cooling."
+                )
+            validated_heat = validate_control_percent(
+                heat_level_percent,
+                label="heat_level_percent",
+            )
+            validated_fan = validate_control_percent(
+                fan_level_percent,
+                label="fan_level_percent",
+            )
+
+            def apply_verified() -> None:
+                session.heat_level_percent = validated_heat
+                session.fan_level_percent = validated_fan
+                session.cooling_on = False
+                session.stop(
+                    utc_now=self._utc_now,
+                    monotonic_now=self._monotonic_now,
+                    phase="complete",
+                )
+
+            return self._complete_reserved_canonical_driver_events(
+                session,
+                reservation=reservation,
+                events=(
+                    (
+                        "cooling_stopped",
+                        {
+                            "heat_level_percent": validated_heat,
+                            "fan_level_percent": validated_fan,
+                            "cooling_on": False,
+                        },
+                    ),
+                ),
+                apply_verified=apply_verified,
+            )
         with self._lock:
             self._assert_driver_command_reservation(session, reservation)
             if cooling_on:
@@ -2992,6 +3884,138 @@ class RoastSessionStore:
                 )
             self._abort_finalisation_for_emergency_stop_locked(session)
 
+    def retain_active_verified_emergency_containment(
+        self,
+        session: RoastSession,
+        *,
+        safety_payload: Mapping[str, EventPayloadValue],
+    ) -> None:
+        """Retain verified containment when its active fault row cannot be saved.
+
+        This keeps the accepted driver result distinct from an unverified
+        emergency stop: no fault row is added and the incomplete recording
+        remains visible through the session's existing persistence evidence.
+        Callers must restrict this exceptional admission to the composed
+        manual/mock writer route.
+
+        Args:
+            session: Latest active session whose fault row was not saved.
+            safety_payload: Independently verified driver containment evidence.
+        """
+        with self._lock:
+            self._assert_latest_session(session)
+            if not has_verified_emergency_containment(safety_payload=safety_payload):
+                raise SessionLifecycleError(
+                    "Verified emergency containment is required before recovery admission."
+                )
+            _apply_emergency_safety_payload(session, safety_payload)
+            if session.active:
+                session.stop(
+                    utc_now=self._utc_now,
+                    monotonic_now=self._monotonic_now,
+                    phase="fault",
+                )
+            else:
+                session.phase = "fault"
+            if session.faulted_at_utc is None:
+                session.faulted_at_utc = self._utc_now()
+                session.faulted_monotonic_seconds = session.elapsed_monotonic_seconds(
+                    self._monotonic_now
+                )
+            self._fault_recovery_admission_blocks.discard(session.id)
+            self._abort_finalisation_for_emergency_stop_locked(session)
+
+    def settle_known_incomplete_fault_recovery(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+        connected: bool,
+    ) -> RoastSession | None:
+        """Retain one verified guarded result when its canonical generation failed.
+
+        The returned projection is driver evidence only.  This method never
+        appends a recovery event or timestamps one, so it cannot turn an
+        accepted command into a saved record.
+
+        Args:
+            session: Latest stopped fault session owning the recovery command.
+            reservation: Exact guarded recovery reservation.
+            heat_level_percent: Driver-reported heat after the command.
+            fan_level_percent: Driver-reported fan after the command.
+            cooling_on: Driver-reported cooling state after the command.
+            connected: Whether the driver remained connected after the command.
+
+        Returns:
+            A projection of the accepted unsaved result, or ``None`` when the
+            result cannot be proved safe enough to retain.
+        """
+        with self._lock:
+            if not session.mock_log_torn:
+                return None
+            try:
+                self._assert_stopped_fault_recovery_session_locked(session)
+                if (
+                    reservation.session_id != session.id
+                    or session.pending_driver_command_token != reservation.token
+                    or session.pending_driver_command_kind != reservation.kind
+                    or reservation.kind not in {"drop", "start_cooling", "stop_cooling"}
+                    or not connected
+                ):
+                    return None
+                heat = validate_control_percent(heat_level_percent, label="heat_level_percent")
+                fan = validate_control_percent(fan_level_percent, label="fan_level_percent")
+            except SessionLifecycleError:
+                return None
+            if heat != 0:
+                return None
+            if reservation.kind in {"drop", "start_cooling"} and (fan != 100 or not cooling_on):
+                return None
+            if reservation.kind == "stop_cooling" and cooling_on:
+                return None
+            if reservation.kind == "drop":
+                persisted_drop = self._get_existing_singleton_event(session, "beans_dropped")
+                if (
+                    session.beans_added_at_utc is None
+                    or session.unrecorded_fault_recovery_drop_accepted
+                ):
+                    return None
+                if persisted_drop is None:
+                    session.unrecorded_fault_recovery_drop_accepted = True
+                elif (
+                    persisted_drop.payload.get("recovery_after_fault") is not True
+                    or self._get_existing_singleton_event(session, "cooling_started") is not None
+                ):
+                    # Only the first, verified row of this exact composed
+                    # recovery Drop may survive a failed derived cooling row.
+                    # Any other existing endpoint is not evidence for this
+                    # reservation and retains the established fail-closed path.
+                    return None
+            elif reservation.kind == "stop_cooling" and (
+                session.beans_added_at_utc is not None
+                and not _has_recorded_beans_dropped(session)
+                and not session.unrecorded_fault_recovery_drop_accepted
+                and not self._has_verified_known_zero_ordinary_discharge_locked(session)
+            ):
+                return None
+            if (
+                reservation.kind == "stop_cooling"
+                and self._has_verified_known_zero_ordinary_discharge_locked(session)
+            ):
+                # The exact reservation and returned connected zero-heat,
+                # fan-100, cooling-off state have both been checked above.
+                session.ordinary_drop_persistence_zero_cooling_settled = True
+            session.heat_level_percent = heat
+            session.fan_level_percent = fan
+            session.cooling_on = cooling_on
+            session.phase = "fault"
+            self._clear_driver_command_reservation_locked(session, reservation)
+            self._clear_fault_recovery_in_flight_locked(session, reservation)
+            return _copy_session_for_read(session)
+
     def clear_fault_recovery_in_flight(
         self,
         session: RoastSession,
@@ -3032,8 +4056,17 @@ class RoastSessionStore:
 
         Raises:
             SessionLifecycleError: If the reservation/session is stale, heat is
-                non-zero, or the command did not establish its required state.
+            non-zero, or the command did not establish its required state.
         """
+        if session.canonical_writer is not None:
+            return self._complete_reserved_canonical_fault_recovery_snapshot(
+                session,
+                reservation=reservation,
+                heat_level_percent=heat_level_percent,
+                fan_level_percent=fan_level_percent,
+                cooling_on=cooling_on,
+                connected=connected,
+            )
         completed = False
         with self._lock:
             try:
@@ -3062,7 +4095,10 @@ class RoastSessionStore:
                     raise SessionLifecycleError(
                         "Fault recovery cooling requires fan 100 and cooling active."
                     )
-                if self._normal_drop_persistence_torn and reservation.kind in {
+                if (
+                    self._normal_drop_persistence_torn or session.mock_log_torn
+                ) and reservation.kind in {
+                    "drop",
                     "start_cooling",
                     "stop_cooling",
                 }:
@@ -3120,12 +4156,174 @@ class RoastSessionStore:
                 # that reservation for the caller's narrow known-state
                 # settlement; every other failure retains eager clearing.
                 if not (
-                    self._normal_drop_persistence_torn
-                    and reservation.kind in {"start_cooling", "stop_cooling"}
+                    (self._normal_drop_persistence_torn or session.mock_log_torn)
+                    and reservation.kind in {"drop", "start_cooling", "stop_cooling"}
                 ):
                     self._clear_driver_command_reservation_locked(session, reservation)
                 if completed:
                     self._clear_fault_recovery_in_flight_locked(session, reservation)
+
+    def _complete_reserved_canonical_fault_recovery_snapshot(
+        self,
+        session: RoastSession,
+        *,
+        reservation: DriverCommandReservation,
+        heat_level_percent: int,
+        fan_level_percent: int,
+        cooling_on: bool,
+        connected: bool,
+    ) -> tuple[RoastEvent, RoastSession]:
+        """Settle one composed recovery command without holding the store lock on I/O.
+
+        The recovery reservation remains the command's authority while its
+        exact row is owned by the generation writer.  In particular, a second
+        emergency may cancel that reservation while the write is stalled; the
+        later settlement then cannot project stale recovery state or admit the
+        derived cooling row.
+        """
+        writer = session.canonical_writer
+        assert writer is not None
+        with self._lock:
+            self._assert_stopped_fault_recovery_session_locked(session)
+            if (
+                reservation.session_id != session.id
+                or session.pending_driver_command_token != reservation.token
+                or session.pending_driver_command_kind != reservation.kind
+            ):
+                # No canonical turn owns this result yet.  The driver has
+                # returned, but its completion is still ambiguous, so leave
+                # the established guarded-recovery replacement path intact.
+                raise SessionLifecycleError("Driver command reservation is no longer active.")
+            validated_heat = validate_control_percent(
+                heat_level_percent,
+                label="heat_level_percent",
+            )
+            validated_fan = validate_control_percent(
+                fan_level_percent,
+                label="fan_level_percent",
+            )
+            if validated_heat != 0:
+                raise SessionLifecycleError("Heat must be off after fault recovery.")
+            if not connected:
+                raise SessionLifecycleError("Driver disconnected during fault recovery.")
+            if reservation.kind in ("drop", "start_cooling") and (
+                not cooling_on or validated_fan != 100
+            ):
+                raise SessionLifecycleError(
+                    "Fault recovery cooling requires fan 100 and cooling active."
+                )
+            if reservation.kind == "stop_cooling" and cooling_on:
+                raise SessionLifecycleError(
+                    "Fault recovery cooling stop requires cooling inactive."
+                )
+            if self._normal_drop_persistence_torn or session.mock_log_torn:
+                raise EventLogRecordingError
+            payload: dict[str, EventPayloadValue] = {
+                "heat_level_percent": validated_heat,
+                "fan_level_percent": validated_fan,
+                "cooling_on": cooling_on,
+                "recovery_after_fault": True,
+            }
+            if reservation.kind == "drop":
+                kind: RoastEventKind = "beans_dropped"
+            elif reservation.kind == "start_cooling":
+                kind = "cooling_started"
+            elif reservation.kind == "stop_cooling":
+                kind = "cooling_stopped"
+            else:  # pragma: no cover - DriverCommandReservation is closed.
+                raise SessionLifecycleError("Unsupported stopped-fault recovery command.")
+            event = self._new_stopped_recovery_event_locked(session, kind, payload)
+            completion = writer.submit(_event_log_row(session, event), lane="event")
+
+        # Never wait for the writer while owning store admission.  State and
+        # emergency callers must be able to acquire it while this exact row is
+        # stalled, and the reservation remains the only recovery authority.
+        completion.result()
+
+        derived: RoastEvent | None = None
+        with self._lock:
+            self._assert_stopped_fault_recovery_session_locked(session)
+            if (
+                reservation.session_id != session.id
+                or session.pending_driver_command_token != reservation.token
+                or session.pending_driver_command_kind != reservation.kind
+            ):
+                # The exact row is now read-back verified.  Retain that fact
+                # without projecting its mutable phase/control consequences;
+                # it fences a repeat Drop but cannot authorize a fresh Start.
+                session.event_timeline.append(event)
+                if reservation.kind == "drop":
+                    self._historical_fault_drop_start_blocks.add(session.id)
+                self._clear_fault_recovery_in_flight_locked(session, reservation)
+                raise RecoveryPersistenceSupersededError(
+                    "Driver command reservation was superseded during persistence."
+                )
+            session.event_timeline.append(event)
+            if reservation.kind == "drop":
+                derived = self._new_stopped_recovery_event_locked(
+                    session,
+                    "cooling_started",
+                    payload,
+                )
+                derived_completion = writer.submit(_event_log_row(session, derived), lane="event")
+            else:
+                derived_completion = None
+
+        if derived_completion is not None:
+            # The paired cooling fact is admitted only after the exact Drop is
+            # verified.  A superseding emergency before this admission leaves
+            # no ineligible trailing cooling row behind.
+            derived_completion.result()
+
+        with self._lock:
+            self._assert_stopped_fault_recovery_session_locked(session)
+            if (
+                reservation.session_id != session.id
+                or session.pending_driver_command_token != reservation.token
+                or session.pending_driver_command_kind != reservation.kind
+            ):
+                if derived_completion is not None:
+                    assert derived is not None
+                    session.event_timeline.append(derived)
+                self._clear_fault_recovery_in_flight_locked(session, reservation)
+                raise RecoveryPersistenceSupersededError(
+                    "Driver command reservation was superseded during persistence."
+                )
+            if derived_completion is not None:
+                assert derived is not None
+                session.event_timeline.append(derived)
+            session.heat_level_percent = validated_heat
+            session.fan_level_percent = validated_fan
+            session.cooling_on = cooling_on
+            session.phase = "fault"
+            if reservation.kind == "stop_cooling":
+                self._fault_drop_cooling_cycle_required.discard(session.id)
+            self._clear_driver_command_reservation_locked(session, reservation)
+            self._clear_fault_recovery_in_flight_locked(session, reservation)
+            return event, _copy_session_for_read(session)
+
+    def _new_stopped_recovery_event_locked(
+        self,
+        session: RoastSession,
+        kind: RoastEventKind,
+        payload: dict[str, EventPayloadValue],
+    ) -> RoastEvent:
+        """Build one ordered stopped-fault recovery fact under store admission."""
+        existing_event = self._get_existing_singleton_event(session, kind)
+        if existing_event is not None and kind not in {"cooling_started", "cooling_stopped"}:
+            raise SessionLifecycleError("Stopped-fault recovery event already exists.")
+        recorded_at_utc = _normalize_event_recorded_at_utc(session, recorded_at_utc=self._utc_now())
+        monotonic_seconds = _normalize_event_monotonic_seconds(
+            session,
+            monotonic_seconds=max(0.0, self._monotonic_now() - session.monotonic_start),
+        )
+        _validate_event_monotonic_order(session, kind=kind, monotonic_seconds=monotonic_seconds)
+        return RoastEvent(
+            kind=kind,
+            recorded_at_utc=recorded_at_utc,
+            monotonic_seconds=monotonic_seconds,
+            payload=dict(payload),
+        )
 
     def retain_fault_drop_ambiguity(self, session: RoastSession) -> None:
         """Fence admission after a drop may have actuated without durable evidence."""
@@ -3172,6 +4370,10 @@ class RoastSessionStore:
         """Stop cooling for one active session."""
         with self._lock:
             self._assert_latest_active_session(session)
+            if _has_unrecorded_charge_attempt(session):
+                raise SessionLifecycleError(
+                    "Cooling cannot stop while a charge attempt has no canonical record."
+                )
             if session.beans_dropped_at_utc is None:
                 raise SessionLifecycleError("Cooling cannot stop before beans are dropped.")
             if session.cooling_started_at_utc is None or not session.cooling_on:
@@ -3189,6 +4391,536 @@ class RoastSessionStore:
         with self._lock:
             event = self.stop_cooling(session)
             return event, _copy_session_for_read(session)
+
+    def begin_manual_first_crack_write(
+        self,
+        session: RoastSession,
+        *,
+        observer_publication_token: object | None = None,
+        on_live: Callable[[RoastSession, object], None] | None = None,
+        started_monotonic_seconds: float | None = None,
+    ) -> ManualFirstCrackAttempt:
+        """Stage one manual first-crack row on the private mock writer.
+
+        This deliberately reserves no driver capability.  The short store
+        section captures only the exact session and clock identity; audit and
+        canonical filesystem work run on the owned worker after that section.
+        """
+        with self._lock:
+            if not self._manual_first_crack_writer_enabled:
+                raise SessionLifecycleError("Manual first-crack writer is unavailable.")
+            self._assert_latest_active_session(session)
+            self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
+            if session.faulted_at_utc is not None:
+                raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
+            existing = self._get_existing_singleton_event(session, "first_crack_detected")
+            if existing is not None:
+                completed: Future[ManualFirstCrackSettlement] = Future()
+                completed.set_result(
+                    ManualFirstCrackSettlement(
+                        outcome="duplicate",
+                        event=existing,
+                        snapshot=_copy_session_for_read(session),
+                    )
+                )
+                return ManualFirstCrackAttempt(
+                    token="duplicate",
+                    started_monotonic_seconds=self._monotonic_now(),
+                    deadline_monotonic_seconds=self._monotonic_now(),
+                    completion=completed,
+                )
+            if session.manual_first_crack_endpoint_admitted:
+                raise SessionLifecycleError(
+                    "Manual first-crack mark cannot be admitted after a lifecycle endpoint."
+                )
+            if (
+                self._manual_first_crack_attempt is not None
+                and self._manual_first_crack_attempt_session_id == session.id
+                and not self._manual_first_crack_attempt.completion.done()
+            ):
+                return self._manual_first_crack_attempt
+            if (
+                session.manual_first_crack_admission_expired
+                or session.manual_first_crack_canonical_evidence in {"zero", "uncertain"}
+            ):
+                raise SessionLifecycleError(
+                    "Manual first-crack mark is pending or incomplete; do not resend it."
+                )
+            _validate_event_transition(session, "first_crack_detected")
+            started_monotonic_seconds = (
+                self._monotonic_now()
+                if started_monotonic_seconds is None
+                else started_monotonic_seconds
+            )
+            deadline_monotonic_seconds = (
+                started_monotonic_seconds + self._manual_first_crack_budget_seconds
+            )
+            token = uuid4().hex
+            event = self._new_event_locked(session, "first_crack_detected")
+            # Bind audit evidence to the original mark, never to a later
+            # session or writer selected after an endpoint races this attempt.
+            self._manual_first_crack_audit_identities[token] = _ManualFirstCrackAuditIdentity(
+                recorded_at_utc=event.recorded_at_utc,
+                monotonic_seconds=event.monotonic_seconds,
+                capture_ownership_sequence=session.capture_ownership_sequence,
+                session_id=session.id,
+                writer_generation=id(session.canonical_writer),
+            )
+            # Pending is visibly non-live and blocks only the exact recipe path
+            # through its existing missing-canonical-FC check.
+            session.manual_first_crack_pending = True
+            writer = self._manual_first_crack_writers.get(session.id)
+            if writer is None:
+                if (
+                    len(self._manual_first_crack_writers)
+                    >= self._manual_first_crack_writer_capacity
+                ):
+                    session.manual_first_crack_pending = False
+                    raise SessionLifecycleError(
+                        "Manual first-crack writer capacity is unavailable."
+                    )
+                writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="manual-fc-writer")
+                self._manual_first_crack_writers[session.id] = writer
+            completion: Future[ManualFirstCrackSettlement] = Future()
+            work_completion = writer.submit(
+                self._write_manual_first_crack,
+                session,
+                token,
+                event,
+                deadline_monotonic_seconds,
+                on_live,
+                observer_publication_token,
+                completion,
+            )
+            attempt = ManualFirstCrackAttempt(
+                token=token,
+                started_monotonic_seconds=started_monotonic_seconds,
+                deadline_monotonic_seconds=deadline_monotonic_seconds,
+                completion=completion,
+                observer_publication_token=observer_publication_token,
+                on_live=on_live,
+            )
+            self._manual_first_crack_attempt = attempt
+            self._manual_first_crack_attempt_session_id = session.id
+            work_completion.add_done_callback(
+                lambda _: self._release_manual_first_crack_writer(session.id, writer)
+            )
+
+            def settle_caller(
+                finished: Future[ManualFirstCrackSettlement],
+            ) -> None:
+                """Settle non-live outcomes after their owned audit work ends."""
+                if completion.done():
+                    return
+                try:
+                    completion.set_result(finished.result())
+                except BaseException as error:
+                    completion.set_exception(error)
+
+            work_completion.add_done_callback(settle_caller)
+            return attempt
+
+    def manual_first_crack_monotonic_now(self) -> float:
+        """Return the injected monotonic clock used by manual-mark deadlines."""
+        return self._monotonic_now()
+
+    def manual_first_crack_remaining_seconds(self, attempt: ManualFirstCrackAttempt) -> float:
+        """Return remaining producer budget in the attempt's clock domain."""
+        return attempt.deadline_monotonic_seconds - self._monotonic_now()
+
+    def revoke_manual_first_crack_live_publication(self, attempt: ManualFirstCrackAttempt) -> None:
+        """Irrevocably revoke live projection after the producer wait expires."""
+        self.settle_or_revoke_manual_first_crack_live_publication(attempt)
+
+    def settle_or_revoke_manual_first_crack_live_publication(
+        self, attempt: ManualFirstCrackAttempt
+    ) -> ManualFirstCrackSettlement | None:
+        """Atomically retain a live settlement or revoke this attempt's claim.
+
+        The completion future is resolved under this same store lock when a
+        live publication wins. Reading an already-complete future cannot
+        block, and observer callbacks remain outside the lock.
+        """
+        if attempt.token == "duplicate":
+            return
+        with self._lock:
+            if attempt.completion.done():
+                settlement = attempt.completion.result()
+                if settlement.outcome == "live":
+                    return settlement
+            self._manual_first_crack_live_revoked_tokens.add(attempt.token)
+            session = self._sessions_by_id.get(self._manual_first_crack_attempt_session_id or "")
+            if (
+                session is not None
+                and self._manual_first_crack_attempt is attempt
+                and self._get_existing_singleton_event(session, "first_crack_detected") is None
+            ):
+                session.manual_first_crack_admission_expired = True
+        return None
+
+    def revoke_unconsumed_manual_first_crack_live_publication(self, session: RoastSession) -> None:
+        """Revoke a pending mark's live right at a mutable endpoint admission."""
+        with self._lock:
+            self._revoke_unconsumed_manual_first_crack_live_locked(session)
+
+    def admit_manual_first_crack_endpoint(self, session: RoastSession) -> None:
+        """Close composed manual-mark admission when its session is still active.
+
+        A concurrently completed captured session is intentionally untouched:
+        its completed lifecycle cannot acquire a new live mark, and an
+        emergency already eligible for that exact latest session must not be
+        refused by an active-only assertion.
+        """
+        with self._lock:
+            self._assert_latest_session(session)
+            if session.active:
+                self._admit_manual_first_crack_endpoint_locked(session)
+
+    def _admit_manual_first_crack_endpoint_locked(self, session: RoastSession) -> None:
+        """Record endpoint ownership before revoking an existing pending mark."""
+        session.manual_first_crack_endpoint_admitted = True
+        self._revoke_unconsumed_manual_first_crack_live_locked(session)
+
+    def _revoke_unconsumed_manual_first_crack_live_locked(self, session: RoastSession) -> None:
+        """Revoke only the current generation's not-yet-live mark under admission."""
+        attempt = self._manual_first_crack_attempt
+        if (
+            attempt is None
+            or self._manual_first_crack_attempt_session_id != session.id
+            or attempt.completion.done()
+            or self._get_existing_singleton_event(session, "first_crack_detected") is not None
+        ):
+            return
+        self._manual_first_crack_live_revoked_tokens.add(attempt.token)
+        session.manual_first_crack_admission_expired = True
+
+    def _release_manual_first_crack_writer(
+        self, session_id: str, writer: ThreadPoolExecutor
+    ) -> None:
+        """Release an idle generation lane without cancelling owned I/O."""
+        with self._lock:
+            if self._manual_first_crack_writers.get(session_id) is writer:
+                del self._manual_first_crack_writers[session_id]
+        writer.shutdown(wait=False, cancel_futures=False)
+
+    def shutdown_manual_first_crack_writer(self) -> None:
+        """Stop accepting private writer work without cancelling an owned write."""
+        with self._lock:
+            writers = tuple(self._manual_first_crack_writers.values())
+        for writer in writers:
+            writer.shutdown(wait=False, cancel_futures=False)
+        with self._lock:
+            canonical_writers = [
+                session.canonical_writer
+                for session in self._sessions_by_id.values()
+                if session.canonical_writer is not None
+            ]
+        for canonical_writer in canonical_writers:
+            canonical_writer.shutdown()
+
+    def _write_manual_first_crack(
+        self,
+        session: RoastSession,
+        token: str,
+        event: RoastEvent,
+        deadline_monotonic_seconds: float,
+        on_live: Callable[[RoastSession, object], None] | None,
+        observer_publication_token: object | None,
+        caller_completion: Future[ManualFirstCrackSettlement],
+    ) -> ManualFirstCrackSettlement:
+        """Own audit, canonical append, verification and settlement for one mark."""
+        try:
+            self._append_manual_first_crack_audit(session, token=token, disposition="begin")
+        except Exception:
+            return self._settle_manual_first_crack_failure(
+                session,
+                token=token,
+                canonical_evidence="zero",
+                audit_unresolved=True,
+            )
+
+        completion: Future[None] | None = None
+        canonical_evidence: Literal["zero", "uncertain"] | None = None
+        with self._lock:
+            if (
+                self._latest_session is not session
+                or not session.active
+                or session.faulted_at_utc is not None
+                or token in self._manual_first_crack_live_revoked_tokens
+                or self._monotonic_now() >= deadline_monotonic_seconds
+            ):
+                historical = self._settle_manual_first_crack_historical_locked(
+                    session, token=token, canonical_evidence="zero"
+                )
+            else:
+                historical = None
+                writer = session.canonical_writer
+                try:
+                    _validate_event_transition(session, "first_crack_detected")
+                    _validate_event_monotonic_order(
+                        session,
+                        kind="first_crack_detected",
+                        monotonic_seconds=event.monotonic_seconds,
+                    )
+                except SessionLifecycleError:
+                    historical = self._settle_manual_first_crack_historical_locked(
+                        session, token=token, canonical_evidence="zero"
+                    )
+                if historical is None and writer is None:
+                    historical = self._settle_manual_first_crack_historical_locked(
+                        session, token=token, canonical_evidence="zero"
+                    )
+                elif historical is None:
+                    # This is the irreversible admission point.  Reserving the
+                    # generation-owned event lane and enqueuing its exact frame
+                    # occur while endpoint admission still has this store lock.
+                    # The worker may perform I/O immediately, but no completion
+                    # is awaited until after this critical section has ended.
+                    try:
+                        assert writer is not None
+                        self._canonical_event_admissions.add((session.id, "first_crack_detected"))
+                        completion = writer.submit(_event_log_row(session, event), lane="event")
+                    except _CanonicalAdmissionRefusedError:
+                        self._canonical_event_admissions.discard(
+                            (session.id, "first_crack_detected")
+                        )
+                        canonical_evidence = "zero"
+                    except Exception:
+                        self._canonical_event_admissions.discard(
+                            (session.id, "first_crack_detected")
+                        )
+                        canonical_evidence = "uncertain"
+        if canonical_evidence is not None:
+            return self._settle_manual_first_crack_failure(
+                session, token=token, canonical_evidence=canonical_evidence
+            )
+        if historical is not None:
+            self._append_manual_first_crack_terminal_audit(
+                session, token=token, disposition="historical"
+            )
+            return historical
+
+        try:
+            if completion is None:
+                raise EventLogRecordingError("Manual first-crack record was not admitted.")
+            completion.result()
+        except _CanonicalAdmissionRefusedError:
+            return self._settle_manual_first_crack_failure(
+                session, token=token, canonical_evidence="zero"
+            )
+        except Exception:
+            return self._settle_manual_first_crack_failure(
+                session, token=token, canonical_evidence="uncertain"
+            )
+
+        snapshot: RoastSession | None = None
+        settlement: ManualFirstCrackSettlement | None = None
+        with self._lock:
+            # A command endpoint, expiry, replacement or fault may have won
+            # while the exact accepted bytes were being written.  Such bytes
+            # remain audit evidence only and never re-enter the live timeline.
+            if (
+                self._latest_session is not session
+                or not session.active
+                or session.faulted_at_utc is not None
+                or token in self._manual_first_crack_live_revoked_tokens
+                or self._monotonic_now() >= deadline_monotonic_seconds
+            ):
+                historical = self._settle_manual_first_crack_historical_locked(
+                    session, token=token, canonical_evidence="verified"
+                )
+            else:
+                try:
+                    _validate_event_transition(session, "first_crack_detected")
+                    _validate_event_monotonic_order(
+                        session,
+                        kind="first_crack_detected",
+                        monotonic_seconds=event.monotonic_seconds,
+                    )
+                except SessionLifecycleError:
+                    historical = self._settle_manual_first_crack_historical_locked(
+                        session, token=token, canonical_evidence="verified"
+                    )
+                else:
+                    historical = None
+                    session.event_timeline.append(event)
+                    _apply_event_timestamp(session, event)
+                    session.first_crack_source = "manual_mark"
+                    session.manual_first_crack_pending = False
+                    snapshot = _copy_session_for_read(session)
+                    self._canonical_event_admissions.discard((session.id, "first_crack_detected"))
+                    # Publish the caller-visible terminal result in the same
+                    # admission section that chooses live over historical.
+                    # A simultaneous deadline revocation can therefore only
+                    # observe an unresolved attempt or this exact settlement.
+                    settlement = ManualFirstCrackSettlement(
+                        outcome="live", event=event, snapshot=snapshot
+                    )
+                    caller_completion.set_result(settlement)
+        if historical is not None:
+            self._append_manual_first_crack_terminal_audit(
+                session, token=token, disposition="historical"
+            )
+            return historical
+        assert snapshot is not None and settlement is not None
+        # The worker retains the captured claim until it consumes it or
+        # another endpoint invalidates it.
+        if on_live is not None and observer_publication_token is not None:
+            with suppress(BaseException):
+                on_live(session, observer_publication_token)
+        # The verified immutable producer result is available before the
+        # diagnostic terminal audit. The owned worker still performs that
+        # audit after settling the caller-visible future.
+        self._append_manual_first_crack_terminal_audit(session, token=token, disposition="live")
+        return settlement
+
+    def _settle_manual_first_crack_historical_locked(
+        self,
+        session: RoastSession,
+        *,
+        token: str,
+        canonical_evidence: Literal["verified", "zero"],
+    ) -> ManualFirstCrackSettlement:
+        """Settle verified bytes without allowing them to acquire live authority."""
+        if self._latest_session is session:
+            session.manual_first_crack_pending = False
+            session.manual_first_crack_export_disqualified = True
+            session.manual_first_crack_admission_expired = True
+            session.manual_first_crack_canonical_evidence = canonical_evidence
+            snapshot = _copy_session_for_read(session)
+        else:
+            snapshot = None
+        self._manual_first_crack_live_revoked_tokens.discard(token)
+        self._canonical_event_admissions.discard((session.id, "first_crack_detected"))
+        return ManualFirstCrackSettlement(outcome="historical", snapshot=snapshot)
+
+    def _append_manual_first_crack_terminal_audit(
+        self, session: RoastSession, *, token: str, disposition: str
+    ) -> None:
+        """Write terminal audit evidence without changing a settled result."""
+        try:
+            self._append_manual_first_crack_audit(session, token=token, disposition=disposition)
+        except BaseException:
+            # A terminal audit is diagnostic-only after the canonical result
+            # has settled, but its failure remains truthful private evidence.
+            with self._lock:
+                if self._latest_session is session:
+                    session.manual_first_crack_audit_unresolved = True
+        finally:
+            with self._lock:
+                self._manual_first_crack_audit_identities.pop(token, None)
+
+    def _settle_manual_first_crack_failure(
+        self,
+        session: RoastSession,
+        *,
+        token: str,
+        canonical_evidence: Literal["zero", "uncertain"],
+        audit_unresolved: bool = False,
+    ) -> ManualFirstCrackSettlement:
+        """Latch an incomplete manual writer generation without driver side effects."""
+        with self._lock:
+            if self._latest_session is session:
+                session.manual_first_crack_pending = False
+                session.manual_first_crack_export_disqualified = True
+                if canonical_evidence == "uncertain":
+                    session.mock_log_torn = True
+                session.manual_first_crack_admission_expired = True
+                session.manual_first_crack_canonical_evidence = canonical_evidence
+                session.manual_first_crack_audit_unresolved |= audit_unresolved
+                snapshot = _copy_session_for_read(session)
+            else:
+                snapshot = None
+            self._manual_first_crack_live_revoked_tokens.discard(token)
+            self._canonical_event_admissions.discard((session.id, "first_crack_detected"))
+        self._append_manual_first_crack_terminal_audit(session, token=token, disposition="failed")
+        return ManualFirstCrackSettlement(outcome="failed", snapshot=snapshot)
+
+    def _append_manual_first_crack_audit(
+        self, session: RoastSession, *, token: str, disposition: str
+    ) -> None:
+        """Append and verify one framed non-canonical mark audit row outside admission."""
+        if session.log_writer is None:
+            raise EventLogRecordingError("Manual first-crack audit has no log target.")
+        path = session.log_writer.log_dir / "first-crack-audit.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row: dict[str, object] = {
+            "version": 1,
+            "type": "manual_first_crack_audit",
+            "session_id": session.id,
+            "token": token,
+            "disposition": disposition,
+        }
+        with self._lock:
+            identity = self._manual_first_crack_audit_identities.get(token)
+        if identity is not None:
+            row.update(
+                {
+                    "session_id": identity.session_id,
+                    "recorded_at_utc": identity.recorded_at_utc.isoformat(),
+                    "monotonic_seconds": identity.monotonic_seconds,
+                    "capture_ownership_sequence": identity.capture_ownership_sequence,
+                    "writer_generation": identity.writer_generation,
+                }
+            )
+        frame = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+        try:
+            with path.open("ab+") as output:
+                before = os.fstat(output.fileno())
+                offset = output.tell()
+                output.write(frame)
+                output.flush()
+                os.fsync(output.fileno())
+                after = os.fstat(output.fileno())
+                if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                    raise EventLogRecordingError("Manual first-crack audit identity changed.")
+                output.seek(offset)
+                if output.read() != frame:
+                    raise EventLogRecordingError("Manual first-crack audit verification failed.")
+        except OSError as exc:
+            raise EventLogRecordingError("Manual first-crack audit was not verified.") from exc
+
+    def _append_and_verify_manual_first_crack_row(
+        self, session: RoastSession, event: RoastEvent
+    ) -> None:
+        """Append and read back exactly one canonical first-crack JSONL frame."""
+        if session.canonical_writer is not None:
+            _append_event_log_row(session, event)
+            return
+        if session.log_writer is None:
+            raise EventLogRecordingError("Manual first-crack record has no log target.")
+        path = session.log_writer.log_dir / "roast.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "session_id": session.id,
+            "type": "event",
+            "kind": event.kind,
+            "recorded_at_utc": event.recorded_at_utc.isoformat(),
+            "monotonic_seconds": event.monotonic_seconds,
+            "payload": dict(event.payload),
+        }
+        frame = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+        try:
+            with path.open("ab+") as output:
+                before = os.fstat(output.fileno())
+                offset = output.tell()
+                output.write(frame)
+                output.flush()
+                os.fsync(output.fileno())
+                after = os.fstat(output.fileno())
+                if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                    raise EventLogRecordingError(
+                        "Manual first-crack log identity changed during append."
+                    )
+                output.seek(offset)
+                if output.read() != frame:
+                    raise EventLogRecordingError(
+                        "Manual first-crack log frame verification failed."
+                    )
+        except OSError as exc:
+            raise EventLogRecordingError(
+                "Manual first-crack canonical record was not verified."
+            ) from exc
 
     def record_event(
         self,
@@ -3325,9 +5057,145 @@ class RoastSessionStore:
         provenance: Literal["manual_mark"] | None = None,
     ) -> tuple[RoastEvent, RoastSession]:
         """Record one event and return the event plus an atomic lightweight snapshot."""
+        writer = session.canonical_writer
+        if writer is None:
+            with self._lock:
+                event = self.record_event(session, kind, payload=payload, provenance=provenance)
+                return event, _copy_session_for_read(session)
+
+        # This is the composed mock path.  It deliberately admits the exact
+        # row under the store lock, then leaves that lock before waiting for
+        # the generation-owned writer.  A held ordinary mark must therefore
+        # not delay a state read or emergency driver's pre-dispatch section.
+        admission_key = (session.id, kind)
+        completion: Future[None] | None = None
+        submission_error: Exception | None = None
         with self._lock:
-            event = self.record_event(session, kind, payload=payload, provenance=provenance)
-            return event, _copy_session_for_read(session)
+            if provenance is not None and (
+                type(provenance) is not str
+                or provenance != "manual_mark"
+                or kind not in {"beans_added", "first_crack_detected"}
+            ):
+                raise SessionLifecycleError(
+                    "Manual provenance is valid only for charge or first crack."
+                )
+            is_manual_charge = kind == "beans_added" and provenance is not None
+            self._assert_latest_active_session(session)
+            if kind == "beans_dropped" and self._normal_drop_in_flight is not None:
+                raise SessionLifecycleError(
+                    "Beans dropped can only be recorded by the owned normal-drop settlement."
+                )
+            self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
+            if kind != "fault":
+                self._assert_finalisation_allows_mutation(session)
+            if session.faulted_at_utc is not None and kind != "fault":
+                raise SessionLifecycleError("No non-fault events can be recorded after a fault.")
+
+            existing_event = self._get_existing_singleton_event(session, kind)
+            if existing_event is not None:
+                return existing_event, _copy_session_for_read(session)
+            if is_manual_charge and (
+                session.manual_charge_persistence_uncertain
+                or session.manual_charge_persistence_zero
+            ):
+                # A later press has no authority to recast the original
+                # automatic charge's established persistence evidence.
+                raise _CanonicalAdmissionRefusedError(
+                    "Original automatic charge persistence evidence is already established."
+                )
+            if admission_key in self._canonical_event_admissions:
+                raise SessionLifecycleError("Canonical event admission is still pending.")
+            _validate_event_transition(session, kind)
+
+            recorded_at_utc = _normalize_event_recorded_at_utc(
+                session, recorded_at_utc=self._utc_now()
+            )
+            monotonic_seconds = _normalize_event_monotonic_seconds(
+                session,
+                monotonic_seconds=session.elapsed_monotonic_seconds(self._monotonic_now),
+            )
+            _validate_event_monotonic_order(
+                session,
+                kind=kind,
+                monotonic_seconds=monotonic_seconds,
+            )
+            event = RoastEvent(
+                kind=kind,
+                recorded_at_utc=recorded_at_utc,
+                monotonic_seconds=monotonic_seconds,
+                payload={} if payload is None else dict(payload),
+            )
+            self._canonical_event_admissions.add(admission_key)
+            if is_manual_charge:
+                session.manual_charge_persistence_pending = True
+            # A composed human charge owns both its store admission and its
+            # queued writer turn.  `submit_group` never runs inline, so the
+            # subsequent settlement remains outside the store lock.
+            try:
+                completion = writer.submit_group((_event_log_row(session, event),), lane="event")[0]
+            except Exception as error:
+                submission_error = error
+
+        try:
+            if submission_error is not None:
+                raise submission_error
+            if completion is None:
+                raise EventLogRecordingError("Canonical event record was not admitted.")
+            completion.result()
+        except _CanonicalAdmissionRefusedError:
+            with self._lock:
+                self._canonical_event_admissions.discard(admission_key)
+                if is_manual_charge:
+                    session.manual_charge_persistence_pending = False
+                    session.manual_charge_persistence_zero = True
+            raise
+        except Exception:
+            with self._lock:
+                self._canonical_event_admissions.discard(admission_key)
+                if is_manual_charge:
+                    session.manual_charge_persistence_pending = False
+                    session.manual_charge_persistence_uncertain = True
+            raise
+
+        with self._lock:
+            try:
+                # A verified human charge remains an exact historical fact
+                # after an emergency, but must not revive roast phase or live
+                # authority.  The fact preserves the existing guarded Drop
+                # and cooling recovery path for this exact stopped session.
+                if (
+                    is_manual_charge
+                    and self._latest_session is session
+                    and not session.active
+                    and session.faulted_at_utc is not None
+                ):
+                    _record_historical_manual_charge_locked(session, event, source=provenance)
+                    return event, _copy_session_for_read(session)
+                # Persistence is not authority to revive a session that a
+                # fault, replacement, or endpoint changed while its row was
+                # saving.
+                self._assert_latest_active_session(session)
+                self._assert_normal_drop_persistence_allows_competing_writer_locked(session)
+                if session.faulted_at_utc is not None:
+                    raise SessionLifecycleError(
+                        "No non-fault events can be recorded after a fault."
+                    )
+                if self._get_existing_singleton_event(session, kind) is not None:
+                    raise SessionLifecycleError(
+                        "Canonical event admission was displaced while saving."
+                    )
+                _validate_event_transition(session, kind)
+                session.event_timeline.append(event)
+                _apply_event_timestamp(session, event)
+                if provenance is not None:
+                    if kind == "beans_added":
+                        session.beans_added_source = provenance
+                        session.manual_charge_persistence_pending = False
+                    else:
+                        session.first_crack_source = provenance
+                return event, _copy_session_for_read(session)
+            finally:
+                self._canonical_event_admissions.discard(admission_key)
 
     def process_auto_t0_reading_snapshot(
         self,
@@ -3335,6 +5203,8 @@ class RoastSessionStore:
         *,
         bean_temp_c: float,
         drop_threshold_c: float,
+        defer_canonical_settlement: bool = False,
+        on_live_settlement: Callable[[], None] | None = None,
     ) -> tuple[RoastEvent | None, RoastSession]:
         """Process one bean-temperature reading for automatic T0 detection.
 
@@ -3342,6 +5212,15 @@ class RoastSessionStore:
             session: Session to mutate.
             bean_temp_c: Current bean temperature from the configured driver.
             drop_threshold_c: Required drop from max preheat temperature.
+
+        Args:
+            defer_canonical_settlement: Keep the exact accepted writer turn
+                owned by its generation and settle it from its completion
+                callback. This is used only by the autonomous manual/mock
+                sampler so a held recorder cannot suppress later driver reads.
+            on_live_settlement: Called after a deferred turn becomes the
+                current session's verified live charge. It is never called for
+                historical or failed settlement.
 
         Returns:
             The recorded beans-added event when this reading crosses the
@@ -3355,6 +5234,11 @@ class RoastSessionStore:
             SessionLifecycleError: If called outside the pre-T0 active phase or
                 with non-finite inputs.
         """
+        writer: _CanonicalGenerationWriter | None = None
+        event: RoastEvent | None = None
+        completion: Future[None] | None = None
+        submission_error: Exception | None = None
+        admission_key = (session.id, "beans_added")
         with self._lock:
             self._assert_latest_active_session(session)
             if self._finalisation_blocks_mutation(session):
@@ -3363,6 +5247,17 @@ class RoastSessionStore:
                 return self._get_existing_singleton_event(session, "beans_added"), (
                     _copy_session_for_read(session)
                 )
+            # One automatic charge is one exact observation.  Once its
+            # admitted writer turn has settled uncertainly, a later
+            # temperature read must remain useful without submitting a new
+            # charge or recasting that prior uncertainty as known-zero.
+            if (
+                session.manual_charge_persistence_uncertain
+                or session.manual_charge_persistence_zero
+            ):
+                return None, _copy_session_for_read(session)
+            if admission_key in self._canonical_event_admissions:
+                return None, _copy_session_for_read(session)
             _validate_event_transition(session, "beans_added")
             current_temp = float(bean_temp_c)
             threshold = float(drop_threshold_c)
@@ -3398,23 +5293,190 @@ class RoastSessionStore:
                 # back to the confirmation tick rather than crash.
                 turning_point_elapsed_seconds = confirmation_elapsed_seconds
 
-            event = self._record_backdated_beans_added(
+            payload: dict[str, EventPayloadValue] = {
+                "source": "auto_t0",
+                "charge_temperature_c": round(previous_max, 3),
+                "detected_bean_temperature_c": round(current_temp, 3),
+                "drop_c": round(drop_c, 3),
+                "drop_threshold_c": round(threshold, 3),
+                "turning_point_monotonic_seconds": round(turning_point_elapsed_seconds, 3),
+                "confirmed_at_monotonic_seconds": round(confirmation_elapsed_seconds, 3),
+                "confirmed_at_utc": confirmation_at_utc.isoformat(),
+            }
+            writer = session.canonical_writer
+            if writer is None:
+                event = self._record_backdated_beans_added(
+                    session,
+                    turning_point_elapsed_seconds=turning_point_elapsed_seconds,
+                    confirmation_elapsed_seconds=confirmation_elapsed_seconds,
+                    confirmation_at_utc=confirmation_at_utc,
+                    payload=payload,
+                )
+                return event, _copy_session_for_read(session)
+            event = self._new_backdated_beans_added(
                 session,
                 turning_point_elapsed_seconds=turning_point_elapsed_seconds,
                 confirmation_elapsed_seconds=confirmation_elapsed_seconds,
-                confirmation_at_utc=confirmation_at_utc,
-                payload={
-                    "source": "auto_t0",
-                    "charge_temperature_c": round(previous_max, 3),
-                    "detected_bean_temperature_c": round(current_temp, 3),
-                    "drop_c": round(drop_c, 3),
-                    "drop_threshold_c": round(threshold, 3),
-                    "turning_point_monotonic_seconds": round(turning_point_elapsed_seconds, 3),
-                    "confirmed_at_monotonic_seconds": round(confirmation_elapsed_seconds, 3),
-                    "confirmed_at_utc": confirmation_at_utc.isoformat(),
-                },
+                payload=payload,
             )
-            return event, _copy_session_for_read(session)
+            self._canonical_event_admissions.add(admission_key)
+            session.manual_charge_persistence_pending = True
+            # `submit_group` always queues to the owned executor; unlike the
+            # convenience `submit` method it has no writer-thread inline-I/O
+            # branch.  Thus the exact auto-T0 frame is enqueued with its
+            # store admission, while completion still settles outside this
+            # lock.
+            try:
+                completion = writer.submit_group((_event_log_row(session, event),), lane="event")[0]
+            except Exception as error:
+                submission_error = error
+
+        assert writer is not None and event is not None
+        if defer_canonical_settlement:
+            if submission_error is not None:
+                self._settle_deferred_auto_t0(
+                    session=session,
+                    event=event,
+                    admission_key=admission_key,
+                    completion=None,
+                    submission_error=submission_error,
+                    on_live_settlement=on_live_settlement,
+                )
+            elif completion is None:
+                self._settle_deferred_auto_t0(
+                    session=session,
+                    event=event,
+                    admission_key=admission_key,
+                    completion=None,
+                    submission_error=EventLogRecordingError(
+                        "Automatic charge record was not admitted."
+                    ),
+                    on_live_settlement=on_live_settlement,
+                )
+            else:
+                completion.add_done_callback(
+                    lambda result: self._settle_deferred_auto_t0(
+                        session=session,
+                        event=event,
+                        admission_key=admission_key,
+                        completion=result,
+                        submission_error=None,
+                        on_live_settlement=on_live_settlement,
+                    )
+                )
+            # An accepted deferred row is not live until its exact completion
+            # settles. In particular, do not discard pre-T0 observations or
+            # project roast phase from this producer turn.
+            return None, _copy_session_for_read(session)
+
+        try:
+            if submission_error is not None:
+                raise submission_error
+            if completion is None:
+                raise EventLogRecordingError("Automatic charge record was not admitted.")
+            completion.result()
+        except _CanonicalAdmissionRefusedError:
+            with self._lock:
+                self._canonical_event_admissions.discard(admission_key)
+                session.manual_charge_persistence_pending = False
+                session.manual_charge_persistence_zero = True
+            raise
+        except Exception:
+            with self._lock:
+                self._canonical_event_admissions.discard(admission_key)
+                session.manual_charge_persistence_pending = False
+                session.manual_charge_persistence_uncertain = True
+            raise
+
+        with self._lock:
+            try:
+                if (
+                    self._latest_session is session
+                    and not session.active
+                    and session.faulted_at_utc is not None
+                ):
+                    _record_historical_manual_charge_locked(session, event)
+                    return event, _copy_session_for_read(session)
+                self._assert_latest_active_session(session)
+                if self._get_existing_singleton_event(session, "beans_added") is not None:
+                    raise SessionLifecycleError(
+                        "Canonical event admission was displaced while saving."
+                    )
+                _validate_event_transition(session, "beans_added")
+                session.event_timeline.append(event)
+                _apply_event_timestamp(session, event)
+                session.beans_added_source = "auto_t0"
+                session.manual_charge_persistence_pending = False
+                session.manual_charge_persistence_zero = False
+                return event, _copy_session_for_read(session)
+            finally:
+                self._canonical_event_admissions.discard(admission_key)
+
+    def _settle_deferred_auto_t0(
+        self,
+        *,
+        session: RoastSession,
+        event: RoastEvent,
+        admission_key: tuple[str, RoastEventKind],
+        completion: Future[None] | None,
+        submission_error: Exception | None,
+        on_live_settlement: Callable[[], None] | None,
+    ) -> None:
+        """Settle one exact deferred automatic-charge writer turn.
+
+        This callback never dispatches a driver command. It records only the
+        exact turn it was given, retaining a verified row as historical when
+        lifecycle ownership changed before completion.
+        """
+        error = submission_error
+        if error is None:
+            try:
+                if completion is None:
+                    raise EventLogRecordingError("Automatic charge record was not admitted.")
+                completion.result()
+            except Exception as exc:  # noqa: BLE001 - writer owns exact failure evidence.
+                error = exc
+        if error is not None:
+            with self._lock:
+                self._canonical_event_admissions.discard(admission_key)
+                session.manual_charge_persistence_pending = False
+                if isinstance(error, _CanonicalAdmissionRefusedError) and error.known_zero:
+                    session.manual_charge_persistence_zero = True
+                else:
+                    session.manual_charge_persistence_uncertain = True
+            return
+
+        live_settled = False
+        with self._lock:
+            try:
+                current = self._latest_session is session and session.active
+                if (
+                    current
+                    and session.faulted_at_utc is None
+                    and self._get_existing_singleton_event(session, "beans_added") is None
+                ):
+                    _validate_event_transition(session, "beans_added")
+                    session.event_timeline.append(event)
+                    _apply_event_timestamp(session, event)
+                    session.beans_added_source = "auto_t0"
+                    session.manual_charge_persistence_pending = False
+                    session.manual_charge_persistence_zero = False
+                    live_settled = True
+                else:
+                    # A completed exact turn may still be retained for its own
+                    # generation after fault, shutdown, or replacement, but it
+                    # must never project phase or authority into that state.
+                    if event not in session.event_timeline:
+                        _record_historical_manual_charge_locked(session, event)
+            finally:
+                self._canonical_event_admissions.discard(admission_key)
+        if live_settled and on_live_settlement is not None:
+            try:
+                on_live_settlement()
+            except Exception:
+                # Observer notification cannot recast a verified canonical
+                # charge as a sampler failure or alter its settled evidence.
+                return
 
     def _record_backdated_beans_added(
         self,
@@ -3445,6 +5507,27 @@ class RoastSessionStore:
         Returns:
             The recorded, backdated ``beans_added`` event.
         """
+        event = self._new_backdated_beans_added(
+            session,
+            turning_point_elapsed_seconds=turning_point_elapsed_seconds,
+            confirmation_elapsed_seconds=confirmation_elapsed_seconds,
+            payload=payload,
+        )
+        _append_event_log_row(session, event)
+        session.event_timeline.append(event)
+        _apply_event_timestamp(session, event)
+        session.beans_added_source = "auto_t0"
+        return event
+
+    def _new_backdated_beans_added(
+        self,
+        session: RoastSession,
+        *,
+        turning_point_elapsed_seconds: float,
+        confirmation_elapsed_seconds: float,
+        payload: dict[str, EventPayloadValue],
+    ) -> RoastEvent:
+        """Build one automatic T0 row without performing persistence."""
         backdated_elapsed_seconds = round(turning_point_elapsed_seconds, 6)
         # The turning point can never be after the confirmation tick or before
         # the session start; clamp defensively so the timeline stays ordered.
@@ -3466,17 +5549,12 @@ class RoastSessionStore:
             kind="beans_added",
             monotonic_seconds=monotonic_seconds,
         )
-        event = RoastEvent(
+        return RoastEvent(
             kind="beans_added",
             recorded_at_utc=recorded_at_utc,
             monotonic_seconds=monotonic_seconds,
             payload=dict(payload),
         )
-        _append_event_log_row(session, event)
-        session.event_timeline.append(event)
-        _apply_event_timestamp(session, event)
-        session.beans_added_source = "auto_t0"
-        return event
 
     def record_first_crack_window_observation(
         self,
@@ -3647,6 +5725,11 @@ class RoastSessionStore:
                 if safety_payload is None
                 else dict(safety_payload)
             )
+            if session.manual_first_crack_pending or session.first_crack_source == "manual_mark":
+                # A fault cannot make an accepted or still-writing human mark
+                # eligible for standard replay. This is evidence-only state;
+                # it deliberately has no driver consequence.
+                session.manual_first_crack_export_disqualified = True
             _apply_emergency_safety_payload(session, normalized_safety_payload)
             event_payload = _build_emergency_fault_payload(
                 reason=reason,
@@ -4272,6 +6355,8 @@ class RoastSessionStore:
                 log_dir=self._default_log_dir / session_id,
             ),
         )
+        if self._manual_first_crack_writer_enabled:
+            session.canonical_writer = _CanonicalGenerationWriter(session=session)
         self._latest_session = session
         self._sessions_by_id[session_id] = session
         self._session_id_order.append(session_id)
@@ -4293,9 +6378,29 @@ class RoastSessionStore:
             raise SessionLifecycleError(
                 "Cannot start a roast session until post-drop cooling is started and stopped."
             )
+        if session is not None and session.id in self._historical_fault_drop_start_blocks:
+            raise SessionLifecycleError(
+                "Cannot start a roast session after a superseded recovery bean drop."
+            )
         if session is not None and session.id in self._fault_drop_ambiguity_required:
             raise SessionLifecycleError(
                 "Cannot start a roast session after an ambiguous bean drop."
+            )
+        if session is not None and _has_unrecorded_charge_attempt(session):
+            raise SessionLifecycleError(
+                "Cannot start a roast session while a charge attempt has no canonical record."
+            )
+        if (
+            session is not None
+            and not session.active
+            and session.faulted_at_utc is not None
+            and session.beans_added_at_utc is not None
+            and not _has_recorded_beans_dropped(session)
+            and not session.unrecorded_fault_recovery_drop_accepted
+            and not self._has_settled_known_zero_ordinary_discharge_locked(session)
+        ):
+            raise SessionLifecycleError(
+                "Cannot start a roast session until post-fault bean discharge is verified."
             )
         if (
             session is not None
@@ -4317,6 +6422,38 @@ class RoastSessionStore:
             raise SessionLifecycleError("Cannot start a roast session during fault recovery.")
         if session is not None and session.id in self._fault_recovery_in_flight_tokens:
             raise SessionLifecycleError("Cannot start a roast session during fault recovery I/O.")
+
+    def _has_verified_known_zero_ordinary_discharge_locked(self, session: RoastSession) -> bool:
+        """Return the exact qualified ordinary-Drop discharge evidence.
+
+        Only a pre-dispatch coupled-group refusal can create the zero fact.
+        The current stopped-fault controls must still be the verified emergency
+        containment projection; a raw returned flag or incomplete writer alone
+        is never sufficient.
+        """
+        return (
+            session.verified_ordinary_driver_drop
+            and session.ordinary_drop_persistence_zero
+            and not session.unrecorded_driver_drop
+            and session.mock_log_torn
+            and session.heat_level_percent == 0
+            and session.fan_level_percent == 100
+            and session.cooling_on
+        )
+
+    def _has_settled_known_zero_ordinary_discharge_locked(self, session: RoastSession) -> bool:
+        """Return qualified discharge evidence after its exact cooling settlement."""
+        return (
+            session.verified_ordinary_driver_drop
+            and session.ordinary_drop_persistence_zero
+            and session.ordinary_drop_persistence_zero_cooling_settled
+            and not session.unrecorded_driver_drop
+            and session.mock_log_torn
+            and session.heat_level_percent == 0
+            and not session.cooling_on
+            and session.pending_driver_command_token is None
+            and session.id not in self._fault_recovery_in_flight_tokens
+        )
 
     def _assert_session_start_reservation(
         self,
@@ -4364,14 +6501,18 @@ class RoastSessionStore:
             raise SessionLifecycleError("The exact normal bean-drop log has an uncertain tail.")
         if kind == "drop" and self._normal_drop_in_flight is not None:
             raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
+        if kind == "control" and session.pending_driver_command_token is not None:
+            raise SessionLifecycleError("Another driver command is already in progress.")
+        if kind == "control" and self._normal_drop_in_flight is not None:
+            raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
+        if kind == "control" and self._ordinary_drop_is_unresolved_locked(session):
+            # An owned, returned-unsettled, or unknown ordinary Drop may
+            # already have moved beans. Controls must not enter the driver on
+            # that unresolved batch; cooling and emergency routes retain their
+            # separately established admission rules.
+            raise SessionLifecycleError("A prior bean-drop outcome is unresolved.")
         if session.pending_driver_command_token is not None:
             raise SessionLifecycleError("Another driver command is already in progress.")
-        if (
-            kind == "control"
-            and self._normal_drop_in_flight is not None
-            and self._normal_drop_reservation_matches_locked(session, self._normal_drop_in_flight)
-        ):
-            raise SessionLifecycleError("A normal bean-drop operation is unresolved.")
         reservation = DriverCommandReservation(
             session_id=session.id,
             token=_generate_session_id(),
@@ -4380,6 +6521,19 @@ class RoastSessionStore:
         session.pending_driver_command_token = reservation.token
         session.pending_driver_command_kind = reservation.kind
         return reservation
+
+    def _ordinary_drop_is_unresolved_locked(self, session: RoastSession) -> bool:
+        """Return whether an ordinary Drop may have moved beans without settlement."""
+        operation = self._normal_drop_in_flight
+        return (
+            session.ordinary_driver_drop_dispatch_owned
+            or session.verified_ordinary_driver_drop
+            or session.unrecorded_driver_drop
+            or (
+                operation is not None
+                and self._normal_drop_reservation_matches_locked(session, operation)
+            )
+        )
 
     def _normal_drop_exact_identity_rejection_locked(
         self, identity: NormalDropIdentity
@@ -4544,10 +6698,61 @@ class RoastSessionStore:
         event = self._new_emergency_fault_event_locked(
             session, payload=payload, allow_stopped_latest=allow_stopped_latest
         )
-        _append_event_log_row(session, event)
-        session.event_timeline.append(event)
+        if session.canonical_writer is not None:
+            # Canonical storage never runs while emergency admission owns the
+            # store lock. This covers both an ordinary fault-only turn and a
+            # fault queued behind an accepted human FC.
+            completion = session.canonical_writer.submit(
+                _event_log_row(session, event), lane="event"
+            )
+            self._emergency_fault_completions[id(event)] = (event, completion)
+
+            def settle_fault_write(result: Future[None]) -> None:
+                """Publish the deferred fault history only after its exact turn verifies."""
+                try:
+                    result.result()
+                except Exception:
+                    # The writer latches incomplete evidence itself.  Keep the
+                    # fault's already-recorded containment state, but never
+                    # manufacture a durable timeline row for a failed append.
+                    return
+                with self._lock:
+                    if event not in session.event_timeline:
+                        session.event_timeline.append(event)
+
+            completion.add_done_callback(settle_fault_write)
+
+            def retire_unclaimed_fault_write(result: Future[None]) -> None:
+                """Retire a settled turn that no handler took ownership of."""
+                del result
+                with self._lock:
+                    current = self._emergency_fault_completions.get(id(event))
+                    if current is not None and current[0] is event and current[1] is completion:
+                        del self._emergency_fault_completions[id(event)]
+
+            completion.add_done_callback(retire_unclaimed_fault_write)
+        else:
+            _append_event_log_row(session, event)
+            session.event_timeline.append(event)
         _apply_event_timestamp(session, event)
         return event
+
+    def emergency_fault_completion(self, event: RoastEvent) -> Future[None] | None:
+        """Return the deferred append owned by this exact emergency fault."""
+        with self._lock:
+            current = self._emergency_fault_completions.get(id(event))
+            if current is not None and current[0] is event:
+                del self._emergency_fault_completions[id(event)]
+                return current[1]
+            if any(
+                recorded is event
+                for session in self._sessions_by_id.values()
+                for recorded in session.event_timeline
+            ):
+                return None
+        failed: Future[None] = Future()
+        failed.set_exception(EventLogRecordingError("Emergency fault save failed or is unknown."))
+        return failed
 
     def _new_emergency_fault_event_locked(
         self,
@@ -4621,6 +6826,54 @@ def _apply_event_timestamp(session: RoastSession, event: RoastEvent) -> None:
         session.phase = "fault"
         session.faulted_at_utc = event.recorded_at_utc
         session.faulted_monotonic_seconds = event.monotonic_seconds
+
+
+def _record_historical_manual_charge_locked(
+    session: RoastSession,
+    event: RoastEvent,
+    *,
+    source: Literal["manual_mark", "auto_t0"] | None = None,
+) -> None:
+    """Retain one verified pre-fault charge without reopening the roast.
+
+    The caller holds the store lock and has proved that this exact accepted
+    canonical row completed after an emergency displaced its live settlement.
+    """
+    fault_index = next(
+        (
+            index
+            for index, existing in enumerate(session.event_timeline)
+            if existing.kind == "fault"
+        ),
+        len(session.event_timeline),
+    )
+    session.event_timeline.insert(fault_index, event)
+    session.beans_added_at_utc = event.recorded_at_utc
+    session.beans_added_monotonic_seconds = event.monotonic_seconds
+    event_source = source if source is not None else event.payload.get("source")
+    if event_source == "manual_mark":
+        session.beans_added_source = "manual_mark"
+    elif event_source == "auto_t0":
+        session.beans_added_source = "auto_t0"
+    else:
+        session.beans_added_source = None
+    session.manual_charge_persistence_pending = False
+
+
+def _has_unresolved_manual_charge(session: RoastSession) -> bool:
+    """Return whether a manual charge may exist without verified discharge."""
+    return session.manual_charge_persistence_pending or session.manual_charge_persistence_uncertain
+
+
+def _has_unrecorded_charge_attempt(session: RoastSession) -> bool:
+    """Return whether an original charge attempt lacks a canonical event.
+
+    A known-zero result establishes only that its canonical row was never
+    written; it does not establish that the operator did not charge the drum.
+    This is exact-session recovery evidence and intentionally does not consult
+    the generation-wide torn flag.
+    """
+    return _has_unresolved_manual_charge(session) or session.manual_charge_persistence_zero
 
 
 def _detected_elapsed_seconds(
@@ -4912,4 +7165,14 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         unpersisted_mock_drop_fault_count=session.unpersisted_mock_drop_fault_count,
         torn_start_cooling_attempted=session.torn_start_cooling_attempted,
         unconfirmed_torn_start_cooling_attempted=session.unconfirmed_torn_start_cooling_attempted,
+        unrecorded_fault_recovery_drop_accepted=(session.unrecorded_fault_recovery_drop_accepted),
+        manual_first_crack_pending=session.manual_first_crack_pending,
+        manual_first_crack_export_disqualified=session.manual_first_crack_export_disqualified,
+        manual_first_crack_admission_expired=session.manual_first_crack_admission_expired,
+        manual_first_crack_canonical_evidence=session.manual_first_crack_canonical_evidence,
+        manual_first_crack_audit_unresolved=session.manual_first_crack_audit_unresolved,
+        manual_first_crack_endpoint_admitted=session.manual_first_crack_endpoint_admitted,
+        manual_charge_persistence_pending=session.manual_charge_persistence_pending,
+        manual_charge_persistence_uncertain=session.manual_charge_persistence_uncertain,
+        manual_charge_persistence_zero=session.manual_charge_persistence_zero,
     )
