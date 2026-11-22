@@ -10,7 +10,7 @@ from importlib import import_module
 from math import isfinite
 from threading import Event, Lock, Thread
 from time import monotonic
-from typing import Any, Literal, Protocol, cast, runtime_checkable
+from typing import Any, Literal, Never, Protocol, cast, runtime_checkable
 
 from coffee_roaster_mcp.controls import validate_control_percent
 from coffee_roaster_mcp.session import EventPayloadValue, SessionPurpose
@@ -524,10 +524,6 @@ HottopSettlementResult = Literal[
 HottopAttemptRole = Literal["ordinary", "drop", "emergency", "repeat"]
 
 
-class HottopDropRefused(RuntimeError):
-    """Raised when candidate-mode Drop admission retains uncertain ownership."""
-
-
 @dataclass(frozen=True)
 class HottopWriteAttempt:
     """Bounded host-side evidence for one candidate command write entry."""
@@ -556,6 +552,45 @@ class HottopCommandSettlement:
     attempt_handle_identity: int | None = None
     attempt_seq: int | None = None
     attempt_revision: int | None = None
+
+
+HottopExactDropRefusalReason = Literal[
+    "candidate_mode_required",
+    "receipt_age_bound_unset",
+    "stop_first",
+    "stream_lost",
+    "receipt_replaced",
+    "receipt_missing",
+    "receipt_ineligible",
+    "receipt_expired",
+    "prior_unresolved",
+]
+
+
+@dataclass(frozen=True)
+class HottopExactDropRefusalEvidence:
+    """Closed driver evidence for one refused candidate exact-Drop invocation.
+
+    `retained_prior_drop` is separate from the invocation reason: it identifies
+    a prior unsettled Drop without inferring that its commanded or physical
+    effect is absent.
+    """
+
+    reason: HottopExactDropRefusalReason
+    retained_prior_drop: HottopCommandSettlement | None = None
+
+
+class HottopDropRefused(RuntimeError):
+    """Legacy base for candidate-mode Drop admission refusal."""
+
+
+class HottopExactDropRefused(HottopDropRefused):
+    """Raised with typed evidence when an exact candidate Drop is refused."""
+
+    def __init__(self, evidence: HottopExactDropRefusalEvidence) -> None:
+        """Store closed refusal evidence while retaining RuntimeError compatibility."""
+        self.evidence = evidence
+        super().__init__(evidence.reason)
 
 
 @dataclass(frozen=True)
@@ -2224,6 +2259,14 @@ class HottopRoasterDriver:
                     return
                 if self._command_thread is not None and self._command_thread.is_alive():
                     raise RuntimeError("Previous Hottop command loop is still stopping.")
+                if (
+                    self._hottop_reception == "candidate/v1"
+                    and self._reception_epoch != 0
+                    and not self._candidate_prestart_clear_locked()
+                ):
+                    raise RuntimeError(
+                        "candidate/v1 requires known-clear command ownership before reconnect."
+                    )
                 if self._port is None:
                     raise ValueError("Hottop serial port is required before connect.")
                 port = self._port
@@ -2499,13 +2542,21 @@ class HottopRoasterDriver:
         return self.read_state()
 
     def _candidate_streaming_owner_locked(self) -> bool:
-        """Return whether this driver still owns an active candidate stream."""
+        """Return whether one staged owner still owns the live candidate stream."""
+        command_thread = self._command_thread
         return bool(
             self._serial is not None
             and self._serial.is_open
             and self._connected
             and not self._disconnect_requested.is_set()
             and not self._stop_event.is_set()
+            and self._start_owner is not None
+            and self._start_phase is HottopStartPhase.STREAMING
+            and self._start_handle is self._serial
+            and self._start_stream_admission is not None
+            and self._start_stream_admission.is_set()
+            and command_thread is not None
+            and command_thread.is_alive()
         )
 
     def _drop_is_unresolved_locked(self) -> bool:
@@ -2518,31 +2569,54 @@ class HottopRoasterDriver:
     def _admit_exact_drop_locked(self, exact_drop: HottopExactDropArbitration) -> None:
         """Recheck one receipt identity and admit only an exact candidate Drop."""
         if self._hottop_reception != "candidate/v1":
-            raise HottopDropRefused("candidate exact Drop requires candidate/v1 reception.")
+            self._raise_exact_drop_refused("candidate_mode_required")
         age_bound = self._simulation_receipt_age_bound_seconds
         if age_bound is None:
-            raise HottopDropRefused(
-                "candidate exact Drop requires a configured simulation receipt age bound."
-            )
+            self._raise_exact_drop_refused("receipt_age_bound_unset")
         candidate = exact_drop.candidate
+        if not candidate.receipt_classification.eligible:
+            self._raise_exact_drop_refused("receipt_ineligible")
+        if self._drop_is_unresolved_locked():
+            self._raise_exact_drop_refused("prior_unresolved")
+        if candidate.emergency_count != self._emergency_count:
+            self._raise_exact_drop_refused("stop_first")
         if not candidate.streaming or not self._candidate_streaming_owner_locked():
-            raise HottopDropRefused("candidate exact Drop stream ownership was revoked.")
+            self._raise_exact_drop_refused("stream_lost")
         if (
             candidate.epoch != self._reception_epoch
             or candidate.handle_token != self._reception_handle_token
-            or candidate.receipt_sequence != self._reception_sequence
-            or candidate.receipt is not self._reception_record
-            or candidate.drop_transition_count != self._drop_transition_count
-            or candidate.emergency_count != self._emergency_count
+        ):
+            self._raise_exact_drop_refused("stream_lost")
+        if candidate.receipt is not self._reception_record:
+            self._raise_exact_drop_refused(
+                "receipt_missing" if self._reception_record is None else "receipt_replaced"
+            )
+        if candidate.receipt_sequence != self._reception_sequence:
+            self._raise_exact_drop_refused("receipt_replaced")
+        if (
+            candidate.drop_transition_count != self._drop_transition_count
             or candidate.drop_settlement != self._drop_settlement
             or candidate.emergency_settlements != tuple(self._emergency_settlements)
         ):
-            raise HottopDropRefused("candidate exact Drop snapshot was superseded.")
+            self._raise_exact_drop_refused("receipt_replaced")
         classification = self._classify_current_receipt_locked()
         if not classification.eligible:
-            raise HottopDropRefused("candidate exact Drop receipt is not eligible.")
-        if self._drop_is_unresolved_locked():
-            raise HottopDropRefused("candidate Drop retains an unresolved command settlement.")
+            reason: HottopExactDropRefusalReason = (
+                "receipt_expired"
+                if "receipt_age_exceeds_bound" in classification.reasons
+                else "receipt_ineligible"
+            )
+            self._raise_exact_drop_refused(reason)
+
+    def _raise_exact_drop_refused(self, reason: HottopExactDropRefusalReason) -> Never:
+        """Raise typed exact-Drop refusal without erasing retained ownership."""
+        prior_drop = self._drop_settlement
+        retained_prior_drop = (
+            prior_drop
+            if prior_drop is not None and prior_drop.result in {"pending", "entering", "unknown"}
+            else None
+        )
+        raise HottopExactDropRefused(HottopExactDropRefusalEvidence(reason, retained_prior_drop))
 
     def _classify_current_receipt_locked(self) -> HottopReceiptClassification:
         """Classify the current receipt from this driver's injected host clock."""
