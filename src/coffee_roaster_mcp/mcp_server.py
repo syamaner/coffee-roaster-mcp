@@ -2325,6 +2325,22 @@ def create_mcp_server(
                         )
                         if not driver.asserted_written_start(owner, published_session):
                             raise SessionLifecycleError("Staged Hottop start changed after setup.")
+                        if driver.capabilities.hottop_reception_candidate_version == 1:
+                            result = StartRoastSessionResult(
+                                session=_serialize_session_state(
+                                    session,
+                                    config=server_context.config,
+                                    first_crack_runtime=server_context.first_crack_runtime.snapshot(),
+                                    first_crack_observation=(
+                                        server_context.first_crack_runtime.observation_for_session(
+                                            session.id
+                                        )
+                                    ),
+                                    ambient_runtime=server_context.ambient_runtime.snapshot(),
+                                )
+                            )
+                            driver.hand_off_written_start_to_stream(owner, published_session)
+                            return result
                 except BaseException:
                     for stop_runtime in started:
                         with suppress(Exception):

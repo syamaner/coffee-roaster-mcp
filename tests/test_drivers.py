@@ -3797,6 +3797,191 @@ def test_claimed_first_write_consumes_entry_before_native_write(
     assert transport.writes == [claim.frame]
 
 
+def test_candidate_claimed_first_write_hands_off_same_handle_and_epoch() -> None:
+    """The simulated first frame becomes the sole serial stream owner once verified."""
+    transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        command_interval_seconds=0.01,
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    owner = driver.reserve_inhibited_start("server")
+    driver.open_inhibited_start(owner)
+    driver.begin_inhibited_start_promotion(owner)
+    session = object()
+    driver.bind_promoted_inhibited_start(owner, session)
+    claim = driver.claim_prepared_first_write(driver.prepare_promoted_first_write(owner, session))
+
+    assert driver.dispatch_claimed_first_write(claim) is HottopFirstWriteDisposition.WRITTEN
+    assert transport.writes_snapshot() == [claim.frame]
+    assert claim.epoch is not None
+    first_attempt = driver._attempt_history[0]  # pyright: ignore[reportPrivateUsage]
+    assert (first_attempt.role, first_attempt.result, first_attempt.epoch) == (
+        "ordinary",
+        "accepted_by_host",
+        claim.epoch,
+    )
+    driver.hand_off_written_start_to_stream(owner, session)
+    assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.STREAMING)
+    assert _wait_for_hottop_write(transport, lambda _frame: True, start_index=1) == claim.frame
+    assert driver._attempt_history[-1].epoch == claim.epoch  # pyright: ignore[reportPrivateUsage]
+
+    driver.disconnect()
+
+    assert driver.inspect_inhibited_start() == (None, None)
+    replacement = driver.reserve_inhibited_start("replacement")
+    assert driver.abort_inhibited_start(replacement) is HottopStartSettlement.NOT_ENTERED
+
+
+def test_candidate_stop_before_admission_records_no_first_write_attempt() -> None:
+    """A candidate Stop after claim supersedes first-byte admission without native I/O."""
+    transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    owner = driver.reserve_inhibited_start("server")
+    driver.open_inhibited_start(owner)
+    driver.begin_inhibited_start_promotion(owner)
+    session = object()
+    driver.bind_promoted_inhibited_start(owner, session)
+    claim = driver.claim_prepared_first_write(driver.prepare_promoted_first_write(owner, session))
+    driver.emergency_stop(reason="test")
+
+    with pytest.raises(RuntimeError, match="superseded before admission"):
+        driver.dispatch_claimed_first_write(claim)
+
+    assert transport.writes_snapshot() == []
+    assert driver._attempt_history == []  # pyright: ignore[reportPrivateUsage]
+    assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.CLAIMED)
+
+
+def test_candidate_pending_stop_refuses_reservation_before_factory_open() -> None:
+    """A pending candidate Stop fences a later Start before it can open a transport."""
+    factory = FakeSerialFactory()
+    driver = HottopRoasterDriver(
+        port="fake", serial_factory=factory, hottop_reception="candidate/v1"
+    )
+    driver.emergency_stop(reason="test")
+
+    with pytest.raises(RuntimeError, match="known-clear"):
+        driver.reserve_inhibited_start("server")
+
+    assert factory.calls == []
+
+
+@pytest.mark.parametrize("receipt", [True, HOTTOP_PACKET_LENGTH - 1])
+def test_candidate_first_write_requires_an_exact_integer_receipt(receipt: object) -> None:
+    """A bool or short candidate receipt retains unknown first-write ownership."""
+
+    class Transport(FakeSerialTransport):
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return cast(int, receipt)
+
+    transport = Transport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    owner = driver.reserve_inhibited_start("server")
+    driver.open_inhibited_start(owner)
+    driver.begin_inhibited_start_promotion(owner)
+    session = object()
+    driver.bind_promoted_inhibited_start(owner, session)
+    claim = driver.claim_prepared_first_write(driver.prepare_promoted_first_write(owner, session))
+
+    assert driver.dispatch_claimed_first_write(claim) is HottopFirstWriteDisposition.UNKNOWN
+    assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.UNRESOLVED)
+    assert driver._attempt_history[-1].result == "unknown"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_candidate_first_write_exception_retains_unknown_ownership() -> None:
+    """A raising candidate first write records unknown receipt evidence and does not stream."""
+    transport = FailingSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    owner = driver.reserve_inhibited_start("server")
+    driver.open_inhibited_start(owner)
+    driver.begin_inhibited_start_promotion(owner)
+    session = object()
+    driver.bind_promoted_inhibited_start(owner, session)
+    claim = driver.claim_prepared_first_write(driver.prepare_promoted_first_write(owner, session))
+
+    with pytest.raises(OSError, match="serial write failed"):
+        driver.dispatch_claimed_first_write(claim)
+
+    assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.UNRESOLVED)
+    assert driver._attempt_history[-1].result == "unknown"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_candidate_stop_during_blocked_first_write_is_not_delayed() -> None:
+    """Candidate Stop remains state-lock-only while the first native write is blocked."""
+    transport = BlockingWriteSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    owner = driver.reserve_inhibited_start("server")
+    driver.open_inhibited_start(owner)
+    driver.begin_inhibited_start_promotion(owner)
+    session = object()
+    driver.bind_promoted_inhibited_start(owner, session)
+    claim = driver.claim_prepared_first_write(driver.prepare_promoted_first_write(owner, session))
+    outcomes: list[HottopFirstWriteDisposition] = []
+    worker = Thread(target=lambda: outcomes.append(driver.dispatch_claimed_first_write(claim)))
+    worker.start()
+    assert transport.started.wait(timeout=1.0)
+
+    driver.emergency_stop(reason="test")
+    assert transport.writes_snapshot() == [claim.frame]
+    transport.release.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert outcomes == [HottopFirstWriteDisposition.WRITTEN]
+    assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.WRITTEN)
+
+
+def test_candidate_disconnect_close_failure_retains_stream_owner() -> None:
+    """A failed candidate stream close fences reconnect behind unresolved ownership."""
+
+    class FailingCloseTransport(FakeSerialTransport):
+        def close(self) -> None:
+            self.close_calls += 1
+            raise OSError("close failed")
+
+    transport = FailingCloseTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        command_interval_seconds=1.0,
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    owner = driver.reserve_inhibited_start("server")
+    driver.open_inhibited_start(owner)
+    driver.begin_inhibited_start_promotion(owner)
+    session = object()
+    driver.bind_promoted_inhibited_start(owner, session)
+    claim = driver.claim_prepared_first_write(driver.prepare_promoted_first_write(owner, session))
+    assert driver.dispatch_claimed_first_write(claim) is HottopFirstWriteDisposition.WRITTEN
+    driver.hand_off_written_start_to_stream(owner, session)
+
+    with pytest.raises(OSError, match="close failed"):
+        driver.disconnect()
+
+    assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.UNRESOLVED)
+    with pytest.raises(RuntimeError, match="staged"):
+        driver.connect()
+
+
 @pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
 def test_inhibited_close_interruption_propagates_and_retains_exact_handle(
     interruption: type[BaseException],
