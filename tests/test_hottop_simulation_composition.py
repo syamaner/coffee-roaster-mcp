@@ -1023,6 +1023,188 @@ def test_simulation_stopped_nonfault_exact_stop_refuses_before_runtime_cleanup(
     asyncio.run(exercise())
 
 
+def test_simulation_stopped_fault_exact_stop_cleans_verified_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A trusted exact Stop cleans the selected stopped-fault session once."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+
+    async def exercise() -> None:
+        """Enter a stopped fault through Stop, then recover it through exact Stop."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            session_id = started.session.session_id
+            await _call(server, "mark_beans_added", context)
+            driver_calls: list[str] = []
+            original_driver_stop = context.roaster_driver.emergency_stop
+
+            def record_driver_stop(*, reason: str) -> object:
+                """Record each driver dispatch while preserving the simulation behavior."""
+                driver_calls.append(reason)
+                return original_driver_stop(reason=reason)
+
+            monkeypatch.setattr(context.roaster_driver, "emergency_stop", record_driver_stop)
+            await _call(server, "emergency_stop", context, reason="enter stopped fault")
+
+            first_crack_cleanup_ids: list[str] = []
+            sampler_cleanup_ids: list[str] = []
+            ambient_cleanup_ids: list[str] = []
+            original_first_crack_freeze = context.first_crack_runtime.freeze_observation_boundary
+            original_sampler_stop = context.telemetry_sampler.stop_for_session
+            original_ambient_stop = context.ambient_runtime.stop_for_session
+
+            def record_first_crack_cleanup(
+                session: object, ticket: object | None, *, reason: str
+            ) -> None:
+                """Record the exact session receiving first-crack cleanup."""
+                first_crack_cleanup_ids.append(cast(Any, session).id)
+                original_first_crack_freeze(cast(Any, session), ticket, reason=reason)
+
+            def record_sampler_cleanup(session_id: str, *, reason: str) -> None:
+                """Record the exact session receiving sampler cleanup."""
+                sampler_cleanup_ids.append(session_id)
+                original_sampler_stop(session_id, reason=reason)
+
+            def record_ambient_cleanup(session_id: str, *, reason: str) -> object:
+                """Record the exact session receiving ambient cleanup."""
+                ambient_cleanup_ids.append(session_id)
+                return original_ambient_stop(session_id, reason=reason)
+
+            monkeypatch.setattr(
+                context.first_crack_runtime,
+                "freeze_observation_boundary",
+                record_first_crack_cleanup,
+            )
+            monkeypatch.setattr(
+                context.telemetry_sampler, "stop_for_session", record_sampler_cleanup
+            )
+            monkeypatch.setattr(context.ambient_runtime, "stop_for_session", record_ambient_cleanup)
+
+            stopped = cast(
+                EventCommandResult,
+                await _call(
+                    server,
+                    "emergency_stop",
+                    context,
+                    expected_session_id=session_id,
+                ),
+            )
+
+            assert stopped.event.kind == "fault"
+            assert driver_calls == ["enter stopped fault", "manual emergency stop"]
+            assert first_crack_cleanup_ids == [session_id]
+            assert sampler_cleanup_ids == [session_id]
+            assert ambient_cleanup_ids == [session_id]
+
+    asyncio.run(exercise())
+
+
+def test_simulation_stopped_fault_exact_stop_cancellation_failure_cleans_verified_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A selected stopped-fault owner is cleaned when start cancellation fails."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+
+    async def exercise() -> None:
+        """Raise from stopped-fault cancellation after selection through registered Stop."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            session_id = started.session.session_id
+            await _call(server, "mark_beans_added", context)
+            driver_calls: list[str] = []
+            original_driver_stop = context.roaster_driver.emergency_stop
+
+            def record_driver_stop(*, reason: str) -> object:
+                """Record driver dispatches while preserving the initial fault Stop."""
+                driver_calls.append(reason)
+                return original_driver_stop(reason=reason)
+
+            monkeypatch.setattr(context.roaster_driver, "emergency_stop", record_driver_stop)
+            await _call(server, "emergency_stop", context, reason="enter stopped fault")
+
+            first_crack_cleanup_ids: list[str] = []
+            sampler_cleanup_ids: list[str] = []
+            ambient_cleanup_ids: list[str] = []
+            original_first_crack_stop = context.first_crack_runtime.stop_for_session
+            original_sampler_stop = context.telemetry_sampler.stop_for_session
+            original_ambient_stop = context.ambient_runtime.stop_for_session
+
+            def reject_start_cancellation() -> None:
+                """Model the first cancellable stopped-fault step failing."""
+                raise RuntimeError("synthetic start cancellation failure")
+
+            def record_first_crack_cleanup(session_id: str, *, reason: str) -> object:
+                """Record the exact session receiving first-crack cleanup."""
+                first_crack_cleanup_ids.append(session_id)
+                return original_first_crack_stop(session_id, reason=reason)
+
+            def record_sampler_cleanup(session_id: str, *, reason: str) -> None:
+                """Record the exact session receiving sampler cleanup."""
+                sampler_cleanup_ids.append(session_id)
+                original_sampler_stop(session_id, reason=reason)
+
+            def record_ambient_cleanup(session_id: str, *, reason: str) -> object:
+                """Record the exact session receiving ambient cleanup."""
+                ambient_cleanup_ids.append(session_id)
+                return original_ambient_stop(session_id, reason=reason)
+
+            monkeypatch.setattr(
+                context.session_store,
+                "cancel_session_start_for_emergency_stop",
+                reject_start_cancellation,
+            )
+            monkeypatch.setattr(
+                context.first_crack_runtime,
+                "stop_for_session",
+                record_first_crack_cleanup,
+            )
+            monkeypatch.setattr(
+                context.telemetry_sampler, "stop_for_session", record_sampler_cleanup
+            )
+            monkeypatch.setattr(context.ambient_runtime, "stop_for_session", record_ambient_cleanup)
+
+            with pytest.raises(RuntimeError, match="synthetic start cancellation failure"):
+                await _call(
+                    server,
+                    "emergency_stop",
+                    context,
+                    expected_session_id=session_id,
+                )
+
+            assert driver_calls == ["enter stopped fault"]
+            assert first_crack_cleanup_ids == [session_id]
+            assert sampler_cleanup_ids == [session_id]
+            assert ambient_cleanup_ids == [session_id]
+
+    asyncio.run(exercise())
+
+
 def test_simulation_reception_tool_projects_one_registered_eligible_snapshot(
     tmp_path: Path,
 ) -> None:

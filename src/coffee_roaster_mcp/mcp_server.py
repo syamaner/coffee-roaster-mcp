@@ -4196,6 +4196,7 @@ def _create_mcp_server(
                             expected_session_id=expected_session_id,
                             allow_in_flight=True,
                         )
+                        cleanup_owner = session
                         server_context.session_store.cancel_session_start_for_emergency_stop()
                         mode = "STOPPED_FAULT"
                 else:
