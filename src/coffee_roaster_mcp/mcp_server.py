@@ -43,6 +43,10 @@ from coffee_roaster_mcp.capture_evidence import (
     CaptureEvidencePublisher,
     CaptureEvidenceSnapshot,
 )
+from coffee_roaster_mcp.cold_receipt_report import (
+    ColdReceiptReport,
+    project_cold_receipt_report,
+)
 from coffee_roaster_mcp.cold_temperature import (
     COLD_TEMPERATURE_NOT_ELIGIBLE,
     ColdTemperatureProjection,
@@ -69,6 +73,7 @@ from coffee_roaster_mcp.drivers import (
     HottopStartSettlement,
     LifecycleEvidenceDriver,
     MockRoasterDriver,
+    ReceiptObservationDriver,
     RoasterCapabilities,
     RoasterDriver,
     RoasterState,
@@ -121,6 +126,74 @@ from coffee_roaster_mcp.session import (
 
 FixedZeroSessionId = Annotated[str, Strict(), StringConstraints(min_length=1, max_length=128)]
 _FIXED_ZERO_DRIVER_IDENTIFIER_PATTERN = r"[a-z][a-z0-9_-]{0,63}"
+_COLD_RECEIPT_REPORT_PREFIX = "hottop_receipt_v1_"
+_COLD_RECEIPT_REPORT_FIELDS = (
+    "receipt_report_version",
+    "outcome",
+    "defects",
+    "same_handle_epoch",
+    "read_returned_age_seconds",
+    "drained_floor_present",
+    "drained_floor_age_seconds",
+    "queued_before_read",
+    "queued_after_read",
+    "requested_byte_count",
+    "returned_byte_count",
+    "packet_count",
+    "skipped_byte_count",
+    "prior_tail_length",
+    "tail_length",
+    "latest_bean_temp_c",
+    "latest_env_temp_c",
+    "receipt_sequence",
+    "observer_discard_count",
+    "sensor_age",
+    "max_host_age",
+    "queue_scope",
+)
+_COLD_RECEIPT_REPORT_DEFECTS = frozenset(
+    {
+        "no_receipt",
+        "epoch_or_handle_changed",
+        "superseded",
+        "unit_not_explicit_celsius",
+        "queue_unreadable",
+        "read_size_contradiction",
+        "read_truncated",
+        "misaligned_or_skipped",
+        "parser_remainder",
+        "backlog_visible",
+        "latest_pair_rejected",
+        "invalid_packet_history",
+        "no_drained_floor",
+        "clock_regression",
+        "receipt_age_exceeds_bound",
+    }
+)
+_COLD_RECEIPT_MALFORMED_VALUES: dict[str, EventPayloadValue] = {
+    "receipt_report_version": 1,
+    "outcome": "malformed",
+    "defects": "",
+    "same_handle_epoch": None,
+    "read_returned_age_seconds": None,
+    "drained_floor_present": False,
+    "drained_floor_age_seconds": None,
+    "queued_before_read": None,
+    "queued_after_read": None,
+    "requested_byte_count": None,
+    "returned_byte_count": None,
+    "packet_count": None,
+    "skipped_byte_count": None,
+    "prior_tail_length": None,
+    "tail_length": None,
+    "latest_bean_temp_c": None,
+    "latest_env_temp_c": None,
+    "receipt_sequence": 0,
+    "observer_discard_count": 0,
+    "sensor_age": "unknown",
+    "max_host_age": "not_selected",
+    "queue_scope": "host_os_receive_queue",
+}
 FixedZeroOutcome = Literal[
     "refused_identity",
     "refused_capability",
@@ -2979,6 +3052,7 @@ def build_server_context(
                 temperature_unit=config.roaster.temperature_unit,
                 command_interval_seconds=config.roaster.command_interval_seconds,
                 hottop_reception=config.roaster.hottop_reception,
+                receipt_report=config.roaster.hottop_receipt_report,
             )
         else:
             roaster_driver = create_roaster_driver(
@@ -3480,7 +3554,10 @@ def _create_mcp_server(
         server_context = ctx.request_context.lifespan_context
         session = _resolve_session(server_context, session_id=session_id)
         observation_source_session_id = session.id
-        driver_state = _read_current_driver_state(server_context)
+        driver_state, receipt_observation = _read_driver_state_for_request(
+            server_context,
+            session=session,
+        )
         device_state = _serialize_device_state(driver_state)
         cold_temperature_projection = _project_cold_temperature_for_session(
             server_context,
@@ -3539,6 +3616,13 @@ def _create_mcp_server(
             session=session,
             observation_source_session_id=observation_source_session_id,
             projection=cold_temperature_projection,
+        )
+        device_state = _decorate_device_state_with_cold_receipt_report(
+            server_context,
+            session=session,
+            observation_source_session_id=observation_source_session_id,
+            device_state=device_state,
+            observation=receipt_observation,
         )
         return _serialize_session_state(
             session,
@@ -6863,6 +6947,103 @@ def _read_current_driver_state(server_context: ServerContext) -> RoasterState:
             f"Could not read current roaster state from driver {driver_name}: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
+
+
+def _cold_receipt_reporting_is_enabled(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+) -> bool:
+    """Return whether this request may use the passive receipt snapshot capability."""
+    roaster = server_context.config.roaster
+    return (
+        roaster.driver == HOTTOP_DRIVER_NAME
+        and roaster.temperature_unit == "celsius"
+        and roaster.hottop_receipt_report == "observe/v1"
+        and _is_latest_active_cold_session(server_context, session=session)
+        and isinstance(server_context.roaster_driver, ReceiptObservationDriver)
+    )
+
+
+def _read_driver_state_for_request(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+) -> tuple[RoasterState, object | None]:
+    """Read one driver snapshot, including receipt facts only for an eligible cold read."""
+    if not _cold_receipt_reporting_is_enabled(server_context, session=session):
+        return _read_current_driver_state(server_context), None
+
+    try:
+        receipt_driver = cast(ReceiptObservationDriver, server_context.roaster_driver)
+        driver_state, observation = receipt_driver.read_state_and_receipt_observation()
+        return driver_state, observation
+    except Exception as exc:
+        driver_name = server_context.config.roaster.driver
+        raise RuntimeError(
+            f"Could not read current roaster state from driver {driver_name}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _flatten_cold_receipt_report(observation: object) -> dict[str, EventPayloadValue]:
+    """Convert the closed receipt report into the registered flat raw-data keys."""
+    try:
+        report = project_cold_receipt_report(cast(Any, observation))
+        if type(report) is not ColdReceiptReport:
+            raise TypeError("receipt projection returned an unexpected type")
+        defects = report.defects
+        if type(defects) is not tuple or any(
+            type(defect) is not str or defect not in _COLD_RECEIPT_REPORT_DEFECTS
+            for defect in defects
+        ):
+            raise TypeError("receipt projection returned invalid defects")
+        flat: dict[str, EventPayloadValue] = {}
+        for field_name in _COLD_RECEIPT_REPORT_FIELDS:
+            value: EventPayloadValue
+            if field_name == "defects":
+                value = ",".join(defects)
+            else:
+                value = cast(EventPayloadValue, getattr(report, field_name))
+            if value is not None and type(value) not in (str, int, float, bool):
+                raise TypeError("receipt projection returned a non-scalar value")
+            flat[f"{_COLD_RECEIPT_REPORT_PREFIX}{field_name}"] = value
+        if len(flat) != len(_COLD_RECEIPT_REPORT_FIELDS):
+            raise AssertionError("receipt report key set is not fixed")
+        return flat
+    except Exception:  # noqa: BLE001 - malformed optional diagnostics must not fail the read.
+        return {
+            f"{_COLD_RECEIPT_REPORT_PREFIX}{field_name}": _COLD_RECEIPT_MALFORMED_VALUES[field_name]
+            for field_name in _COLD_RECEIPT_REPORT_FIELDS
+        }
+
+
+def _decorate_device_state_with_cold_receipt_report(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    observation_source_session_id: str,
+    device_state: RoasterDeviceState,
+    observation: object | None,
+) -> RoasterDeviceState:
+    """Return a separately decorated cold response after final session reconciliation."""
+    if (
+        observation is None
+        or session.purpose == "roast"
+        or not _is_cold_observation_readmissible(
+            server_context,
+            session=session,
+            observation_source_session_id=observation_source_session_id,
+        )
+    ):
+        return device_state
+    receipt_data = _flatten_cold_receipt_report(observation)
+    if set(device_state.raw_vendor_data).intersection(receipt_data):
+        return device_state
+    return dataclasses.replace(
+        device_state,
+        raw_vendor_data={**device_state.raw_vendor_data, **receipt_data},
+    )
 
 
 def _observe_cold_characterisation_roast_fan(

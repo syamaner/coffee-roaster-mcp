@@ -10,6 +10,7 @@ from typing import Any, Never, cast
 import pytest
 
 import coffee_roaster_mcp.drivers as drivers_module
+from coffee_roaster_mcp.cold_receipt_report import ColdReceiptReport, project_cold_receipt_report
 from coffee_roaster_mcp.cold_temperature import ColdTemperatureProjection, project_cold_temperature
 from coffee_roaster_mcp.drivers import (
     HOTTOP_DRIVER_NAME,
@@ -1127,6 +1128,25 @@ def test_candidate_refuses_provider_non_celsius_and_mock_composition() -> None:
         )
     with pytest.raises(ValueError, match="mock driver"):
         create_roaster_driver("mock", hottop_reception="candidate/v1")
+
+
+def test_receipt_report_refuses_unsafe_compositions() -> None:
+    """The passive observer remains separate from candidate and mock modes."""
+    factory = FakeSerialFactory()
+    with pytest.raises(ValueError, match="cannot be combined"):
+        HottopRoasterDriver(
+            serial_factory=factory,
+            hottop_reception="candidate/v1",
+            receipt_report="observe/v1",
+        )
+    with pytest.raises(ValueError, match="temperature_unit celsius"):
+        HottopRoasterDriver(
+            serial_factory=factory,
+            temperature_unit="auto",
+            receipt_report="observe/v1",
+        )
+    with pytest.raises(ValueError, match="mock driver"):
+        create_roaster_driver("mock", receipt_report="observe/v1")
 
 
 class MutableReceptionClock:
@@ -5178,3 +5198,663 @@ def test_inhibited_foreign_open_cannot_enter_factory() -> None:
         driver.open_inhibited_start(HottopStartOwner(owner.server_token, owner.generation))
     assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.RESERVED)
     assert driver.abort_inhibited_start(owner) is HottopStartSettlement.NOT_ENTERED
+
+
+def test_receipt_report_observes_a_complete_packet_without_query_io() -> None:
+    """One passive observer report uses cached facts and leaves command output ordinary."""
+
+    class CountingTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.waiting_calls = 0
+
+        @property
+        def in_waiting(self) -> int:
+            self.waiting_calls += 1
+            return super().in_waiting
+
+    transport = CountingTransport()
+    clock = MutableReceptionClock(10.0)
+    driver = HottopRoasterDriver(
+        port="fake",
+        command_interval_seconds=60.0,
+        serial_factory=FakeSerialFactory(transport),
+        receipt_report="observe/v1",
+        reception_clock=clock,
+    )
+    driver.connect()
+    try:
+        driver._send_command_frame()  # pyright: ignore[reportPrivateUsage]
+        clock.value = 11.0
+        transport.queue_read_data(
+            _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+        )
+        driver._send_command_frame()  # pyright: ignore[reportPrivateUsage]
+        clock.value = 14.0
+        query_counts = (len(transport.writes), len(transport.read_sizes), transport.waiting_calls)
+
+        state, observation = driver.read_state_and_receipt_observation()
+        report = project_cold_receipt_report(observation)
+
+        assert report.outcome == "complete_celsius_packet_received"
+        assert report.defects == ()
+        assert report.same_handle_epoch is True
+        assert report.read_returned_age_seconds == 3.0
+        assert report.drained_floor_present is True
+        assert report.drained_floor_age_seconds == 4.0
+        assert report.latest_bean_temp_c == state.bean_temp_c == 197.0
+        assert report.latest_env_temp_c == state.env_temp_c == 202.0
+        assert report.receipt_sequence == 1
+        assert (
+            len(transport.writes),
+            len(transport.read_sizes),
+            transport.waiting_calls,
+        ) == query_counts
+    finally:
+        driver.disconnect()
+
+
+def test_receipt_report_ages_from_transport_return_across_parser_delay_and_silence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Receipt age stays bound to transport return, not later parser work or silence."""
+
+    transport = FakeSerialTransport()
+    clock = MutableReceptionClock(10.0)
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        receipt_report="observe/v1",
+        reception_clock=clock,
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    original_parse = drivers_module._parse_hottop_status_buffer  # pyright: ignore[reportPrivateUsage]
+
+    def parse_after_delay(
+        buffer: bytes, *, temperature_unit: HottopTemperatureUnit
+    ) -> tuple[list[drivers_module.HottopStatusPacket], bytes]:
+        result = original_parse(buffer, temperature_unit=temperature_unit)
+        clock.value = 14.0
+        return result
+
+    monkeypatch.setattr(drivers_module, "_parse_hottop_status_buffer", parse_after_delay)
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+    )
+
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+    _, completion_observation = driver.read_state_and_receipt_observation()
+    completion_report = project_cold_receipt_report(completion_observation)
+
+    assert completion_observation.receipt is not None
+    assert completion_observation.receipt.read_returned_at == 10.0
+    assert completion_observation.receipt_sequence == 1
+    assert completion_observation.classification.sensor_age == "unknown"
+    assert completion_report.read_returned_age_seconds == 4.0
+    clock.value = 24.0
+
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+    _, silent_observation = driver.read_state_and_receipt_observation()
+    silent_report = project_cold_receipt_report(silent_observation)
+
+    assert silent_observation.receipt is completion_observation.receipt
+    assert silent_observation.receipt_sequence == 1
+    assert silent_observation.classification.sensor_age == "unknown"
+    assert silent_report.read_returned_age_seconds == 14.0
+
+
+def test_receipt_report_held_read_cannot_publish_to_reused_active_handle() -> None:
+    """A read bound to an old epoch cannot alter a later reuse of its transport."""
+
+    class BlockingReadTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block_reads = False
+            self.read_started = Event()
+            self.release_read = Event()
+
+        def read(self, size: int) -> bytes:
+            if self.block_reads:
+                self.read_started.set()
+                assert self.release_read.wait(timeout=1.0)
+            return super().read(size)
+
+    held_transport = BlockingReadTransport()
+    replacement_transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(held_transport),
+        receipt_report="observe/v1",
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = held_transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    held_transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=184, raw_bean_temperature=184)
+    )
+    driver._read_status_packet_with_receipt_report(held_transport)  # pyright: ignore[reportPrivateUsage]
+    assert driver.read_state_and_receipt_observation()[0].bean_temp_c == 184.0
+
+    held_transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=199, raw_bean_temperature=199)
+    )
+    held_transport.block_reads = True
+    reader = Thread(
+        target=driver._read_status_packet_with_receipt_report,  # pyright: ignore[reportPrivateUsage]
+        args=(held_transport,),
+    )
+    reader.start()
+    assert held_transport.read_started.wait(timeout=1.0)
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = replacement_transport  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+        driver._serial = held_transport  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    held_transport.release_read.set()
+    reader.join(timeout=1.0)
+
+    state, observation = driver.read_state_and_receipt_observation()
+    assert not reader.is_alive()
+    assert state.bean_temp_c == state.env_temp_c == 184.0
+    assert observation.receipt is None
+    assert observation.observer_discard_count == 0
+
+
+@pytest.mark.parametrize(
+    ("late_scanner_failure", "publish_newer"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_receipt_report_held_scanner_publishes_state_and_receipt_decision_together(
+    monkeypatch: pytest.MonkeyPatch, late_scanner_failure: bool, publish_newer: bool
+) -> None:
+    """A held scanner cannot pair new ordinary state with an earlier receipt."""
+
+    class HeldScanner:
+        def __init__(self, scanner: Callable[..., HottopStatusReadScan]) -> None:
+            self._scanner = scanner
+            self.started = Event()
+            self.release = Event()
+            self.calls = 0
+
+        def __call__(self, *args: object, **kwargs: object) -> HottopStatusReadScan:
+            self.calls += 1
+            if self.calls == 1:
+                self.started.set()
+                assert self.release.wait(timeout=1.0)
+            if late_scanner_failure and self.calls == 1:
+                raise OSError("scanner failed late")
+            return self._scanner(*args, **kwargs)
+
+    transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        receipt_report="observe/v1",
+        reception_clock=MutableReceptionClock(1.0),
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=184, raw_bean_temperature=184)
+    )
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+
+    held_scanner = HeldScanner(drivers_module.scan_hottop_status_read)
+    monkeypatch.setattr(drivers_module, "scan_hottop_status_read", held_scanner)
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=190, raw_bean_temperature=190)
+    )
+    reader = Thread(
+        target=driver._read_status_packet_with_receipt_report,  # pyright: ignore[reportPrivateUsage]
+        args=(transport,),
+    )
+    reader.start()
+    assert held_scanner.started.wait(timeout=1.0)
+
+    held_state, held_observation = driver.read_state_and_receipt_observation()
+    assert held_state.bean_temp_c == held_state.env_temp_c == 184.0
+    assert held_observation.receipt is not None
+    assert held_observation.receipt.latest_pair_c == (184.0, 184.0)
+
+    if publish_newer:
+        transport.queue_read_data(
+            _build_hottop_status_packet(raw_env_temperature=191, raw_bean_temperature=191)
+        )
+        driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+
+    held_scanner.release.set()
+    reader.join(timeout=1.0)
+    state, observation = driver.read_state_and_receipt_observation()
+    assert not reader.is_alive()
+    expected_temperature = 191.0 if publish_newer else 190.0
+    assert state.bean_temp_c == state.env_temp_c == expected_temperature
+    if late_scanner_failure:
+        assert observation.receipt is None
+        assert observation.observer_discard_count == 1
+    else:
+        assert observation.receipt is not None
+        assert observation.receipt.latest_pair_c == (expected_temperature, expected_temperature)
+
+
+def test_receipt_report_retains_ordinary_errors_and_partial_observations() -> None:
+    """Observer diagnostics preserve ordinary parser progress and read error accounting."""
+
+    class FailingClock:
+        def __call__(self) -> float:
+            raise OSError("observer clock failed")
+
+    transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        receipt_report="observe/v1",
+        reception_clock=FailingClock(),
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=184, raw_bean_temperature=184)
+    )
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+
+    driver._reception_clock = MutableReceptionClock(1.0)  # pyright: ignore[reportPrivateUsage]
+    state, observation = driver.read_state_and_receipt_observation()
+    assert state.bean_temp_c == state.env_temp_c == 184.0
+    assert state.raw_vendor_data["status_read_error_count"] == 0
+    assert observation.receipt is None
+    assert observation.observer_discard_count == 1
+
+    clock = MutableReceptionClock(1.0)
+    partial_transport = FakeSerialTransport()
+    partial_driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(partial_transport),
+        receipt_report="observe/v1",
+        reception_clock=clock,
+    )
+    with partial_driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        partial_driver._serial = partial_transport  # pyright: ignore[reportPrivateUsage]
+        partial_driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        partial_driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    partial_transport.queue_read_data(b"\x00" * 12)
+    partial_driver._read_status_packet_with_receipt_report(  # pyright: ignore[reportPrivateUsage]
+        partial_transport
+    )
+
+    partial_state, partial_observation = partial_driver.read_state_and_receipt_observation()
+    assert partial_state.raw_vendor_data["status_packet_count"] == 0
+    assert partial_observation.receipt is not None
+    assert partial_observation.receipt.scan.tail_length == 12
+
+
+def test_receipt_report_exposes_queued_and_read_error_negative_observations() -> None:
+    """Negative queue and read outcomes are cached without issuing reporting I/O."""
+
+    class NegativeQueueTransport(FakeSerialTransport):
+        @property
+        def in_waiting(self) -> int:
+            return -1
+
+    class FailingReadTransport(FakeSerialTransport):
+        def read(self, size: int) -> bytes:
+            _ = size
+            raise OSError("read failed")
+
+    for transport, expected_errors in (
+        (NegativeQueueTransport(), 0),
+        (FailingReadTransport(), 1),
+    ):
+        driver = HottopRoasterDriver(
+            port="fake",
+            serial_factory=FakeSerialFactory(transport),
+            receipt_report="observe/v1",
+        )
+        with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+            driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+            driver._connected = True  # pyright: ignore[reportPrivateUsage]
+            driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+        if isinstance(transport, FailingReadTransport):
+            transport.queue_read_data(b"x")
+        driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+
+        state, observation = driver.read_state_and_receipt_observation()
+        assert observation.receipt is None
+        assert observation.observer_discard_count == 1
+        assert state.raw_vendor_data["status_read_error_count"] == expected_errors
+
+
+def test_receipt_report_missing_pre_read_queue_never_establishes_a_floor() -> None:
+    """Missing queue metadata is not equivalent to an explicit empty queue."""
+
+    class MissingThenReadableTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self._missing = True
+
+        @property
+        def in_waiting(self) -> int:
+            if self._missing:
+                self._missing = False
+                raise AttributeError("in_waiting unavailable")
+            return super().in_waiting
+
+    def observe(*, missing_first: bool) -> tuple[ColdReceiptReport, int, int]:
+        transport: FakeSerialTransport = (
+            MissingThenReadableTransport() if missing_first else FakeSerialTransport()
+        )
+        clock = MutableReceptionClock(10.0)
+        driver = HottopRoasterDriver(
+            port="fake",
+            serial_factory=FakeSerialFactory(transport),
+            receipt_report="observe/v1",
+            reception_clock=clock,
+        )
+        with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+            driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+            driver._connected = True  # pyright: ignore[reportPrivateUsage]
+            driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+        driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+        clock.value = 12.0
+        transport.queue_read_data(
+            _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+        )
+        driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+        clock.value = 14.0
+        state, observation = driver.read_state_and_receipt_observation()
+        return (
+            project_cold_receipt_report(observation),
+            cast(int, state.raw_vendor_data["status_read_error_count"]),
+            len(transport.read_sizes),
+        )
+
+    missing_report, missing_errors, missing_reads = observe(missing_first=True)
+    empty_report, empty_errors, empty_reads = observe(missing_first=False)
+
+    assert missing_errors == 0
+    assert missing_reads == 1
+    assert missing_report.defects == ("no_drained_floor",)
+    assert missing_report.drained_floor_present is False
+    assert missing_report.drained_floor_age_seconds is None
+    assert missing_report.read_returned_age_seconds == 2.0
+    assert empty_errors == 0
+    assert empty_reads == 1
+    assert empty_report.defects == ()
+    assert empty_report.drained_floor_present is True
+    assert empty_report.drained_floor_age_seconds == 4.0
+
+
+def test_receipt_report_query_clock_failure_is_a_read_only_unusable_snapshot() -> None:
+    """A bad query clock neither discards nor relabels cached transport receipt facts."""
+
+    transport = FakeSerialTransport()
+    clock = MutableReceptionClock(10.0)
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        receipt_report="observe/v1",
+        reception_clock=clock,
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+    clock.value = 12.0
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+    )
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+    clock.value = 0.0
+
+    _, regressed_observation = driver.read_state_and_receipt_observation()
+    regressed_report = project_cold_receipt_report(regressed_observation)
+
+    assert regressed_observation.observed_at == 0.0
+    assert regressed_observation.receipt is not None
+    assert regressed_report.outcome == "receipt_unusable"
+    assert "clock_regression" in regressed_report.defects
+    assert regressed_report.read_returned_age_seconds is None
+    clock.value = float("nan")
+
+    _, failed_observation = driver.read_state_and_receipt_observation()
+    failed_report = project_cold_receipt_report(failed_observation)
+
+    assert failed_observation.observed_at is None
+    assert failed_observation.receipt is not None
+    assert failed_observation.receipt_sequence == 1
+    assert failed_observation.observer_discard_count == 0
+    assert failed_report.outcome == "receipt_unusable"
+    assert "clock_regression" in failed_report.defects
+    assert failed_report.latest_bean_temp_c is None
+    assert failed_report.read_returned_age_seconds is None
+    assert failed_report.drained_floor_age_seconds is None
+
+    clock.value = 14.0
+    _, recovered_observation = driver.read_state_and_receipt_observation()
+    recovered_report = project_cold_receipt_report(recovered_observation)
+
+    assert recovered_observation.receipt is failed_observation.receipt
+    assert recovered_observation.receipt_sequence == 1
+    assert recovered_observation.observer_discard_count == 0
+    assert recovered_report.outcome == "complete_celsius_packet_received"
+    assert recovered_report.read_returned_age_seconds == 2.0
+
+
+def test_receipt_report_query_clock_failure_without_a_receipt_is_unusable() -> None:
+    """An unavailable initial query clock does not invent a zero host timestamp."""
+
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(),
+        receipt_report="observe/v1",
+        reception_clock=lambda: float("nan"),
+    )
+
+    _, observation = driver.read_state_and_receipt_observation()
+    report = project_cold_receipt_report(observation)
+
+    assert observation.observed_at is None
+    assert observation.receipt is None
+    assert observation.receipt_sequence == 0
+    assert observation.observer_discard_count == 0
+    assert report.outcome == "receipt_unusable"
+    assert report.latest_bean_temp_c is None
+    assert report.read_returned_age_seconds is None
+
+
+def test_receipt_report_genuine_zero_clock_regression_and_read_failure_stay_independent() -> None:
+    """A finite zero clock and a read failure remain distinct from query-clock failure."""
+
+    class FailingReadTransport(FakeSerialTransport):
+        def read(self, size: int) -> bytes:
+            _ = size
+            raise OSError("read failed")
+
+    transport = FailingReadTransport()
+    clock = MutableReceptionClock(0.0)
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        receipt_report="observe/v1",
+        reception_clock=clock,
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    transport.queue_read_data(b"x")
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+    state, zero_observation = driver.read_state_and_receipt_observation()
+
+    assert zero_observation.observed_at == 0.0
+    assert zero_observation.observer_discard_count == 1
+    assert state.raw_vendor_data["status_read_error_count"] == 1
+    driver._reception_clock = lambda: float("nan")  # pyright: ignore[reportPrivateUsage]
+    state, failed_observation = driver.read_state_and_receipt_observation()
+
+    assert failed_observation.observed_at is None
+    assert failed_observation.observer_discard_count == 1
+    assert state.raw_vendor_data["status_read_error_count"] == 1
+
+
+@pytest.mark.parametrize("observer_failure", ["scanner_mismatch", "clock_error"])
+def test_receipt_report_optional_failures_preserve_ordinary_parser_result(
+    monkeypatch: pytest.MonkeyPatch, observer_failure: str
+) -> None:
+    """Receipt diagnostics never erase the matching legacy parser publication."""
+
+    class FailingClock:
+        def __call__(self) -> float:
+            raise OSError("observer clock failed")
+
+    packet = _build_hottop_status_packet(raw_env_temperature=184, raw_bean_temperature=184)
+    off_transport = FakeSerialTransport()
+    on_transport = FakeSerialTransport()
+    off_transport.queue_read_data(packet)
+    on_transport.queue_read_data(packet)
+    off_driver = HottopRoasterDriver(port="fake", serial_factory=FakeSerialFactory(off_transport))
+    clock: Callable[[], float] = MutableReceptionClock(1.0)
+    if observer_failure == "clock_error":
+        clock = FailingClock()
+    on_driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(on_transport),
+        receipt_report="observe/v1",
+        reception_clock=clock,
+    )
+    for driver, transport in ((off_driver, off_transport), (on_driver, on_transport)):
+        with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+            driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+            driver._connected = True  # pyright: ignore[reportPrivateUsage]
+            if driver is on_driver:
+                driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    if observer_failure == "scanner_mismatch":
+        original_scan = drivers_module.scan_hottop_status_read
+
+        def mismatched_scan(
+            read_bytes: bytes,
+            *,
+            prior_tail: bytes = b"",
+            queued_before_read: object,
+            requested_byte_count: int = HOTTOP_PACKET_LENGTH * 4,
+            temperature_unit: HottopTemperatureUnit = "celsius",
+        ) -> HottopStatusReadScan:
+            return replace(
+                original_scan(
+                    read_bytes,
+                    prior_tail=prior_tail,
+                    queued_before_read=queued_before_read,
+                    requested_byte_count=requested_byte_count,
+                    temperature_unit=temperature_unit,
+                ),
+                tail_bytes=b"x",
+                tail_length=1,
+            )
+
+        monkeypatch.setattr(drivers_module, "scan_hottop_status_read", mismatched_scan)
+
+    off_driver._read_status_packet(off_transport)  # pyright: ignore[reportPrivateUsage]
+    on_driver._read_status_packet_with_receipt_report(on_transport)  # pyright: ignore[reportPrivateUsage]
+    if observer_failure == "clock_error":
+        on_driver._reception_clock = MutableReceptionClock(2.0)  # pyright: ignore[reportPrivateUsage]
+
+    off_state = off_driver.read_state()
+    on_state, observation = on_driver.read_state_and_receipt_observation()
+    assert (
+        (on_state.bean_temp_c, on_state.env_temp_c)
+        == (
+            off_state.bean_temp_c,
+            off_state.env_temp_c,
+        )
+        == (184.0, 184.0)
+    )
+    assert (
+        on_state.raw_vendor_data["status_packet_count"]
+        == off_state.raw_vendor_data["status_packet_count"]
+        == 1
+    )
+    assert on_state.raw_vendor_data["status_read_error_count"] == 0
+    assert observation.receipt is None
+    assert observation.observer_discard_count == 1
+
+
+@pytest.mark.parametrize(
+    ("read_bytes", "expected_packets", "expected_tail", "expected_after"),
+    [
+        (
+            _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+            + b"\x00" * 12,
+            1,
+            12,
+            0,
+        ),
+        (
+            b"".join(
+                _build_hottop_status_packet(
+                    raw_env_temperature=202 + index, raw_bean_temperature=197 + index
+                )
+                for index in range(7)
+            ),
+            4,
+            0,
+            108,
+        ),
+    ],
+)
+def test_receipt_report_projects_exact_bounded_parser_outcomes(
+    read_bytes: bytes, expected_packets: int, expected_tail: int, expected_after: int
+) -> None:
+    """Observer reports the ordinary bounded parser result without further reads."""
+    transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        receipt_report="observe/v1",
+        reception_clock=MutableReceptionClock(1.0),
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    transport.queue_read_data(read_bytes)
+
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+    state, observation = driver.read_state_and_receipt_observation()
+
+    assert state.raw_vendor_data["status_packet_count"] == expected_packets
+    assert observation.receipt is not None
+    assert observation.receipt.scan.tail_length == expected_tail
+    assert observation.receipt.queued_after_read == expected_after
+
+
+def test_receipt_report_nan_clock_does_not_change_ordinary_write_accounting() -> None:
+    """An unusable observer clock cannot turn a complete command write into an error."""
+    transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        receipt_report="observe/v1",
+        reception_clock=lambda: float("nan"),
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+    )
+
+    driver._send_command_frame()  # pyright: ignore[reportPrivateUsage]
+
+    state = driver.read_state()
+    assert state.raw_vendor_data["last_command_write_size"] == HOTTOP_PACKET_LENGTH
+    assert state.raw_vendor_data["command_loop_error_count"] == 0
+    assert state.raw_vendor_data["status_packet_count"] == 1

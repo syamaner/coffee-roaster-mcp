@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from coffee_roaster_mcp.config import ConfigError, load_config
+from coffee_roaster_mcp.config import ConfigError, RoasterConfig, load_config
 
 
 def test_default_config_allows_mock_run_without_file(
@@ -19,6 +19,7 @@ def test_default_config_allows_mock_run_without_file(
     assert config.roaster.port is None
     assert config.roaster.baudrate == 115_200
     assert config.roaster.temperature_unit == "celsius"
+    assert config.roaster.hottop_receipt_report == "off"
     assert config.first_crack.mode == "disabled"
     assert config.first_crack.repo_id == "syamaner/coffee-first-crack-detection"
     assert config.first_crack.precision == "int8"
@@ -39,6 +40,14 @@ def test_default_config_allows_mock_run_without_file(
     assert config.ambient.mode == "disabled"
     assert config.ambient.device is None
     assert config.ambient.poll_interval_seconds == 30.0
+
+
+def test_roaster_config_keeps_command_interval_at_its_existing_position() -> None:
+    """Appending receipt reporting cannot reinterpret legacy positional construction."""
+    config = RoasterConfig("hottop", None, 115_200, "celsius", False, "off", 0.75)
+
+    assert config.command_interval_seconds == 0.75
+    assert config.hottop_receipt_report == "off"
 
 
 def test_missing_explicit_config_file_fails(tmp_path: Path) -> None:
@@ -480,6 +489,40 @@ def test_hottop_reception_is_exact_and_requires_explicit_celsius_after_overrides
         encoding="utf-8",
     )
     with pytest.raises(ConfigError, match="exactly"):
+        load_config(config_path, environ={})
+
+
+def test_hottop_receipt_report_is_yaml_only_exact_and_requires_celsius(tmp_path: Path) -> None:
+    """The passive observer is opt-in, exact, and cannot use inferred units."""
+    config_path = tmp_path / "receipt-report.yaml"
+    config_path.write_text(
+        "roaster:\n  hottop_receipt_report: observe/v1\n  temperature_unit: celsius\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path, environ={"COFFEE_ROASTER_HOTTOP_RECEPTION": "off"})
+
+    assert config.roaster.hottop_receipt_report == "observe/v1"
+    assert config.roaster.temperature_unit_explicit is True
+
+    config_path.write_text(
+        "roaster:\n  hottop_receipt_report: ' observe/v1 '\n  temperature_unit: celsius\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="exactly"):
+        load_config(config_path, environ={})
+
+    config_path.write_text("roaster:\n  hottop_receipt_report: observe/v1\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="explicitly configured"):
+        load_config(config_path, environ={})
+
+    config_path.write_text(
+        "roaster:\n  hottop_reception: candidate/v1\n"
+        "  hottop_receipt_report: observe/v1\n"
+        "  temperature_unit: celsius\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="cannot be combined"):
         load_config(config_path, environ={})
 
 
