@@ -4050,6 +4050,115 @@ def test_get_roast_state_implicit_poll_successor_during_sync_read_does_not_charg
     assert successor_snapshot.auto_t0_current_drop_c == 0.0
 
 
+def test_registered_manual_mock_implicit_poll_does_not_seed_successor_auto_t0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An off-loop implicit poll cannot carry an old sample into a new roast."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "roaster:\n  driver: mock\n"
+        "first_crack:\n  mode: audio\n  event_authority: manual\n"
+        "recording:\n  enabled: true\n  autocapture: true\n"
+        "session:\n  auto_t0_detection_enabled: true\n  auto_t0_drop_threshold_c: 25\n"
+        f"logging:\n  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    context = build_server_context(config_path=config_path)
+    runtime = FakeFirstCrackRuntime()
+    _set_first_crack_runtime(context, runtime)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(context)
+    started = _call_tool(server, "start_roast_session", ctx, first_crack_observer_ack="manual/v1")
+    predecessor = started.session
+    context.telemetry_sampler.stop_for_session(predecessor.session_id, reason="controlled poll")
+    driver = context.roaster_driver
+    assert type(driver) is MockRoasterDriver
+    driver._thermal_sample = dataclasses.replace(  # pyright: ignore[reportPrivateUsage]
+        driver._thermal_sample,  # pyright: ignore[reportPrivateUsage]
+        bean_temp_c=200.0,
+        env_temp_c=200.0,
+    )
+    entered = Event()
+    release = Event()
+    responses: list[object] = []
+    errors: list[BaseException] = []
+    original_process = mcp_server._process_auto_t0_for_active_session  # pyright: ignore[reportPrivateUsage]
+
+    def hold_predecessor_observation(
+        server_context: ServerContext,
+        *,
+        session_id: str | None,
+        device_state: RoasterDeviceState,
+        defer_canonical_settlement: bool = False,
+    ) -> bool:
+        if session_id == predecessor.session_id:
+            entered.set()
+            assert release.wait(timeout=1.0)
+        return original_process(
+            server_context,
+            session_id=session_id,
+            device_state=device_state,
+            defer_canonical_settlement=defer_canonical_settlement,
+        )
+
+    monkeypatch.setattr(
+        mcp_server, "_process_auto_t0_for_active_session", hold_predecessor_observation
+    )
+    request = Thread(
+        target=_record_tool_result,
+        args=(responses, errors, server, "get_roast_state", ctx),
+    )
+    request.start()
+    try:
+        assert entered.wait(timeout=1.0)
+        active = context.session_store.get_active_session()
+        assert active is not None and active.id == predecessor.session_id
+        context.session_store.record_event(active, "beans_added")
+        context.session_store.record_event(active, "beans_dropped")
+        context.session_store.start_cooling(active)
+        context.session_store.stop_cooling(active)
+        successor = context.session_store.start_session()
+        release.set()
+        request.join(timeout=1.0)
+        assert not request.is_alive() and errors == [] and len(responses) == 1
+
+        # The released old 200 °C observation must not charge or seed the new
+        # implicit session. Its own first 145 °C observation remains a baseline.
+        driver._thermal_sample = dataclasses.replace(  # pyright: ignore[reportPrivateUsage]
+            driver._thermal_sample,  # pyright: ignore[reportPrivateUsage]
+            bean_temp_c=145.0,
+            env_temp_c=145.0,
+        )
+        first_successor_state = _call_tool(server, "get_roast_state", ctx)
+        assert first_successor_state.session_id == successor.id
+        first_snapshot = context.session_store.get_session_snapshot(session_id=successor.id)
+        assert first_snapshot.event_timeline == []
+        assert first_snapshot.auto_t0_charge_temperature_c == 145.0
+        assert runtime.discarded_sessions == []
+
+        # A stable successor still takes the real automatic-T0 path using only
+        # its own sufficient fall.
+        driver._thermal_sample = dataclasses.replace(  # pyright: ignore[reportPrivateUsage]
+            driver._thermal_sample,  # pyright: ignore[reportPrivateUsage]
+            bean_temp_c=200.0,
+            env_temp_c=200.0,
+        )
+        _call_tool(server, "get_roast_state", ctx)
+        driver._thermal_sample = dataclasses.replace(  # pyright: ignore[reportPrivateUsage]
+            driver._thermal_sample,  # pyright: ignore[reportPrivateUsage]
+            bean_temp_c=145.0,
+            env_temp_c=145.0,
+        )
+        charged = _call_tool(server, "get_roast_state", ctx)
+        assert [event.kind for event in charged.events] == ["beans_added"]
+        assert charged.t0_status.charge_temperature_c == 200.0
+        assert runtime.discarded_sessions == [successor.id]
+        assert driver.emergency_count == 0
+    finally:
+        release.set()
+        request.join(timeout=1.0)
+
+
 def test_mock_replay_publisher_prunes_completed_cache_for_evicted_session() -> None:
     """A later admitted request removes completed replay cache entries evicted by the store."""
     store = RoastSessionStore(session_history_limit=1)
@@ -4098,7 +4207,9 @@ def test_mock_replay_publisher_retains_newer_cache_after_out_of_order_snapshot(
     older_key = (older.id, older.capture_ownership_sequence)
     older_snapshot_taken = Event()
     resume_older = Event()
+    older_published = Event()
     newer_published = Event()
+    release_publication: dict[str, Event] = {older.id: Event()}
     request_thread_id: int | None = None
     original_retained_keys = store.get_retained_capture_ownership_keys
 
@@ -4111,13 +4222,37 @@ def test_mock_replay_publisher_retains_newer_cache_after_out_of_order_snapshot(
         return keys
 
     sealed_by_session: dict[str, object] = {older.id: object()}
+    publication_callbacks = {
+        id(sealed_by_session[older.id]): older_published,
+    }
+    original_add_done_callback: Callable[
+        [Future[object], Callable[[Future[object]], object]], None
+    ] = Future[object].add_done_callback
+
+    def observe_publication_callback(
+        future: Future[object], callback: Callable[[Future[object]], object]
+    ) -> None:
+        if callback.__name__ != "retire_temporary_refusal":
+            original_add_done_callback(future, callback)
+            return
+
+        def observed(completion: Future[object]) -> None:
+            callback(completion)
+            published = publication_callbacks.get(id(completion.result()))
+            if published is not None:
+                published.set()
+
+        original_add_done_callback(future, observed)
 
     def publish(*_args: object) -> object:
         session_id = cast(str, _args[1])
+        if session_id in release_publication:
+            assert release_publication[session_id].wait(timeout=1.0)
         return sealed_by_session[session_id]
 
     monkeypatch.setattr(store, "get_retained_capture_ownership_keys", retained_keys)
     monkeypatch.setattr(publisher, "_publish", publish)
+    monkeypatch.setattr(Future, "add_done_callback", observe_publication_callback)
     older_request: dict[str, Future[object]] = {}
 
     def request_older() -> None:
@@ -4146,6 +4281,7 @@ def test_mock_replay_publisher_retains_newer_cache_after_out_of_order_snapshot(
         store.stop_cooling(newer)
         newer_key = (newer.id, newer.capture_ownership_sequence)
         sealed_by_session[newer.id] = object()
+        publication_callbacks[id(sealed_by_session[newer.id])] = newer_published
         newer_future = cast(
             Future[object],
             publisher.request(
@@ -4156,19 +4292,54 @@ def test_mock_replay_publisher_retains_newer_cache_after_out_of_order_snapshot(
                 deadline_monotonic_seconds=time.monotonic() + 1,
             ),
         )
-        newer_future.add_done_callback(lambda _future: newer_published.set())
-        assert newer_future.result(timeout=1) is sealed_by_session[newer.id]
+        # Wait for the publisher's registered callback itself, rather than a
+        # test callback or Future.result(), before observing its cache effects.
         assert newer_published.wait(timeout=1)
         assert publisher._sealed[newer_key] is sealed_by_session[newer.id]  # pyright: ignore[reportPrivateUsage]
         assert publisher._outcomes[newer_key] is newer_future  # pyright: ignore[reportPrivateUsage]
 
         resume_older.set()
+        deadline = time.monotonic() + 1.0
+        while "future" not in older_request and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert "future" in older_request
+        older_future = older_request["future"]
+        assert not older_future.done() and not older_future.cancelled()
+
+        # Advance retention while the old publication is running. It remains
+        # owned until settlement, but cannot restore a sealed entry afterwards.
+        newest = store.start_session()
+        store.record_event(newest, "beans_added")
+        store.record_event(newest, "beans_dropped")
+        store.start_cooling(newest)
+        store.stop_cooling(newest)
+        sealed_by_session[newest.id] = object()
+        publisher.request(
+            store=store,
+            session_id=newest.id,
+            observation=lambda _session_id: None,
+            config=cast(AppConfig, None),
+            deadline_monotonic_seconds=time.monotonic() + 1,
+        )
+        assert publisher._outcomes[older_key] is older_future  # pyright: ignore[reportPrivateUsage]
+        assert not older_future.cancelled()
+
+        release_publication[older.id].set()
         request_thread.join(timeout=1)
         assert not request_thread.is_alive()
-        assert older_request["future"].result(timeout=1) is sealed_by_session[older.id]
-        assert publisher._sealed[older_key] is sealed_by_session[older.id]  # pyright: ignore[reportPrivateUsage]
+        assert older_future.result(timeout=1) is sealed_by_session[older.id]
+        assert older_published.wait(timeout=1)
+        assert older_key not in publisher._sealed  # pyright: ignore[reportPrivateUsage]
         assert publisher._sealed[newer_key] is sealed_by_session[newer.id]  # pyright: ignore[reportPrivateUsage]
-        assert publisher._outcomes[older_key] is older_request["future"]  # pyright: ignore[reportPrivateUsage]
+        # The next admitted request removes the now-completed old outcome.
+        publisher.request(
+            store=store,
+            session_id=newest.id,
+            observation=lambda _session_id: None,
+            config=cast(AppConfig, None),
+            deadline_monotonic_seconds=time.monotonic() + 1,
+        )
+        assert older_key not in publisher._outcomes  # pyright: ignore[reportPrivateUsage]
         assert publisher._outcomes[newer_key] is newer_future  # pyright: ignore[reportPrivateUsage]
     finally:
         resume_older.set()
