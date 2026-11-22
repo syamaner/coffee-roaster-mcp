@@ -4084,6 +4084,98 @@ def test_mock_replay_publisher_prunes_completed_cache_for_evicted_session() -> N
     publisher._executor.shutdown(wait=True)  # pyright: ignore[reportPrivateUsage]
 
 
+def test_mock_replay_publisher_retains_newer_cache_after_out_of_order_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale snapshot cannot evict a completed newer replay publication."""
+    store = RoastSessionStore(session_history_limit=2)
+    older = store.start_session()
+    store.record_event(older, "beans_added")
+    store.record_event(older, "beans_dropped")
+    store.start_cooling(older)
+    store.stop_cooling(older)
+    publisher = mcp_server._MockReplayPublisher()  # pyright: ignore[reportPrivateUsage]
+    older_key = (older.id, older.capture_ownership_sequence)
+    older_snapshot_taken = Event()
+    resume_older = Event()
+    newer_published = Event()
+    request_thread_id: int | None = None
+    original_retained_keys = store.get_retained_capture_ownership_keys
+
+    def retained_keys() -> tuple[tuple[str, int], ...]:
+        keys = original_retained_keys()
+        if get_ident() == request_thread_id:
+            assert keys == (older_key,)
+            older_snapshot_taken.set()
+            assert resume_older.wait(timeout=1)
+        return keys
+
+    sealed_by_session: dict[str, object] = {older.id: object()}
+
+    def publish(*_args: object) -> object:
+        session_id = cast(str, _args[1])
+        return sealed_by_session[session_id]
+
+    monkeypatch.setattr(store, "get_retained_capture_ownership_keys", retained_keys)
+    monkeypatch.setattr(publisher, "_publish", publish)
+    older_request: dict[str, Future[object]] = {}
+
+    def request_older() -> None:
+        nonlocal request_thread_id
+        request_thread_id = get_ident()
+        older_request["future"] = cast(
+            Future[object],
+            publisher.request(
+                store=store,
+                session_id=older.id,
+                observation=lambda _session_id: None,
+                config=cast(AppConfig, None),
+                deadline_monotonic_seconds=time.monotonic() + 1,
+            ),
+        )
+
+    request_thread = Thread(target=request_older)
+    request_thread.start()
+    try:
+        assert older_snapshot_taken.wait(timeout=1)
+
+        newer = store.start_session()
+        store.record_event(newer, "beans_added")
+        store.record_event(newer, "beans_dropped")
+        store.start_cooling(newer)
+        store.stop_cooling(newer)
+        newer_key = (newer.id, newer.capture_ownership_sequence)
+        sealed_by_session[newer.id] = object()
+        newer_future = cast(
+            Future[object],
+            publisher.request(
+                store=store,
+                session_id=newer.id,
+                observation=lambda _session_id: None,
+                config=cast(AppConfig, None),
+                deadline_monotonic_seconds=time.monotonic() + 1,
+            ),
+        )
+        newer_future.add_done_callback(lambda _future: newer_published.set())
+        assert newer_future.result(timeout=1) is sealed_by_session[newer.id]
+        assert newer_published.wait(timeout=1)
+        assert publisher._sealed[newer_key] is sealed_by_session[newer.id]  # pyright: ignore[reportPrivateUsage]
+        assert publisher._outcomes[newer_key] is newer_future  # pyright: ignore[reportPrivateUsage]
+
+        resume_older.set()
+        request_thread.join(timeout=1)
+        assert not request_thread.is_alive()
+        assert older_request["future"].result(timeout=1) is sealed_by_session[older.id]
+        assert publisher._sealed[older_key] is sealed_by_session[older.id]  # pyright: ignore[reportPrivateUsage]
+        assert publisher._sealed[newer_key] is sealed_by_session[newer.id]  # pyright: ignore[reportPrivateUsage]
+        assert publisher._outcomes[older_key] is older_request["future"]  # pyright: ignore[reportPrivateUsage]
+        assert publisher._outcomes[newer_key] is newer_future  # pyright: ignore[reportPrivateUsage]
+    finally:
+        resume_older.set()
+        request_thread.join(timeout=1)
+        publisher._executor.shutdown(wait=True)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_get_roast_state_discards_queued_first_crack_windows_after_auto_t0(
     tmp_path: Path,
 ) -> None:

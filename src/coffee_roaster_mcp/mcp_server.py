@@ -1840,10 +1840,10 @@ class _MockReplayPublisher:
         with self._lock:
             self._retention_floor = max(self._retention_floor, minimum_retained_sequence)
             for cached_key in tuple(self._sealed):
-                if cached_key not in retained_key_set:
+                if cached_key[1] < self._retention_floor:
                     del self._sealed[cached_key]
             for cached_key, cached_outcome in tuple(self._outcomes.items()):
-                if cached_key not in retained_key_set and cached_outcome.done():
+                if cached_key[1] < self._retention_floor and cached_outcome.done():
                     del self._outcomes[cached_key]
             if key not in retained_key_set or key[1] < self._retention_floor:
                 completed = Future[SealedMockReplayExport | None]()
