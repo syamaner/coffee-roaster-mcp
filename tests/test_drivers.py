@@ -17,9 +17,11 @@ from coffee_roaster_mcp.drivers import (
     HOTTOP_PACKET_PREFIX,
     CommandStreaming,
     DriverLifecycleEvidence,
+    ExactDropArbitration,
     FixedZeroCommandedState,
     HottopDrainedFloor,
     HottopDropRefused,
+    HottopExactDropArbitration,
     HottopFirstWriteDisposition,
     HottopReceiptClassification,
     HottopReceivedPacket,
@@ -1106,6 +1108,205 @@ def test_candidate_refuses_provider_non_celsius_and_mock_composition() -> None:
         )
     with pytest.raises(ValueError, match="mock driver"):
         create_roaster_driver("mock", hottop_reception="candidate/v1")
+
+
+class MutableReceptionClock:
+    """Deterministic injected host clock for candidate exact-Drop tests."""
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        """Return the current test-controlled host time."""
+        return self.value
+
+
+def _candidate_exact_drop_driver() -> tuple[
+    HottopRoasterDriver, FakeSerialTransport, MutableReceptionClock
+]:
+    """Build one streaming fake with a current, eligible typed receipt."""
+    transport = FakeSerialTransport()
+    clock = MutableReceptionClock(10.0)
+    driver = create_roaster_driver(
+        HOTTOP_DRIVER_NAME,
+        port="fake",
+        temperature_unit="celsius",
+        hottop_reception="candidate/v1",
+        serial_factory=FakeSerialFactory(transport),
+        reception_clock=clock,
+        simulation_receipt_age_bound_seconds=3.0,
+    )
+    assert isinstance(driver, HottopRoasterDriver)
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_reception_epoch(transport)  # pyright: ignore[reportPrivateUsage]
+    driver._read_status_packet_candidate(transport)  # pyright: ignore[reportPrivateUsage]
+    clock.value = 11.0
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+    )
+    driver._read_status_packet_candidate(transport)  # pyright: ignore[reportPrivateUsage]
+    return driver, transport, clock
+
+
+def _exact_drop_arbitration(driver: HottopRoasterDriver) -> HottopExactDropArbitration:
+    """Bind one opaque store operation to the driver's current receipt snapshot."""
+    return HottopExactDropArbitration(
+        operation_id="operation-1",
+        session_id="session-1",
+        operation_token="token-1",
+        candidate=driver.snapshot_exact_drop_candidate(),
+    )
+
+
+def test_candidate_exact_drop_admits_one_current_receipt_and_one_command_revision() -> None:
+    """One current eligible receipt admits exactly the shared Drop transition."""
+    driver, transport, _clock = _candidate_exact_drop_driver()
+    arbitration = _exact_drop_arbitration(driver)
+    revision_before = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+
+    state = driver.drop_beans(exact_drop=arbitration)
+
+    frame = driver._current_command_frame()  # pyright: ignore[reportPrivateUsage]
+    assert transport.writes_snapshot() == []
+    assert arbitration.candidate.streaming is True
+    assert arbitration.candidate.receipt_classification.eligible is True
+    assert state.raw_vendor_data["solenoid_open"] is True
+    assert driver._command_state_revision == revision_before + 1  # pyright: ignore[reportPrivateUsage]
+    assert driver._drop_transition_count == 1  # pyright: ignore[reportPrivateUsage]
+    assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
+    assert driver._drop_settlement.transition_revision == revision_before + 1  # pyright: ignore[reportPrivateUsage]
+    assert frame[10] == 0
+    assert frame[16] == 1
+
+
+def test_candidate_exact_drop_refuses_mock_only_arbitration_without_receipt_identity() -> None:
+    """Mock arbitration cannot substitute for an evaluated candidate receipt."""
+    driver, _transport, _clock = _candidate_exact_drop_driver()
+    mock_only = ExactDropArbitration(
+        operation_id="operation-1",
+        session_id="session-1",
+        cancelled=Event(),
+        expected_drop_transition_count=0,
+        expected_emergency_count=0,
+    )
+
+    with pytest.raises(TypeError, match="HottopExactDropArbitration"):
+        driver.drop_beans(exact_drop=mock_only)
+
+    assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+def test_candidate_exact_drop_refuses_receipt_replaced_after_snapshot() -> None:
+    """A later producer receipt supersedes the exact snapshot before admission."""
+    driver, transport, clock = _candidate_exact_drop_driver()
+    arbitration = _exact_drop_arbitration(driver)
+    clock.value = 12.0
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=203, raw_bean_temperature=198)
+    )
+    driver._read_status_packet_candidate(transport)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(HottopDropRefused, match="superseded"):
+        driver.drop_beans(exact_drop=arbitration)
+
+    assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+def test_candidate_exact_drop_refuses_record_disappearing_after_snapshot() -> None:
+    """A current stream still refuses once its exact receipt is discarded."""
+    driver, transport, _clock = _candidate_exact_drop_driver()
+    arbitration = _exact_drop_arbitration(driver)
+    driver._invalidate_candidate_receipt(  # pyright: ignore[reportPrivateUsage]
+        transport,
+        driver._reception_epoch,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    with pytest.raises(HottopDropRefused, match="superseded"):
+        driver.drop_beans(exact_drop=arbitration)
+
+    assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+def test_candidate_exact_drop_refuses_expired_same_receipt() -> None:
+    """The admission lock reclassifies the unchanged receipt with the injected clock."""
+    driver, _transport, clock = _candidate_exact_drop_driver()
+    arbitration = _exact_drop_arbitration(driver)
+    clock.value = 14.1
+
+    with pytest.raises(HottopDropRefused, match="not eligible"):
+        driver.drop_beans(exact_drop=arbitration)
+
+    assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+def test_candidate_exact_drop_refuses_disconnect_epoch_change_after_snapshot() -> None:
+    """A revoked stream cannot use an otherwise eligible prior receipt."""
+    driver, _transport, _clock = _candidate_exact_drop_driver()
+    arbitration = _exact_drop_arbitration(driver)
+    driver.disconnect()
+
+    with pytest.raises(HottopDropRefused, match="stream ownership was revoked"):
+        driver.drop_beans(exact_drop=arbitration)
+
+    assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+def test_candidate_exact_drop_refuses_stop_linearised_first() -> None:
+    """An independent Stop before admission prevents an additional Drop transition."""
+    driver, _transport, _clock = _candidate_exact_drop_driver()
+    arbitration = _exact_drop_arbitration(driver)
+    driver.emergency_stop(reason="test")
+    revision_after_stop = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(HottopDropRefused, match="superseded"):
+        driver.drop_beans(exact_drop=arbitration)
+
+    assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+    assert driver._emergency_count == 1  # pyright: ignore[reportPrivateUsage]
+    assert driver._command_state_revision == revision_after_stop  # pyright: ignore[reportPrivateUsage]
+
+
+def test_candidate_stop_after_unknown_exact_drop_write_preserves_history_and_refuses_repeat() -> (
+    None
+):
+    """An uncertain first write retains its Drop and independent Stop history."""
+
+    class PartialTransport(FakeSerialTransport):
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data) - 1
+
+    transport = PartialTransport()
+    clock = MutableReceptionClock(10.0)
+    driver = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+        reception_clock=clock,
+        simulation_receipt_age_bound_seconds=3.0,
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_reception_epoch(transport)  # pyright: ignore[reportPrivateUsage]
+    driver._read_status_packet_candidate(transport)  # pyright: ignore[reportPrivateUsage]
+    clock.value = 11.0
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+    )
+    driver._read_status_packet_candidate(transport)  # pyright: ignore[reportPrivateUsage]
+    driver.drop_beans(exact_drop=_exact_drop_arbitration(driver))
+    driver._send_command_frame_candidate()  # pyright: ignore[reportPrivateUsage]
+    driver.emergency_stop(reason="test")
+
+    with pytest.raises(HottopDropRefused, match="unresolved"):
+        driver.drop_beans(exact_drop=_exact_drop_arbitration(driver))
+
+    assert driver._drop_transition_count == 1  # pyright: ignore[reportPrivateUsage]
+    assert driver._emergency_count == 1  # pyright: ignore[reportPrivateUsage]
+    assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
+    assert driver._drop_settlement.result == "unknown"  # pyright: ignore[reportPrivateUsage]
 
 
 def test_candidate_drop_first_attempt_is_fixed_and_unknown_refuses_repeat() -> None:
