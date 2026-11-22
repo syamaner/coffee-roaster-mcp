@@ -190,6 +190,7 @@ class FirstCrackSessionRuntime:
         observation_model_loader: Callable[[FirstCrackConfig], ObservationModel] | None = None,
         session_is_retained: Callable[[str], bool] | None = None,
         capture_evidence: CaptureEvidencePublisher | None = None,
+        event_domain_mapped: bool = True,
     ) -> None:
         """Initialize a session-owned first-crack runtime.
 
@@ -214,6 +215,7 @@ class FirstCrackSessionRuntime:
         self._capture_cleanup_generation: int | None = None
         self._completed_observation: ObservationSnapshot | None = None
         self._session_is_retained = session_is_retained
+        self._event_domain_mapped = event_domain_mapped
         self._observation_history: dict[str, _ObservationHistoryEntry] = {}
         self._observation_model_loader = observation_model_loader or load_observation_model
         self._observation_generation = 0
@@ -291,6 +293,13 @@ class FirstCrackSessionRuntime:
                 pass
             else:
                 coordinator()
+
+    def set_event_domain_mapped(self, *, event_domain_mapped: bool) -> None:
+        """Set the private assembly-time relationship between events and capture."""
+        with self._lock:
+            if self._active_session_id is not None:
+                raise RuntimeError("Clock-domain mapping cannot change during a session.")
+            self._event_domain_mapped = event_domain_mapped
 
     def set_recording_metadata(self, *, origin: str, roast_num: int) -> RecordingMetadata:
         """Store annotation-pipeline metadata for the next roast's recording.
@@ -478,6 +487,7 @@ class FirstCrackSessionRuntime:
                 session,
                 metadata=self._recording_metadata,
                 recovered_first_crack_holder=self._recovered_first_crack_holder,
+                event_domain_mapped=self._event_domain_mapped,
             )
             recorder = self._wrap_manual_recorder_for_evidence(session, recorder)
             self._active_recorder = recorder
@@ -605,6 +615,7 @@ class FirstCrackSessionRuntime:
                     session,
                     metadata=self._recording_metadata,
                     recovered_first_crack_holder=self._recovered_first_crack_holder,
+                    event_domain_mapped=self._event_domain_mapped,
                 )
                 recorder = self._wrap_manual_recorder_for_evidence(session, recorder)
                 self._active_recorder = recorder
@@ -642,6 +653,7 @@ class FirstCrackSessionRuntime:
                     recording_origin_reader=(lambda: recorder.started_monotonic_seconds)
                     if recorder is not None
                     else None,
+                    event_domain_mapped=self._event_domain_mapped,
                 )
                 # Boundary producers are deliberately able to find this observer
                 # before worker admission. The runtime admission proof below is
@@ -1594,6 +1606,7 @@ def build_session_recorder(
     *,
     metadata: RecordingMetadata | None = None,
     recovered_first_crack_holder: list[float | None] | None = None,
+    event_domain_mapped: bool = True,
 ) -> RoastRecorder | None:
     """Build a per-roast audio recorder for one session, or `None` when disabled.
 
@@ -1669,6 +1682,8 @@ def build_session_recorder(
     recorder_holder: list[RoastRecorder] = []
 
     def milestones() -> dict[str, float | None]:
+        if not event_domain_mapped:
+            return {}
         recorder = recorder_holder[0] if recorder_holder else None
         recording_started_monotonic = (
             recorder.started_monotonic_seconds if recorder is not None else None

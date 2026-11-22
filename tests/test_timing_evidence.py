@@ -139,6 +139,116 @@ def test_timing_evidence_returns_atomic_mock_record() -> None:
     assert result.record.environment.clock_epoch_id == result.record.clock.epoch_id
 
 
+def test_hottop_reception_assembly_refuses_post_bracket_manual_mark_then_recovers() -> None:
+    """A manual mark after a frozen candidate bracket cannot inherit its receipt."""
+    clock = SimpleNamespace(value=0.0)
+    store = RoastSessionStore(
+        utc_now=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        monotonic_now=lambda: clock.value,
+        session_id_factory=lambda: "hottop-reception-session",
+    )
+    session = store.start_session()
+    clock.value = 10.0
+    store.record_event(session, "beans_added", provenance="manual_mark")
+    admission = store.admit_timing_evidence(session.id)
+
+    # The driver candidate and its bracket have already been frozen at 70.2.
+    # The manual mark is committed immediately before store assembly.
+    clock.value = 71.2
+    store.record_event(session, "first_crack_detected", provenance="manual_mark")
+    finalized: list[dict[str, object]] = []
+    refused = store.assemble_hottop_reception_evidence(
+        admission,
+        t0=70.2,
+        t1=70.2,
+        finalize=lambda record: finalized.append(record) or record,
+    )
+
+    assert refused.outcome == "refused_identity"
+    assert refused.reason_code == "session_changed_during_read"
+    assert refused.result is None
+    assert finalized == []
+    assert session.hottop_reception_evidence_sequence == 0
+
+    recovered = store.assemble_hottop_reception_evidence(
+        store.admit_timing_evidence(session.id),
+        t0=72.0,
+        t1=72.0,
+        finalize=lambda record: record,
+    )
+
+    assert recovered.outcome == "evidence"
+    assert recovered.reason_code is None
+    assert recovered.result is not None
+    assert session.hottop_reception_evidence_sequence == 1
+    recovered_record = cast(dict[str, object], recovered.result)
+    assert recovered_record["reception_evidence_sequence"] == 1
+
+
+@pytest.mark.parametrize("transition", ["charge", "first_crack"])
+def test_hottop_reception_assembly_refuses_same_tick_transition_after_admission(
+    transition: str,
+) -> None:
+    """A same-clock charge or human FC added in-read cannot reuse a receipt."""
+    clock = SimpleNamespace(value=0.0)
+    store = RoastSessionStore(
+        utc_now=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        monotonic_now=lambda: clock.value,
+        session_id_factory=lambda: f"same-tick-{transition}",
+    )
+    session = store.start_session()
+    if transition == "first_crack":
+        clock.value = 10.0
+        store.record_event(session, "beans_added", provenance="manual_mark")
+    admission = store.admit_timing_evidence(session.id)
+
+    clock.value = 70.2
+    if transition == "charge":
+        store.record_event(session, "beans_added", provenance="manual_mark")
+    else:
+        store.record_event(session, "first_crack_detected", provenance="manual_mark")
+    refused = store.assemble_hottop_reception_evidence(
+        admission,
+        t0=70.2,
+        t1=70.2,
+        finalize=lambda record: record,
+    )
+
+    assert refused.outcome == "refused_identity"
+    assert refused.reason_code == "session_changed_during_read"
+    assert session.hottop_reception_evidence_sequence == 0
+
+
+def test_hottop_reception_assembly_accepts_previously_established_same_tick_mark() -> None:
+    """A human FC observed before sampling remains valid at the same clock tick."""
+    clock = SimpleNamespace(value=0.0)
+    store = RoastSessionStore(
+        utc_now=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        monotonic_now=lambda: clock.value,
+        session_id_factory=lambda: "established-same-tick",
+    )
+    session = store.start_session()
+    clock.value = 10.0
+    store.record_event(session, "beans_added", provenance="manual_mark")
+    clock.value = 70.2
+    store.record_event(session, "first_crack_detected", provenance="manual_mark")
+    admission = store.admit_timing_evidence(session.id)
+
+    accepted = store.assemble_hottop_reception_evidence(
+        admission,
+        t0=70.2,
+        t1=70.2,
+        finalize=lambda record: record,
+    )
+
+    assert accepted.outcome == "evidence"
+    assert accepted.reason_code is None
+    assert accepted.result is not None
+    accepted_record = cast(dict[str, object], accepted.result)
+    assert accepted_record["reception_evidence_sequence"] == 1
+    assert session.hottop_reception_evidence_sequence == 1
+
+
 def test_timing_evidence_preserves_exact_bracket_and_has_no_session_side_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -355,6 +465,57 @@ def test_event_evidence_rejects_inconsistent_source_time_basis() -> None:
                 "physical_time_bound": "not_provided",
             }
         )
+
+
+def test_hottop_reception_read_models_close_settlement_slots_and_reasons() -> None:
+    """Advertised and typed read models reject crossed slots and bad refusal reasons."""
+    settlement_schema = mcp_server.HottopCommandSettlements.model_json_schema()
+    pair_schema = mcp_server.HottopIneligibleReceptionPair.model_json_schema()
+    settlement_validator: Any = Draft202012Validator(settlement_schema)
+    pair_validator: Any = Draft202012Validator(pair_schema)
+    settlement = {
+        "transition_seq": 1,
+        "result": "pending",
+        "attempt_seq": None,
+        "physical_effect": "not_established",
+    }
+    valid_settlements = (
+        {"drop": {**settlement, "transition": "drop"}, "emergency": None},
+        {"drop": None, "emergency": {**settlement, "transition": "emergency"}},
+    )
+    for value in valid_settlements:
+        settlement_validator.validate(value)
+        assert mcp_server.HottopCommandSettlements.model_validate(value)
+
+    invalid_settlements = (
+        {"drop": {**settlement, "transition": "emergency"}, "emergency": None},
+        {"drop": None, "emergency": {**settlement, "transition": "drop"}},
+    )
+    for value in invalid_settlements:
+        with pytest.raises(ValidationError):
+            settlement_validator.validate(value)
+        with pytest.raises((TypeError, ValueError)):
+            mcp_server.HottopCommandSettlements.model_validate(value)
+
+    for value in (
+        {"status": "ineligible", "reasons": ["no_receipt"]},
+        {"status": "ineligible", "reasons": ["no_receipt", "superseded"]},
+    ):
+        pair_validator.validate(value)
+        assert mcp_server.HottopIneligibleReceptionPair.model_validate(
+            {**value, "reasons": tuple(value["reasons"])}
+        )
+    invalid_pairs: tuple[dict[str, object], ...] = (
+        {"status": "ineligible", "reasons": []},
+        {"status": "ineligible", "reasons": ["no_receipt", "no_receipt"]},
+    )
+    for value in invalid_pairs:
+        with pytest.raises(ValidationError):
+            pair_validator.validate(value)
+        with pytest.raises((TypeError, ValueError)):
+            mcp_server.HottopIneligibleReceptionPair.model_validate(
+                {**value, "reasons": tuple(cast(list[str], value["reasons"]))}
+            )
 
 
 def test_timing_evidence_models_reject_inexact_rows() -> None:
@@ -1588,7 +1749,9 @@ def test_timing_evidence_real_stdio_schema_and_malformed_requests(
                 "from coffee_roaster_mcp.session import RoastSessionStore",
                 "Path(os.environ['P1_WIRE_IMPORTED_MODULE']).write_text(mcp_server.__file__)",
                 "Path(os.environ['P1_WIRE_READ_COUNTER']).write_text('0')",
-                "clock_values = iter((100.0, 100.30000000000004, 100.6000000000001, 100.7, 100.8))",
+                # Start state projection samples the operational store clock.
+                "clock_values = iter((100.0, 100.0, "
+                "100.30000000000004, 100.6000000000001, 100.7, 100.8))",
                 "mcp_server.RoastSessionStore = functools.partial(",
                 "    RoastSessionStore, monotonic_now=lambda: next(clock_values)",
                 ")",
