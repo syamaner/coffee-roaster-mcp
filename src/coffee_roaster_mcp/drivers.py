@@ -2243,6 +2243,28 @@ class HottopRoasterDriver:
             for settlement in settlements
         )
 
+    def _candidate_reconnect_inhibited_locked(self) -> bool:
+        """Return whether retained candidate command ownership forbids reconnect.
+
+        Reconnect has a narrower boundary than a new staged Start: ordinary
+        preconnect command state, such as a fan setting, remains supported.
+        A commanded open chute would be replayed on the replacement stream,
+        however, and any unresolved Drop or Stop settlement remains owned by
+        its earlier transport.
+        """
+        if self._hottop_reception != "candidate/v1":
+            return False
+        if self._solenoid_open:
+            return True
+        settlements = (
+            (self._drop_settlement, *self._emergency_settlements)
+            if self._drop_settlement is not None
+            else tuple(self._emergency_settlements)
+        )
+        return any(
+            settlement.result in {"pending", "entering", "unknown"} for settlement in settlements
+        )
+
     def _refuse_staged_connect(self) -> None:
         """Refuse unrelated legacy reuse before waiting on native lifecycle work."""
         with self._state_lock:
@@ -2262,11 +2284,9 @@ class HottopRoasterDriver:
                 if (
                     self._hottop_reception == "candidate/v1"
                     and self._reception_epoch != 0
-                    and not self._candidate_prestart_clear_locked()
+                    and self._candidate_reconnect_inhibited_locked()
                 ):
-                    raise RuntimeError(
-                        "candidate/v1 requires known-clear command ownership before reconnect."
-                    )
+                    raise RuntimeError("candidate/v1 retains command ownership before reconnect.")
                 if self._port is None:
                     raise ValueError("Hottop serial port is required before connect.")
                 port = self._port
@@ -2281,19 +2301,34 @@ class HottopRoasterDriver:
                 write_timeout=self._write_timeout_seconds,
             )
 
+            replacement_inhibited = False
             with self._state_lock:
-                self._serial = serial_transport
-                if self._hottop_reception == "candidate/v1":
-                    self._begin_reception_epoch(serial_transport)
-                self._connected = True
-                self._disconnect_requested.clear()
-                self._stop_event.clear()
-                self._command_thread = Thread(
-                    target=self._command_loop,
-                    daemon=True,
-                    name="HottopCommandLoop",
-                )
-                self._command_thread.start()
+                # Factory entry is unbounded.  Recheck the precise reconnect
+                # boundary before publishing its handle so a prior epoch's
+                # exact Drop cannot be written or settled on this transport.
+                if (
+                    self._hottop_reception == "candidate/v1"
+                    and self._reception_epoch != 0
+                    and self._candidate_reconnect_inhibited_locked()
+                ):
+                    replacement_inhibited = True
+                else:
+                    self._serial = serial_transport
+                    if self._hottop_reception == "candidate/v1":
+                        self._begin_reception_epoch(serial_transport)
+                    self._connected = True
+                    self._disconnect_requested.clear()
+                    self._stop_event.clear()
+                    self._command_thread = Thread(
+                        target=self._command_loop,
+                        daemon=True,
+                        name="HottopCommandLoop",
+                    )
+                    self._command_thread.start()
+            if replacement_inhibited:
+                if serial_transport.is_open:
+                    serial_transport.close()
+                raise RuntimeError("candidate/v1 retains command ownership before reconnect.")
 
     def disconnect(self) -> None:
         """Stop command loop and close serial transport."""

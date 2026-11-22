@@ -1463,6 +1463,64 @@ def test_candidate_clean_reconnect_streams_a_new_closed_frame() -> None:
     assert replacement_first_frame[16] == 0
 
 
+def test_candidate_reconnect_preserves_fan_only_preconnect_compatibility() -> None:
+    """A closed, settled candidate may retain an ordinary fan setting on reconnect."""
+    first_transport = FakeSerialTransport()
+    replacement_transport = FakeSerialTransport()
+    factory = SequentialSerialFactory([first_transport, replacement_transport])
+    driver = HottopRoasterDriver(
+        port="fake",
+        command_interval_seconds=0.01,
+        serial_factory=factory,
+        hottop_reception="candidate/v1",
+    )
+
+    driver.connect()
+    _wait_for_hottop_write(first_transport, lambda frame: frame[16] == 0)
+    driver.disconnect()
+    driver.set_fan(fan_level_percent=30)
+    driver.connect()
+    replacement_first_frame = _wait_for_hottop_write(
+        replacement_transport,
+        lambda frame: frame[12] == 3,
+    )
+    driver.disconnect()
+
+    assert len(factory.calls) == 2
+    assert replacement_first_frame[16] == 0
+    assert replacement_first_frame[12] == 3
+
+
+def test_candidate_reconnect_rechecks_open_chute_before_installing_replacement() -> None:
+    """A command change during factory entry cannot publish an open replacement stream."""
+    first_transport = FakeSerialTransport()
+    replacement_transport = FakeSerialTransport()
+    factory = SequentialSerialFactory([first_transport])
+    driver = HottopRoasterDriver(
+        port="fake",
+        command_interval_seconds=0.01,
+        serial_factory=factory,
+        hottop_reception="candidate/v1",
+    )
+    driver.connect()
+    _wait_for_hottop_write(first_transport, lambda frame: frame[16] == 0)
+    driver.disconnect()
+
+    def admit_replacement(*args: object, **kwargs: object) -> FakeSerialTransport:
+        del args, kwargs
+        driver.drop_beans()
+        return replacement_transport
+
+    driver._serial_factory = admit_replacement  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(RuntimeError, match="retains command ownership"):
+        driver.connect()
+
+    assert replacement_transport.writes_snapshot() == []
+    assert replacement_transport.close_calls == 1
+    assert driver._drop_transition_count == 1  # pyright: ignore[reportPrivateUsage]
+
+
 def test_candidate_public_factory_negative_drop_receipt_remains_unknown_after_stop() -> None:
     """An unrepresentable Drop receipt remains unavailable and blocks a later Drop."""
 
