@@ -1152,7 +1152,7 @@ def test_candidate_public_factory_negative_drop_receipt_remains_unknown_after_st
         driver.drop_beans()
         assert transport.first_drop_written.wait(timeout=1.0)
         first_evidence = driver.read_lifecycle_evidence()
-        assert first_evidence.last_command_write_size is None
+        assert first_evidence.last_command_write_size == 0
         assert first_evidence.command_send_attempts == 1
         assert first_evidence.command_write_count == 0
         assert first_evidence.command_loop_error_count == 1
