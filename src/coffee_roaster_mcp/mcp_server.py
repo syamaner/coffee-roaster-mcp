@@ -1813,6 +1813,7 @@ class _MockReplayPublisher:
         self._outcomes: dict[tuple[str, int], Future[SealedMockReplayExport | None]] = {}
         self._sealed: dict[tuple[str, int], SealedMockReplayExport] = {}
         self._in_flight: Future[SealedMockReplayExport | None] | None = None
+        self._retention_floor = 0
 
     def request(
         self,
@@ -1826,14 +1827,28 @@ class _MockReplayPublisher:
         """Return the one owned publication outcome for an exact generation."""
         try:
             snapshot, _incomplete = store.observe_export_readiness(session_id=session_id)
+            retained_keys = store.get_retained_capture_ownership_keys()
         except SessionLifecycleError:
             completed: Future[SealedMockReplayExport | None] = Future()
             completed.set_result(None)
             return completed
         key = (snapshot.id, snapshot.capture_ownership_sequence)
+        retained_key_set = frozenset(retained_keys)
+        minimum_retained_sequence = min((item[1] for item in retained_keys), default=0)
         future: Future[SealedMockReplayExport | None] | None = None
         reused = False
         with self._lock:
+            self._retention_floor = max(self._retention_floor, minimum_retained_sequence)
+            for cached_key in tuple(self._sealed):
+                if cached_key not in retained_key_set:
+                    del self._sealed[cached_key]
+            for cached_key, cached_outcome in tuple(self._outcomes.items()):
+                if cached_key not in retained_key_set and cached_outcome.done():
+                    del self._outcomes[cached_key]
+            if key not in retained_key_set or key[1] < self._retention_floor:
+                completed = Future[SealedMockReplayExport | None]()
+                completed.set_result(None)
+                return completed
             existing = self._outcomes.get(key)
             if existing is not None:
                 if not existing.done():
@@ -1893,7 +1908,7 @@ class _MockReplayPublisher:
                         del self._outcomes[key]
                 else:
                     sealed = completion.result()
-                    if sealed is not None:
+                    if sealed is not None and key[1] >= self._retention_floor:
                         self._sealed[key] = sealed
 
         future.add_done_callback(retire_temporary_refusal)
@@ -3491,13 +3506,13 @@ def _create_mcp_server(
                 auto_t0_recorded = await asyncio.to_thread(
                     _process_auto_t0_for_active_session,
                     server_context,
-                    session_id=session_id,
+                    session_id=observation_source_session_id,
                     device_state=device_state,
                 )
             else:
                 auto_t0_recorded = _process_auto_t0_for_active_session(
                     server_context,
-                    session_id=session_id,
+                    session_id=observation_source_session_id,
                     device_state=device_state,
                 )
         except EventLogRecordingError:

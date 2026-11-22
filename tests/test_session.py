@@ -3654,6 +3654,30 @@ def test_canonical_writer_exclusively_binds_first_target_and_appends_owned_targe
     store.shutdown_manual_first_crack_writer()
 
 
+@pytest.mark.parametrize("mutation", ["same_length_rewrite", "append"])
+def test_canonical_writer_rejects_seal_when_verified_bytes_change(
+    tmp_path: Path, mutation: str
+) -> None:
+    """A stable inode is insufficient when canonical bytes no longer match."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    writer = session.canonical_writer
+    assert writer is not None and session.log_writer is not None
+    writer.append({"type": "event", "kind": "beans_added"}, lane="event")
+    path = session.log_writer.log_dir / "roast.jsonl"
+    expected = path.read_bytes()
+    if mutation == "same_length_rewrite":
+        path.write_bytes(b"x" * len(expected))
+    else:
+        with path.open("ab") as stream:
+            stream.write(b'{"type":"event"}\n')
+
+    with pytest.raises(session_module.EventLogRecordingError):
+        writer.read_sealed_bytes()
+
+    store.shutdown_manual_first_crack_writer()
+
+
 def test_canonical_group_latches_executing_failure_before_later_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

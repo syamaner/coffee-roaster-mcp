@@ -13,6 +13,7 @@ import os
 import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from concurrent.futures import Future
 from pathlib import Path
 from threading import Event, Lock, Thread, get_ident
 from types import SimpleNamespace, TracebackType
@@ -3996,6 +3997,91 @@ def test_get_roast_state_records_automatic_t0_after_configured_drop(
     assert cast(float, t0_payload["turning_point_monotonic_seconds"]) <= cast(
         float, t0_payload["confirmed_at_monotonic_seconds"]
     )
+
+
+def test_get_roast_state_implicit_poll_successor_during_sync_read_does_not_charge_successor(
+    tmp_path: Path,
+) -> None:
+    """An implicit state read cannot apply its predecessor sample to a successor."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "session:",
+                "  auto_t0_detection_enabled: true",
+                "  auto_t0_drop_threshold_c: 25",
+                f"logging:\n  log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver(bean_temp_c=170.0)
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+
+    predecessor = _call_tool(server, "start_roast_session", ctx).session
+    _call_tool(server, "get_roast_state", ctx)
+    driver.bean_temp_c = 145.0
+    original_read = driver.read_state
+
+    def replace_session_during_read() -> RoasterState:
+        store = server_context.session_store
+        active = store.get_active_session()
+        assert active is not None and active.id == predecessor.session_id
+        store.record_event(active, "beans_added")
+        store.record_event(active, "beans_dropped")
+        store.start_cooling(active)
+        store.stop_cooling(active)
+        successor = store.start_session()
+        store.process_auto_t0_reading_snapshot(successor, bean_temp_c=170.0, drop_threshold_c=25.0)
+        return original_read()
+
+    driver.read_state = replace_session_during_read
+    reply = _call_tool(server, "get_roast_state", ctx)
+
+    successor = server_context.session_store.get_active_session()
+    assert successor is not None and successor.id != predecessor.session_id
+    successor_snapshot = server_context.session_store.get_session_snapshot(session_id=successor.id)
+    assert reply.device_state is not None
+    assert successor_snapshot.event_timeline == []
+    assert successor_snapshot.auto_t0_charge_temperature_c == 170.0
+    assert successor_snapshot.auto_t0_current_drop_c == 0.0
+
+
+def test_mock_replay_publisher_prunes_completed_cache_for_evicted_session() -> None:
+    """A later admitted request removes completed replay cache entries evicted by the store."""
+    store = RoastSessionStore(session_history_limit=1)
+    evicted = store.start_session()
+    store.record_event(evicted, "beans_added")
+    store.record_event(evicted, "beans_dropped")
+    store.start_cooling(evicted)
+    store.stop_cooling(evicted)
+    retained = store.start_session()
+    publisher = mcp_server._MockReplayPublisher()  # pyright: ignore[reportPrivateUsage]
+    evicted_key = (evicted.id, evicted.capture_ownership_sequence)
+    retained_key = (retained.id, retained.capture_ownership_sequence)
+    completed: Future[object] = Future()
+    completed.set_result(None)
+    pending: Future[object] = Future()
+    publisher._sealed[evicted_key] = cast(Any, object())  # pyright: ignore[reportPrivateUsage]
+    publisher._outcomes[evicted_key] = cast(Any, completed)  # pyright: ignore[reportPrivateUsage]
+    publisher._outcomes[retained_key] = cast(Any, pending)  # pyright: ignore[reportPrivateUsage]
+
+    assert (
+        publisher.request(
+            store=store,
+            session_id=retained.id,
+            observation=lambda _session_id: None,
+            config=cast(AppConfig, None),
+            deadline_monotonic_seconds=0.0,
+        )
+        is pending
+    )
+    assert evicted_key not in publisher._sealed  # pyright: ignore[reportPrivateUsage]
+    assert evicted_key not in publisher._outcomes  # pyright: ignore[reportPrivateUsage]
+    publisher._executor.shutdown(wait=True)  # pyright: ignore[reportPrivateUsage]
 
 
 def test_get_roast_state_discards_queued_first_crack_windows_after_auto_t0(

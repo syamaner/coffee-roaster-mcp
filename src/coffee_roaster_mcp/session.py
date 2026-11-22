@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -274,6 +275,8 @@ class _CanonicalGenerationWriter:
         self._lock = Lock()
         self._identity: tuple[int, int] | None = None
         self._incomplete = False
+        self._verified_byte_count = 0
+        self._verified_digest = hashlib.sha256()
         self._telemetry_rows = 0
         self._telemetry_bytes = 0
         self._event_rows = 0
@@ -473,6 +476,9 @@ class _CanonicalGenerationWriter:
                     raise EventLogRecordingError("Canonical log frame verification failed.")
             finally:
                 os.close(reader)
+            with self._lock:
+                self._verified_byte_count += len(frame)
+                self._verified_digest.update(frame)
         except EventLogRecordingError:
             raise
         except OSError as error:
@@ -511,27 +517,48 @@ class _CanonicalGenerationWriter:
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        descriptor = os.open(path, flags)
         try:
-            checked = os.fstat(descriptor)
-            identity = (checked.st_dev, checked.st_ino)
-            if not stat.S_ISREG(checked.st_mode):
-                raise EventLogRecordingError("Canonical log target is not a regular file.")
             with self._lock:
-                if self._identity != identity or self._incomplete:
+                identity = self._identity
+                incomplete = self._incomplete
+                expected_byte_count = self._verified_byte_count
+                expected_digest = self._verified_digest.copy()
+            if identity is None or incomplete:
+                raise EventLogRecordingError("Canonical log identity is not sealable.")
+            descriptor = os.open(path, flags)
+            try:
+                checked = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(checked.st_mode)
+                    or (checked.st_dev, checked.st_ino) != identity
+                ):
                     raise EventLogRecordingError("Canonical log identity is not sealable.")
-            chunks: list[bytes] = []
-            while True:
-                chunk = os.read(descriptor, 64 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            after = os.fstat(descriptor)
-            if (after.st_dev, after.st_ino) != identity:
-                raise EventLogRecordingError("Canonical log identity changed during sealing.")
-            return b"".join(chunks)
-        finally:
-            os.close(descriptor)
+                chunks: list[bytes] = []
+                actual_digest = hashlib.sha256()
+                while True:
+                    chunk = os.read(descriptor, 64 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    actual_digest.update(chunk)
+                after = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(after.st_mode)
+                    or (after.st_dev, after.st_ino) != identity
+                    or sum(map(len, chunks)) != expected_byte_count
+                    or actual_digest.digest() != expected_digest.digest()
+                ):
+                    raise EventLogRecordingError("Canonical log integrity changed during sealing.")
+                with self._lock:
+                    if self._verified_byte_count != expected_byte_count:
+                        raise EventLogRecordingError("Canonical log changed during sealing.")
+                return b"".join(chunks)
+            finally:
+                os.close(descriptor)
+        except EventLogRecordingError:
+            raise
+        except OSError as error:
+            raise EventLogRecordingError("Canonical log storage or verification failed.") from error
 
 
 @dataclass(frozen=True)
@@ -2790,6 +2817,15 @@ class RoastSessionStore:
                 or self._manual_mock_sampler_admissions.get(session.id, 0) > 0
                 or session.manual_first_crack_pending
                 or session.manual_first_crack_export_disqualified
+            )
+
+    def get_retained_capture_ownership_keys(self) -> tuple[tuple[str, int], ...]:
+        """Return retained session capture keys without performing filesystem work."""
+        with self._lock:
+            return tuple(
+                (session_id, self._sessions_by_id[session_id].capture_ownership_sequence)
+                for session_id in self._session_id_order
+                if session_id in self._sessions_by_id
             )
 
     def prepare_manual_mock_replay_export(
