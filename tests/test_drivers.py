@@ -3811,6 +3811,37 @@ def test_hottop_lifecycle_evidence_surfaces_transport_is_open_failure() -> None:
     assert transport.close_calls == 1
 
 
+@pytest.mark.parametrize(
+    ("invalid_is_open", "exception_type", "message"),
+    ((None, ValueError, "complete"), (1, TypeError, "boolean")),
+)
+def test_hottop_off_lifecycle_evidence_rejects_invalid_installed_transport_status(
+    invalid_is_open: None | int,
+    exception_type: type[Exception],
+    message: str,
+) -> None:
+    """Off-mode evidence rejects a non-boolean installed transport status."""
+    transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        command_interval_seconds=0.05,
+        serial_factory=FakeSerialFactory(transport=transport),
+    )
+    driver.connect()
+    try:
+        assert driver.read_lifecycle_evidence().serial_open is True
+        transport.is_open = cast(Any, invalid_is_open)
+
+        with pytest.raises(exception_type, match=message):
+            driver.read_lifecycle_evidence()
+    finally:
+        transport.is_open = True
+        driver.disconnect()
+
+    assert transport.close_calls == 1
+    assert driver.read_lifecycle_evidence().serial_open is False
+
+
 @pytest.mark.parametrize("invalid_is_open", (None, 1))
 def test_candidate_lifecycle_evidence_rejects_inconclusive_retained_handle_status(
     invalid_is_open: None | int,
@@ -4651,7 +4682,11 @@ def test_candidate_deferred_ambiguous_worker_cannot_write_to_replacement_transpo
     stale_worker.start()
     try:
         assert stale_worker_started.wait(timeout=1.0)
-        assert not replacement_transport.stale_replacement_write.wait(timeout=0.1)
+        stale_worker.join(timeout=1.0)
+        assert not stale_worker.is_alive()
+        assert replacement_transport.streaming_write.is_set()
+        assert driver.read_lifecycle_evidence().command_loop_running is True
+        assert not replacement_transport.stale_replacement_write.is_set()
         assert old_transport.writes_snapshot() == [claim.frame]
     finally:
         driver.disconnect()
