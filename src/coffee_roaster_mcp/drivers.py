@@ -376,7 +376,12 @@ class DriverLifecycleEvidence:
             "status_read_error_count",
         )
         values = tuple(getattr(self, name) for name in optional)
-        if self.command_streaming_required and any(value is None for value in values):
+        required_values = tuple(
+            value
+            for name, value in zip(optional, values, strict=True)
+            if name != "last_command_write_size"
+        )
+        if self.command_streaming_required and any(value is None for value in required_values):
             raise ValueError("Streaming driver lifecycle evidence must be complete.")
         if not self.command_streaming_required and any(value is not None for value in values):
             raise ValueError("Non-streaming driver lifecycle evidence must omit lifecycle fields.")
@@ -2363,7 +2368,9 @@ class HottopRoasterDriver:
                     self._command_send_attempts += 1
                 bytes_written = serial_transport.write(frame)
                 with self._state_lock:
-                    self._last_command_write_size = bytes_written
+                    self._last_command_write_size = (
+                        bytes_written if type(bytes_written) is int and bytes_written >= 0 else None
+                    )
                     if bytes_written == len(frame):
                         self._command_write_count += 1
                     else:
@@ -2416,7 +2423,9 @@ class HottopRoasterDriver:
                         self._settle_attempt(attempt, "unknown")
                     raise
                 with self._state_lock:
-                    self._last_command_write_size = receipt if type(receipt) is int else 0
+                    self._last_command_write_size = (
+                        receipt if type(receipt) is int and receipt >= 0 else None
+                    )
                     result: HottopWriteResult = (
                         "accepted_by_host"
                         if type(receipt) is int and receipt == len(frame) == HOTTOP_PACKET_LENGTH
