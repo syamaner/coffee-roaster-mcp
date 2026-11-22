@@ -27,6 +27,7 @@ def trusted_manual_driver_admission() -> object:
 TransportType = Literal["stdio"]
 TemperatureUnit = Literal["celsius", "fahrenheit", "auto"]
 HottopReceptionMode = Literal["off", "candidate/v1"]
+HottopReceiptReportMode = Literal["off", "observe/v1"]
 FirstCrackMode = Literal["disabled", "audio", "manual"]
 FirstCrackEventAuthority = Literal["automatic", "manual"]
 ModelPrecision = Literal["int8", "fp32"]
@@ -54,6 +55,7 @@ class RoasterConfig:
     temperature_unit_explicit: bool = False
     hottop_reception: HottopReceptionMode = "off"
     command_interval_seconds: float = 0.3
+    hottop_receipt_report: HottopReceiptReportMode = "off"
 
 
 @dataclass(frozen=True)
@@ -341,6 +343,15 @@ def _roaster_from_mapping(raw: Mapping[str, Any]) -> RoasterConfig:
         hottop_reception=_hottop_reception(
             _string(raw, "hottop_reception", "off", label="roaster.hottop_reception"),
             label="roaster.hottop_reception",
+        ),
+        hottop_receipt_report=_hottop_receipt_report(
+            _string(
+                raw,
+                "hottop_receipt_report",
+                "off",
+                label="roaster.hottop_receipt_report",
+            ),
+            label="roaster.hottop_receipt_report",
         ),
         command_interval_seconds=_float(
             raw,
@@ -1032,15 +1043,30 @@ def _hottop_reception(value: str, label: str) -> HottopReceptionMode:
     return cast(HottopReceptionMode, value)
 
 
+def _hottop_receipt_report(value: str, label: str) -> HottopReceiptReportMode:
+    """Validate the deliberately exact Hottop receipt-report observer token."""
+    if value not in {"off", "observe/v1"}:
+        raise ConfigError(f"{label} must be exactly 'off' or 'observe/v1'.")
+    return cast(HottopReceiptReportMode, value)
+
+
 def _validate_hottop_reception_config(config: AppConfig) -> None:
-    """Refuse candidate composition without an explicitly supplied Celsius unit."""
+    """Refuse incompatible Hottop reception and receipt-report configurations."""
     roaster = config.roaster
-    if roaster.hottop_reception != "candidate/v1":
-        return
-    if not roaster.temperature_unit_explicit or roaster.temperature_unit != "celsius":
+    requires_explicit_celsius = (
+        roaster.hottop_reception == "candidate/v1" or roaster.hottop_receipt_report == "observe/v1"
+    )
+    if requires_explicit_celsius and (
+        not roaster.temperature_unit_explicit or roaster.temperature_unit != "celsius"
+    ):
         raise ConfigError(
-            "roaster.hottop_reception candidate/v1 requires an explicitly configured "
-            "roaster.temperature_unit of celsius."
+            "roaster.hottop reception or receipt reporting requires an explicitly "
+            "configured roaster.temperature_unit of celsius."
+        )
+    if roaster.hottop_reception == "candidate/v1" and roaster.hottop_receipt_report == "observe/v1":
+        raise ConfigError(
+            "roaster.hottop_receipt_report observe/v1 cannot be combined with "
+            "roaster.hottop_reception candidate/v1."
         )
 
 

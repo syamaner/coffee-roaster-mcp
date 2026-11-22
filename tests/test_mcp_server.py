@@ -49,10 +49,13 @@ from coffee_roaster_mcp.detector import (
 )
 from coffee_roaster_mcp.drivers import (
     HOTTOP_DRIVER_NAME,
+    HOTTOP_PACKET_LENGTH,
+    HOTTOP_PACKET_PREFIX,
     DriverLifecycleEvidence,
     EmergencyStopResult,
     ExactDropArbitration,
     FixedZeroCommandedState,
+    HottopReceiptObservation,
     HottopRoasterDriver,
     HottopStartPhase,
     MockRoasterDriver,
@@ -60,6 +63,7 @@ from coffee_roaster_mcp.drivers import (
     RoasterDriver,
     RoasterState,
     build_hottop_command_packet,
+    calculate_hottop_packet_checksum,
 )
 from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackRuntimeSnapshot,
@@ -10028,6 +10032,391 @@ class ColdTemperatureCountingDriver(LifecycleRecordingDriver):
         return state
 
 
+class _ReceiptReportTransport:
+    """In-memory serial transport used only to prepare cached receipt observations."""
+
+    def __init__(self) -> None:
+        """Initialize an open transport with an empty receive queue."""
+        self.is_open = True
+        self.read_calls = 0
+        self.waiting_calls = 0
+        self.write_calls = 0
+        self.close_calls = 0
+        self._queued = bytearray()
+
+    @property
+    def in_waiting(self) -> int:
+        """Return the queued byte count and record the setup probe."""
+        self.waiting_calls += 1
+        return len(self._queued)
+
+    def close(self) -> None:
+        """Record a close without accessing a device."""
+        self.close_calls += 1
+        self.is_open = False
+
+    def read(self, size: int) -> bytes:
+        """Return up to ``size`` queued setup bytes."""
+        self.read_calls += 1
+        chunk = bytes(self._queued[:size])
+        del self._queued[:size]
+        return chunk
+
+    def write(self, data: bytes) -> int:
+        """Record a write without transmitting bytes."""
+        self.write_calls += 1
+        return len(data)
+
+    def queue(self, data: bytes) -> None:
+        """Append deterministic packet bytes for pre-request setup."""
+        self._queued.extend(data)
+
+
+class _ReceiptClock:
+    """Deterministic receipt clock for the in-memory Hottop setup."""
+
+    def __init__(self, value: float = 1.0) -> None:
+        """Initialize the current host-clock value."""
+        self.value = value
+
+    def __call__(self) -> float:
+        """Return the current deterministic host-clock value."""
+        return self.value
+
+
+class _ReceiptCountingHottopDriver(HottopRoasterDriver):
+    """Real Hottop adapter with counters for the registered cold-read boundary."""
+
+    def __init__(
+        self,
+        *,
+        port: str,
+        receipt_report: str,
+        serial_factory: Callable[..., _ReceiptReportTransport],
+        reception_clock: Callable[[], float],
+    ) -> None:
+        """Initialize the real adapter and snapshot-call counters."""
+        super().__init__(
+            port=port,
+            receipt_report=cast(Any, receipt_report),
+            serial_factory=serial_factory,
+            reception_clock=reception_clock,
+        )
+        self.combined_reads = 0
+        self.read_state_calls = 0
+        self.lifecycle_evidence_calls = 0
+
+    def read_state(self) -> RoasterState:
+        """Count ordinary snapshot calls."""
+        self.read_state_calls += 1
+        return super().read_state()
+
+    def read_state_and_receipt_observation(self) -> tuple[RoasterState, HottopReceiptObservation]:
+        """Count atomic receipt snapshots while retaining the real implementation."""
+        self.combined_reads += 1
+        return super().read_state_and_receipt_observation()
+
+    def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
+        """Count the existing read-only lifecycle observation."""
+        self.lifecycle_evidence_calls += 1
+        return super().read_lifecycle_evidence()
+
+
+def _receipt_status_packet(*, bean: int = 197, environment: int = 202) -> bytes:
+    """Build one valid Celsius status packet for receipt-observer setup."""
+    packet = bytearray(HOTTOP_PACKET_LENGTH)
+    packet[: len(HOTTOP_PACKET_PREFIX)] = HOTTOP_PACKET_PREFIX
+    packet[23] = environment // 256
+    packet[24] = environment % 256
+    packet[25] = bean // 256
+    packet[26] = bean % 256
+    packet[-1] = calculate_hottop_packet_checksum(packet)
+    return bytes(packet)
+
+
+def _receipt_reporting_context(
+    tmp_path: Path,
+) -> tuple[ServerContext, _ReceiptCountingHottopDriver, _ReceiptReportTransport, _ReceiptClock]:
+    """Build one cold-read context around a real adapter and fake transport."""
+    context = _cold_finalisation_context(tmp_path)
+    object.__setattr__(
+        context,
+        "config",
+        dataclasses.replace(
+            context.config,
+            roaster=RoasterConfig(
+                driver=HOTTOP_DRIVER_NAME,
+                port="fake",
+                temperature_unit="celsius",
+                temperature_unit_explicit=True,
+                hottop_receipt_report="observe/v1",
+            ),
+        ),
+    )
+    transport = _ReceiptReportTransport()
+    clock = _ReceiptClock()
+
+    def serial_factory(*_args: object, **_kwargs: object) -> _ReceiptReportTransport:
+        """Return the sole in-memory setup transport."""
+        return transport
+
+    driver = _ReceiptCountingHottopDriver(
+        port="fake",
+        receipt_report="observe/v1",
+        serial_factory=serial_factory,
+        reception_clock=clock,
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    object.__setattr__(context, "roaster_driver", driver)
+    return context, driver, transport, clock
+
+
+def _prepare_receipt_read(
+    driver: _ReceiptCountingHottopDriver,
+    transport: _ReceiptReportTransport,
+    clock: _ReceiptClock,
+    data: bytes,
+) -> None:
+    """Record one drained floor then cache a receipt before the server request."""
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+    clock.value += 1.0
+    transport.queue(data)
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_registered_cold_read_flattens_one_cached_complete_receipt(tmp_path: Path) -> None:
+    """An opted-in cold read adds the fixed receipt keys without request-time transport I/O."""
+    context, driver, transport, clock = _receipt_reporting_context(tmp_path)
+    _prepare_receipt_read(driver, transport, clock, _receipt_status_packet())
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    base_state = driver.read_state()
+    request_counts = (
+        transport.read_calls,
+        transport.waiting_calls,
+        transport.write_calls,
+        transport.close_calls,
+    )
+
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert driver.combined_reads == 1
+    assert driver.read_state_calls == 1  # The pre-request baseline only.
+    assert driver.lifecycle_evidence_calls == 1
+    assert (
+        transport.read_calls,
+        transport.waiting_calls,
+        transport.write_calls,
+        transport.close_calls,
+    ) == request_counts
+    assert state.device_state is not None
+    raw = state.device_state.raw_vendor_data
+    receipt_keys = {key for key in raw if key.startswith("hottop_receipt_v1_")}
+    expected_receipt_keys = {
+        f"hottop_receipt_v1_{field}"
+        for field in mcp_server._COLD_RECEIPT_REPORT_FIELDS  # pyright: ignore[reportPrivateUsage]
+    }
+    assert receipt_keys == expected_receipt_keys
+    assert raw["hottop_receipt_v1_outcome"] == "complete_celsius_packet_received"
+    assert raw["hottop_receipt_v1_latest_bean_temp_c"] == 197.0
+    assert raw["hottop_receipt_v1_latest_env_temp_c"] == 202.0
+    assert raw["hottop_receipt_v1_defects"] == ""
+    assert all(type(value) in (str, int, float, bool, type(None)) for value in raw.values())
+    assert all(not isinstance(value, (dict, list, tuple)) for value in raw.values())
+    assert not any(key.startswith("hottop_receipt_v1_") for key in base_state.raw_vendor_data)
+    assert {key: raw[key] for key in base_state.raw_vendor_data} == base_state.raw_vendor_data
+    assert state.device_state.bean_temp_c == base_state.bean_temp_c
+    assert state.device_state.env_temp_c == base_state.env_temp_c
+    receipt_json = json.dumps(
+        {key: raw[key] for key in receipt_keys}, separators=(",", ":")
+    ).encode()
+    assert len(receipt_json) <= 2048
+    assert len(json.dumps(raw, separators=(",", ":")).encode()) <= 8192
+
+
+@pytest.mark.parametrize(
+    ("data", "expected_defect"),
+    (
+        (_receipt_status_packet() + b"x" * 12, "parser_remainder"),
+        (_receipt_status_packet() * 7, "backlog_visible"),
+    ),
+)
+def test_registered_cold_read_retains_cached_partial_and_queued_receipt_distinctions(
+    tmp_path: Path,
+    data: bytes,
+    expected_defect: str,
+) -> None:
+    """Cached parser and queue defects are exposed as one flat ordered diagnostic string."""
+    context, driver, transport, clock = _receipt_reporting_context(tmp_path)
+    _prepare_receipt_read(driver, transport, clock, data)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert driver.combined_reads == 1
+    assert driver.read_state_calls == 0
+    assert state.device_state is not None
+    raw = state.device_state.raw_vendor_data
+    assert raw["hottop_receipt_v1_outcome"] == "receipt_unusable"
+    assert expected_defect in cast(str, raw["hottop_receipt_v1_defects"]).split(",")
+    assert raw["hottop_receipt_v1_latest_bean_temp_c"] is None
+    assert raw["hottop_receipt_v1_latest_env_temp_c"] is None
+
+
+def test_registered_cold_read_reports_no_receipt_from_one_cached_atomic_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A fresh opted-in cold session emits its fixed no-receipt map without transport I/O."""
+    context, driver, transport, _clock = _receipt_reporting_context(tmp_path)
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    request_counts = (
+        transport.read_calls,
+        transport.waiting_calls,
+        transport.write_calls,
+        transport.close_calls,
+    )
+
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert driver.combined_reads == 1
+    assert driver.read_state_calls == 0
+    assert state.device_state is not None
+    raw = state.device_state.raw_vendor_data
+    assert raw["hottop_receipt_v1_outcome"] == "no_receipt"
+    assert raw["hottop_receipt_v1_receipt_sequence"] == 0
+    assert (
+        transport.read_calls,
+        transport.waiting_calls,
+        transport.write_calls,
+        transport.close_calls,
+    ) == request_counts
+
+
+def test_registered_cold_read_drops_receipt_after_final_session_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A receipt held for cold session A cannot decorate replacement session B."""
+    context, driver, transport, clock = _receipt_reporting_context(tmp_path)
+    _prepare_receipt_read(driver, transport, clock, _receipt_status_packet())
+    initial = context.session_store.start_session(purpose="cold_characterisation")
+    original_observe = mcp_server._observe_cold_characterisation_roast_fan  # pyright: ignore[reportPrivateUsage]
+
+    def replace_after_observation(
+        server_context: ServerContext,
+        *,
+        session: RoastSession,
+        driver_state: RoasterState,
+    ) -> ColdCharacterisationObservation | None:
+        """Replace the source session after existing reconciliation work has started."""
+        observation = original_observe(server_context, session=session, driver_state=driver_state)
+        initial.monotonic_stop = initial.monotonic_start
+        context.session_store.start_session(purpose="cold_characterisation")
+        return observation
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_observe_cold_characterisation_roast_fan",
+        replace_after_observation,
+    )
+
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=initial.id)
+
+    assert driver.combined_reads == 1
+    assert state.session_id == initial.id and not state.active
+    assert state.device_state is not None
+    assert not any(
+        key.startswith("hottop_receipt_v1_") for key in state.device_state.raw_vendor_data
+    )
+
+
+def test_registered_cold_read_uses_malformed_fixed_receipt_map_without_changing_legacy_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed report remains a non-fatal, fixed-key diagnostic response."""
+    context, driver, transport, clock = _receipt_reporting_context(tmp_path)
+    _prepare_receipt_read(driver, transport, clock, _receipt_status_packet())
+    session = context.session_store.start_session(purpose="cold_characterisation")
+    baseline = driver.read_state()
+
+    def malformed_report(_observation: object) -> object:
+        """Return a deliberately invalid projection boundary value."""
+        return object()
+
+    monkeypatch.setattr(mcp_server, "project_cold_receipt_report", malformed_report)
+
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert state.device_state is not None
+    raw = state.device_state.raw_vendor_data
+    assert raw["hottop_receipt_v1_outcome"] == "malformed"
+    assert raw["hottop_receipt_v1_defects"] == ""
+    assert {key: raw[key] for key in baseline.raw_vendor_data} == baseline.raw_vendor_data
+
+
+@pytest.mark.parametrize(("purpose", "stop"), (("roast", False), ("cold_characterisation", True)))
+def test_receipt_reporting_is_absent_outside_the_latest_active_cold_session(
+    tmp_path: Path,
+    purpose: SessionPurpose,
+    stop: bool,
+) -> None:
+    """Opted receipt reporting does not broaden ordinary or historical state reads."""
+    context, driver, transport, clock = _receipt_reporting_context(tmp_path)
+    _prepare_receipt_read(driver, transport, clock, _receipt_status_packet())
+    session = context.session_store.start_session(purpose=purpose)
+    if stop:
+        session.monotonic_stop = session.monotonic_start
+
+    state = _call_tool(create_mcp_server(), "get_roast_state", _ctx(context), session_id=session.id)
+
+    assert driver.combined_reads == 0
+    assert driver.read_state_calls == 1
+    assert state.device_state is not None
+    assert not any(
+        key.startswith("hottop_receipt_v1_") for key in state.device_state.raw_vendor_data
+    )
+    assert transport.write_calls == 0
+
+
+def test_flat_receipt_report_worst_case_values_remain_within_registered_size_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The closed 22-key receipt map remains below its measured compact JSON bound."""
+    report = mcp_server.ColdReceiptReport(
+        receipt_report_version=1,
+        outcome="receipt_unusable",
+        defects=tuple(sorted(mcp_server._COLD_RECEIPT_REPORT_DEFECTS)),  # pyright: ignore[reportPrivateUsage]
+        same_handle_epoch=True,
+        read_returned_age_seconds=1.7976931348623157e308,
+        drained_floor_present=True,
+        drained_floor_age_seconds=1.7976931348623157e308,
+        queued_before_read=2**53 - 1,
+        queued_after_read=2**53 - 1,
+        requested_byte_count=2**53 - 1,
+        returned_byte_count=2**53 - 1,
+        packet_count=2**53 - 1,
+        skipped_byte_count=2**53 - 1,
+        prior_tail_length=2**53 - 1,
+        tail_length=2**53 - 1,
+        latest_bean_temp_c=1.7976931348623157e308,
+        latest_env_temp_c=1.7976931348623157e308,
+        receipt_sequence=2**53 - 1,
+        observer_discard_count=2**53 - 1,
+    )
+
+    def worst_case_report(_observation: object) -> mcp_server.ColdReceiptReport:
+        """Return the prebuilt bounded projection."""
+        return report
+
+    monkeypatch.setattr(mcp_server, "project_cold_receipt_report", worst_case_report)
+
+    raw = mcp_server._flatten_cold_receipt_report(object())  # pyright: ignore[reportPrivateUsage]
+
+    assert len(raw) == 22
+    assert len(json.dumps(raw, separators=(",", ":")).encode()) <= 2048
+
+
 def test_cold_temperature_projection_uses_single_state_snapshot(tmp_path: Path) -> None:
     """M7: one `read_state` and one lifecycle read; counters equal the same response."""
     context = _cold_finalisation_context(tmp_path)
@@ -14269,6 +14658,50 @@ def test_manual_authority_composition_refuses_before_driver_creation(
     with pytest.raises(ConfigError, match="requires mock driver"):
         build_server_context(config_path=tmp_path / "not-read.yaml")
     assert not calls
+
+
+@pytest.mark.parametrize("receipt_report", ["off", "observe/v1"])
+def test_build_server_context_passes_receipt_reporting_only_to_ordinary_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_report: str,
+) -> None:
+    """The normal driver factory receives the configured passive-report setting unchanged."""
+    config = AppConfig(
+        roaster=RoasterConfig(
+            driver=HOTTOP_DRIVER_NAME,
+            port="fake",
+            temperature_unit="celsius",
+            temperature_unit_explicit=receipt_report == "observe/v1",
+            hottop_receipt_report=cast(Any, receipt_report),
+        )
+    )
+    received: list[dict[str, object]] = []
+
+    def load(**_kwargs: object) -> AppConfig:
+        """Return the already-validated in-memory configuration."""
+        return config
+
+    def factory(*_args: object, **kwargs: object) -> MockRoasterDriver:
+        """Record ordinary assembly arguments without constructing hardware adapters."""
+        received.append(kwargs)
+        return MockRoasterDriver()
+
+    monkeypatch.setattr(mcp_server, "load_config", load)
+    monkeypatch.setattr(mcp_server, "create_roaster_driver", factory)
+
+    build_server_context(config_path=tmp_path / "not-read.yaml")
+
+    assert received == [
+        {
+            "port": "fake",
+            "baudrate": 115_200,
+            "temperature_unit": "celsius",
+            "command_interval_seconds": 0.3,
+            "hottop_reception": "off",
+            "receipt_report": receipt_report,
+        }
+    ]
 
 
 def test_build_server_context_refuses_candidate_without_composition_before_driver_construction(
