@@ -3050,8 +3050,16 @@ def build_server_context(
     capture_evidence_configured = _manual_capture_configured(
         config, roaster_driver, simulation_composition
     )
+    trusted_simulation = _trusted_hottop_simulation_components(
+        config=config,
+        driver=roaster_driver,
+        simulation_composition=simulation_composition,
+        binding=_trusted_hottop_simulation_binding,
+    )
     unavailable_export_marker = (
-        _establish_unavailable_export_marker(config) if simulation_composition is None else None
+        _establish_unavailable_export_marker(config)
+        if simulation_composition is None or trusted_simulation
+        else None
     )
     capture_evidence_publisher = CaptureEvidencePublisher()
     server_context: ServerContext | None = None
@@ -3078,22 +3086,8 @@ def build_server_context(
             default_log_dir=config.logging.log_dir / "roasts",
             telemetry_log_interval_seconds=config.logging.sample_interval_seconds,
             monotonic_now=simulation_composition.clock,
-            manual_first_crack_writer_enabled=_trusted_hottop_simulation_components(
-                config=config,
-                driver=roaster_driver,
-                simulation_composition=simulation_composition,
-                binding=_trusted_hottop_simulation_binding,
-            ),
-            manual_first_crack_budget_seconds=(
-                None
-                if _trusted_hottop_simulation_components(
-                    config=config,
-                    driver=roaster_driver,
-                    simulation_composition=simulation_composition,
-                    binding=_trusted_hottop_simulation_binding,
-                )
-                else 1.0
-            ),
+            manual_first_crack_writer_enabled=trusted_simulation,
+            manual_first_crack_budget_seconds=(None if trusted_simulation else 1.0),
         )
     mock_replay_publisher = _MockReplayPublisher()
 
@@ -3136,14 +3130,7 @@ def build_server_context(
         simulation_composition_id=(uuid4().hex if simulation_composition is not None else None),
         _trusted_hottop_simulation_binding=_trusted_hottop_simulation_binding,
         _trusted_hottop_simulation_driver=(
-            cast(HottopRoasterDriver, roaster_driver)
-            if _trusted_hottop_simulation_components(
-                config=config,
-                driver=roaster_driver,
-                simulation_composition=simulation_composition,
-                binding=_trusted_hottop_simulation_binding,
-            )
-            else None
+            cast(HottopRoasterDriver, roaster_driver) if trusted_simulation else None
         ),
         unavailable_export_marker=unavailable_export_marker,
         mock_replay_publisher=mock_replay_publisher,
@@ -3986,9 +3973,7 @@ def _create_mcp_server(
                 if unavailable is None:
                     raise ValueError("Roast export is unavailable.")
                 return unavailable
-            export = await _export_trusted_hottop_simulation_snapshot(
-                server_context, session.id
-            )
+            export = await _export_trusted_hottop_simulation_snapshot(server_context, session.id)
             if export is not None:
                 return ExportRoastLogResult(
                     session_id=export.session_id,

@@ -1394,10 +1394,30 @@ def test_trusted_simulation_export_preserves_canonical_writer_and_closed_snapsho
                 assert summary["roaster_driver"] == HOTTOP_DRIVER_NAME
             assert raw_jsonl.read_bytes() == canonical_before
             assert (raw_jsonl.stat().st_dev, raw_jsonl.stat().st_ino) == identity_before
-            event_kinds = [json.loads(line)["kind"] for line in canonical_before.decode().splitlines()]
+            event_kinds = [
+                json.loads(line)["kind"] for line in canonical_before.decode().splitlines()
+            ]
             with Path(raw_dir / "roast.csv").open(newline="", encoding="utf-8") as output:
-                assert [row["event"] for row in csv.DictReader(output) if row["event"]] == event_kinds
+                assert [
+                    row["event"] for row in csv.DictReader(output) if row["event"]
+                ] == event_kinds
 
+    asyncio.run(exercise())
+
+
+def test_trusted_simulation_interrupted_export_uses_a_fresh_composition(tmp_path: Path) -> None:
+    """An interrupted synthetic run exports only from its own fresh transport."""
+    interrupted_root = tmp_path / "interrupted"
+    interrupted_root.mkdir()
+    config = _simulation_config(interrupted_root)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+
+    async def exercise() -> None:
+        """Exercise the interrupted export path without reusing a staged transport."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
             interrupted = cast(
                 StartRoastSessionResult,
                 await _call(
@@ -1411,28 +1431,107 @@ def test_trusted_simulation_export_preserves_canonical_writer_and_closed_snapsho
             await _call(server, "mark_beans_added", context)
             await _call(server, "mark_first_crack", context)
             await _call(server, "emergency_stop", context, reason="synthetic interruption")
-            interrupted_session = context.session_store.get_latest_session()
-            assert interrupted_session is not None and interrupted_session.log_writer is not None
-            interrupted_dir = interrupted_session.log_writer.log_dir
+            session = context.session_store.get_latest_session()
+            assert session is not None and session.log_writer is not None
             for arguments in ({}, {"session_id": interrupted.session.session_id}):
                 unavailable = await _call(server, "export_roast_log", context, **arguments)
                 assert unavailable.ready is False
-            assert not (interrupted_dir / "roast.csv").exists()
-            assert not (interrupted_dir / "summary.json").exists()
+            assert not (session.log_writer.log_dir / "roast.csv").exists()
+            assert not (session.log_writer.log_dir / "summary.json").exists()
 
     asyncio.run(exercise())
 
 
-def test_trusted_simulation_export_refuses_markerless_and_unsettled_snapshot(
+def test_trusted_simulation_export_refuses_occupied_marker_and_unsettled_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Trusted simulation fails closed when its unavailable marker or settlement is absent."""
+    """Trusted simulation fails closed for occupied markers and unsettled writers."""
+    occupied_root = tmp_path / "occupied"
+    occupied_root.mkdir()
+    config = _simulation_config(occupied_root)
+    marker = occupied_root / "logs" / ".roastpilot-export-unavailable"
+    marker.mkdir(parents=True)
+    occupied = create_hottop_simulation_mcp_server(
+        config_path=config,
+        composition=HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0),
+    )
+
+    async def occupied_exercise() -> None:
+        """Refuse the opaque export path from a preoccupied namespace."""
+        lifespan = occupied.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(occupied) as context:
+            cast(
+                StartRoastSessionResult,
+                await _call(
+                    occupied,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            with pytest.raises(ValueError, match="Roast export is unavailable\\."):
+                await _call(occupied, "export_roast_log", context)
+
+    asyncio.run(occupied_exercise())
+
+    healthy_root = tmp_path / "unsettled"
+    healthy_root.mkdir()
+    healthy_config = _simulation_config(healthy_root)
+    healthy = create_hottop_simulation_mcp_server(
+        config_path=healthy_config,
+        composition=HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0),
+    )
+
+    def wait_for_idle(*, timeout_seconds: float) -> bool:
+        """Model one writer that cannot settle inside the bounded export wait."""
+        assert timeout_seconds >= 0
+        return False
+
+    async def unsettled_exercise() -> None:
+        """Refuse an otherwise healthy terminal composition with a held writer."""
+        lifespan = healthy.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(healthy) as context:
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    healthy,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            await _call(healthy, "mark_beans_added", context)
+            await _call(healthy, "drop_beans", context)
+            await _call(healthy, "start_cooling", context)
+            await _call(healthy, "stop_cooling", context)
+            session = context.session_store.get_latest_session()
+            assert session is not None and session.canonical_writer is not None
+            monkeypatch.setattr(session.canonical_writer, "wait_for_idle", wait_for_idle)
+            unavailable = await _call(
+                healthy, "export_roast_log", context, session_id=started.session.session_id
+            )
+            assert unavailable.ready is False
+            assert not (session.log_writer.log_dir / "roast.csv").exists()  # type: ignore[union-attr]
+            assert not (session.log_writer.log_dir / "summary.json").exists()  # type: ignore[union-attr]
+
+    asyncio.run(unsettled_exercise())
+
+
+@pytest.mark.parametrize("mutation", ["missing", "tampered"])
+def test_trusted_simulation_export_refuses_missing_or_tampered_canonical_log(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Trusted export never substitutes a missing or modified canonical JSONL."""
     config = _simulation_config(tmp_path)
     composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
     server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
 
     async def exercise() -> None:
-        """Exercise marker and writer-settlement refusal through registered tools."""
+        """Reach a terminal synthetic session, then invalidate its canonical bytes."""
         lifespan = server.settings.lifespan
         assert lifespan is not None
         async with lifespan(server) as context:
@@ -1446,28 +1545,79 @@ def test_trusted_simulation_export_refuses_markerless_and_unsettled_snapshot(
                     first_crack_observer_ack="manual/v1",
                 ),
             )
-            monkeypatch.setattr(context, "unavailable_export_marker", None)
-            with pytest.raises(ValueError, match="Roast export is unavailable\\."):
-                await _call(server, "export_roast_log", context)
-            with pytest.raises(ValueError, match="Unknown session_id"):
-                await _call(server, "export_roast_log", context, session_id="unknown")
-            monkeypatch.setattr(
-                context,
-                "unavailable_export_marker",
-                tmp_path / "unavailable",
-            )
             await _call(server, "mark_beans_added", context)
             await _call(server, "drop_beans", context)
             await _call(server, "start_cooling", context)
             await _call(server, "stop_cooling", context)
             session = context.session_store.get_latest_session()
-            assert session is not None and session.canonical_writer is not None
-            monkeypatch.setattr(session.canonical_writer, "wait_for_idle", lambda **_kwargs: False)
+            assert session is not None and session.log_writer is not None
+            canonical_path = session.log_writer.log_dir / "roast.jsonl"
+            if mutation == "missing":
+                canonical_path.unlink()
+            else:
+                canonical_path.write_bytes(b'{"kind":"tampered"}\n')
+
             unavailable = await _call(
                 server, "export_roast_log", context, session_id=started.session.session_id
             )
             assert unavailable.ready is False
-            assert not (session.log_writer.log_dir / "roast.csv").exists()  # type: ignore[union-attr]
-            assert not (session.log_writer.log_dir / "summary.json").exists()  # type: ignore[union-attr]
+            assert not (session.log_writer.log_dir / "roast.csv").exists()
+            assert not (session.log_writer.log_dir / "summary.json").exists()
+
+    asyncio.run(exercise())
+
+
+def test_trusted_simulation_active_export_refuses_during_held_canonical_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Active trusted export remains inert while its canonical writer owns a turn."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+    append_started = Event()
+    release_append = Event()
+    original_append = session_module._CanonicalGenerationWriter._append_verified  # pyright: ignore[reportPrivateUsage]
+
+    def hold_append(writer: object, frame: bytes) -> None:
+        """Hold the beans-added frame after its canonical write begins."""
+        original_append(writer, frame)  # type: ignore[arg-type]
+        if b'"beans_added"' in frame:
+            append_started.set()
+            assert release_append.wait(timeout=1.0)
+
+    monkeypatch.setattr(
+        session_module._CanonicalGenerationWriter,  # pyright: ignore[reportPrivateUsage]
+        "_append_verified",
+        hold_append,
+    )
+
+    async def exercise() -> None:
+        """Observe refusal through the registered active export route."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            mark = asyncio.create_task(_call(server, "mark_beans_added", context))
+            assert await asyncio.to_thread(append_started.wait, 1.0)
+            session = context.session_store.get_active_session()
+            assert session is not None and session.log_writer is not None
+            unavailable = await _call(
+                server, "export_roast_log", context, session_id=started.session.session_id
+            )
+            assert unavailable.ready is False
+            assert not (session.log_writer.log_dir / "roast.csv").exists()
+            assert not (session.log_writer.log_dir / "summary.json").exists()
+            release_append.set()
+            await mark
+            await _call(server, "emergency_stop", context, reason="synthetic test cleanup")
 
     asyncio.run(exercise())
