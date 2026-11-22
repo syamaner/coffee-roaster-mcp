@@ -3248,6 +3248,26 @@ def test_hottop_lifecycle_evidence_surfaces_transport_is_open_failure() -> None:
     assert transport.close_calls == 1
 
 
+@pytest.mark.parametrize("invalid_is_open", (None, 1))
+def test_candidate_lifecycle_evidence_rejects_inconclusive_retained_handle_status(
+    invalid_is_open: None | int,
+) -> None:
+    """Candidate retained handles cannot convert invalid status into closure evidence."""
+    transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="/dev/test-hottop",
+        serial_factory=FakeSerialFactory(transport=transport),
+        hottop_reception="candidate/v1",
+    )
+    owner = driver.reserve_inhibited_start("server", purpose="roast")
+    driver.open_inhibited_start(owner)
+
+    transport.is_open = cast(Any, invalid_is_open)
+
+    with pytest.raises((TypeError, ValueError), match="complete|boolean"):
+        driver.read_lifecycle_evidence()
+
+
 def test_hottop_lifecycle_evidence_reports_stuck_loop_after_disconnect_timeout() -> None:
     """A timed-out Hottop loop remains visible as failed disconnect confirmation evidence."""
     factory = FakeSerialFactory()
@@ -3985,9 +4005,7 @@ def test_candidate_stop_after_full_first_write_refuses_handoff_without_second_fr
     assert transport.writes_snapshot() == [claim.frame]
 
 
-def test_candidate_deferred_ambiguous_worker_cannot_write_to_replacement_transport(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_candidate_deferred_ambiguous_worker_cannot_write_to_replacement_transport() -> None:
     """An old ambiguous worker retains its handle gate across a clean replacement connect."""
 
     class OrderedTransport(FakeSerialTransport):
@@ -3995,9 +4013,23 @@ def test_candidate_deferred_ambiguous_worker_cannot_write_to_replacement_transpo
             super().__init__()
             self.first_write = Event()
             self.streaming_write = Event()
+            self.stale_replacement_write = Event()
+            self._stale_writer_identity: int | None = None
+            self._writer_identities: list[int] = []
+            self._writer_lock = Lock()
+
+        def track_stale_writer(self, identity: int) -> None:
+            """Record the real deferred worker identity for replacement-write detection."""
+            with self._writer_lock:
+                self._stale_writer_identity = identity
 
         def write(self, data: bytes) -> int:
             receipt = super().write(data)
+            with self._writer_lock:
+                writer_identity = get_ident()
+                self._writer_identities.append(writer_identity)
+                if writer_identity == self._stale_writer_identity:
+                    self.stale_replacement_write.set()
             if len(self.writes_snapshot()) == 1:
                 self.first_write.set()
             else:
@@ -4031,26 +4063,38 @@ def test_candidate_deferred_ambiguous_worker_cannot_write_to_replacement_transpo
         deferred_workers.append(worker)
         raise RuntimeError("synthetic ambiguous launch")
 
-    monkeypatch.setattr(Thread, "start", defer_then_raise)
-    with pytest.raises(RuntimeError, match="ambiguous launch"):
-        driver.hand_off_written_start_to_stream(owner, session)
+    with pytest.MonkeyPatch.context() as launch_patch:
+        launch_patch.setattr(Thread, "start", defer_then_raise)
+        with pytest.raises(RuntimeError, match="ambiguous launch"):
+            driver.hand_off_written_start_to_stream(owner, session)
 
     deferred_worker = deferred_workers.pop()
-    deferred_gate, deferred_transport = cast(
-        tuple[Event, SerialTransport], cast(Any, deferred_worker)._args
-    )
-    assert deferred_transport is old_transport
-    assert isinstance(deferred_gate, Event)
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        deferred_admission = driver._start_stream_admission  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(deferred_admission, Event)
+    deferred_admission.set()
     driver.disconnect()
 
-    monkeypatch.undo()
     driver.connect()
     assert replacement_transport.streaming_write.wait(timeout=1.0)
-    deferred_gate.set()
-    deferred_worker.run()
+    stale_worker_started = Event()
 
-    assert old_transport.writes_snapshot() == [claim.frame]
-    driver.disconnect()
+    def run_deferred_worker() -> None:
+        replacement_transport.track_stale_writer(get_ident())
+        stale_worker_started.set()
+        deferred_worker.run()
+
+    stale_worker = Thread(target=run_deferred_worker)
+    stale_worker.start()
+    try:
+        assert stale_worker_started.wait(timeout=1.0)
+        assert not replacement_transport.stale_replacement_write.wait(timeout=0.1)
+        assert old_transport.writes_snapshot() == [claim.frame]
+    finally:
+        driver.disconnect()
+        stale_worker.join(timeout=1.0)
+
+    assert not stale_worker.is_alive()
 
 
 def test_candidate_stop_before_admission_records_no_first_write_attempt() -> None:

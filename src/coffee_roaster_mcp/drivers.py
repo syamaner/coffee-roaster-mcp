@@ -2347,7 +2347,7 @@ class HottopRoasterDriver:
                 self._start_handle if self._hottop_reception == "candidate/v1" else None
             )
             serial_transport = self._serial if self._serial is not None else retained_handle
-            serial_open = serial_transport is not None and serial_transport.is_open is True
+            serial_open = False if serial_transport is None else serial_transport.is_open
             return DriverLifecycleEvidence(
                 driver=self.name,
                 connected=self._connected,
