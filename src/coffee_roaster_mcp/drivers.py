@@ -2108,7 +2108,7 @@ class HottopRoasterDriver:
             self._start_stream_admission = admission
             command_thread = Thread(
                 target=self._command_loop,
-                args=(admission,),
+                args=(admission, claim.handle),
                 daemon=True,
                 name="HottopCommandLoop",
             )
@@ -2206,6 +2206,7 @@ class HottopRoasterDriver:
                 staged_stream_owner = (
                     self._hottop_reception == "candidate/v1"
                     and self._start_owner is not None
+                    and serial_transport is not None
                     and self._start_handle is serial_transport
                     and self._serial is serial_transport
                 )
@@ -2342,7 +2343,11 @@ class HottopRoasterDriver:
     def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
         """Read command lifecycle state under one state-lock hold."""
         with self._state_lock:
-            serial_open = self._serial is not None and self._serial.is_open
+            retained_handle = (
+                self._start_handle if self._hottop_reception == "candidate/v1" else None
+            )
+            serial_transport = self._serial if self._serial is not None else retained_handle
+            serial_open = serial_transport is not None and serial_transport.is_open is True
             return DriverLifecycleEvidence(
                 driver=self.name,
                 connected=self._connected,
@@ -2508,14 +2513,22 @@ class HottopRoasterDriver:
             cooling_on=cooling_on,
         )
 
-    def _command_loop(self, admission: Event | None = None) -> None:
+    def _command_loop(
+        self,
+        admission: Event | None = None,
+        expected_transport: SerialTransport | None = None,
+    ) -> None:
         """Stream current Hottop command frames until disconnect requests shutdown."""
         if admission is not None:
             while not admission.is_set():
                 if self._stop_event.wait(self._command_interval_seconds):
                     return
         while not self._stop_event.wait(self._command_interval_seconds):
-            self._send_command_frame()
+            if expected_transport is not None:
+                with self._state_lock:
+                    if self._serial is not expected_transport:
+                        return
+            self._send_command_frame(expected_transport=expected_transport)
             self._run_command_loop_iteration_hook()
 
     def _run_command_loop_iteration_hook(self) -> None:
@@ -2534,10 +2547,10 @@ class HottopRoasterDriver:
             if serial_transport is not None and serial_transport.is_open:
                 self._close_serial_transport(serial_transport)
 
-    def _send_command_frame(self) -> None:
+    def _send_command_frame(self, *, expected_transport: SerialTransport | None = None) -> None:
         """Send one command-frame tick if packet construction is available."""
         if self._hottop_reception == "candidate/v1":
-            self._send_command_frame_candidate()
+            self._send_command_frame_candidate(expected_transport=expected_transport)
             return
         try:
             with self._state_lock:
@@ -2572,7 +2585,9 @@ class HottopRoasterDriver:
                 self._command_loop_error_count += 1
                 self._last_command_write_size = 0
 
-    def _send_command_frame_candidate(self) -> None:
+    def _send_command_frame_candidate(
+        self, *, expected_transport: SerialTransport | None = None
+    ) -> None:
         """Send one candidate frame after atomically recording its host entry evidence."""
         try:
             with self._state_lock:
@@ -2587,6 +2602,10 @@ class HottopRoasterDriver:
                         or not self._connected
                         or serial_transport is None
                         or not serial_transport.is_open
+                        or (
+                            expected_transport is not None
+                            and serial_transport is not expected_transport
+                        )
                     ):
                         return
                     revision = self._command_state_revision
