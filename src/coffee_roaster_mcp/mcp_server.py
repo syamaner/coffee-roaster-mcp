@@ -2743,13 +2743,17 @@ def build_server_context(
         interval_seconds=config.logging.sample_interval_seconds,
         sample_callback=sample_active_session,
     )
-    session_store = RoastSessionStore(
-        default_log_dir=config.logging.log_dir / "roasts",
-        telemetry_log_interval_seconds=config.logging.sample_interval_seconds,
-        monotonic_now=(
-            simulation_composition.clock if simulation_composition is not None else time.monotonic
-        ),
-    )
+    if simulation_composition is None:
+        session_store = RoastSessionStore(
+            default_log_dir=config.logging.log_dir / "roasts",
+            telemetry_log_interval_seconds=config.logging.sample_interval_seconds,
+        )
+    else:
+        session_store = RoastSessionStore(
+            default_log_dir=config.logging.log_dir / "roasts",
+            telemetry_log_interval_seconds=config.logging.sample_interval_seconds,
+            monotonic_now=simulation_composition.clock,
+        )
 
     def session_is_retained(session_id: str) -> bool:
         try:

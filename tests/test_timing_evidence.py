@@ -1683,7 +1683,9 @@ def test_timing_evidence_real_stdio_schema_and_malformed_requests(
                 "from coffee_roaster_mcp.session import RoastSessionStore",
                 "Path(os.environ['P1_WIRE_IMPORTED_MODULE']).write_text(mcp_server.__file__)",
                 "Path(os.environ['P1_WIRE_READ_COUNTER']).write_text('0')",
-                "clock_values = iter((100.0, 100.30000000000004, 100.6000000000001, 100.7, 100.8))",
+                # Start state projection samples the operational store clock.
+                "clock_values = iter((100.0, 100.0, "
+                "100.30000000000004, 100.6000000000001, 100.7, 100.8))",
                 "mcp_server.RoastSessionStore = functools.partial(",
                 "    RoastSessionStore, monotonic_now=lambda: next(clock_values)",
                 ")",

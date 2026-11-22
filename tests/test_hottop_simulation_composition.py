@@ -369,6 +369,12 @@ def test_simulation_reception_tool_projects_one_registered_eligible_snapshot(
             )
             async with ClientSession(client_receive, client_send) as client:
                 await client.initialize()
+                discovered = await client.list_tools()
+                assert any(
+                    tool.name == "get_hottop_reception_evidence" for tool in discovered.tools
+                )
+                assert composition.serial_factory_calls == 0
+                assert composition.transport.writes_snapshot() == ()
                 started = await client.call_tool(
                     "start_roast_session",
                     {"purpose": "roast", "first_crack_observer_ack": "manual/v1"},
@@ -417,7 +423,11 @@ def test_simulation_reception_tool_projects_one_registered_eligible_snapshot(
                 assert len(composition.transport.writes_snapshot()) > writes_after_floor
                 clock.value = 180.0
                 composition.queue_status_bytes(_status_packet(bean_c=195, environment_c=204))
-                await asyncio.sleep(0.05)
+                for _ in range(100):
+                    if composition.transport.in_waiting == 0:
+                        break
+                    await asyncio.sleep(0.01)
+                assert composition.transport.in_waiting == 0
                 state = await client.call_tool("get_roast_state", {})
                 assert state.isError is False
                 assert state.structuredContent is not None
