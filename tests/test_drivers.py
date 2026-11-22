@@ -11,12 +11,14 @@ import pytest
 
 from coffee_roaster_mcp.cold_temperature import ColdTemperatureProjection, project_cold_temperature
 from coffee_roaster_mcp.drivers import (
+    HOTTOP_DRIVER_NAME,
     HOTTOP_PACKET_LENGTH,
     HOTTOP_PACKET_PREFIX,
     CommandStreaming,
     DriverLifecycleEvidence,
     FixedZeroCommandedState,
     HottopDrainedFloor,
+    HottopDropRefused,
     HottopFirstWriteDisposition,
     HottopReceiptClassification,
     HottopReceivedPacket,
@@ -1062,6 +1064,174 @@ def test_create_roaster_driver_returns_hottop_driver() -> None:
 
     assert isinstance(driver, HottopRoasterDriver)
     assert driver.read_state().raw_vendor_data["temperature_unit"] == "fahrenheit"
+
+
+def test_candidate_factory_requires_simulated_transport_and_declares_capability() -> None:
+    """The candidate cannot select pyserial and is declared only with fake composition."""
+    with pytest.raises(ValueError, match="injected simulated transport"):
+        create_roaster_driver(
+            HOTTOP_DRIVER_NAME,
+            temperature_unit="celsius",
+            hottop_reception="candidate/v1",
+        )
+    factory = FakeSerialFactory()
+    driver = create_roaster_driver(
+        HOTTOP_DRIVER_NAME,
+        temperature_unit="celsius",
+        hottop_reception="candidate/v1",
+        serial_factory=factory,
+    )
+
+    assert isinstance(driver, HottopRoasterDriver)
+    assert driver.capabilities.hottop_reception_candidate_version == 1
+    assert factory.calls == []
+
+
+def test_candidate_refuses_provider_non_celsius_and_mock_composition() -> None:
+    """The candidate's simulated boundary has no fallback to an unsafe composition."""
+    factory = FakeSerialFactory()
+    with pytest.raises(ValueError, match="temperature_unit celsius"):
+        HottopRoasterDriver(
+            serial_factory=factory,
+            temperature_unit="auto",
+            hottop_reception="candidate/v1",
+        )
+    with pytest.raises(ValueError, match="command_frame_provider"):
+        HottopRoasterDriver(
+            serial_factory=factory,
+            hottop_reception="candidate/v1",
+            command_frame_provider=lambda: b"",
+        )
+    with pytest.raises(ValueError, match="mock driver"):
+        create_roaster_driver("mock", hottop_reception="candidate/v1")
+
+
+def test_candidate_drop_first_attempt_is_fixed_and_unknown_refuses_repeat() -> None:
+    """A non-exact first Drop write remains unknown while emergency admission stays open."""
+
+    class PartialTransport(FakeSerialTransport):
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data) - 1
+
+    transport = PartialTransport()
+    driver = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_reception_epoch(transport)  # pyright: ignore[reportPrivateUsage]
+    driver.drop_beans()
+    driver._send_command_frame_candidate()  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(HottopDropRefused):
+        driver.drop_beans()
+    emergency = driver.emergency_stop(reason="test")
+
+    assert emergency.safety_method == "emergency_stop"
+    assert driver._drop_transition_count == 1  # pyright: ignore[reportPrivateUsage]
+    assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
+    assert driver._drop_settlement.result == "unknown"  # pyright: ignore[reportPrivateUsage]
+    assert driver._attempt_history[-1].role == "drop"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_candidate_write_gate_rebuilds_emergency_frame_after_drop_is_closed() -> None:
+    """Stop can close an unentered Drop while the candidate gate waits for its lock."""
+
+    class SignallingLock:
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self.command_loop_waiting = Event()
+
+        def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+            if get_ident() != main_thread:
+                self.command_loop_waiting.set()
+            return self._lock.acquire(blocking, timeout)
+
+        def release(self) -> None:
+            self._lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.release()
+
+    class WrittenTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.written = Event()
+
+        def write(self, data: bytes) -> int:
+            result = super().write(data)
+            self.written.set()
+            return result
+
+    transport = WrittenTransport()
+    driver = HottopRoasterDriver(
+        port="simulated",
+        command_interval_seconds=0.01,
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    gate = SignallingLock()
+    main_thread = get_ident()
+    driver._command_write_lock = gate  # pyright: ignore[reportPrivateUsage]
+    driver.drop_beans()
+    assert gate.acquire()
+    driver.connect()
+    try:
+        assert gate.command_loop_waiting.wait(timeout=1.0)
+        driver.emergency_stop(reason="test")
+        assert transport.writes_snapshot() == []
+        gate.release()
+        assert transport.written.wait(timeout=1.0)
+
+        assert transport.writes_snapshot()[0][16] == 0
+        assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_settlement.result == "not_attempted"  # pyright: ignore[reportPrivateUsage]
+        assert (driver._drop_transition_count, driver._emergency_count) == (1, 1)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        if gate._lock.locked():  # pyright: ignore[reportPrivateUsage]
+            gate.release()
+        driver.disconnect()
+
+
+def test_candidate_receipt_uses_prior_floor_and_leaves_age_bound_unset() -> None:
+    """A simulated clean read publishes host receipt only, never qualification."""
+    transport = FakeSerialTransport()
+    clock_values = iter((1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
+    driver = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+        reception_clock=lambda: next(clock_values),
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_reception_epoch(transport)  # pyright: ignore[reportPrivateUsage]
+    driver._read_status_packet_candidate(transport)  # pyright: ignore[reportPrivateUsage]
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+    )
+    driver._read_status_packet_candidate(transport)  # pyright: ignore[reportPrivateUsage]
+
+    receipt = driver._reception_record  # pyright: ignore[reportPrivateUsage]
+    assert receipt is not None
+    result = classify_hottop_received_packet(
+        receipt,
+        candidate_configured=True,
+        current_epoch=driver._reception_epoch,  # pyright: ignore[reportPrivateUsage]
+        current_handle_identity=id(transport),
+        current_sequence=receipt.sequence,
+        now=6.0,
+        receipt_age_bound_seconds=None,
+    )
+    assert receipt.latest_pair_c == (197.0, 202.0)
+    assert result.reasons == ("receipt_age_bound_unset",)
 
 
 def test_create_roaster_safety_driver_alias_returns_mock_driver() -> None:
