@@ -517,6 +517,7 @@ HottopReceiptReason = Literal[
     "receipt_age_exceeds_bound",
 ]
 HottopReceptionMode = Literal["off", "candidate/v1"]
+HottopReceiptReportMode = Literal["off", "observe/v1"]
 HottopWriteResult = Literal["entering", "accepted_by_host", "unknown"]
 HottopSettlementResult = Literal[
     "pending", "not_attempted", "entering", "accepted_by_host", "unknown"
@@ -900,6 +901,45 @@ class HottopReceiptClassification:
     def primary_reason(self) -> HottopReceiptReason | None:
         """Return the first fixed-order ineligibility reason, when present."""
         return self.reasons[0] if self.reasons else None
+
+
+@dataclass(frozen=True)
+class HottopReceiptObservation:
+    """One cached observer snapshot paired with a normalized driver state.
+
+    This is host-side receipt evidence only.  Its ``observed_at`` value is a
+    host clock reading, not a sensor timestamp or a hardware freshness claim.
+    """
+
+    receipt: HottopReceivedPacket | None
+    classification: HottopReceiptClassification
+    epoch: int
+    handle_token: int
+    receipt_sequence: int
+    observer_discard_count: int
+    observed_at: float
+
+    def __post_init__(self) -> None:
+        """Validate scalar observer facts without accessing a transport."""
+        for label in (
+            "epoch",
+            "handle_token",
+            "receipt_sequence",
+            "observer_discard_count",
+        ):
+            _validate_nonnegative_exact_int(getattr(self, label), label=label)
+        _validate_finite_time(self.observed_at, label="observed_at")
+
+
+@runtime_checkable
+class ReceiptObservationDriver(Protocol):
+    """Optional read-only capability for an atomic state and receipt snapshot."""
+
+    def read_state_and_receipt_observation(
+        self,
+    ) -> tuple[RoasterState, HottopReceiptObservation]:
+        """Return cached state and receipt facts under one driver-state lock."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -1726,6 +1766,7 @@ class HottopRoasterDriver:
         command_loop_iteration_hook: Callable[[], None] | None = None,
         command_frame_provider: HottopCommandFrameProvider | None = None,
         hottop_reception: HottopReceptionMode = "off",
+        receipt_report: HottopReceiptReportMode = "off",
         reception_clock: Callable[[], float] | None = None,
         simulation_receipt_age_bound_seconds: float | None = None,
     ) -> None:
@@ -1741,6 +1782,7 @@ class HottopRoasterDriver:
             command_loop_iteration_hook: Optional hook called after a loop iteration.
             command_frame_provider: Optional command-frame source for each loop tick.
             hottop_reception: Opt-in host-receipt candidate mode.
+            receipt_report: Opt-in passive receipt-report observer mode.
             reception_clock: Optional injected host clock for simulated candidate tests.
             simulation_receipt_age_bound_seconds: Required positive host-receipt
                 age bound for candidate exact Drop admission.
@@ -1752,6 +1794,10 @@ class HottopRoasterDriver:
         normalized_temperature_unit = _validate_hottop_temperature_unit(temperature_unit)
         if hottop_reception not in {"off", "candidate/v1"}:
             raise ValueError("hottop_reception must be exactly 'off' or 'candidate/v1'.")
+        if receipt_report not in {"off", "observe/v1"}:
+            raise ValueError("receipt_report must be exactly 'off' or 'observe/v1'.")
+        if receipt_report == "observe/v1" and hottop_reception == "candidate/v1":
+            raise ValueError("receipt_report observe/v1 cannot be combined with candidate/v1.")
         if hottop_reception == "candidate/v1" and (
             serial_factory is None or serial_factory is _create_pyserial_transport
         ):
@@ -1761,6 +1807,8 @@ class HottopRoasterDriver:
             )
         if hottop_reception == "candidate/v1" and normalized_temperature_unit != "celsius":
             raise ValueError("candidate/v1 requires temperature_unit celsius.")
+        if receipt_report == "observe/v1" and normalized_temperature_unit != "celsius":
+            raise ValueError("receipt_report observe/v1 requires temperature_unit celsius.")
         if hottop_reception == "candidate/v1" and command_frame_provider is not None:
             raise ValueError("candidate/v1 does not permit command_frame_provider.")
         if simulation_receipt_age_bound_seconds is not None:
@@ -1776,6 +1824,7 @@ class HottopRoasterDriver:
             _create_pyserial_transport if serial_factory is None else serial_factory
         )
         self._hottop_reception: HottopReceptionMode = hottop_reception
+        self._receipt_report: HottopReceiptReportMode = receipt_report
         self._reception_clock = reception_clock or monotonic
         self._simulation_receipt_age_bound_seconds = simulation_receipt_age_bound_seconds
         self._join_timeout_seconds = join_timeout_seconds
@@ -1826,6 +1875,12 @@ class HottopRoasterDriver:
         self._reception_floor: HottopDrainedFloor | None = None
         self._reception_record: HottopReceivedPacket | None = None
         self._reception_discard_count = 0
+        self._receipt_report_epoch = 0
+        self._receipt_report_handle_token = 0
+        self._receipt_report_sequence = 0
+        self._receipt_report_floor: HottopDrainedFloor | None = None
+        self._receipt_report_record: HottopReceivedPacket | None = None
+        self._receipt_report_discard_count = 0
         self._attempt_sequence = 0
         self._attempt_history: list[HottopWriteAttempt] = []
         self._drop_transition_count = 0
@@ -2331,6 +2386,8 @@ class HottopRoasterDriver:
                     self._serial = serial_transport
                     if self._hottop_reception == "candidate/v1":
                         self._begin_reception_epoch(serial_transport)
+                    if self._receipt_report == "observe/v1":
+                        self._begin_receipt_report_handle()
                     self._connected = True
                     self._disconnect_requested.clear()
                     self._stop_event.clear()
@@ -2434,6 +2491,11 @@ class HottopRoasterDriver:
                     self._disconnect_requested.set()
                     self._connected = False
                     self._stop_event.set()
+                    if self._receipt_report == "observe/v1":
+                        self._receipt_report_epoch += 1
+                        self._receipt_report_handle_token += 1
+                        self._receipt_report_floor = None
+                        self._receipt_report_record = None
                 if close_failed:
                     self._last_command_write_size = 0
                 return self._command_thread, self._serial
@@ -2455,42 +2517,69 @@ class HottopRoasterDriver:
     def read_state(self) -> RoasterState:
         """Return the current normalized Hottop lifecycle state."""
         with self._state_lock:
-            command_loop_running = (
-                self._command_thread is not None and self._command_thread.is_alive()
+            return self._state_snapshot_locked()
+
+    def read_state_and_receipt_observation(
+        self,
+    ) -> tuple[RoasterState, HottopReceiptObservation]:
+        """Return cached normalized state and passive receipt facts atomically."""
+        with self._state_lock:
+            observed_at = self._reception_clock()
+            observation = HottopReceiptObservation(
+                receipt=self._receipt_report_record,
+                classification=classify_hottop_received_packet(
+                    self._receipt_report_record,
+                    candidate_configured=False,
+                    current_epoch=self._receipt_report_epoch,
+                    current_handle_identity=self._receipt_report_handle_token,
+                    current_sequence=self._receipt_report_sequence,
+                    now=observed_at,
+                    receipt_age_bound_seconds=None,
+                ),
+                epoch=self._receipt_report_epoch,
+                handle_token=self._receipt_report_handle_token,
+                receipt_sequence=self._receipt_report_sequence,
+                observer_discard_count=self._receipt_report_discard_count,
+                observed_at=observed_at,
             )
-            return RoasterState(
-                driver=self.name,
-                connected=self._connected,
-                bean_temp_c=self._latest_bean_temp_c,
-                env_temp_c=self._latest_env_temp_c,
-                heat_level_percent=self._heat_level_percent,
-                fan_level_percent=self._main_fan_level_percent,
-                cooling_on=self._cooling_motor_on,
-                raw_vendor_data={
-                    "port": self._port,
-                    "baudrate": self._baudrate,
-                    "temperature_unit": self._temperature_unit,
-                    "resolved_temperature_unit": self._latest_resolved_temperature_unit,
-                    "raw_bean_temperature": self._latest_raw_bean_temperature,
-                    "raw_env_temperature": self._latest_raw_env_temperature,
-                    "status_packet_count": self._status_packet_count,
-                    "ignored_temperature_packet_count": self._ignored_temperature_packet_count,
-                    "status_read_error_count": self._status_read_error_count,
-                    "command_interval_seconds": self._command_interval_seconds,
-                    "command_loop_running": command_loop_running,
-                    "command_loop_iterations": self._command_loop_iterations,
-                    "command_frame_poll_count": self._command_frame_poll_count,
-                    "command_send_attempts": self._command_send_attempts,
-                    "command_write_count": self._command_write_count,
-                    "last_command_write_size": self._last_command_write_size,
-                    "command_loop_error_count": self._command_loop_error_count,
-                    "roast_fan_level_percent": self._roast_fan_level_percent,
-                    "main_fan_level_percent": self._main_fan_level_percent,
-                    "solenoid_open": self._solenoid_open,
-                    "drum_motor_on": self._drum_motor_on,
-                    "cooling_motor_on": self._cooling_motor_on,
-                },
-            )
+            return self._state_snapshot_locked(), observation
+
+    def _state_snapshot_locked(self) -> RoasterState:
+        """Build one normalized state while the caller holds ``_state_lock``."""
+        command_loop_running = self._command_thread is not None and self._command_thread.is_alive()
+        return RoasterState(
+            driver=self.name,
+            connected=self._connected,
+            bean_temp_c=self._latest_bean_temp_c,
+            env_temp_c=self._latest_env_temp_c,
+            heat_level_percent=self._heat_level_percent,
+            fan_level_percent=self._main_fan_level_percent,
+            cooling_on=self._cooling_motor_on,
+            raw_vendor_data={
+                "port": self._port,
+                "baudrate": self._baudrate,
+                "temperature_unit": self._temperature_unit,
+                "resolved_temperature_unit": self._latest_resolved_temperature_unit,
+                "raw_bean_temperature": self._latest_raw_bean_temperature,
+                "raw_env_temperature": self._latest_raw_env_temperature,
+                "status_packet_count": self._status_packet_count,
+                "ignored_temperature_packet_count": self._ignored_temperature_packet_count,
+                "status_read_error_count": self._status_read_error_count,
+                "command_interval_seconds": self._command_interval_seconds,
+                "command_loop_running": command_loop_running,
+                "command_loop_iterations": self._command_loop_iterations,
+                "command_frame_poll_count": self._command_frame_poll_count,
+                "command_send_attempts": self._command_send_attempts,
+                "command_write_count": self._command_write_count,
+                "last_command_write_size": self._last_command_write_size,
+                "command_loop_error_count": self._command_loop_error_count,
+                "roast_fan_level_percent": self._roast_fan_level_percent,
+                "main_fan_level_percent": self._main_fan_level_percent,
+                "solenoid_open": self._solenoid_open,
+                "drum_motor_on": self._drum_motor_on,
+                "cooling_motor_on": self._cooling_motor_on,
+            },
+        )
 
     def read_lifecycle_evidence(self) -> DriverLifecycleEvidence:
         """Read command lifecycle state under one state-lock hold."""
@@ -3056,6 +3145,9 @@ class HottopRoasterDriver:
 
     def _read_status_packet(self, serial_transport: SerialTransport) -> None:
         """Read available Hottop status bytes and update normalized temperatures."""
+        if self._receipt_report == "observe/v1":
+            self._read_status_packet_with_receipt_report(serial_transport)
+            return
         try:
             waiting = getattr(serial_transport, "in_waiting", 0)
             if not isinstance(waiting, int) or waiting <= 0:
@@ -3089,6 +3181,188 @@ class HottopRoasterDriver:
         except Exception:
             with self._state_lock:
                 self._status_read_error_count += 1
+
+    def _read_status_packet_with_receipt_report(self, serial_transport: SerialTransport) -> None:
+        """Observe one ordinary status read without changing its parser semantics."""
+        started_at: float | None
+        try:
+            started_at = self._reception_clock()
+            queued_before = cast(object, getattr(serial_transport, "in_waiting"))  # noqa: B009
+        except Exception:
+            self._discard_receipt_report_record()
+            return
+        if not _is_nonnegative_exact_int(queued_before):
+            self._discard_receipt_report_record()
+            return
+        queued_before_int = cast(int, queued_before)
+
+        with self._state_lock:
+            prior_tail = self._status_buffer
+            temperature_unit = self._temperature_unit
+            epoch = self._receipt_report_epoch
+            handle_token = self._receipt_report_handle_token
+
+        if queued_before_int == 0:
+            if not prior_tail:
+                self._publish_receipt_report_floor(
+                    serial_transport, epoch, handle_token, started_at
+                )
+            return
+
+        read = getattr(serial_transport, "read", None)
+        if not callable(read):
+            self._discard_receipt_report_record()
+            return
+        requested = min(queued_before_int, _HOTTOP_STATUS_READ_MAX_BYTES)
+        try:
+            chunk = read(requested)
+        except Exception:
+            self._discard_receipt_report_record()
+            return
+
+        try:
+            returned_at = self._reception_clock()
+            queued_after = cast(object, getattr(serial_transport, "in_waiting"))  # noqa: B009
+        except Exception:
+            self._update_legacy_status_from_chunk(chunk, prior_tail, temperature_unit)
+            self._discard_receipt_report_record()
+            return
+        if not _is_nonnegative_exact_int(queued_after):
+            self._update_legacy_status_from_chunk(chunk, prior_tail, temperature_unit)
+            self._discard_receipt_report_record()
+            return
+        if not isinstance(chunk, bytes) or not chunk:
+            self._discard_receipt_report_record()
+            return
+
+        try:
+            scan = scan_hottop_status_read(
+                chunk,
+                prior_tail=prior_tail,
+                queued_before_read=queued_before_int,
+                requested_byte_count=requested,
+                temperature_unit=temperature_unit,
+            )
+            statuses, remaining_buffer = _parse_hottop_status_buffer(
+                prior_tail + chunk,
+                temperature_unit=temperature_unit,
+            )
+            scan_matches_legacy = (
+                scan.packets == tuple(statuses) and scan.tail_bytes == remaining_buffer
+            )
+        except Exception:
+            self._update_legacy_status_from_chunk(chunk, prior_tail, temperature_unit)
+            self._discard_receipt_report_record()
+            return
+
+        with self._state_lock:
+            self._publish_legacy_statuses_locked(statuses, remaining_buffer)
+            if (
+                not scan_matches_legacy
+                or self._serial is not serial_transport
+                or not self._connected
+                or self._disconnect_requested.is_set()
+                or self._receipt_report_epoch != epoch
+                or self._receipt_report_handle_token != handle_token
+            ):
+                self._receipt_report_record = None
+                self._receipt_report_discard_count += 1
+                return
+            self._receipt_report_sequence += 1
+            self._receipt_report_record = build_hottop_received_packet(
+                epoch=epoch,
+                handle_identity=handle_token,
+                sequence=self._receipt_report_sequence,
+                read_started_at=started_at,
+                read_returned_at=returned_at,
+                configured_temperature_unit=temperature_unit,
+                queued_before_read=queued_before_int,
+                queued_after_read=queued_after,
+                scan=scan,
+                drained_floor=self._receipt_report_floor,
+            )
+            if queued_after == 0 and scan.tail_length == 0:
+                self._receipt_report_floor = HottopDrainedFloor(
+                    epoch=epoch,
+                    handle_identity=handle_token,
+                    sequence=self._receipt_report_sequence,
+                    observed_at=returned_at,
+                )
+
+    def _update_legacy_status_from_chunk(
+        self,
+        chunk: object,
+        prior_tail: bytes,
+        temperature_unit: HottopTemperatureUnit,
+    ) -> None:
+        """Preserve legacy parser updates when receipt observation is unusable."""
+        if not isinstance(chunk, bytes) or not chunk:
+            return
+        try:
+            statuses, remaining_buffer = _parse_hottop_status_buffer(
+                prior_tail + chunk,
+                temperature_unit=temperature_unit,
+            )
+        except Exception:
+            return
+        with self._state_lock:
+            self._publish_legacy_statuses_locked(statuses, remaining_buffer)
+
+    def _publish_legacy_statuses_locked(
+        self,
+        statuses: list[HottopStatusPacket],
+        remaining_buffer: bytes,
+    ) -> None:
+        """Apply the established parser result while the caller holds ``_state_lock``."""
+        self._status_buffer = remaining_buffer
+        for status in statuses:
+            self._status_packet_count += 1
+            self._latest_raw_bean_temperature = status.raw_bean_temperature
+            self._latest_raw_env_temperature = status.raw_env_temperature
+            if status.bean_temp_c is None or status.env_temp_c is None:
+                self._ignored_temperature_packet_count += 1
+                self._latest_resolved_temperature_unit = status.resolved_temperature_unit
+                continue
+            self._latest_bean_temp_c = status.bean_temp_c
+            self._latest_env_temp_c = status.env_temp_c
+            self._latest_resolved_temperature_unit = status.resolved_temperature_unit
+
+    def _begin_receipt_report_handle(self) -> None:
+        """Mint one passive-observer handle when its serial handle is published."""
+        self._receipt_report_epoch += 1
+        self._receipt_report_handle_token += 1
+        self._receipt_report_floor = None
+        self._receipt_report_record = None
+
+    def _publish_receipt_report_floor(
+        self,
+        serial_transport: SerialTransport,
+        epoch: int,
+        handle_token: int,
+        observed_at: float,
+    ) -> None:
+        """Record a zero-queue/parser floor only for the still-current handle."""
+        with self._state_lock:
+            if (
+                self._serial is serial_transport
+                and self._connected
+                and not self._disconnect_requested.is_set()
+                and self._receipt_report_epoch == epoch
+                and self._receipt_report_handle_token == handle_token
+                and not self._status_buffer
+            ):
+                self._receipt_report_floor = HottopDrainedFloor(
+                    epoch=epoch,
+                    handle_identity=handle_token,
+                    sequence=self._receipt_report_sequence,
+                    observed_at=observed_at,
+                )
+
+    def _discard_receipt_report_record(self) -> None:
+        """Clear the current passive observer record after an unusable observation."""
+        with self._state_lock:
+            self._receipt_report_record = None
+            self._receipt_report_discard_count += 1
 
     def _begin_reception_epoch(self, handle: SerialTransport) -> None:
         """Start a receive epoch while the new handle is atomically published."""
@@ -3446,6 +3720,7 @@ def create_roaster_driver(
     temperature_unit: HottopTemperatureUnit = "celsius",
     command_interval_seconds: float = 0.3,
     hottop_reception: HottopReceptionMode = "off",
+    receipt_report: HottopReceiptReportMode = "off",
     serial_factory: SerialTransportFactory | None = None,
     reception_clock: Callable[[], float] | None = None,
     simulation_receipt_age_bound_seconds: float | None = None,
@@ -3459,6 +3734,7 @@ def create_roaster_driver(
         temperature_unit: Configured roaster temperature unit.
         command_interval_seconds: Configured command interval.
         hottop_reception: Opt-in Hottop receipt candidate mode.
+        receipt_report: Opt-in passive Hottop receipt-report observer mode.
         serial_factory: Trusted injected simulated serial transport factory.
         reception_clock: Trusted host clock for deterministic simulated reception.
         simulation_receipt_age_bound_seconds: Positive candidate exact-Drop host
@@ -3473,6 +3749,8 @@ def create_roaster_driver(
     if driver_name == "mock":
         if hottop_reception == "candidate/v1":
             raise ValueError("candidate/v1 is not supported by the mock driver.")
+        if receipt_report == "observe/v1":
+            raise ValueError("receipt_report observe/v1 is not supported by the mock driver.")
         return MockRoasterDriver()
     if driver_name == HOTTOP_DRIVER_NAME:
         return HottopRoasterDriver(
@@ -3481,6 +3759,7 @@ def create_roaster_driver(
             temperature_unit=temperature_unit,
             command_interval_seconds=command_interval_seconds,
             hottop_reception=hottop_reception,
+            receipt_report=receipt_report,
             serial_factory=serial_factory,
             reception_clock=reception_clock,
             simulation_receipt_age_bound_seconds=simulation_receipt_age_bound_seconds,

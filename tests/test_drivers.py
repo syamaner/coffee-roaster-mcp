@@ -10,6 +10,7 @@ from typing import Any, Never, cast
 import pytest
 
 import coffee_roaster_mcp.drivers as drivers_module
+from coffee_roaster_mcp.cold_receipt_report import project_cold_receipt_report
 from coffee_roaster_mcp.cold_temperature import ColdTemperatureProjection, project_cold_temperature
 from coffee_roaster_mcp.drivers import (
     HOTTOP_DRIVER_NAME,
@@ -1127,6 +1128,25 @@ def test_candidate_refuses_provider_non_celsius_and_mock_composition() -> None:
         )
     with pytest.raises(ValueError, match="mock driver"):
         create_roaster_driver("mock", hottop_reception="candidate/v1")
+
+
+def test_receipt_report_refuses_unsafe_compositions() -> None:
+    """The passive observer remains separate from candidate and mock modes."""
+    factory = FakeSerialFactory()
+    with pytest.raises(ValueError, match="cannot be combined"):
+        HottopRoasterDriver(
+            serial_factory=factory,
+            hottop_reception="candidate/v1",
+            receipt_report="observe/v1",
+        )
+    with pytest.raises(ValueError, match="temperature_unit celsius"):
+        HottopRoasterDriver(
+            serial_factory=factory,
+            temperature_unit="auto",
+            receipt_report="observe/v1",
+        )
+    with pytest.raises(ValueError, match="mock driver"):
+        create_roaster_driver("mock", receipt_report="observe/v1")
 
 
 class MutableReceptionClock:
@@ -5178,3 +5198,57 @@ def test_inhibited_foreign_open_cannot_enter_factory() -> None:
         driver.open_inhibited_start(HottopStartOwner(owner.server_token, owner.generation))
     assert driver.inspect_inhibited_start() == (owner, HottopStartPhase.RESERVED)
     assert driver.abort_inhibited_start(owner) is HottopStartSettlement.NOT_ENTERED
+
+
+def test_receipt_report_observes_a_complete_packet_without_query_io() -> None:
+    """One passive observer report uses cached facts and leaves command output ordinary."""
+
+    class CountingTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.waiting_calls = 0
+
+        @property
+        def in_waiting(self) -> int:
+            self.waiting_calls += 1
+            return super().in_waiting
+
+    transport = CountingTransport()
+    clock = MutableReceptionClock(10.0)
+    driver = HottopRoasterDriver(
+        port="fake",
+        command_interval_seconds=60.0,
+        serial_factory=FakeSerialFactory(transport),
+        receipt_report="observe/v1",
+        reception_clock=clock,
+    )
+    driver.connect()
+    try:
+        driver._send_command_frame()  # pyright: ignore[reportPrivateUsage]
+        clock.value = 11.0
+        transport.queue_read_data(
+            _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+        )
+        driver._send_command_frame()  # pyright: ignore[reportPrivateUsage]
+        clock.value = 14.0
+        query_counts = (len(transport.writes), len(transport.read_sizes), transport.waiting_calls)
+
+        state, observation = driver.read_state_and_receipt_observation()
+        report = project_cold_receipt_report(observation)
+
+        assert report.outcome == "complete_celsius_packet_received"
+        assert report.defects == ()
+        assert report.same_handle_epoch is True
+        assert report.read_returned_age_seconds == 3.0
+        assert report.drained_floor_present is True
+        assert report.drained_floor_age_seconds == 4.0
+        assert report.latest_bean_temp_c == state.bean_temp_c == 197.0
+        assert report.latest_env_temp_c == state.env_temp_c == 202.0
+        assert report.receipt_sequence == 1
+        assert (
+            len(transport.writes),
+            len(transport.read_sizes),
+            transport.waiting_calls,
+        ) == query_counts
+    finally:
+        driver.disconnect()
