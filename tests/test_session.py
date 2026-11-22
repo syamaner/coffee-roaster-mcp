@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import time
+from collections.abc import Callable
+from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from threading import Event, Thread
+from typing import Literal, cast
 
 import pytest
 
@@ -1334,6 +1339,11 @@ def test_auto_t0_records_beans_added_from_drop_against_preheat_max() -> None:
     assert snapshot.phase == "roasting"
     assert snapshot.beans_added_at_utc == session.created_at_utc
     assert snapshot.beans_added_monotonic_seconds == 0.0
+    duplicate, duplicate_snapshot = store.record_event_snapshot(
+        session, "beans_added", provenance="manual_mark"
+    )
+    assert duplicate is event
+    assert duplicate_snapshot.beans_added_source == "auto_t0"
     assert snapshot.auto_t0_charge_temperature_c == 170.0
     assert snapshot.auto_t0_current_drop_c == 26.5
 
@@ -2857,3 +2867,962 @@ def test_exact_start_revoke_retains_inflight_until_settlement(emergency: bool) -
     assert not store.revoke_session_start(owner)
     store.clear_session_start_reservation(owner)
     assert store.complete_session_start_snapshot(newer).active
+
+
+def test_manual_first_crack_writer_publishes_only_after_verified_append(tmp_path: Path) -> None:
+    """The composed writer makes a human mark live only after its owned turn."""
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path,
+        manual_first_crack_writer_enabled=True,
+    )
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+
+    settlement = store.begin_manual_first_crack_write(session).completion.result(timeout=1)
+
+    assert settlement.outcome == "live"
+    assert settlement.event is not None
+    snapshot = store.get_session_snapshot(session_id=session.id)
+    assert snapshot.phase == "development"
+    assert snapshot.first_crack_source == "manual_mark"
+    assert not snapshot.manual_first_crack_pending
+    assert not snapshot.manual_first_crack_export_disqualified
+    deadline = time.monotonic() + 1.0
+    audit_path = tmp_path / session.id / "first-crack-audit.jsonl"
+    while (
+        not audit_path.is_file() or len(audit_path.read_text(encoding="utf-8").splitlines()) < 2
+    ) and time.monotonic() < deadline:
+        time.sleep(0.001)
+    audit_rows = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    assert [row["disposition"] for row in audit_rows] == ["begin", "live"]
+    assert audit_rows[0]["recorded_at_utc"] == audit_rows[1]["recorded_at_utc"]
+    assert audit_rows[0]["monotonic_seconds"] == audit_rows[1]["monotonic_seconds"]
+    assert (
+        audit_rows[0]["capture_ownership_sequence"] == audit_rows[1]["capture_ownership_sequence"]
+    )
+    assert audit_rows[0]["writer_generation"] == audit_rows[1]["writer_generation"]
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_manual_first_crack_audit_failure_is_unsubmitted_canonical_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed private begin spends the mark without tearing the canonical writer."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    original_audit = store._append_manual_first_crack_audit  # pyright: ignore[reportPrivateUsage]
+
+    def fail_begin(current: RoastSession, *, token: str, disposition: str) -> None:
+        if disposition == "begin":
+            raise OSError("synthetic audit ENOSPC")
+        original_audit(current, token=token, disposition=disposition)
+
+    monkeypatch.setattr(store, "_append_manual_first_crack_audit", fail_begin)
+    assert (
+        store.begin_manual_first_crack_write(session).completion.result(timeout=1).outcome
+        == "failed"
+    )
+    failed = store.get_session_snapshot(session_id=session.id)
+    assert failed.manual_first_crack_canonical_evidence == "zero"
+    assert failed.manual_first_crack_audit_unresolved
+    assert not failed.mock_log_torn
+    with pytest.raises(SessionLifecycleError, match="do not resend"):
+        store.begin_manual_first_crack_write(session)
+
+    safety_payload = session_module.default_emergency_safety_payload()
+    safety_payload["driver_safety_method_called"] = True
+    fault, _ = store.emergency_stop_snapshot(
+        session, reason="synthetic", safety_payload=safety_payload
+    )
+    completion = store.emergency_fault_completion(fault)
+    assert completion is not None
+    completion.result(timeout=1)
+    recovery_steps: tuple[tuple[Literal["drop", "stop_cooling"], bool], ...] = (
+        ("drop", True),
+        ("stop_cooling", False),
+    )
+    for kind, cooling_on in recovery_steps:
+        reservation = store.reserve_driver_fault_recovery(session, kind=kind)
+        store.complete_reserved_driver_fault_recovery_snapshot(
+            session,
+            reservation=reservation,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=cooling_on,
+        )
+
+    successor = store.start_session()
+    assert successor.id != session.id
+    assert [
+        json.loads(line)["kind"]
+        for line in (tmp_path / session.id / "roast.jsonl").read_text(encoding="utf-8").splitlines()
+    ] == ["beans_added", "fault", "beans_dropped", "cooling_started", "cooling_stopped"]
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_manual_first_crack_refused_full_lane_is_known_zero_evidence(tmp_path: Path) -> None:
+    """A previously failed writer refuses this mark before any canonical bytes exist."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    writer = session.canonical_writer
+    assert writer is not None
+    with writer._lock:  # pyright: ignore[reportPrivateUsage]
+        writer._incomplete = True  # pyright: ignore[reportPrivateUsage]
+    session.mock_log_torn = True
+
+    assert (
+        store.begin_manual_first_crack_write(session).completion.result(timeout=1).outcome
+        == "failed"
+    )
+    snapshot = store.get_session_snapshot(session_id=session.id)
+    assert snapshot.manual_first_crack_canonical_evidence == "zero"
+    assert snapshot.mock_log_torn
+    assert [event.kind for event in snapshot.event_timeline] == ["beans_added"]
+    with pytest.raises(SessionLifecycleError, match="do not resend"):
+        store.begin_manual_first_crack_write(session)
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_manual_first_crack_becomes_historical_when_drop_admits_before_acceptance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-driver drop admission prevents a staged mark from entering development."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    entered = Event()
+    release = Event()
+    original_audit = store._append_manual_first_crack_audit  # pyright: ignore[reportPrivateUsage]
+
+    def held_begin(current: RoastSession, *, token: str, disposition: str) -> None:
+        if disposition == "begin":
+            entered.set()
+            assert release.wait(timeout=1.0)
+        original_audit(current, token=token, disposition=disposition)
+
+    monkeypatch.setattr(store, "_append_manual_first_crack_audit", held_begin)
+    mark = store.begin_manual_first_crack_write(session)
+    assert entered.wait(timeout=1.0)
+    reservation = store.reserve_driver_drop(session)
+    assert reservation.reservation is not None
+    store.clear_driver_command_reservation(session, reservation.reservation)
+    release.set()
+
+    assert mark.completion.result(timeout=1.0).outcome == "historical"
+    snapshot = store.get_session_snapshot(session_id=session.id)
+    assert snapshot.phase == "roasting"
+    assert snapshot.first_crack_at_utc is None
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_manual_first_crack_notifies_before_terminal_audit_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Terminal audit failure cannot retract a verified live mark or its notification."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    notified = Event()
+    original_audit = store._append_manual_first_crack_audit  # pyright: ignore[reportPrivateUsage]
+
+    def fail_live(current: RoastSession, *, token: str, disposition: str) -> None:
+        if disposition == "live":
+            raise RuntimeError("terminal audit unavailable")
+        original_audit(current, token=token, disposition=disposition)
+
+    monkeypatch.setattr(store, "_append_manual_first_crack_audit", fail_live)
+    settlement = store.begin_manual_first_crack_write(
+        session,
+        observer_publication_token=object(),
+        on_live=lambda _session, _token: notified.set(),
+    ).completion.result(timeout=1.0)
+
+    assert settlement.outcome == "live"
+    assert notified.is_set()
+    snapshot = store.get_session_snapshot(session_id=session.id)
+    assert snapshot.phase == "development"
+    assert snapshot.manual_first_crack_audit_unresolved
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_manual_first_crack_live_settlement_precedes_held_terminal_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A verified live mark replies while its owned terminal audit remains running."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    audit_entered = Event()
+    release_audit = Event()
+    original_audit = store._append_manual_first_crack_audit  # pyright: ignore[reportPrivateUsage]
+
+    def hold_live(current: RoastSession, *, token: str, disposition: str) -> None:
+        if disposition == "live":
+            audit_entered.set()
+            assert release_audit.wait(timeout=1.0)
+        original_audit(current, token=token, disposition=disposition)
+
+    monkeypatch.setattr(store, "_append_manual_first_crack_audit", hold_live)
+    attempt = store.begin_manual_first_crack_write(session)
+    assert audit_entered.wait(timeout=1.0)
+    settlement = attempt.completion.result(timeout=0.1)
+    assert settlement.outcome == "live"
+    assert settlement.event is not None
+    release_audit.set()
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_normal_drop_prewrite_capacity_refusal_is_not_classified_as_torn(tmp_path: Path) -> None:
+    """A known-zero Drop admission refusal retains unknown outcome without torn evidence."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    session.timing_evidence_sequence = 1
+    writer = session.canonical_writer
+    assert writer is not None
+    with writer._lock:  # pyright: ignore[reportPrivateUsage]
+        writer._incomplete = True  # pyright: ignore[reportPrivateUsage]
+    session.mock_log_torn = True
+    raw_path = session.log_writer.log_dir / "roast.jsonl" if session.log_writer else None
+    assert raw_path is not None
+    raw_before = raw_path.read_bytes()
+    admission = store.admit_normal_drop(store.normal_drop_identity(session))
+    assert admission.reservation is not None
+
+    settlement = store.complete_normal_drop_success(
+        session,
+        reservation=admission.reservation,
+        heat_level_percent=0,
+        fan_level_percent=100,
+        cooling_on=True,
+    )
+
+    assert settlement.outcome == "unknown"
+    assert not store._normal_drop_persistence_torn  # pyright: ignore[reportPrivateUsage]
+    assert raw_path.read_bytes() == raw_before
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_manual_first_crack_writer_has_a_fresh_generation_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held retired generation audit cannot starve a fresh generation's mark."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    first = store.start_session()
+    store.record_event(first, "beans_added")
+    entered = Event()
+    release = Event()
+    original_audit = store._append_manual_first_crack_audit  # pyright: ignore[reportPrivateUsage]
+
+    def hold_first_begin(current: RoastSession, *, token: str, disposition: str) -> None:
+        if current is first and disposition == "begin":
+            entered.set()
+            assert release.wait(timeout=1.0)
+        original_audit(current, token=token, disposition=disposition)
+
+    monkeypatch.setattr(store, "_append_manual_first_crack_audit", hold_first_begin)
+    first_mark = store.begin_manual_first_crack_write(first)
+    assert entered.wait(timeout=1.0)
+    store.revoke_unconsumed_manual_first_crack_live_publication(first)
+    safety_payload = session_module.default_emergency_safety_payload()
+    safety_payload["driver_safety_method_called"] = True
+    fault, _ = store.emergency_stop_snapshot(first, reason="test", safety_payload=safety_payload)
+    fault_completion = store.emergency_fault_completion(fault)
+    assert fault_completion is not None
+    fault_completion.result(timeout=1.0)
+    recovery_steps: tuple[tuple[Literal["drop", "start_cooling", "stop_cooling"], bool], ...] = (
+        ("drop", True),
+        ("start_cooling", True),
+        ("stop_cooling", False),
+    )
+    for kind, cooling_on in recovery_steps:
+        reservation = store.reserve_driver_fault_recovery(first, kind=kind)
+        store.complete_reserved_driver_fault_recovery_snapshot(
+            first,
+            reservation=reservation,
+            heat_level_percent=0,
+            fan_level_percent=100,
+            cooling_on=cooling_on,
+        )
+    second = store.start_session()
+    store.record_event(second, "beans_added")
+
+    second_mark = store.begin_manual_first_crack_write(second)
+    assert second_mark.completion.result(timeout=1.0).outcome == "live"
+    release.set()
+    assert first_mark.completion.result(timeout=1.0).outcome == "historical"
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_manual_first_crack_expiry_preserves_only_historical_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An expired writer may finish its row but cannot retrospectively go live."""
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path,
+        manual_first_crack_writer_enabled=True,
+    )
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    writer = session.canonical_writer
+    assert writer is not None
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+
+    def append_then_expire(frame: bytes) -> None:
+        original_append(frame)
+        if b'"kind":"first_crack_detected"' in frame:
+            clock.monotonic_value = 101.0
+
+    monkeypatch.setattr(writer, "_append_verified", append_then_expire)
+
+    settlement = store.begin_manual_first_crack_write(session).completion.result(timeout=1)
+
+    assert settlement.outcome == "historical"
+    snapshot, incomplete = store.observe_export_readiness(session_id=session.id)
+    assert snapshot.first_crack_at_utc is None
+    assert snapshot.phase == "roasting"
+    assert incomplete
+    assert (tmp_path / session.id / "roast.jsonl").is_file()
+    store.shutdown_manual_first_crack_writer()
+
+
+@pytest.mark.parametrize("expiry_after_append", [False, True])
+def test_expired_manual_first_crack_refuses_a_repeat_with_exact_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, expiry_after_append: bool
+) -> None:
+    """An expired receipt stays singleton whether it wrote zero or verified bytes."""
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path,
+        manual_first_crack_writer_enabled=True,
+    )
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    if expiry_after_append:
+        writer = session.canonical_writer
+        assert writer is not None
+        original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+
+        def append_then_expire(frame: bytes) -> None:
+            original_append(frame)
+            if b'"kind":"first_crack_detected"' in frame:
+                clock.monotonic_value = 101.0
+
+        monkeypatch.setattr(writer, "_append_verified", append_then_expire)
+    else:
+        original_audit = store._append_manual_first_crack_audit  # pyright: ignore[reportPrivateUsage]
+
+        def stage_then_expire(current: RoastSession, *, token: str, disposition: str) -> None:
+            original_audit(current, token=token, disposition=disposition)
+            if disposition == "begin":
+                clock.monotonic_value = 101.0
+
+        monkeypatch.setattr(store, "_append_manual_first_crack_audit", stage_then_expire)
+
+    settlement = store.begin_manual_first_crack_write(session).completion.result(timeout=1)
+
+    assert settlement.outcome == "historical"
+    snapshot = store.get_session_snapshot(session_id=session.id)
+    assert snapshot.manual_first_crack_admission_expired
+    assert snapshot.manual_first_crack_canonical_evidence == (
+        "verified" if expiry_after_append else "zero"
+    )
+    with pytest.raises(SessionLifecycleError, match="do not resend"):
+        store.begin_manual_first_crack_write(session)
+    assert [event.kind for event in snapshot.event_timeline] == ["beans_added"]
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_uncertain_manual_first_crack_refuses_a_repeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unverified canonical turn cannot be replaced by a second append."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    writer = session.canonical_writer
+    assert writer is not None
+
+    def fail_append(frame: bytes) -> None:
+        if b'"kind":"first_crack_detected"' in frame:
+            raise RuntimeError("synthetic uncertain append")
+        original_append(frame)
+
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(writer, "_append_verified", fail_append)
+    settlement = store.begin_manual_first_crack_write(session).completion.result(timeout=1)
+
+    assert settlement.outcome == "failed"
+    snapshot = store.get_session_snapshot(session_id=session.id)
+    assert snapshot.manual_first_crack_canonical_evidence == "uncertain"
+    with pytest.raises(SessionLifecycleError, match="do not resend"):
+        store.begin_manual_first_crack_write(session)
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_deferred_fault_is_not_durable_when_held_first_crack_fault_append_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prompt emergency result never turns a failed queued fault into history."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    store.record_event(session, "beans_added")
+    writer = session.canonical_writer
+    assert writer is not None
+    first_crack_entered = Event()
+    release_first_crack = Event()
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+
+    def hold_first_crack_then_fail_fault(frame: bytes) -> None:
+        if b'"kind":"first_crack_detected"' in frame:
+            first_crack_entered.set()
+            assert release_first_crack.wait(timeout=1.0)
+        if b'"kind":"fault"' in frame:
+            raise OSError("synthetic fault append failure")
+        original_append(frame)
+
+    monkeypatch.setattr(writer, "_append_verified", hold_first_crack_then_fail_fault)
+    mark = store.begin_manual_first_crack_write(session)
+    assert first_crack_entered.wait(timeout=1.0)
+
+    event, snapshot = store.emergency_stop_snapshot(session, reason="synthetic")
+
+    assert event.kind == "fault"
+    assert snapshot.faulted_at_utc == event.recorded_at_utc
+    assert [item.kind for item in snapshot.event_timeline] == ["beans_added"]
+    assert not writer.wait_for_idle(timeout_seconds=0.01)
+
+    release_first_crack.set()
+    mark.completion.result(timeout=1.0)
+    assert writer.wait_for_idle(timeout_seconds=1.0) is False
+    settled = store.get_session_snapshot(session_id=session.id)
+    assert settled.mock_log_torn
+    assert [item.kind for item in settled.event_timeline] == ["beans_added"]
+    assert session.log_writer is not None
+    assert b'"kind":"fault"' not in (session.log_writer.log_dir / "roast.jsonl").read_bytes()
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_incomplete_writer_refuses_queued_turn_after_torn_executing_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A queued turn is definitely unwritten after a prior turn tears the log."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    writer = session.canonical_writer
+    assert writer is not None
+    first_row = {"type": "event", "index": 1}
+    second_row = {"type": "event", "index": 2}
+    first_frame = (json.dumps(first_row, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    entered_write = Event()
+    release_write = Event()
+    original_write = os.write
+    write_count = 0
+
+    def torn_write(descriptor: int, contents: bytes) -> int:
+        nonlocal write_count
+        write_count += 1
+        if write_count == 1:
+            entered_write.set()
+            assert release_write.wait(timeout=1.0)
+            return original_write(descriptor, contents[:3])
+        raise OSError("synthetic write failure after real short write")
+
+    monkeypatch.setattr(session_module.os, "write", torn_write)
+    first = writer.submit(first_row, lane="event")
+    assert entered_write.wait(timeout=1.0)
+    second = writer.submit(second_row, lane="event")
+    release_write.set()
+
+    with pytest.raises(
+        session_module.EventLogRecordingError,
+        match="^Canonical log storage or verification failed\\.$",
+    ) as raised:
+        first.result(timeout=1.0)
+    assert isinstance(raised.value.__cause__, OSError)
+    assert str(raised.value.__cause__) == "synthetic write failure after real short write"
+    with pytest.raises(
+        session_module._CanonicalAdmissionRefusedError,  # pyright: ignore[reportPrivateUsage]
+        match="incomplete",
+    ):
+        second.result(timeout=1.0)
+
+    assert writer.wait_for_idle(timeout_seconds=1.0) is False
+    assert session.mock_log_torn
+    assert session.log_writer is not None
+    assert (session.log_writer.log_dir / "roast.jsonl").read_bytes() == first_frame[:3]
+    with writer._lock:  # pyright: ignore[reportPrivateUsage]
+        assert writer._event_rows == 0  # pyright: ignore[reportPrivateUsage]
+        assert writer._event_bytes == 0  # pyright: ignore[reportPrivateUsage]
+    store.shutdown_manual_first_crack_writer()
+
+
+@pytest.mark.parametrize(
+    ("automatic_charge_outcome", "expected_zero", "expected_uncertain"),
+    [
+        ("executing_failure", False, True),
+        ("pre_submission_refusal", True, False),
+    ],
+)
+def test_manual_charge_refusal_preserves_automatic_charge_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    automatic_charge_outcome: str,
+    expected_zero: bool,
+    expected_uncertain: bool,
+) -> None:
+    """A later manual press cannot change automatic charge persistence evidence."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    writer = session.canonical_writer
+    assert writer is not None
+    original_write = os.write
+
+    def fail_automatic_charge_write(descriptor: int, contents: bytes) -> int:
+        if b'"kind":"beans_added"' in contents and b'"source":"auto_t0"' in contents:
+            raise OSError("synthetic automatic charge write failure")
+        return original_write(descriptor, contents)
+
+    monkeypatch.setattr(session_module.os, "write", fail_automatic_charge_write)
+    try:
+        store.process_auto_t0_reading_snapshot(session, bean_temp_c=170.0, drop_threshold_c=25.0)
+        if automatic_charge_outcome == "pre_submission_refusal":
+            writer._latch_incomplete()  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(session_module.EventLogRecordingError):
+            store.process_auto_t0_reading_snapshot(
+                session, bean_temp_c=145.0, drop_threshold_c=25.0
+            )
+
+        assert session.manual_charge_persistence_zero is expected_zero
+        assert session.manual_charge_persistence_uncertain is expected_uncertain
+        with pytest.raises(
+            session_module._CanonicalAdmissionRefusedError,  # pyright: ignore[reportPrivateUsage]
+            match="Original automatic charge persistence evidence is already established.",
+        ):
+            store.record_event_snapshot(session, "beans_added", provenance="manual_mark")
+
+        assert session.manual_charge_persistence_zero is expected_zero
+        assert session.manual_charge_persistence_uncertain is expected_uncertain
+        assert session.event_timeline == []
+    finally:
+        store.shutdown_manual_first_crack_writer()
+
+
+def test_configured_generation_telemetry_queue_is_bounded_and_observers_stay_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held canonical turn neither grows telemetry work nor pins the store lock."""
+    clock = ClockHarness()
+    store = RoastSessionStore(
+        utc_now=clock.utc_now,
+        monotonic_now=clock.monotonic_now,
+        default_log_dir=tmp_path,
+        telemetry_log_interval_seconds=1.0,
+        manual_first_crack_writer_enabled=True,
+    )
+    session = store.start_session()
+    writer = session.canonical_writer
+    assert writer is not None
+    entered = Event()
+    release = Event()
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+
+    def held_append(frame: bytes) -> None:
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(timeout=1.0)
+        original_append(frame)
+
+    monkeypatch.setattr(writer, "_append_verified", held_append)
+    try:
+        writer.append_later({"type": "event", "session_id": session.id}, lane="event")
+        assert entered.wait(timeout=1.0)
+
+        # This is the public telemetry store route. It must reserve, not wait
+        # for the held event writer. The sixty-fifth row latches incomplete
+        # recording, but remains a live sample rather than reaching the caller.
+        for index in range(64):
+            clock.monotonic_value = 101.0 + index
+            store.record_telemetry_sample(
+                session,
+                bean_temp_c=100.0,
+                env_temp_c=120.0,
+                heat_level_percent=0,
+                fan_level_percent=0,
+                cooling_on=False,
+            )
+        with writer._lock:  # pyright: ignore[reportPrivateUsage]
+            assert writer._telemetry_rows == 64  # pyright: ignore[reportPrivateUsage]
+            queued_bytes = writer._telemetry_bytes  # pyright: ignore[reportPrivateUsage]
+        assert queued_bytes <= session_module._CANONICAL_LANE_BYTE_LIMIT  # pyright: ignore[reportPrivateUsage]
+
+        clock.monotonic_value = 165.0
+        overflow_snapshot = store.record_telemetry_sample(
+            session,
+            bean_temp_c=101.0,
+            env_temp_c=121.0,
+            heat_level_percent=0,
+            fan_level_percent=0,
+            cooling_on=False,
+        )
+
+        assert overflow_snapshot.mock_log_torn
+        assert overflow_snapshot.faulted_at_utc is None
+        assert overflow_snapshot.event_timeline == []
+        assert overflow_snapshot.telemetry_buffer[-1].monotonic_seconds == 65.0
+        assert overflow_snapshot.telemetry_buffer[-1].bean_temp_c == 101.0
+        assert len(overflow_snapshot.telemetry_buffer) == 65
+        with writer._lock:  # pyright: ignore[reportPrivateUsage]
+            assert writer._telemetry_rows == 64  # pyright: ignore[reportPrivateUsage]
+            assert writer._telemetry_bytes == queued_bytes  # pyright: ignore[reportPrivateUsage]
+        assert not writer.wait_for_idle(timeout_seconds=0.01)
+    finally:
+        release.set()
+        store.shutdown_manual_first_crack_writer()
+
+
+def test_configured_event_snapshot_releases_store_lock_before_canonical_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held ordinary event row leaves reads and fault admission available."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    writer = session.canonical_writer
+    assert writer is not None
+    append_entered = Event()
+    release_append = Event()
+    snapshot_finished = Event()
+    emergency_admitted = Event()
+    errors: list[BaseException] = []
+    accepted_charges: list[session_module.RoastEvent] = []
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+    original_new_fault = store._new_emergency_fault_event_locked  # pyright: ignore[reportPrivateUsage]
+
+    def held_append(frame: bytes) -> None:
+        if not append_entered.is_set():
+            append_entered.set()
+            assert release_append.wait(timeout=1.0)
+        original_append(frame)
+
+    def observe_fault_admission(
+        session_arg: RoastSession,
+        *,
+        payload: dict[str, session_module.EventPayloadValue],
+        allow_stopped_latest: bool,
+    ) -> session_module.RoastEvent:
+        emergency_admitted.set()
+        return original_new_fault(
+            session_arg,
+            payload=payload,
+            allow_stopped_latest=allow_stopped_latest,
+        )
+
+    def record_beans_added() -> None:
+        try:
+            event, _ = store.record_event_snapshot(session, "beans_added", provenance="manual_mark")
+            accepted_charges.append(event)
+        except BaseException as error:  # noqa: BLE001 - worker error is the assertion subject.
+            errors.append(error)
+
+    def read_snapshot() -> None:
+        store.get_session_snapshot(session_id=session.id)
+        snapshot_finished.set()
+
+    def admit_emergency() -> None:
+        try:
+            store.emergency_stop(session, reason="test")
+        except BaseException as error:  # noqa: BLE001 - worker error is the assertion subject.
+            errors.append(error)
+
+    monkeypatch.setattr(writer, "_append_verified", held_append)
+    monkeypatch.setattr(store, "_new_emergency_fault_event_locked", observe_fault_admission)
+    ordinary = Thread(target=record_beans_added)
+    ordinary.start()
+    assert append_entered.wait(timeout=1.0)
+
+    read = Thread(target=read_snapshot)
+    read.start()
+    assert snapshot_finished.wait(timeout=1.0)
+
+    emergency = Thread(target=admit_emergency)
+    emergency.start()
+    assert emergency_admitted.wait(timeout=1.0)
+
+    release_append.set()
+    ordinary.join(timeout=1.0)
+    emergency.join(timeout=1.0)
+    read.join(timeout=1.0)
+    assert not ordinary.is_alive() and not emergency.is_alive() and not read.is_alive()
+    assert errors == []
+    assert writer.wait_for_idle(timeout_seconds=1.0)
+    snapshot = store.get_session_snapshot(session_id=session.id)
+    assert [event.kind for event in snapshot.event_timeline] == ["beans_added", "fault"]
+    charge, fault = snapshot.event_timeline
+    assert snapshot.phase == "fault"
+    assert charge.kind == "beans_added"
+    assert len(accepted_charges) == 1
+    accepted = accepted_charges[0]
+    assert charge.recorded_at_utc == accepted.recorded_at_utc
+    assert charge.monotonic_seconds == accepted.monotonic_seconds
+    assert charge.payload == accepted.payload
+    assert snapshot.beans_added_at_utc == charge.recorded_at_utc
+    assert snapshot.beans_added_monotonic_seconds == charge.monotonic_seconds
+    assert snapshot.beans_added_source == "manual_mark"
+    assert fault.kind == "fault"
+    assert snapshot.pending_driver_command_token is None
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_configured_generation_event_lane_rejects_the_seventeenth_inflight_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Canonical event capacity includes the executing row and is fail-closed."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    writer = session.canonical_writer
+    assert writer is not None
+    entered = Event()
+    release = Event()
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+
+    def held_append(frame: bytes) -> None:
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(timeout=1.0)
+        original_append(frame)
+
+    monkeypatch.setattr(writer, "_append_verified", held_append)
+    for index in range(16):
+        writer.append_later({"type": "event", "index": index}, lane="event")
+    assert entered.wait(timeout=1.0)
+    with pytest.raises(session_module.EventLogRecordingError, match="capacity"):
+        writer.append_later({"type": "event", "index": 16}, lane="event")
+    assert session.mock_log_torn
+    release.set()
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_canonical_writer_exclusively_binds_first_target_and_appends_owned_target(
+    tmp_path: Path,
+) -> None:
+    """An occupied first target is preserved; a newly created target remains owned."""
+    occupied_store = RoastSessionStore(
+        default_log_dir=tmp_path / "occupied", manual_first_crack_writer_enabled=True
+    )
+    occupied_session = occupied_store.start_session()
+    occupied_writer = occupied_session.canonical_writer
+    assert occupied_writer is not None and occupied_session.log_writer is not None
+    occupied_path = occupied_session.log_writer.log_dir / "roast.jsonl"
+    original_bytes = b'{"kind":"foreign","type":"event"}\n'
+    occupied_path.parent.mkdir(parents=True, exist_ok=True)
+    occupied_path.write_bytes(original_bytes)
+
+    with pytest.raises(
+        session_module.EventLogRecordingError,
+        match="^Canonical log storage or verification failed\\.$",
+    ) as raised:
+        occupied_writer.append({"type": "event", "kind": "beans_added"}, lane="event")
+    assert isinstance(raised.value.__cause__, FileExistsError)
+    assert occupied_path.read_bytes() == original_bytes
+    assert occupied_session.mock_log_torn
+    occupied_store.shutdown_manual_first_crack_writer()
+
+    store = RoastSessionStore(
+        default_log_dir=tmp_path / "owned", manual_first_crack_writer_enabled=True
+    )
+    session = store.start_session()
+    writer = session.canonical_writer
+    assert writer is not None and session.log_writer is not None
+    writer.append({"type": "event", "kind": "beans_added"}, lane="event")
+    writer.append({"type": "event", "kind": "beans_dropped"}, lane="event")
+    path = session.log_writer.log_dir / "roast.jsonl"
+    expected = path.read_bytes()
+    assert writer.read_sealed_bytes() == expected
+    assert [json.loads(line)["kind"] for line in expected.decode("utf-8").splitlines()] == [
+        "beans_added",
+        "beans_dropped",
+    ]
+    assert not session.mock_log_torn
+    store.shutdown_manual_first_crack_writer()
+
+
+@pytest.mark.parametrize("mutation", ["truncate", "same_length_rewrite", "append"])
+def test_canonical_writer_rejects_seal_when_verified_bytes_change(
+    tmp_path: Path, mutation: str
+) -> None:
+    """A stable inode is insufficient when canonical bytes no longer match."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    writer = session.canonical_writer
+    assert writer is not None and session.log_writer is not None
+    writer.append({"type": "event", "kind": "beans_added"}, lane="event")
+    path = session.log_writer.log_dir / "roast.jsonl"
+    expected = path.read_bytes()
+    if mutation == "truncate":
+        with path.open("r+b") as stream:
+            stream.truncate(len(expected) - 1)
+    elif mutation == "same_length_rewrite":
+        path.write_bytes(b"x" * len(expected))
+    else:
+        with path.open("ab") as stream:
+            stream.write(b'{"type":"event"}\n')
+
+    with pytest.raises(session_module.EventLogRecordingError):
+        writer.read_sealed_bytes()
+
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_canonical_writer_readback_failure_does_not_advance_verified_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed append readback leaves the previously verified seal unchanged."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    writer = session.canonical_writer
+    assert writer is not None
+    writer.append({"type": "event", "kind": "beans_added"}, lane="event")
+    before_count = writer._verified_byte_count  # pyright: ignore[reportPrivateUsage]
+    before_digest = writer._verified_digest.copy().digest()  # pyright: ignore[reportPrivateUsage]
+
+    def fail_second_frame_read(descriptor: int, size: int) -> bytes:
+        del descriptor, size
+        raise OSError("synthetic readback failure")
+
+    monkeypatch.setattr(session_module.os, "read", fail_second_frame_read)
+    with pytest.raises(session_module.EventLogRecordingError, match="storage or verification"):
+        writer.append({"type": "event", "kind": "beans_dropped"}, lane="event")
+
+    assert writer._verified_byte_count == before_count  # pyright: ignore[reportPrivateUsage]
+    assert writer._verified_digest.copy().digest() == before_digest  # pyright: ignore[reportPrivateUsage]
+    assert session.mock_log_torn
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_canonical_group_latches_executing_failure_before_later_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A queued sibling cannot append after an executing turn fails before callbacks install."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    writer = session.canonical_writer
+    assert writer is not None and session.log_writer is not None
+    first_failed = Event()
+    original_append = writer._append_verified  # pyright: ignore[reportPrivateUsage]
+    original_add_done_callback: Callable[[Future[None], Callable[[Future[None]], object]], None] = (
+        Future[None].add_done_callback
+    )
+
+    def fail_after_short_write(frame: bytes) -> None:
+        if b'"index":1' in frame:
+            original_append(frame)
+            first_failed.set()
+            raise OSError("synthetic post-write verification failure")
+        original_append(frame)
+
+    def register_after_failure(
+        future: Future[None], callback: Callable[[Future[None]], object]
+    ) -> None:
+        assert first_failed.wait(timeout=1.0)
+        original_add_done_callback(future, callback)
+
+    monkeypatch.setattr(writer, "_append_verified", fail_after_short_write)
+    monkeypatch.setattr(Future, "add_done_callback", register_after_failure)
+    futures = writer.submit_group(
+        (
+            {"type": "event", "index": 1},
+            {"type": "event", "index": 2},
+        ),
+        lane="event",
+    )
+
+    with pytest.raises(OSError, match="post-write"):
+        futures[0].result(timeout=1.0)
+    with pytest.raises(session_module.EventLogRecordingError, match="incomplete"):
+        futures[1].result(timeout=1.0)
+    path = session.log_writer.log_dir / "roast.jsonl"
+    assert [
+        json.loads(line)["index"] for line in path.read_text(encoding="utf-8").splitlines()
+    ] == [1]
+    assert session.mock_log_torn
+    store.shutdown_manual_first_crack_writer()
+
+
+def test_nested_canonical_writer_failure_latches_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-entrant writer failure also retains the incomplete generation fact."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    writer = session.canonical_writer
+    assert writer is not None
+
+    def fail_write(_frame: bytes) -> None:
+        raise OSError("synthetic nested writer failure")
+
+    monkeypatch.setattr(writer, "_append_verified", fail_write)
+    outer = writer._executor.submit(  # pyright: ignore[reportPrivateUsage]
+        writer.submit, {"type": "event", "index": 1}, lane="event"
+    )
+    nested = outer.result(timeout=1.0)
+    with pytest.raises(OSError, match="nested writer failure"):
+        nested.result(timeout=1.0)
+    assert session.mock_log_torn
+    store.shutdown_manual_first_crack_writer()
+
+
+@pytest.mark.parametrize("limit", ("rows", "bytes"))
+def test_canonical_group_admission_is_atomic_at_equality_and_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: str
+) -> None:
+    """A coupled Drop group never admits its first row without its cooling row."""
+    store = RoastSessionStore(default_log_dir=tmp_path, manual_first_crack_writer_enabled=True)
+    session = store.start_session()
+    writer = session.canonical_writer
+    assert writer is not None
+    rows = (
+        {"type": "event", "kind": "beans_dropped"},
+        {"type": "event", "kind": "cooling_started"},
+    )
+    encoded_size = sum(
+        len((json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode())
+        for row in rows
+    )
+    if limit == "rows":
+        monkeypatch.setattr(session_module, "_CANONICAL_EVENT_ROW_LIMIT", len(rows))
+    else:
+        monkeypatch.setattr(session_module, "_CANONICAL_LANE_BYTE_LIMIT", encoded_size)
+
+    # Equality is admissible for the unconditional one-row and coupled two-row cases.
+    assert len(writer.submit_group(rows[:1], lane="event")) == 1
+    assert writer.wait_for_idle(timeout_seconds=1.0)
+    assert len(writer.submit_group(rows, lane="event")) == 2
+    assert writer.wait_for_idle(timeout_seconds=1.0)
+    store.shutdown_manual_first_crack_writer()
+
+    overflow_store = RoastSessionStore(
+        default_log_dir=tmp_path / "overflow", manual_first_crack_writer_enabled=True
+    )
+    overflow_session = overflow_store.start_session()
+    overflow_writer = overflow_session.canonical_writer
+    assert overflow_writer is not None
+    if limit == "rows":
+        monkeypatch.setattr(session_module, "_CANONICAL_EVENT_ROW_LIMIT", 1)
+    else:
+        monkeypatch.setattr(session_module, "_CANONICAL_LANE_BYTE_LIMIT", encoded_size - 1)
+    with pytest.raises(session_module.EventLogRecordingError, match="capacity"):
+        overflow_writer.submit_group(rows, lane="event")
+    assert overflow_session.mock_log_torn
+    assert overflow_writer._event_rows == 0  # pyright: ignore[reportPrivateUsage]
+    assert overflow_writer._event_bytes == 0  # pyright: ignore[reportPrivateUsage]
+    overflow_store.shutdown_manual_first_crack_writer()

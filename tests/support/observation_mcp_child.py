@@ -10,12 +10,14 @@ from collections.abc import Callable
 from pathlib import Path
 
 from coffee_roaster_mcp import mcp_server
+from coffee_roaster_mcp import session as session_module
 from coffee_roaster_mcp.artifacts import ResolvedArtifact, ResolvedDetectorArtifacts
 from coffee_roaster_mcp.audio import AudioCaptureSnapshot, AudioWindow, RoastRecorder
 from coffee_roaster_mcp.config import AppConfig, AudioConfig, FirstCrackConfig
 from coffee_roaster_mcp.detector import (
     FirstCrackDetectorOutput,
 )
+from coffee_roaster_mcp.drivers import EmergencyStopResult
 from coffee_roaster_mcp.first_crack_observation import Record, SummaryRecord
 from coffee_roaster_mcp.first_crack_observer import (
     JsonlObservationSink,
@@ -23,11 +25,112 @@ from coffee_roaster_mcp.first_crack_observer import (
     load_observation_model,
 )
 from coffee_roaster_mcp.first_crack_runtime import FirstCrackSessionRuntime
+from coffee_roaster_mcp.mcp_server import ServerContext
 
 
 def serve(config_path: Path, barriers: Path, blocked_stage: str) -> None:
+    if blocked_stage == "recovery-drop-fsync-enospc":
+        original_write = session_module.os.write
+        original_fsync = session_module.os.fsync
+        original_drop_beans = mcp_server.MockRoasterDriver.drop_beans
+        original_mock_emergency_stop = mcp_server.MockRoasterDriver.emergency_stop
+        recovery_cooling_descriptor: int | None = None
+
+        def record_recovery_drop_write(descriptor: int, frame: bytes) -> int:
+            nonlocal recovery_cooling_descriptor
+            count = original_write(descriptor, frame)
+            if b'"kind":"cooling_started"' in frame:
+                recovery_cooling_descriptor = descriptor
+            return count
+
+        def fail_recovery_drop_sync(descriptor: int) -> None:
+            if descriptor == recovery_cooling_descriptor:
+                raise OSError(28, "synthetic no space during derived cooling sync")
+            original_fsync(descriptor)
+
+        def count_recovery_drop(
+            self: mcp_server.MockRoasterDriver,
+            *,
+            exact_drop: mcp_server.ExactDropArbitration | None = None,
+        ) -> mcp_server.RoasterState:
+            with (barriers / "recovery-drop-driver-calls").open("a", encoding="utf-8") as handle:
+                handle.write("drop\n")
+            return original_drop_beans(self, exact_drop=exact_drop)
+
+        def count_emergency_stop(
+            self: mcp_server.MockRoasterDriver, *, reason: str
+        ) -> EmergencyStopResult:
+            with (barriers / "recovery-drop-driver-calls").open("a", encoding="utf-8") as handle:
+                handle.write("emergency\n")
+            return original_mock_emergency_stop(self, reason=reason)
+
+        session_module.os.write = record_recovery_drop_write
+        session_module.os.fsync = fail_recovery_drop_sync
+        mcp_server.MockRoasterDriver.drop_beans = count_recovery_drop
+        mcp_server.MockRoasterDriver.emergency_stop = count_emergency_stop
+
+    if blocked_stage in {"drop-capacity-one", "drop-capacity-discharge"}:
+        # The ordinary manual charge consumes the sole event-lane slot.  A
+        # returned Drop therefore cannot admit its coupled Drop/cooling rows.
+        session_module._CANONICAL_EVENT_ROW_LIMIT = 1
+        original_drop_beans = mcp_server.MockRoasterDriver.drop_beans
+
+        def count_drop(
+            self: mcp_server.MockRoasterDriver,
+            *,
+            exact_drop: mcp_server.ExactDropArbitration | None = None,
+        ) -> mcp_server.RoasterState:
+            with (barriers / "drop-driver-calls").open("a", encoding="utf-8") as handle:
+                handle.write("drop\n")
+            return original_drop_beans(self, exact_drop=exact_drop)
+
+        mcp_server.MockRoasterDriver.drop_beans = count_drop
+        original_set_heat = mcp_server.MockRoasterDriver.set_heat
+        original_set_fan = mcp_server.MockRoasterDriver.set_fan
+
+        def count_heat(
+            self: mcp_server.MockRoasterDriver, *, heat_level_percent: int
+        ) -> mcp_server.RoasterState:
+            with (barriers / "drop-driver-calls").open("a", encoding="utf-8") as handle:
+                handle.write("heat\n")
+            return original_set_heat(self, heat_level_percent=heat_level_percent)
+
+        def count_fan(
+            self: mcp_server.MockRoasterDriver, *, fan_level_percent: int
+        ) -> mcp_server.RoasterState:
+            with (barriers / "drop-driver-calls").open("a", encoding="utf-8") as handle:
+                handle.write("fan\n")
+            return original_set_fan(self, fan_level_percent=fan_level_percent)
+
+        mcp_server.MockRoasterDriver.set_heat = count_heat
+        mcp_server.MockRoasterDriver.set_fan = count_fan
+
+        if blocked_stage == "drop-capacity-discharge":
+            original_capacity_emergency_stop = mcp_server.MockRoasterDriver.emergency_stop
+            original_stop_cooling = mcp_server.MockRoasterDriver.stop_cooling
+
+            def count_emergency_stop(
+                self: mcp_server.MockRoasterDriver, *, reason: str
+            ) -> EmergencyStopResult:
+                with (barriers / "drop-driver-calls").open("a", encoding="utf-8") as handle:
+                    handle.write("emergency\n")
+                return original_capacity_emergency_stop(self, reason=reason)
+
+            def count_stop_cooling(
+                self: mcp_server.MockRoasterDriver,
+            ) -> mcp_server.RoasterState:
+                with (barriers / "drop-driver-calls").open("a", encoding="utf-8") as handle:
+                    handle.write("stop_cooling\n")
+                return original_stop_cooling(self)
+
+            mcp_server.MockRoasterDriver.emergency_stop = count_emergency_stop
+            mcp_server.MockRoasterDriver.stop_cooling = count_stop_cooling
+
     def barrier(stage: str) -> None:
-        if stage != blocked_stage:
+        expected_stage = blocked_stage
+        if blocked_stage == "first-crack-fault-fail":
+            expected_stage = "first-crack"
+        if stage != expected_stage:
             return
         (barriers / f"{stage}-entered").write_text("entered", encoding="utf-8")
         until = time.monotonic() + 15
@@ -35,6 +138,153 @@ def serve(config_path: Path, barriers: Path, blocked_stage: str) -> None:
             if time.monotonic() > until:
                 raise TimeoutError("test barrier not released")
             threading.Event().wait(0.01)
+
+    if blocked_stage in {
+        "charge",
+        "first-crack",
+        "fault",
+        "first-crack-fault-fail",
+        "recovery-drop",
+        "exact-drop",
+    }:
+        original_append_verified = session_module._CanonicalGenerationWriter._append_verified
+        held_kind = {
+            "charge": b'"kind":"beans_added"',
+            "first-crack": b'"kind":"first_crack_detected"',
+            "fault": b'"kind":"fault"',
+            "first-crack-fault-fail": b'"kind":"first_crack_detected"',
+            "recovery-drop": b'"kind":"beans_dropped"',
+            "exact-drop": b'"kind":"beans_dropped"',
+        }[blocked_stage]
+
+        def hold_canonical_row(
+            self: session_module._CanonicalGenerationWriter, frame: bytes
+        ) -> None:
+            if held_kind in frame:
+                stage = blocked_stage
+                if blocked_stage == "first-crack-fault-fail":
+                    stage = "first-crack"
+                barrier(stage)
+            if blocked_stage == "first-crack-fault-fail" and b'"kind":"fault"' in frame:
+                raise OSError("synthetic queued fault append failure")
+            original_append_verified(self, frame)
+
+        original_emergency_dispatch = mcp_server.run_driver_emergency_stop
+
+        def record_emergency_dispatch(
+            server_context: ServerContext, *, reason: str
+        ) -> dict[str, session_module.EventPayloadValue]:
+            result = original_emergency_dispatch(server_context, reason=reason)
+            (barriers / "emergency-entered").write_text("entered", encoding="utf-8")
+            return result
+
+        session_module._CanonicalGenerationWriter._append_verified = hold_canonical_row
+        mcp_server.run_driver_emergency_stop = record_emergency_dispatch
+
+        if blocked_stage == "recovery-drop":
+            original_drop_beans = mcp_server.MockRoasterDriver.drop_beans
+
+            def count_recovery_drop(
+                self: mcp_server.MockRoasterDriver,
+                *,
+                exact_drop: mcp_server.ExactDropArbitration | None = None,
+            ) -> mcp_server.RoasterState:
+                with (barriers / "recovery-drop-driver-calls").open(
+                    "a", encoding="utf-8"
+                ) as handle:
+                    handle.write("drop\n")
+                return original_drop_beans(self, exact_drop=exact_drop)
+
+            mcp_server.MockRoasterDriver.drop_beans = count_recovery_drop
+
+        if blocked_stage == "exact-drop":
+            original_drop_beans = mcp_server.MockRoasterDriver.drop_beans
+            original_mock_emergency_stop = mcp_server.MockRoasterDriver.emergency_stop
+
+            def count_exact_drop(
+                self: mcp_server.MockRoasterDriver,
+                *,
+                exact_drop: mcp_server.ExactDropArbitration | None = None,
+            ) -> mcp_server.RoasterState:
+                with (barriers / "exact-drop-driver-calls").open("a", encoding="utf-8") as handle:
+                    handle.write("drop\n")
+                return original_drop_beans(self, exact_drop=exact_drop)
+
+            def count_exact_emergency(
+                self: mcp_server.MockRoasterDriver, *, reason: str
+            ) -> EmergencyStopResult:
+                with (barriers / "exact-drop-driver-calls").open("a", encoding="utf-8") as handle:
+                    handle.write("emergency\n")
+                return original_mock_emergency_stop(self, reason=reason)
+
+            mcp_server.MockRoasterDriver.drop_beans = count_exact_drop
+            mcp_server.MockRoasterDriver.emergency_stop = count_exact_emergency
+
+    if blocked_stage == "ordinary-drop-driver":
+        original_drop_beans = mcp_server.MockRoasterDriver.drop_beans
+        drop_calls = 0
+
+        def hold_first_ordinary_drop(
+            self: mcp_server.MockRoasterDriver,
+            *,
+            exact_drop: mcp_server.ExactDropArbitration | None = None,
+        ) -> mcp_server.RoasterState:
+            nonlocal drop_calls
+            drop_calls += 1
+            with (barriers / "ordinary-drop-driver-calls").open("a", encoding="utf-8") as handle:
+                handle.write("drop\n")
+            if drop_calls == 1:
+                (barriers / "ordinary-drop-driver-entered").write_text("entered", encoding="utf-8")
+                until = time.monotonic() + 15
+                while not (barriers / "release").exists():
+                    if time.monotonic() > until:
+                        raise TimeoutError("test barrier not released")
+                    threading.Event().wait(0.01)
+            return original_drop_beans(self, exact_drop=exact_drop)
+
+        mcp_server.MockRoasterDriver.drop_beans = hold_first_ordinary_drop
+
+    if blocked_stage == "lost-ordinary-return":
+        original_drop_beans = mcp_server.MockRoasterDriver.drop_beans
+        original_set_heat = mcp_server.MockRoasterDriver.set_heat
+        original_set_fan = mcp_server.MockRoasterDriver.set_fan
+
+        def count_heat(
+            self: mcp_server.MockRoasterDriver, *, heat_level_percent: int
+        ) -> mcp_server.RoasterState:
+            with (barriers / "lost-ordinary-return-driver-calls").open(
+                "a", encoding="utf-8"
+            ) as handle:
+                handle.write("heat\n")
+            return original_set_heat(self, heat_level_percent=heat_level_percent)
+
+        def count_fan(
+            self: mcp_server.MockRoasterDriver, *, fan_level_percent: int
+        ) -> mcp_server.RoasterState:
+            with (barriers / "lost-ordinary-return-driver-calls").open(
+                "a", encoding="utf-8"
+            ) as handle:
+                handle.write("fan\n")
+            return original_set_fan(self, fan_level_percent=fan_level_percent)
+
+        def lose_ordinary_return(
+            self: mcp_server.MockRoasterDriver,
+            *,
+            exact_drop: mcp_server.ExactDropArbitration | None = None,
+        ) -> mcp_server.RoasterState:
+            entry = "exact" if exact_drop is not None else "ordinary"
+            with (barriers / "lost-ordinary-return-driver-calls").open(
+                "a", encoding="utf-8"
+            ) as handle:
+                handle.write(f"{entry}\n")
+            result = original_drop_beans(self, exact_drop=exact_drop)
+            if exact_drop is None:
+                raise OSError("synthetic lost ordinary Drop return")
+            return result
+
+        mcp_server.MockRoasterDriver.drop_beans = lose_ordinary_return
+        mcp_server.MockRoasterDriver.set_heat = count_heat
+        mcp_server.MockRoasterDriver.set_fan = count_fan
 
     class Capture:
         def __init__(self, recorder: RoastRecorder | None) -> None:
