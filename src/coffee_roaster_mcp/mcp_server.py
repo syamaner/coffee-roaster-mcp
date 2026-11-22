@@ -2762,14 +2762,12 @@ def build_server_context(
             return False
         return True
 
-    event_domain_mapped = (
-        simulation_composition is None or simulation_composition.clock is time.monotonic
-    )
     first_crack_runtime = build_first_crack_session_runtime(
         config,
         session_is_retained=session_is_retained,
     )
-    first_crack_runtime.set_event_domain_mapped(event_domain_mapped=event_domain_mapped)
+    if simulation_composition is not None and simulation_composition.clock is not time.monotonic:
+        first_crack_runtime.set_event_domain_mapped(event_domain_mapped=False)
     if simulation_composition is not None and config.first_crack.event_authority == "manual":
         first_crack_runtime.admit_trusted_manual_driver(admission=simulation_admission)
     if capture_evidence_configured:
