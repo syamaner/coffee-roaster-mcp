@@ -215,6 +215,28 @@ def test_unmapped_event_clock_withholds_capture_mapping(tmp_path: Path) -> None:
         assert accepted is None or abs(accepted) <= 1000
 
 
+def test_unmapped_freeze_skips_owned_window_boundaries_and_preserves_failure_reason(
+    tmp_path: Path,
+) -> None:
+    """An unmapped freeze retains its existing failure without window comparisons."""
+    observer, _capture, _sink, _backend = setup_observer(tmp_path, now=[1544654.0])
+    observer._event_domain_mapped = False
+    observer.charge_at = 110.0
+    observer.cutoff = 181.1
+    observer._owned_windows.append(window(start=1544653.0))
+    observer.failed = True
+    observer.reason = "inference_failed"
+
+    with observer.lock:
+        observer._freeze_locked()
+
+    assert observer.summary is not None
+    assert observer.summary.outcome == "unavailable"
+    assert observer.summary.coverage_complete is False
+    assert observer.summary.counts.undecided_eligible_windows == 0
+    assert observer.summary.reason.value == "inference_failed"
+
+
 def test_deadline_is_enforced_at_acceptance_without_supervisor_poll(tmp_path: Path) -> None:
     now = [21.0]
     observer, capture, sink, _ = setup_observer(tmp_path, now=now)

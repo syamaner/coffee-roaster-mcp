@@ -1283,16 +1283,18 @@ class FirstCrackObserver:
         # Without an accepted cutoff, the lifecycle clock is evidence only for
         # work whose end is strictly before the mapped session-progress witness;
         # it is never published as a drop cutoff.
-        progress = self._mapped_now_locked()
-        pending_eligible = {
-            item.sequence_number
-            for item in self._owned_windows
-            if item.sequence_number not in self._seen_windows
-            and self.charge_at is not None
-            and item.started_at_monotonic_seconds >= self.charge_at
-            and item.started_at_monotonic_seconds + item.duration_seconds
-            < (self.cutoff if self.cutoff is not None else progress)
-        }
+        pending_eligible: set[int] = set()
+        if self._event_domain_mapped:
+            progress = self._mapped_now_locked()
+            pending_eligible = {
+                item.sequence_number
+                for item in self._owned_windows
+                if item.sequence_number not in self._seen_windows
+                and self.charge_at is not None
+                and item.started_at_monotonic_seconds >= self.charge_at
+                and item.started_at_monotonic_seconds + item.duration_seconds
+                < (self.cutoff if self.cutoff is not None else progress)
+            }
         self.counts = self.counts.model_copy(
             update=dict(
                 undecided_eligible_windows=0
@@ -1312,7 +1314,8 @@ class FirstCrackObserver:
         if not self._event_domain_mapped:
             outcome = "unavailable"
             coverage = False
-            self.reason = "clock_domain_unmapped"
+            if not self.failed:
+                self.reason = "clock_domain_unmapped"
         if confirmation is None:
             order = "both_absent" if self.human_at is None else "model_absent"
         elif self.human_at is None:

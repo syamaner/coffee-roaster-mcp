@@ -542,6 +542,29 @@ def test_simulation_reception_tool_projects_one_registered_eligible_snapshot(
             await client_send.aclose()
 
     asyncio.run(exercise())
+    recordings = list((tmp_path / "recordings").rglob("*.wav"))
+    assert len(recordings) == 1
+    with wave.open(str(recordings[0]), "rb") as recording:
+        assert recording.getnframes() == 480
+    sidecars = list((tmp_path / "recordings").rglob("roast.recording.json"))
+    assert len(sidecars) == 1
+    assert json.loads(sidecars[0].read_text(encoding="utf-8"))["milestones"] == {}
+    observation_logs = list((tmp_path / "logs").rglob("first_crack_observation.jsonl"))
+    assert len(observation_logs) == 1
+    frozen = next(
+        json.loads(line)
+        for line in observation_logs[0].read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["record_type"] == "fc_observation_summary"
+    )
+    assert frozen["payload"]["human_mark"]["value"]["session_relative_seconds"]["value"] == 70.0
+    assert frozen["payload"]["frozen_at"]["recording_relative_seconds"] == {
+        "value": None,
+        "null_reason": "clock_unavailable",
+    }
+    assert frozen["payload"]["frozen_at"]["utc"] == {
+        "value": None,
+        "null_reason": "clock_unavailable",
+    }
 
 
 def test_simulation_start_refuses_missing_authority_before_serial_factory(tmp_path: Path) -> None:
@@ -776,7 +799,6 @@ def test_simulation_sdk_manual_confirmation_keeps_capture_until_finalised(tmp_pa
     assert len(sidecars) == 1
     sidecar = json.loads(sidecars[0].read_text(encoding="utf-8"))
     assert sidecar["frame_count"] == 480
-    assert sidecar["milestones"]["first_crack"] is None
 
 
 def test_composed_lifespan_starts_staged_driver_capture_telemetry_and_synthetic_ambient(
