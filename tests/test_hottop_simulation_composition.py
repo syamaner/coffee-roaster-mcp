@@ -11,8 +11,9 @@ import struct
 import sys
 import wave
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread, get_ident, local
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -38,6 +39,9 @@ from coffee_roaster_mcp.drivers import (
     HOTTOP_PACKET_LENGTH,
     HOTTOP_PACKET_PREFIX,
     HottopRoasterDriver,
+    HottopWriteAttempt,
+    MockRoasterDriver,
+    SupersededDriverCommand,
     build_hottop_command_packet,
     calculate_hottop_packet_checksum,
 )
@@ -61,6 +65,7 @@ from coffee_roaster_mcp.mcp_server import (
     create_hottop_simulation_mcp_server,
     create_mcp_server,
 )
+from coffee_roaster_mcp.session import SessionLifecycleError
 
 
 class _Clock:
@@ -144,6 +149,21 @@ def _simulation_config(
     return config
 
 
+def _mock_config(tmp_path: Path) -> Path:
+    """Write a hardware-free ordinary-server config for SDK discovery."""
+    config = tmp_path / "mock.yaml"
+    config.write_text(
+        "roaster:\n"
+        "  driver: mock\n"
+        "first_crack:\n"
+        "  mode: disabled\n"
+        "logging:\n"
+        f"  log_dir: {tmp_path / 'mock-logs'}\n",
+        encoding="utf-8",
+    )
+    return config
+
+
 def _tool_context(context: ServerContext) -> Any:
     """Build the minimal registered-tool context for a real lifespan context."""
     return SimpleNamespace(request_context=SimpleNamespace(lifespan_context=context))
@@ -158,6 +178,403 @@ async def _call(server: Any, name: str, context: ServerContext, **kwargs: object
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+async def _wait_for_synthetic_frame_count(
+    composition: HottopSimulationComposition, frame: bytes, *, start: int, count: int
+) -> tuple[bytes, ...]:
+    """Wait for ``count`` complete expected command frames after ``start``."""
+    while True:
+        frames = composition.transport.writes_snapshot()
+        if sum(candidate == frame for candidate in frames[start:]) >= count:
+            return frames
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("tool_name", ("set_heat", "set_fan"))
+def test_simulated_checked_lever_commands_are_atomic_against_stop(
+    tmp_path: Path, tool_name: str
+) -> None:
+    """Checked lever methods validate first and refuse a stale emergency generation."""
+    server = create_hottop_simulation_mcp_server(
+        config_path=_simulation_config(tmp_path),
+        composition=HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0),
+    )
+
+    async def exercise() -> None:
+        """Exercise the private simulation seam on the connected synthetic driver only."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            driver = cast(HottopRoasterDriver, context.roaster_driver)
+            token = driver._cooling_command_token()  # pyright: ignore[reportPrivateUsage]
+            revision = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+            checked = cast(
+                Callable[..., object], getattr(driver, f"_{tool_name}_unless_superseded")
+            )
+            with pytest.raises(ValueError):
+                checked(token, **{f"{tool_name[4:]}_level_percent": 101})
+            assert driver._command_state_revision == revision  # pyright: ignore[reportPrivateUsage]
+            checked(token, **{f"{tool_name[4:]}_level_percent": 37})
+            state = driver.read_state()
+            assert state.heat_level_percent == (37 if tool_name == "set_heat" else 0)
+            assert state.fan_level_percent == (37 if tool_name == "set_fan" else 0)
+            driver.emergency_stop(reason="synthetic checked-lever witness")
+            stopped_revision = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+            with pytest.raises(SupersededDriverCommand):
+                checked(token, **{f"{tool_name[4:]}_level_percent": 37})
+            assert driver._command_state_revision == stopped_revision  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    (
+        pytest.param("start_cooling", id="start"),
+        pytest.param("stop_cooling", id="stop"),
+    ),
+)
+def test_registered_simulated_guarded_recovery_publishes_before_competitor_can_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+) -> None:
+    """A negative checked token keeps guarded dispatch and publication atomic."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+    emergency_dispatched = Event()
+    competitor_started = Event()
+    competitor_entered = Event()
+    guarded_emergency_reasons: list[str] = []
+    fault_recordings = 0
+
+    async def exercise() -> None:
+        """Force an unproven checked recovery completion through its guarded fallback."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            session_id = started.session.session_id
+            await _call(server, "emergency_stop", context, expected_session_id=session_id)
+            real_lifecycle_barrier = context.lifecycle_barrier
+            ownership_local = local()
+            next_ownership_ordinal = 0
+            negative_checks: list[tuple[int, int | None, bool, bool]] = []
+            guarded_dispatches: list[tuple[int, int | None]] = []
+            fault_publications: list[tuple[int, int | None]] = []
+            competitor_ownership_ordinals: list[int | None] = []
+
+            class OwnershipTrackingBarrier:
+                """Track per-thread lifecycle-barrier ownership without replacing its lock."""
+
+                def __enter__(self) -> OwnershipTrackingBarrier:
+                    nonlocal next_ownership_ordinal
+                    real_lifecycle_barrier.__enter__()
+                    previous = getattr(ownership_local, "active_ordinal", None)
+                    next_ownership_ordinal += 1
+                    ownership_local.previous_ordinal = previous
+                    ownership_local.active_ordinal = next_ownership_ordinal
+                    return self
+
+                def __exit__(self, *args: object) -> object:
+                    previous = ownership_local.previous_ordinal
+                    ownership_local.active_ordinal = previous
+                    return real_lifecycle_barrier.__exit__(*args)
+
+                def locked(self) -> bool:
+                    """Expose the real barrier's locked-state witness."""
+                    return real_lifecycle_barrier.locked()
+
+            object.__setattr__(context, "lifecycle_barrier", OwnershipTrackingBarrier())
+            store = context.session_store
+            original_complete = store.complete_reserved_driver_fault_recovery_snapshot
+            original_record_fault = store.emergency_stop_snapshot
+            original_emergency = HottopRoasterDriver.emergency_stop
+            original_checked = HottopRoasterDriver._cooling_command_completed_before_later_emergency  # pyright: ignore[reportPrivateUsage]
+
+            def fail_completion(*_args: object, **_kwargs: object) -> object:
+                raise SessionLifecycleError("synthetic recovery completion failure")
+
+            def record_fault(*args: object, **kwargs: object) -> object:
+                nonlocal fault_recordings
+                fault_recordings += 1
+                fault_publications.append(
+                    (get_ident(), getattr(ownership_local, "active_ordinal", None))
+                )
+                return original_record_fault(*args, **kwargs)
+
+            def record_negative_check(driver: HottopRoasterDriver, token: object) -> bool:
+                """Record the actual equal-counter check with its supplied live token."""
+                result = original_checked(driver, cast(Any, token))
+                negative_checks.append(
+                    (
+                        get_ident(),
+                        getattr(ownership_local, "active_ordinal", None),
+                        token is not None,
+                        result,
+                    )
+                )
+                return result
+
+            def record_emergency(driver: HottopRoasterDriver, *, reason: str) -> object:
+                result = original_emergency(driver, reason=reason)
+                if reason.startswith("guarded fault recovery"):
+                    guarded_emergency_reasons.append(reason)
+                    guarded_dispatches.append(
+                        (get_ident(), getattr(ownership_local, "active_ordinal", None))
+                    )
+                    emergency_dispatched.set()
+                return result
+
+            def compete() -> None:
+                competitor_started.set()
+                assert emergency_dispatched.wait(timeout=1.0)
+                with context.lifecycle_barrier:
+                    competitor_ownership_ordinals.append(
+                        getattr(ownership_local, "active_ordinal", None)
+                    )
+                    competitor_entered.set()
+
+            monkeypatch.setattr(
+                store, "complete_reserved_driver_fault_recovery_snapshot", fail_completion
+            )
+            monkeypatch.setattr(store, "emergency_stop_snapshot", record_fault)
+            monkeypatch.setattr(
+                HottopRoasterDriver,
+                "_cooling_command_completed_before_later_emergency",
+                record_negative_check,
+            )
+            monkeypatch.setattr(HottopRoasterDriver, "emergency_stop", record_emergency)
+            competitor = Thread(target=compete)
+            competitor.start()
+            assert await asyncio.to_thread(competitor_started.wait, 1.0)
+            with pytest.raises(
+                SessionLifecycleError, match="synthetic recovery completion failure"
+            ):
+                await _call(server, tool_name, context, expected_session_id=session_id)
+            competitor.join(timeout=1.0)
+            assert not competitor.is_alive()
+            assert competitor_entered.is_set()
+            assert guarded_emergency_reasons == [f"guarded fault recovery {tool_name} failed"]
+            assert fault_recordings == 1
+            assert len(negative_checks) == 1
+            check_thread, check_ordinal, supplied_token, check_result = negative_checks[0]
+            assert check_ordinal is not None
+            assert supplied_token
+            assert not check_result
+            assert guarded_dispatches == [(check_thread, check_ordinal)]
+            assert fault_publications == [(check_thread, check_ordinal)]
+            assert len(competitor_ownership_ordinals) == 1
+            competitor_ordinal = competitor_ownership_ordinals[0]
+            assert competitor_ordinal is not None
+            assert competitor_ordinal > check_ordinal
+            latest = store.get_latest_session()
+            assert latest is not None
+            assert latest.pending_driver_command_kind is None
+
+            monkeypatch.setattr(
+                store,
+                "complete_reserved_driver_fault_recovery_snapshot",
+                original_complete,
+            )
+            recovered = await _call(server, tool_name, context, expected_session_id=session_id)
+            assert recovered.session_id == session_id
+            assert context.roaster_driver.read_state().cooling_on is (tool_name == "start_cooling")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("tool_name", ("set_heat", "set_fan"))
+@pytest.mark.parametrize("after_mutation", (False, True), ids=("before", "after"))
+def test_registered_simulated_lever_stop_dispatches_before_held_lever_releases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    after_mutation: bool,
+) -> None:
+    """A simulated lever cannot block registered Stop or outlive its generation."""
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(
+        config_path=_simulation_config(tmp_path), composition=composition
+    )
+    entered = Event()
+    release = Event()
+    checked_name = f"_{tool_name}_unless_superseded"
+    original_checked = getattr(HottopRoasterDriver, checked_name)
+    original_public = getattr(HottopRoasterDriver, tool_name)
+    attempts: list[HottopWriteAttempt] = []
+    original_append = HottopRoasterDriver._append_write_attempt  # pyright: ignore[reportPrivateUsage]
+
+    def hold_checked(driver: HottopRoasterDriver, token: object, **kwargs: object) -> object:
+        """Hold either side of the checked mutation without holding a driver lock."""
+        if not after_mutation:
+            entered.set()
+            assert release.wait(timeout=1.0)
+        state = original_checked(driver, token, **kwargs)
+        if after_mutation:
+            entered.set()
+            assert release.wait(timeout=1.0)
+        return state
+
+    def hold_public(driver: HottopRoasterDriver, **kwargs: object) -> object:
+        """Keep the same witness meaningful against the synchronous base handler."""
+        entered.set()
+        assert release.wait(timeout=1.0)
+        return original_public(driver, **kwargs)
+
+    def record_attempt(driver: HottopRoasterDriver, attempt: HottopWriteAttempt) -> None:
+        """Retain all write attempts; the driver's public history is intentionally capped."""
+        attempts.append(attempt)
+        original_append(driver, attempt)
+
+    monkeypatch.setattr(HottopRoasterDriver, checked_name, hold_checked)
+    monkeypatch.setattr(HottopRoasterDriver, tool_name, hold_public)
+    monkeypatch.setattr(HottopRoasterDriver, "_append_write_attempt", record_attempt)
+
+    async def exercise() -> None:
+        """Drive registered tools through the trusted synthetic composition."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            session_id = started.session.session_id
+            lever_frame = build_hottop_command_packet(
+                heat_level_percent=37 if tool_name == "set_heat" else 0,
+                fan_level_percent=0,
+                main_fan_level_percent=37 if tool_name == "set_fan" else 0,
+                drum_motor_on=tool_name == "set_heat",
+                cooling_motor_on=False,
+            )
+            lever_byte_index, lever_byte_value = (10, 37) if tool_name == "set_heat" else (12, 4)
+            assert lever_frame[lever_byte_index] == lever_byte_value
+            frame_start = len(composition.transport.writes_snapshot())
+            request = asyncio.create_task(
+                _call(server, tool_name, context, **{f"{tool_name[4:]}_level_percent": 37})
+            )
+            assert await asyncio.to_thread(entered.wait, 1.0)
+            if after_mutation:
+                lever_frames = await asyncio.wait_for(
+                    _wait_for_synthetic_frame_count(
+                        composition, lever_frame, start=frame_start, count=1
+                    ),
+                    timeout=1.0,
+                )
+                lever_index = lever_frames.index(lever_frame, frame_start)
+                assert len(lever_frames[lever_index]) == HOTTOP_PACKET_LENGTH
+                assert lever_frames[lever_index][lever_byte_index] == lever_byte_value
+            stopped = await _call(server, "emergency_stop", context, expected_session_id=session_id)
+            assert stopped.session_id == session_id
+            driver = cast(HottopRoasterDriver, context.roaster_driver)
+            emergency_revision = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+            final_revision = emergency_revision
+            emergency_frame = build_hottop_command_packet(
+                heat_level_percent=0,
+                fan_level_percent=0,
+                main_fan_level_percent=100,
+                cooling_motor_on=True,
+            )
+            emergency_frames = await asyncio.wait_for(
+                _wait_for_synthetic_frame_count(
+                    composition, emergency_frame, start=frame_start, count=2
+                ),
+                timeout=1.0,
+            )
+            emergency_index = emergency_frames.index(emergency_frame, frame_start)
+            assert len(emergency_frames[emergency_index]) == HOTTOP_PACKET_LENGTH
+            assert any(
+                attempt.revision == emergency_revision
+                and attempt.role == "emergency"
+                and attempt.frame == emergency_frame
+                for attempt in attempts
+            )
+            recovery_frame: bytes | None = None
+            recovery_index: int | None = None
+            if after_mutation:
+                recovery_start = len(composition.transport.writes_snapshot())
+                recovered = await _call(
+                    server,
+                    "stop_cooling",
+                    context,
+                    expected_session_id=session_id,
+                )
+                assert recovered.session_id == session_id
+                recovery_frame = build_hottop_command_packet(
+                    heat_level_percent=0,
+                    fan_level_percent=0,
+                    main_fan_level_percent=0,
+                    cooling_motor_on=False,
+                )
+                recovery_frames = await asyncio.wait_for(
+                    _wait_for_synthetic_frame_count(
+                        composition, recovery_frame, start=recovery_start, count=2
+                    ),
+                    timeout=1.0,
+                )
+                recovery_index = recovery_frames.index(recovery_frame, recovery_start)
+                assert recovery_index > emergency_index
+                assert all(
+                    len(frame) == HOTTOP_PACKET_LENGTH and frame == emergency_frame
+                    for frame in recovery_frames[emergency_index:recovery_index]
+                )
+                final_revision = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+            release.set()
+            with pytest.raises((SessionLifecycleError, SupersededDriverCommand)):
+                await request
+            assert driver._command_state_revision == final_revision  # pyright: ignore[reportPrivateUsage]
+            if after_mutation:
+                assert driver.read_state().cooling_on is False
+                assert recovery_frame is not None
+                assert recovery_index is not None
+                final_frames = await asyncio.wait_for(
+                    _wait_for_synthetic_frame_count(
+                        composition, recovery_frame, start=recovery_index, count=3
+                    ),
+                    timeout=1.0,
+                )
+                assert all(
+                    len(frame) == HOTTOP_PACKET_LENGTH and frame == recovery_frame
+                    for frame in final_frames[recovery_index:]
+                )
+            else:
+                final_frames = await asyncio.wait_for(
+                    _wait_for_synthetic_frame_count(
+                        composition, emergency_frame, start=emergency_index, count=3
+                    ),
+                    timeout=1.0,
+                )
+                assert all(
+                    len(frame) == HOTTOP_PACKET_LENGTH and frame == emergency_frame
+                    for frame in final_frames[emergency_index:]
+                )
+            assert all(
+                not (attempt.revision >= emergency_revision and attempt.frame == lever_frame)
+                for attempt in attempts
+            )
+            latest = context.session_store.get_latest_session()
+            assert latest is not None
+            assert latest.pending_driver_command_kind is None
+
+    asyncio.run(exercise())
 
 
 def test_candidate_without_trusted_composition_refuses_before_native_transport(
@@ -177,6 +594,560 @@ def test_candidate_without_trusted_composition_refuses_before_native_transport(
         build_server_context(config_path=config)
 
     assert constructed == []
+
+
+@pytest.mark.parametrize("tool_name", ("set_heat", "set_fan"))
+def test_registered_simulated_lever_cancellation_settles_reserved_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    """Cancelling a caller does not cancel its admitted simulated lever worker."""
+    server = create_hottop_simulation_mcp_server(
+        config_path=_simulation_config(tmp_path),
+        composition=HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0),
+    )
+    worker_gate_entered = Event()
+    worker_gate_release = Event()
+    settled = Event()
+    calls = 0
+    checked_name = f"_{tool_name}_unless_superseded"
+    original = getattr(HottopRoasterDriver, checked_name)
+
+    def hold_checked(driver: HottopRoasterDriver, token: object, **kwargs: object) -> object:
+        """Count the admitted worker when it passes the queued-executor gate."""
+        nonlocal calls
+        calls += 1
+        try:
+            return original(driver, token, **kwargs)
+        finally:
+            settled.set()
+
+    monkeypatch.setattr(HottopRoasterDriver, checked_name, hold_checked)
+
+    async def exercise() -> None:
+        """Cancel an accepted but queued caller, then observe its one worker settle."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            await _call(
+                server,
+                "start_roast_session",
+                context,
+                purpose="roast",
+                first_crack_observer_ack="manual/v1",
+            )
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
+                executor.submit(
+                    lambda: (
+                        worker_gate_entered.set(),
+                        worker_gate_release.wait(timeout=1.0),
+                    )
+                )
+                assert await asyncio.to_thread(worker_gate_entered.wait, 1.0)
+                loop = asyncio.get_running_loop()
+                original_submit = loop.run_in_executor
+                submitted = asyncio.Event()
+
+                def queue_worker(
+                    selected_executor: ThreadPoolExecutor | None,
+                    function: Callable[..., object],
+                    *args: object,
+                ) -> asyncio.Future[object]:
+                    """Queue the admitted lever behind a deterministic worker gate."""
+                    assert selected_executor is None
+                    submitted.set()
+                    return original_submit(executor, function, *args)
+
+                monkeypatch.setattr(loop, "run_in_executor", queue_worker)
+                request = asyncio.create_task(
+                    _call(server, tool_name, context, **{f"{tool_name[4:]}_level_percent": 37})
+                )
+                await asyncio.wait_for(submitted.wait(), timeout=1.0)
+                latest = context.session_store.get_latest_session()
+                assert latest is not None
+                assert latest.pending_driver_command_kind == "control"
+                request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+                assert calls == 0
+                worker_gate_release.set()
+                assert await asyncio.wait_for(original_submit(None, settled.wait, 1.0), timeout=1.0)
+                assert calls == 1
+                latest = context.session_store.get_latest_session()
+                assert latest is not None
+                assert latest.pending_driver_command_kind is None
+            finally:
+                worker_gate_release.set()
+                executor.shutdown(wait=True)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("tool_name", ("set_heat", "set_fan"))
+def test_registered_simulated_lever_rejected_submission_releases_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    """A rejected executor submission releases only the admitted lever reservation."""
+    server = create_hottop_simulation_mcp_server(
+        config_path=_simulation_config(tmp_path),
+        composition=HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0),
+    )
+    calls = 0
+    checked_name = f"_{tool_name}_unless_superseded"
+    original = getattr(HottopRoasterDriver, checked_name)
+
+    def record_checked(driver: HottopRoasterDriver, token: object, **kwargs: object) -> object:
+        """Prove a rejected submission never enters the driver."""
+        nonlocal calls
+        calls += 1
+        return original(driver, token, **kwargs)
+
+    monkeypatch.setattr(HottopRoasterDriver, checked_name, record_checked)
+
+    async def exercise() -> None:
+        """Reject the exact default-executor handoff after reservation admission."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            await _call(
+                server,
+                "start_roast_session",
+                context,
+                purpose="roast",
+                first_crack_observer_ack="manual/v1",
+            )
+            rejected_executor = ThreadPoolExecutor(max_workers=1)
+            rejected_executor.shutdown()
+            loop = asyncio.get_running_loop()
+            original_submit = loop.run_in_executor
+
+            def reject_default_executor(
+                selected_executor: ThreadPoolExecutor | None,
+                function: Callable[..., object],
+                *args: object,
+            ) -> asyncio.Future[object]:
+                """Route only the selected default handoff to a shut-down executor."""
+                assert selected_executor is None
+                return original_submit(rejected_executor, function, *args)
+
+            monkeypatch.setattr(loop, "run_in_executor", reject_default_executor)
+            with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
+                await _call(server, tool_name, context, **{f"{tool_name[4:]}_level_percent": 37})
+            assert calls == 0
+            latest = context.session_store.get_latest_session()
+            assert latest is not None
+            assert latest.pending_driver_command_kind is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("tool_name", ("set_heat", "set_fan"))
+def test_registered_simulated_lever_queued_submission_failure_never_enters_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    """A queued worker rejected during thread creation cannot affect a newer owner."""
+    server = create_hottop_simulation_mcp_server(
+        config_path=_simulation_config(tmp_path),
+        composition=HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0),
+    )
+    worker_entered = Event()
+    worker_release = Event()
+    checked_name = f"_{tool_name}_unless_superseded"
+    checked_calls: list[int] = []
+    emergency_calls: list[str] = []
+    original_checked = getattr(HottopRoasterDriver, checked_name)
+    original_emergency = HottopRoasterDriver.emergency_stop
+
+    def record_checked(driver: HottopRoasterDriver, token: object, **kwargs: object) -> object:
+        """Record only workers that reach the existing checked driver route."""
+        checked_calls.append(cast(int, next(iter(kwargs.values()))))
+        return original_checked(driver, token, **kwargs)
+
+    def record_emergency(driver: HottopRoasterDriver, *, reason: str) -> object:
+        """Prove the refused queued worker does not trigger fallback containment."""
+        emergency_calls.append(reason)
+        return original_emergency(driver, reason=reason)
+
+    monkeypatch.setattr(HottopRoasterDriver, checked_name, record_checked)
+    monkeypatch.setattr(HottopRoasterDriver, "emergency_stop", record_emergency)
+
+    async def exercise() -> None:
+        """Make a real executor enqueue work before its second thread start fails."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            await _call(
+                server,
+                "start_roast_session",
+                context,
+                purpose="roast",
+                first_crack_observer_ack="manual/v1",
+            )
+            executor = ThreadPoolExecutor(max_workers=2)
+            try:
+                executor.submit(lambda: (worker_entered.set(), worker_release.wait()))
+                assert await asyncio.to_thread(worker_entered.wait, 1.0)
+                loop = asyncio.get_running_loop()
+                original_submit = loop.run_in_executor
+
+                def queue_on_controlled_executor(
+                    selected_executor: ThreadPoolExecutor | None,
+                    function: Callable[..., object],
+                    *args: object,
+                ) -> asyncio.Future[object]:
+                    """Route only the selected default handoff to the real executor."""
+                    assert selected_executor is None
+                    return original_submit(executor, function, *args)
+
+                monkeypatch.setattr(loop, "run_in_executor", queue_on_controlled_executor)
+
+                def reject_second_worker_start(_thread: Thread) -> None:
+                    """Raise only after the occupied executor has queued the lever worker."""
+                    raise RuntimeError("synthetic thread creation failure")
+
+                with monkeypatch.context() as thread_patch:
+                    thread_patch.setattr(Thread, "start", reject_second_worker_start)
+                    with pytest.raises(RuntimeError, match="synthetic thread creation failure"):
+                        await _call(
+                            server, tool_name, context, **{f"{tool_name[4:]}_level_percent": 37}
+                        )
+
+                latest = context.session_store.get_latest_session()
+                assert latest is not None
+                assert latest.pending_driver_command_kind is None
+                assert checked_calls == []
+                assert emergency_calls == []
+
+                newer = await _call(
+                    server, tool_name, context, **{f"{tool_name[4:]}_level_percent": 41}
+                )
+                assert checked_calls == [41]
+                assert emergency_calls == []
+                assert (
+                    newer.heat_level_percent if tool_name == "set_heat" else newer.fan_level_percent
+                ) == 41
+                latest = context.session_store.get_latest_session()
+                assert latest is not None
+                assert latest.pending_driver_command_kind is None
+            finally:
+                worker_release.set()
+                executor.shutdown(wait=True)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("tool_name", ("set_heat", "set_fan"))
+def test_registered_ordinary_levers_keep_public_driver_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    """The ordinary mock composition retains its public driver control call."""
+    server = create_mcp_server(config_path=_mock_config(tmp_path))
+    calls: list[int] = []
+    original = getattr(MockRoasterDriver, tool_name)
+
+    def record_public(driver: MockRoasterDriver, **kwargs: object) -> object:
+        """Record the unchanged ordinary public-driver route."""
+        calls.append(cast(int, next(iter(kwargs.values()))))
+        return original(driver, **kwargs)
+
+    monkeypatch.setattr(MockRoasterDriver, tool_name, record_public)
+
+    async def exercise() -> None:
+        """Invoke the registered ordinary tool with its existing successful reply."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            await _call(
+                server,
+                "start_roast_session",
+                context,
+                purpose="roast",
+            )
+            result = await _call(
+                server, tool_name, context, **{f"{tool_name[4:]}_level_percent": 37}
+            )
+            assert result.heat_level_percent == (37 if tool_name == "set_heat" else 0)
+            assert result.fan_level_percent == (37 if tool_name == "set_fan" else 0)
+            assert calls == [37]
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "checked_method_name"),
+    [
+        pytest.param("stop_cooling", "_stop_cooling_unless_superseded", id="C6-stop"),
+        pytest.param("start_cooling", "_start_cooling_unless_superseded", id="C7-start"),
+    ],
+)
+def test_registered_simulated_recovery_refuses_a_checked_command_superseded_by_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    checked_method_name: str,
+) -> None:
+    """C6/C7: Stop supersedes a held exact recovery without blocking a fresh one."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+    entered = Event()
+    release = Event()
+    calls = 0
+    original = getattr(HottopRoasterDriver, checked_method_name)
+
+    def hold_first_checked_call(driver: HottopRoasterDriver, token: object) -> object:
+        """Expose the interval after reservation but before the driver's state lock."""
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(timeout=1.0)
+        return original(driver, token)
+
+    monkeypatch.setattr(HottopRoasterDriver, checked_method_name, hold_first_checked_call)
+
+    async def witness_frame(frame: bytes) -> None:
+        """Yield until the synthetic command loop writes one expected frame."""
+        while frame not in composition.transport.writes_snapshot():
+            await asyncio.sleep(0)
+
+    async def exercise() -> None:
+        """Use the registered handlers against only the in-memory composition."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            assert context.config.roaster.port == SYNTHETIC_HOTTOP_PORT
+            assert mcp_server._trusted_hottop_simulation(context)  # pyright: ignore[reportPrivateUsage]
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            session_id = started.session.session_id
+            first_stop = await _call(
+                server,
+                "emergency_stop",
+                context,
+                expected_session_id=session_id,
+            )
+            assert first_stop.session_id == session_id
+            driver = context.roaster_driver
+            emergency_revision = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+            emergency_frame = build_hottop_command_packet(
+                heat_level_percent=0,
+                fan_level_percent=0,
+                main_fan_level_percent=100,
+                cooling_motor_on=True,
+            )
+            await asyncio.wait_for(witness_frame(emergency_frame), timeout=1.0)
+
+            stale = asyncio.create_task(
+                _call(
+                    server,
+                    tool_name,
+                    context,
+                    expected_session_id=session_id,
+                )
+            )
+            assert await asyncio.to_thread(entered.wait, 1.0)
+
+            second_stop = await _call(
+                server,
+                "emergency_stop",
+                context,
+                expected_session_id=session_id,
+            )
+            assert second_stop.session_id == session_id
+            await asyncio.wait_for(witness_frame(emergency_frame), timeout=1.0)
+            release.set()
+            with pytest.raises(SupersededDriverCommand, match="superseded"):
+                await stale
+
+            refused_state = context.roaster_driver.read_state()
+            assert refused_state.cooling_on is True
+            assert refused_state.heat_level_percent == 0
+            assert refused_state.fan_level_percent == 100
+            assert driver._command_state_revision == emergency_revision + 1  # pyright: ignore[reportPrivateUsage]
+            latest = context.session_store.get_latest_session()
+            assert latest is not None
+            assert latest.pending_driver_command_kind is None
+
+            fresh = await _call(
+                server,
+                tool_name,
+                context,
+                expected_session_id=session_id,
+            )
+            assert fresh.session_id == session_id
+            assert calls == 2
+            assert context.roaster_driver.read_state().cooling_on is (tool_name == "start_cooling")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "checked_method_name", "cooling_on"),
+    [
+        pytest.param(
+            "start_cooling",
+            "_start_cooling_unless_superseded",
+            True,
+            id="C5-fault-recovery-start",
+        ),
+        pytest.param(
+            "stop_cooling",
+            "_stop_cooling_unless_superseded",
+            False,
+            id="C5-fault-recovery-stop",
+        ),
+    ],
+)
+def test_registered_simulated_late_fault_recovery_preserves_newer_stop_and_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    checked_method_name: str,
+    cooling_on: bool,
+) -> None:
+    """C5: a returned obsolete recovery cannot contain over a newer Stop owner."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+    checked_returned = Event()
+    release_completion = Event()
+    emergency_entries: list[HottopRoasterDriver] = []
+    checked_calls = 0
+    original_checked = getattr(HottopRoasterDriver, checked_method_name)
+    original_emergency = HottopRoasterDriver.emergency_stop
+
+    def hold_first_return(driver: HottopRoasterDriver, token: object) -> object:
+        """Hold only after the first checked recovery has changed driver state."""
+        nonlocal checked_calls
+        checked_calls += 1
+        state = original_checked(driver, token)
+        if checked_calls == 1:
+            checked_returned.set()
+            assert release_completion.wait(timeout=1.0)
+        return state
+
+    def record_emergency_entry(driver: HottopRoasterDriver, *, reason: str) -> object:
+        """Count actual driver entries instead of inferring them from repeated frames."""
+        emergency_entries.append(driver)
+        return original_emergency(driver, reason=reason)
+
+    monkeypatch.setattr(HottopRoasterDriver, checked_method_name, hold_first_return)
+    monkeypatch.setattr(HottopRoasterDriver, "emergency_stop", record_emergency_entry)
+
+    async def wait_for_frames(frame: bytes, *, start: int, count: int = 1) -> None:
+        """Find the next matching frame, then prove its following stable output."""
+        match_index: int | None = None
+        while match_index is None:
+            writes = composition.transport.writes_snapshot()
+            try:
+                match_index = writes.index(frame, start)
+            except ValueError:
+                await asyncio.sleep(0)
+        while len(composition.transport.writes_snapshot()) < match_index + count:
+            await asyncio.sleep(0)
+        assert (
+            composition.transport.writes_snapshot()[match_index : match_index + count]
+            == (frame,) * count
+        )
+
+    async def exercise() -> None:
+        """Use registered stopped-fault recovery controls against the synthetic transport."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            session_id = started.session.session_id
+            first_stop = await _call(
+                server,
+                "emergency_stop",
+                context,
+                expected_session_id=session_id,
+            )
+            assert first_stop.session_id == session_id
+            assert len(emergency_entries) == 1
+
+            stale_recovery = asyncio.create_task(
+                _call(server, tool_name, context, expected_session_id=session_id)
+            )
+            assert await asyncio.to_thread(checked_returned.wait, 1.0)
+
+            emergency_frame = build_hottop_command_packet(
+                heat_level_percent=0,
+                fan_level_percent=0,
+                main_fan_level_percent=100,
+                cooling_motor_on=True,
+            )
+            emergency_start = len(composition.transport.writes_snapshot())
+            later_stop = await _call(
+                server,
+                "emergency_stop",
+                context,
+                expected_session_id=session_id,
+            )
+            assert later_stop.session_id == session_id
+            await asyncio.wait_for(
+                wait_for_frames(emergency_frame, start=emergency_start), timeout=1.0
+            )
+            assert len(emergency_entries) == 2
+
+            release_completion.set()
+            with pytest.raises(SessionLifecycleError, match="reservation is no longer active"):
+                await stale_recovery
+            assert len(emergency_entries) == 2
+
+            recovery_frame = build_hottop_command_packet(
+                heat_level_percent=0,
+                fan_level_percent=0,
+                main_fan_level_percent=100 if cooling_on else 0,
+                cooling_motor_on=cooling_on,
+            )
+            recovery_start = len(composition.transport.writes_snapshot())
+            recovered = await _call(
+                server,
+                tool_name,
+                context,
+                expected_session_id=session_id,
+            )
+            assert recovered.session_id == session_id
+            await asyncio.wait_for(
+                wait_for_frames(recovery_frame, start=recovery_start), timeout=1.0
+            )
+            revision_after_recovery = context.roaster_driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+
+            final_start = len(composition.transport.writes_snapshot())
+            while len(composition.transport.writes_snapshot()) < final_start + 3:
+                await asyncio.sleep(0)
+            assert (
+                composition.transport.writes_snapshot()[final_start : final_start + 3]
+                == (recovery_frame,) * 3
+            )
+            assert len(emergency_entries) == 2
+            assert context.roaster_driver._command_state_revision == revision_after_recovery  # pyright: ignore[reportPrivateUsage]
+            assert context.roaster_driver.read_state().cooling_on is cooling_on
+            latest = context.session_store.get_latest_session()
+            assert latest is not None
+            assert latest.pending_driver_command_kind is None
+            assert checked_calls == 2
+
+    asyncio.run(exercise())
 
 
 def test_simulation_rejects_wrong_port_before_driver_construction(

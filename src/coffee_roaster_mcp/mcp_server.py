@@ -11,9 +11,11 @@ import time
 from collections.abc import AsyncGenerator, Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
+from contextvars import copy_context
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
 from types import TracebackType
@@ -77,6 +79,7 @@ from coffee_roaster_mcp.drivers import (
     RoasterCapabilities,
     RoasterDriver,
     RoasterState,
+    SupersededDriverCommand,
     create_roaster_driver,
 )
 from coffee_roaster_mcp.exports import (
@@ -2951,6 +2954,23 @@ def _trusted_hottop_simulation(server_context: ServerContext) -> bool:
     )
 
 
+def _trusted_hottop_simulation_cooling_token(server_context: ServerContext) -> object:
+    """Capture the simulated-only identity that fences queued cooling work.
+
+    Callers hold ``lifecycle_barrier`` before calling this helper. The driver
+    then takes its state lock, matching the emergency handler's lock order
+    without doing serial I/O while either lock is held.
+    """
+    driver = server_context.roaster_driver
+    if (
+        not _trusted_hottop_simulation(server_context)
+        or server_context.config.roaster.hottop_reception != "candidate/v1"
+        or type(driver) is not HottopRoasterDriver
+    ):
+        raise RuntimeError("Trusted simulated cooling token is unavailable.")
+    return driver._cooling_command_token()  # pyright: ignore[reportPrivateUsage]
+
+
 def _trusted_hottop_simulation_components(
     *,
     config: AppConfig,
@@ -3710,20 +3730,41 @@ def _create_mcp_server(
         )
 
     @mcp.tool()
-    def set_heat(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+    async def set_heat(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
         heat_level_percent: int,
     ) -> ControlCommandResult:
         """Set heat through the configured driver boundary."""
         server_context = ctx.request_context.lifespan_context
-        session = _require_active_session(server_context)
-        snapshot = _run_reserved_driver_control(
-            server_context,
-            session,
-            driver_command=lambda: server_context.roaster_driver.set_heat(
-                heat_level_percent=heat_level_percent,
-            ),
-        )
+        if _trusted_hottop_simulation(server_context):
+            with server_context.lifecycle_barrier:
+                session = _require_active_session(server_context)
+                lever_token = _trusted_hottop_simulation_cooling_token(server_context)
+                reservation = server_context.session_store.reserve_driver_command(
+                    session,
+                    kind="control",
+                )
+            snapshot = await _submit_admitted_hottop_control(
+                server_context,
+                session,
+                reservation=reservation,
+                lever_token=lever_token,
+                driver_command=lambda: cast(
+                    Any, server_context.roaster_driver
+                )._set_heat_unless_superseded(  # pyright: ignore[reportPrivateUsage]
+                    cast(Any, lever_token),
+                    heat_level_percent=heat_level_percent,
+                ),
+            )
+        else:
+            session = _require_active_session(server_context)
+            snapshot = _run_reserved_driver_control(
+                server_context,
+                session,
+                driver_command=lambda: server_context.roaster_driver.set_heat(
+                    heat_level_percent=heat_level_percent,
+                ),
+            )
         return _serialize_control_result(snapshot)
 
     @mcp.tool()
@@ -3802,20 +3843,41 @@ def _create_mcp_server(
         return _exact_normal_drop_public_result(result)
 
     @mcp.tool()
-    def set_fan(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+    async def set_fan(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
         fan_level_percent: int,
     ) -> ControlCommandResult:
         """Set fan through the configured driver boundary."""
         server_context = ctx.request_context.lifespan_context
-        session = _require_active_session(server_context)
-        snapshot = _run_reserved_driver_control(
-            server_context,
-            session,
-            driver_command=lambda: server_context.roaster_driver.set_fan(
-                fan_level_percent=fan_level_percent,
-            ),
-        )
+        if _trusted_hottop_simulation(server_context):
+            with server_context.lifecycle_barrier:
+                session = _require_active_session(server_context)
+                lever_token = _trusted_hottop_simulation_cooling_token(server_context)
+                reservation = server_context.session_store.reserve_driver_command(
+                    session,
+                    kind="control",
+                )
+            snapshot = await _submit_admitted_hottop_control(
+                server_context,
+                session,
+                reservation=reservation,
+                lever_token=lever_token,
+                driver_command=lambda: cast(
+                    Any, server_context.roaster_driver
+                )._set_fan_unless_superseded(  # pyright: ignore[reportPrivateUsage]
+                    cast(Any, lever_token),
+                    fan_level_percent=fan_level_percent,
+                ),
+            )
+        else:
+            session = _require_active_session(server_context)
+            snapshot = _run_reserved_driver_control(
+                server_context,
+                session,
+                driver_command=lambda: server_context.roaster_driver.set_fan(
+                    fan_level_percent=fan_level_percent,
+                ),
+            )
         return _serialize_control_result(snapshot)
 
     @mcp.tool()
@@ -3918,18 +3980,36 @@ def _create_mcp_server(
         """Start cooling through the driver as an explicit recovery command."""
         server_context = ctx.request_context.lifespan_context
         if expected_session_id is None:
-            session = _require_active_session(server_context)
+            cooling_command_token: object | None = None
+            if _trusted_hottop_simulation(server_context):
+                with server_context.lifecycle_barrier:
+                    session = _require_active_session(server_context)
+                    cooling_command_token = _trusted_hottop_simulation_cooling_token(server_context)
+            else:
+                session = _require_active_session(server_context)
             if _manual_first_crack_writer_composition(server_context):
                 event, snapshot = await asyncio.to_thread(
-                    _run_reserved_driver_start_cooling, server_context, session
+                    _run_reserved_driver_start_cooling,
+                    server_context,
+                    session,
+                    cooling_command_token=cooling_command_token,
                 )
             else:
-                event, snapshot = _run_reserved_driver_start_cooling(server_context, session)
+                event, snapshot = _run_reserved_driver_start_cooling(
+                    server_context,
+                    session,
+                    cooling_command_token=cooling_command_token,
+                )
         else:
             with server_context.lifecycle_barrier:
                 session = _require_guarded_fault_recovery_session(
                     server_context,
                     expected_session_id=expected_session_id,
+                )
+                cooling_command_token = (
+                    _trusted_hottop_simulation_cooling_token(server_context)
+                    if _trusted_hottop_simulation(server_context)
+                    else None
                 )
                 reservation = server_context.session_store.reserve_driver_fault_recovery(
                     session,
@@ -3941,12 +4021,14 @@ def _create_mcp_server(
                     server_context,
                     session,
                     reservation=reservation,
+                    cooling_command_token=cooling_command_token,
                 )
             else:
                 event, snapshot = _run_reserved_driver_fault_recovery(
                     server_context,
                     session,
                     reservation=reservation,
+                    cooling_command_token=cooling_command_token,
                 )
         return _serialize_event_result(snapshot=snapshot, event=event)
 
@@ -3963,6 +4045,11 @@ def _create_mcp_server(
                     server_context,
                     expected_session_id=expected_session_id,
                 )
+                cooling_command_token = (
+                    _trusted_hottop_simulation_cooling_token(server_context)
+                    if _trusted_hottop_simulation(server_context)
+                    else None
+                )
                 reservation = server_context.session_store.reserve_driver_fault_recovery(
                     session,
                     kind="stop_cooling",
@@ -3973,18 +4060,25 @@ def _create_mcp_server(
                     server_context,
                     session,
                     reservation=reservation,
+                    cooling_command_token=cooling_command_token,
                 )
             else:
                 event, snapshot = _run_reserved_driver_fault_recovery(
                     server_context,
                     session,
                     reservation=reservation,
+                    cooling_command_token=cooling_command_token,
                 )
         else:
             session = server_context.session_store.get_active_session()
             if session is None:
                 with server_context.lifecycle_barrier:
                     session = _require_faulted_cooling_session(server_context)
+                    cooling_command_token = (
+                        _trusted_hottop_simulation_cooling_token(server_context)
+                        if _trusted_hottop_simulation(server_context)
+                        else None
+                    )
                     reservation = server_context.session_store.reserve_driver_fault_recovery(
                         session,
                         kind="stop_cooling",
@@ -3995,20 +4089,36 @@ def _create_mcp_server(
                         server_context,
                         session,
                         reservation=reservation,
+                        cooling_command_token=cooling_command_token,
                     )
                 else:
                     event, snapshot = _run_reserved_driver_fault_recovery(
                         server_context,
                         session,
                         reservation=reservation,
+                        cooling_command_token=cooling_command_token,
                     )
             else:
+                cooling_command_token = None
+                if _trusted_hottop_simulation(server_context):
+                    with server_context.lifecycle_barrier:
+                        session = _require_active_session(server_context)
+                        cooling_command_token = _trusted_hottop_simulation_cooling_token(
+                            server_context
+                        )
                 if _manual_first_crack_writer_composition(server_context):
                     event, snapshot = await asyncio.to_thread(
-                        _run_reserved_driver_stop_cooling, server_context, session
+                        _run_reserved_driver_stop_cooling,
+                        server_context,
+                        session,
+                        cooling_command_token=cooling_command_token,
                     )
                 else:
-                    event, snapshot = _run_reserved_driver_stop_cooling(server_context, session)
+                    event, snapshot = _run_reserved_driver_stop_cooling(
+                        server_context,
+                        session,
+                        cooling_command_token=cooling_command_token,
+                    )
         server_context.first_crack_runtime.stop_for_session(
             snapshot.id,
             reason="cooling stopped",
@@ -6533,12 +6643,15 @@ def _run_reserved_driver_control(
     session: RoastSession,
     *,
     driver_command: Callable[[], RoasterState],
+    reservation: DriverCommandReservation | None = None,
+    lever_token: object | None = None,
 ) -> RoastSession:
     """Run one reserved driver control command outside the store lock."""
-    reservation = server_context.session_store.reserve_driver_command(
-        session,
-        kind="control",
-    )
+    if reservation is None:
+        reservation = server_context.session_store.reserve_driver_command(
+            session,
+            kind="control",
+        )
     try:
         driver_state = driver_command()
         try:
@@ -6549,11 +6662,86 @@ def _run_reserved_driver_control(
                 driver_state=driver_state,
             )
         except SessionLifecycleError:
-            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
+            _fail_closed_after_stale_driver_command(
+                server_context,
+                session=session,
+                reservation=reservation,
+                lever_token=lever_token,
+            )
             raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
         raise
+
+
+async def _submit_admitted_hottop_control(
+    server_context: ServerContext,
+    session: RoastSession,
+    *,
+    reservation: DriverCommandReservation,
+    lever_token: object,
+    driver_command: Callable[[], RoasterState],
+) -> RoastSession:
+    """Submit a selected simulated lever only after its executor handoff succeeds.
+
+    A ``ThreadPoolExecutor`` can enqueue a worker and then raise while creating
+    its thread. The queued worker waits for this private handoff before it can
+    enter the checked driver route. A failed submission clears the exact
+    reservation and rejects that worker without a driver call or containment.
+    """
+    admission = Future[bool]()
+    try:
+        execution = asyncio.get_running_loop().run_in_executor(
+            None,
+            copy_context().run,
+            partial(
+                _run_admitted_hottop_control,
+                admission,
+                server_context,
+                session,
+                reservation=reservation,
+                lever_token=lever_token,
+                driver_command=driver_command,
+            ),
+        )
+    except Exception:
+        server_context.session_store.clear_driver_command_reservation(session, reservation)
+        admission.set_result(False)
+        raise
+    admission.set_result(True)
+    try:
+        snapshot = await asyncio.shield(execution)
+    except asyncio.CancelledError:
+        execution.add_done_callback(_observe_hottop_drop_execution)
+        raise
+    return cast(RoastSession, snapshot)
+
+
+def _run_admitted_hottop_control(
+    admission: Future[bool],
+    server_context: ServerContext,
+    session: RoastSession,
+    *,
+    reservation: DriverCommandReservation,
+    lever_token: object,
+    driver_command: Callable[[], RoasterState],
+) -> RoastSession | None:
+    """Run a simulated lever only after its handler affirmatively admits it."""
+    if not admission.result():
+        return None
+    return _run_reserved_driver_control(
+        server_context,
+        session,
+        reservation=reservation,
+        lever_token=lever_token,
+        driver_command=driver_command,
+    )
+
+
+def _observe_hottop_drop_execution(execution: asyncio.Future[Any]) -> None:
+    """Consume a detached receipt-Drop executor outcome after caller cancellation."""
+    with suppress(asyncio.CancelledError, Exception):
+        execution.result()
 
 
 def _begin_drop_observation_boundary(
@@ -6706,6 +6894,8 @@ def _run_reserved_driver_drop(
 def _run_reserved_driver_start_cooling(
     server_context: ServerContext,
     session: RoastSession,
+    *,
+    cooling_command_token: object | None = None,
 ) -> tuple[RoastEvent, RoastSession]:
     """Run a reserved cooling-start command or return the existing event."""
     event_reservation = server_context.session_store.reserve_driver_start_cooling(session)
@@ -6718,7 +6908,9 @@ def _run_reserved_driver_start_cooling(
 
     reservation = event_reservation.reservation
     try:
-        driver_state = server_context.roaster_driver.start_cooling()
+        driver_state = _run_start_cooling_driver_command(
+            server_context, cooling_command_token=cooling_command_token
+        )
         try:
             return server_context.session_store.complete_reserved_driver_start_cooling_snapshot(
                 session,
@@ -6743,13 +6935,29 @@ def _run_reserved_driver_start_cooling(
             server_context.session_store.settle_unconfirmed_torn_start_cooling(
                 session, reservation=reservation
             )
-            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
+            _fail_closed_after_stale_cooling_command(
+                server_context,
+                session=session,
+                reservation=reservation,
+                cooling_command_token=cooling_command_token,
+            )
             raise SessionLifecycleError(
                 "Cooling could not be confirmed after roast log recording failed."
             ) from error
         except SessionLifecycleError:
-            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
+            _fail_closed_after_stale_cooling_command(
+                server_context,
+                session=session,
+                reservation=reservation,
+                cooling_command_token=cooling_command_token,
+            )
             raise
+    except SupersededDriverCommand:
+        # Emergency stop has already cancelled this reservation. This command
+        # made no driver change, so do not replay containment or turn the
+        # session into an unconfirmed completion.
+        server_context.session_store.clear_driver_command_reservation(session, reservation)
+        raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
         raise
@@ -6758,11 +6966,15 @@ def _run_reserved_driver_start_cooling(
 def _run_reserved_driver_stop_cooling(
     server_context: ServerContext,
     session: RoastSession,
+    *,
+    cooling_command_token: object | None = None,
 ) -> tuple[RoastEvent, RoastSession]:
     """Run a reserved cooling-stop command."""
     reservation = server_context.session_store.reserve_driver_stop_cooling(session)
     try:
-        driver_state = server_context.roaster_driver.stop_cooling()
+        driver_state = _run_stop_cooling_driver_command(
+            server_context, cooling_command_token=cooling_command_token
+        )
         try:
             return server_context.session_store.complete_reserved_driver_stop_cooling_snapshot(
                 session,
@@ -6772,8 +6984,18 @@ def _run_reserved_driver_stop_cooling(
                 cooling_on=driver_state.cooling_on,
             )
         except SessionLifecycleError:
-            _fail_closed_after_stale_driver_command(server_context, reservation=reservation)
+            _fail_closed_after_stale_cooling_command(
+                server_context,
+                session=session,
+                reservation=reservation,
+                cooling_command_token=cooling_command_token,
+            )
             raise
+    except SupersededDriverCommand:
+        # See the matching start-cooling path: the cancelled reservation is
+        # the only state this refused command may acknowledge.
+        server_context.session_store.clear_driver_command_reservation(session, reservation)
+        raise
     except Exception:
         server_context.session_store.clear_driver_command_reservation(session, reservation)
         raise
@@ -6784,6 +7006,7 @@ def _run_reserved_driver_fault_recovery(
     session: RoastSession,
     *,
     reservation: DriverCommandReservation,
+    cooling_command_token: object | None = None,
 ) -> tuple[RoastEvent, RoastSession]:
     """Run a pre-reserved stopped-fault command and retain the terminal fault state.
 
@@ -6804,10 +7027,14 @@ def _run_reserved_driver_fault_recovery(
             driver_state = server_context.roaster_driver.drop_beans()
         elif reservation.kind == "start_cooling":
             command = "start_cooling"
-            driver_state = server_context.roaster_driver.start_cooling()
+            driver_state = _run_start_cooling_driver_command(
+                server_context, cooling_command_token=cooling_command_token
+            )
         elif reservation.kind == "stop_cooling":
             command = "stop_cooling"
-            driver_state = server_context.roaster_driver.stop_cooling()
+            driver_state = _run_stop_cooling_driver_command(
+                server_context, cooling_command_token=cooling_command_token
+            )
         else:
             raise SessionLifecycleError("Unsupported stopped-fault recovery command.")
         if command == "drop":
@@ -6888,20 +7115,41 @@ def _run_reserved_driver_fault_recovery(
         # while its owned writer turn was in flight.  Do not dispatch a second
         # protective command merely because the stale caller observes failure.
         raise
+    except SupersededDriverCommand:
+        # The checked simulated method did not mutate the driver. An
+        # emergency has already revoked this exact reservation, so it is not a
+        # failed recovery and must not issue a second emergency.
+        server_context.session_store.clear_driver_command_reservation(session, reservation)
+        server_context.session_store.clear_fault_recovery_in_flight(session, reservation)
+        raise
     except Exception:
         if known_torn_completion or known_incomplete_completion:
             raise
+        superseded_after_driver_application = False
         if command == "drop":
             server_context.session_store.retain_fault_drop_ambiguity_if_unrecorded(session)
-        _fail_closed_guarded_fault_recovery_command(
-            server_context,
-            session=session,
-            reservation=reservation,
-            command=command,
-        )
-        if driver_state is not None and (
-            not driver_state.connected
-            or (command in {"drop", "start_cooling"} and driver_state.fan_level_percent != 100)
+        if driver_state is not None and command in {"start_cooling", "stop_cooling"}:
+            superseded_after_driver_application = _fail_closed_after_stale_cooling_command(
+                server_context,
+                session=session,
+                reservation=reservation,
+                cooling_command_token=cooling_command_token,
+                guarded_fault_recovery=True,
+            )
+        else:
+            _fail_closed_guarded_fault_recovery_command(
+                server_context,
+                session=session,
+                reservation=reservation,
+                command=command,
+            )
+        if (
+            not superseded_after_driver_application
+            and driver_state is not None
+            and (
+                not driver_state.connected
+                or (command in {"drop", "start_cooling"} and driver_state.fan_level_percent != 100)
+            )
         ):
             server_context.session_store.retain_fault_recovery_admission_block(session)
         if command == "drop":
@@ -6914,24 +7162,77 @@ def _run_reserved_driver_fault_recovery(
         raise
 
 
+def _run_start_cooling_driver_command(
+    server_context: ServerContext,
+    *,
+    cooling_command_token: object | None,
+) -> RoasterState:
+    """Run one start-cooling command, using the checked simulation path only.
+
+    An absent token deliberately preserves the existing public driver method
+    for mock, physical, and every ordinary composition.
+    """
+    driver = server_context.roaster_driver
+    if cooling_command_token is None:
+        return driver.start_cooling()
+    if type(driver) is not HottopRoasterDriver:
+        raise RuntimeError("Checked cooling command requires the trusted Hottop simulation.")
+    return driver._start_cooling_unless_superseded(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, cooling_command_token)
+    )
+
+
+def _run_stop_cooling_driver_command(
+    server_context: ServerContext,
+    *,
+    cooling_command_token: object | None,
+) -> RoasterState:
+    """Run one stop-cooling command, using the checked simulation path only."""
+    driver = server_context.roaster_driver
+    if cooling_command_token is None:
+        return driver.stop_cooling()
+    if type(driver) is not HottopRoasterDriver:
+        raise RuntimeError("Checked cooling command requires the trusted Hottop simulation.")
+    return driver._stop_cooling_unless_superseded(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, cooling_command_token)
+    )
+
+
 def _fail_closed_guarded_fault_recovery_command(
     server_context: ServerContext,
     *,
     session: RoastSession,
     reservation: DriverCommandReservation,
     command: Literal["drop", "start_cooling", "stop_cooling"],
-) -> None:
+    cooling_command_token: object | None = None,
+) -> bool:
     """Fence uncertain guarded recovery after any driver or completion failure.
 
     This function reacquires the lifecycle barrier only after the original
-    guarded driver call returns. It serializes the replacement emergency stop
-    and its stored result with a concurrent direct emergency stop, while the
-    store reservation fences new-session admission.
+    guarded driver call returns. It serializes the exact simulated
+    supersession decision, replacement emergency stop, and in-memory fault
+    publication with a concurrent direct emergency stop, while the store
+    reservation fences new-session admission. Deferred ticket commits remain
+    outside that barrier.
+
+    Returns:
+        ``True`` when a checked trusted-simulation cooling command is proven
+        obsolete after it applied. In that case its exact fences are retired
+        and the newer emergency remains the owner.
     """
     prepared_fault: tuple[RoastEvent, RoastSession, MockDropPersistenceTicket | None] | None = None
     attempted_payload = default_emergency_safety_payload()
+    superseded_after_driver_application = False
     try:
         with server_context.lifecycle_barrier:
+            superseded_after_driver_application = _retire_superseded_checked_cooling_command(
+                server_context,
+                session=session,
+                reservation=reservation,
+                cooling_command_token=cooling_command_token,
+            )
+            if superseded_after_driver_application:
+                return True
             attempted_payload = run_driver_emergency_stop(
                 server_context,
                 reason=f"guarded fault recovery {command} failed",
@@ -6971,9 +7272,11 @@ def _fail_closed_guarded_fault_recovery_command(
                 safety_payload=attempted_payload,
             )
     finally:
-        with server_context.lifecycle_barrier:
-            server_context.session_store.clear_driver_command_reservation(session, reservation)
-            server_context.session_store.clear_fault_recovery_in_flight(session, reservation)
+        if not superseded_after_driver_application:
+            with server_context.lifecycle_barrier:
+                server_context.session_store.clear_driver_command_reservation(session, reservation)
+                server_context.session_store.clear_fault_recovery_in_flight(session, reservation)
+    return False
 
 
 def _retain_guarded_emergency_stop_block(
@@ -7108,9 +7411,18 @@ def _fail_closed_after_stale_driver_command(
     server_context: ServerContext,
     *,
     reservation: DriverCommandReservation,
+    session: RoastSession | None = None,
+    lever_token: object | None = None,
 ) -> None:
     """Reapply driver safety when a completed command no longer owns the session."""
     with server_context.lifecycle_barrier:
+        if session is not None and _retire_superseded_checked_cooling_command(
+            server_context,
+            session=session,
+            reservation=reservation,
+            cooling_command_token=lever_token,
+        ):
+            return
         active_session = server_context.session_store.get_active_session()
         if active_session is not None and active_session.id != reservation.session_id:
             return
@@ -7118,6 +7430,82 @@ def _fail_closed_after_stale_driver_command(
             server_context,
             reason="stale driver command after session state changed",
         )
+
+
+def _fail_closed_after_stale_cooling_command(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    reservation: DriverCommandReservation,
+    cooling_command_token: object | None,
+    guarded_fault_recovery: bool = False,
+) -> bool:
+    """Contain stale cooling completion unless a newer simulated emergency owns it.
+
+    A checked cooling call has already mutated the trusted candidate/v1 driver
+    before it returns. Under the lifecycle barrier, the driver's state-lock
+    check can prove that a later same-connection emergency displaced that
+    result. That newer owner is retained and the obsolete operation's exact
+    fences are retired. Every other guarded recovery failure uses its
+    established guarded containment path; ordinary cooling retains the generic
+    stale-command fallback.
+
+    Returns:
+        ``True`` only when the trusted simulation proves the completed command
+        was superseded. Callers must then preserve the newer owner's state
+        rather than applying their ordinary fault-recovery bookkeeping.
+    """
+    if guarded_fault_recovery:
+        return _fail_closed_guarded_fault_recovery_command(
+            server_context,
+            session=session,
+            reservation=reservation,
+            command=cast(Literal["start_cooling", "stop_cooling"], reservation.kind),
+            cooling_command_token=cooling_command_token,
+        )
+    with server_context.lifecycle_barrier:
+        if _retire_superseded_checked_cooling_command(
+            server_context,
+            session=session,
+            reservation=reservation,
+            cooling_command_token=cooling_command_token,
+        ):
+            return True
+        active_session = server_context.session_store.get_active_session()
+        if active_session is not None and active_session.id != reservation.session_id:
+            return False
+        run_driver_emergency_stop(
+            server_context,
+            reason="stale driver command after session state changed",
+        )
+        return False
+
+
+def _retire_superseded_checked_cooling_command(
+    server_context: ServerContext,
+    *,
+    session: RoastSession,
+    reservation: DriverCommandReservation,
+    cooling_command_token: object | None,
+) -> bool:
+    """Retire only an exactly proven obsolete trusted-simulation cooling owner.
+
+    Callers hold ``lifecycle_barrier`` for this check and its exact-token
+    cleanup, making the ownership decision inseparable from fallback dispatch.
+    """
+    driver = server_context.roaster_driver
+    if not (
+        cooling_command_token is not None
+        and _trusted_hottop_simulation(server_context)
+        and type(driver) is HottopRoasterDriver
+        and driver._cooling_command_completed_before_later_emergency(  # pyright: ignore[reportPrivateUsage]
+            cast(Any, cooling_command_token)
+        )
+    ):
+        return False
+    server_context.session_store.clear_driver_command_reservation(session, reservation)
+    server_context.session_store.clear_fault_recovery_in_flight(session, reservation)
+    return True
 
 
 def run_driver_emergency_stop(
