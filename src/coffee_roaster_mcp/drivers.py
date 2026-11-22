@@ -173,6 +173,22 @@ class ExactDropCancelled(Exception):
 
 
 @dataclass(frozen=True)
+class _HottopCoolingCommandToken:
+    """Snapshot identity for one queued simulated cooling command."""
+
+    reception_epoch: int
+    emergency_transition_count: int
+
+
+class SupersededDriverCommand(Exception):
+    """Report that an obsolete driver command made no state change."""
+
+    def __init__(self) -> None:
+        """Initialize the closed refusal message used by command handlers."""
+        super().__init__("Command was superseded and no driver command was applied.")
+
+
+@dataclass(frozen=True)
 class FixedZeroCommandedState:
     """Closed command-state evidence returned by fixed-zero containment.
 
@@ -2685,10 +2701,7 @@ class HottopRoasterDriver:
             label="heat_level_percent",
         )
         with self._state_lock:
-            self._heat_level_percent = heat_level
-            self._command_state_revision += 1
-            if heat_level > 0:
-                self._drum_motor_on = True
+            self._apply_heat_locked(heat_level)
         return self.read_state()
 
     def contain_heat_fixed_zero(self) -> FixedZeroCommandedState:
@@ -2714,8 +2727,7 @@ class HottopRoasterDriver:
             label="fan_level_percent",
         )
         with self._state_lock:
-            self._main_fan_level_percent = fan_level
-            self._command_state_revision += 1
+            self._apply_fan_locked(fan_level)
         return self.read_state()
 
     def snapshot_exact_drop_candidate(self) -> HottopExactDropCandidate:
@@ -2898,25 +2910,124 @@ class HottopRoasterDriver:
     def start_cooling(self) -> RoasterState:
         """Start Hottop cooling motor and main fan."""
         with self._state_lock:
-            self._cooling_motor_on = True
-            self._main_fan_level_percent = 100
-            self._command_state_revision += 1
+            self._apply_start_cooling_locked()
         return self.read_state()
 
     def stop_cooling(self) -> RoasterState:
         """Stop Hottop cooling, close drop path, stop the drum, and clear main fan."""
         with self._state_lock:
-            self._cooling_motor_on = False
-            self._solenoid_open = False
-            # drop_beans now leaves the drum running through cooling to fully
-            # clear the beans (coffee-roaster-mcp#163). stop_cooling is the
-            # end-of-roast action, so it must stop the drum here; otherwise the
-            # drum would spin indefinitely after cooling ends.
-            self._drum_motor_on = False
-            self._main_fan_level_percent = 0
-            self._command_state_revision += 1
-            self._close_unattempted_drop_settlement()
+            self._apply_stop_cooling_locked()
         return self.read_state()
+
+    def _cooling_command_token(self) -> _HottopCoolingCommandToken:
+        """Capture the exact state that can supersede queued cooling work."""
+        with self._state_lock:
+            return _HottopCoolingCommandToken(
+                reception_epoch=self._reception_epoch,
+                emergency_transition_count=self._emergency_count,
+            )
+
+    def _start_cooling_unless_superseded(self, token: _HottopCoolingCommandToken) -> RoasterState:
+        """Start cooling only when no later emergency superseded ``token``."""
+        with self._state_lock:
+            self._raise_if_cooling_command_superseded_locked(token)
+            self._apply_start_cooling_locked()
+        return self.read_state()
+
+    def _stop_cooling_unless_superseded(self, token: _HottopCoolingCommandToken) -> RoasterState:
+        """Stop cooling only when no later emergency superseded ``token``."""
+        with self._state_lock:
+            self._raise_if_cooling_command_superseded_locked(token)
+            self._apply_stop_cooling_locked()
+        return self.read_state()
+
+    def _set_heat_unless_superseded(
+        self,
+        token: _HottopCoolingCommandToken,
+        *,
+        heat_level_percent: int,
+    ) -> RoasterState:
+        """Set heat only when no later emergency superseded ``token``."""
+        heat_level = validate_control_percent(
+            heat_level_percent,
+            label="heat_level_percent",
+        )
+        with self._state_lock:
+            self._raise_if_cooling_command_superseded_locked(token)
+            self._apply_heat_locked(heat_level)
+        return self.read_state()
+
+    def _set_fan_unless_superseded(
+        self,
+        token: _HottopCoolingCommandToken,
+        *,
+        fan_level_percent: int,
+    ) -> RoasterState:
+        """Set fan only when no later emergency superseded ``token``."""
+        fan_level = validate_control_percent(
+            fan_level_percent,
+            label="fan_level_percent",
+        )
+        with self._state_lock:
+            self._raise_if_cooling_command_superseded_locked(token)
+            self._apply_fan_locked(fan_level)
+        return self.read_state()
+
+    def _cooling_command_completed_before_later_emergency(
+        self, token: _HottopCoolingCommandToken
+    ) -> bool:
+        """Return whether a checked cooling command is known obsolete after returning.
+
+        This deliberately recognises only a later candidate/v1 emergency in the
+        same reception epoch. A reconnect, an equal counter, or an unrecognised
+        token remains uncertain for the caller's normal containment path.
+        """
+        with self._state_lock:
+            return (
+                token.reception_epoch == self._reception_epoch
+                and token.emergency_transition_count < self._emergency_count
+            )
+
+    def _raise_if_cooling_command_superseded_locked(
+        self, token: _HottopCoolingCommandToken
+    ) -> None:
+        """Refuse a cooling command whose simulation identity is no longer current."""
+        if (
+            token.reception_epoch != self._reception_epoch
+            or token.emergency_transition_count != self._emergency_count
+        ):
+            raise SupersededDriverCommand()
+
+    def _apply_start_cooling_locked(self) -> None:
+        """Apply the shared start-cooling command state under the state lock."""
+        self._cooling_motor_on = True
+        self._main_fan_level_percent = 100
+        self._command_state_revision += 1
+
+    def _apply_heat_locked(self, heat_level: int) -> None:
+        """Apply one validated heat level under the state lock."""
+        self._heat_level_percent = heat_level
+        self._command_state_revision += 1
+        if heat_level > 0:
+            self._drum_motor_on = True
+
+    def _apply_fan_locked(self, fan_level: int) -> None:
+        """Apply one validated main-fan level under the state lock."""
+        self._main_fan_level_percent = fan_level
+        self._command_state_revision += 1
+
+    def _apply_stop_cooling_locked(self) -> None:
+        """Apply the shared stop-cooling command state under the state lock."""
+        self._cooling_motor_on = False
+        self._solenoid_open = False
+        # drop_beans now leaves the drum running through cooling to fully
+        # clear the beans (coffee-roaster-mcp#163). stop_cooling is the
+        # end-of-roast action, so it must stop the drum here; otherwise the
+        # drum would spin indefinitely after cooling ends.
+        self._drum_motor_on = False
+        self._main_fan_level_percent = 0
+        self._command_state_revision += 1
+        self._close_unattempted_drop_settlement()
 
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
         """Apply safe Hottop emergency-stop command state."""

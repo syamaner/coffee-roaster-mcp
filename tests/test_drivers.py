@@ -39,6 +39,7 @@ from coffee_roaster_mcp.drivers import (
     RoasterState,
     SerialTransport,
     SerialTransportFactory,
+    SupersededDriverCommand,
     build_hottop_command_packet,
     build_hottop_received_packet,
     calculate_hottop_packet_checksum,
@@ -3160,6 +3161,167 @@ def test_hottop_driver_drop_and_cooling_commands_stream_safe_compound_states() -
         assert stopped_packet[35] == sum(stopped_packet[:35]) & 0xFF
     finally:
         driver.disconnect()
+
+
+@pytest.mark.parametrize("command", ["start", "stop"])
+def test_hottop_checked_cooling_commands_match_existing_transitions(command: str) -> None:
+    """Checked cooling transitions retain the matching public-method effects."""
+    ordinary = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(),
+        hottop_reception="candidate/v1",
+    )
+    checked = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(),
+        hottop_reception="candidate/v1",
+    )
+    ordinary.drop_beans()
+    checked.drop_beans()
+
+    token = checked._cooling_command_token()  # pyright: ignore[reportPrivateUsage]
+    if command == "start":
+        expected = ordinary.start_cooling()
+        actual = checked._start_cooling_unless_superseded(token)  # pyright: ignore[reportPrivateUsage]
+    else:
+        expected = ordinary.stop_cooling()
+        actual = checked._stop_cooling_unless_superseded(token)  # pyright: ignore[reportPrivateUsage]
+
+    assert actual == expected
+    assert checked.read_state() == ordinary.read_state()
+    assert checked._command_state_revision == ordinary._command_state_revision  # pyright: ignore[reportPrivateUsage]
+    assert checked._drop_settlement == ordinary._drop_settlement  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("command", ["start", "stop"])
+def test_hottop_checked_cooling_commands_refuse_stale_emergency_token(command: str) -> None:
+    """A later Stop leaves an obsolete cooling command entirely unchanged."""
+    driver = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(),
+        hottop_reception="candidate/v1",
+    )
+    driver.drop_beans()
+    token = driver._cooling_command_token()  # pyright: ignore[reportPrivateUsage]
+    driver.emergency_stop(reason="test")
+    state_after_stop = driver.read_state()
+    revision_after_stop = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+    settlement_after_stop = driver._emergency_settlement  # pyright: ignore[reportPrivateUsage]
+
+    assert state_after_stop.cooling_on is True
+    assert state_after_stop.fan_level_percent == 100
+    with pytest.raises(SupersededDriverCommand) as raised:
+        if command == "start":
+            driver._start_cooling_unless_superseded(token)  # pyright: ignore[reportPrivateUsage]
+        else:
+            driver._stop_cooling_unless_superseded(token)  # pyright: ignore[reportPrivateUsage]
+
+    assert str(raised.value) == "Command was superseded and no driver command was applied."
+    assert driver.read_state() == state_after_stop
+    assert driver._command_state_revision == revision_after_stop  # pyright: ignore[reportPrivateUsage]
+    assert driver._emergency_settlement == settlement_after_stop  # pyright: ignore[reportPrivateUsage]
+
+
+def test_hottop_checked_cooling_commands_refuse_epoch_change_with_matching_count() -> None:
+    """An epoch change supersedes cooling even when the emergency count still matches."""
+    driver = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(),
+        hottop_reception="candidate/v1",
+    )
+    token = driver._cooling_command_token()  # pyright: ignore[reportPrivateUsage]
+    transport = FakeSerialTransport()
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._begin_reception_epoch(transport)  # pyright: ignore[reportPrivateUsage]
+    state_after_epoch_change = driver.read_state()
+    revision_after_epoch_change = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(SupersededDriverCommand):
+        driver._start_cooling_unless_superseded(token)  # pyright: ignore[reportPrivateUsage]
+
+    assert driver.read_state() == state_after_epoch_change
+    assert driver._command_state_revision == revision_after_epoch_change  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("command", ["start", "stop"])
+def test_hottop_checked_cooling_commands_allow_unrelated_heat_and_fan_changes(
+    command: str,
+) -> None:
+    """Heat and fan revisions do not supersede a current cooling token."""
+    driver = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(),
+        hottop_reception="candidate/v1",
+    )
+    token = driver._cooling_command_token()  # pyright: ignore[reportPrivateUsage]
+    driver.set_heat(heat_level_percent=41)
+    driver.set_fan(fan_level_percent=19)
+    revision_before_cooling = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+
+    if command == "start":
+        state = driver._start_cooling_unless_superseded(token)  # pyright: ignore[reportPrivateUsage]
+        assert state.cooling_on is True
+        assert state.fan_level_percent == 100
+    else:
+        state = driver._stop_cooling_unless_superseded(token)  # pyright: ignore[reportPrivateUsage]
+        assert state.cooling_on is False
+        assert state.fan_level_percent == 0
+    assert state.heat_level_percent == 41
+    assert driver._command_state_revision == revision_before_cooling + 1  # pyright: ignore[reportPrivateUsage]
+
+
+def test_hottop_checked_stop_cooling_race_refuses_after_emergency() -> None:
+    """The state-lock comparison prevents a queued worker from overwriting Stop."""
+
+    class WorkerGatedLock:
+        """Hold the worker immediately before its state-lock acquisition."""
+
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self.worker_thread_id: int | None = None
+            self.worker_waiting = Event()
+            self.release_worker = Event()
+
+        def __enter__(self) -> "WorkerGatedLock":
+            if get_ident() == self.worker_thread_id:
+                self.worker_waiting.set()
+                assert self.release_worker.wait(timeout=1.0)
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self._lock.release()
+
+    driver = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(),
+        hottop_reception="candidate/v1",
+    )
+    token = driver._cooling_command_token()  # pyright: ignore[reportPrivateUsage]
+    gate = WorkerGatedLock()
+    driver._state_lock = gate  # pyright: ignore[reportAttributeAccessIssue, reportPrivateUsage]
+    worker_ready = Event()
+    worker_result: list[BaseException] = []
+
+    def apply_stale_stop() -> None:
+        """Attempt the checked command from the blocked worker."""
+        gate.worker_thread_id = get_ident()
+        worker_ready.set()
+        try:
+            driver._stop_cooling_unless_superseded(token)  # pyright: ignore[reportPrivateUsage]
+        except BaseException as error:
+            worker_result.append(error)
+
+    worker = Thread(target=apply_stale_stop)
+    worker.start()
+    assert worker_ready.wait(timeout=1.0)
+    assert gate.worker_waiting.wait(timeout=1.0)
+    driver.emergency_stop(reason="test")
+    state_after_stop = driver.read_state()
+    revision_after_stop = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+
+    gate.release_worker.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert len(worker_result) == 1
+    assert isinstance(worker_result[0], SupersededDriverCommand)
+    assert driver.read_state() == state_after_stop
+    assert driver._command_state_revision == revision_after_stop  # pyright: ignore[reportPrivateUsage]
 
 
 def test_hottop_driver_emergency_stop_streams_safe_stop_state() -> None:
