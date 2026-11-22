@@ -2617,13 +2617,13 @@ class HottopRoasterDriver:
         if age_bound is None:
             self._raise_exact_drop_refused("receipt_age_bound_unset")
         candidate = exact_drop.candidate
-        if not candidate.receipt_classification.eligible:
-            self._raise_exact_drop_refused("receipt_ineligible")
         prior_drop = self._drop_settlement
         if prior_drop is not None and prior_drop.result in {"pending", "entering", "unknown"}:
             self._raise_exact_drop_refused("prior_unresolved")
         if self._solenoid_open:
             self._raise_exact_drop_refused("prior_drop_open")
+        if not candidate.receipt_classification.eligible:
+            self._raise_exact_drop_refused("receipt_ineligible")
         if (
             candidate.drop_transition_count != self._drop_transition_count
             or candidate.drop_settlement != self._drop_settlement
@@ -2655,6 +2655,28 @@ class HottopRoasterDriver:
                 else "receipt_ineligible"
             )
             self._raise_exact_drop_refused(reason)
+        if self._receipt_age_regressed(candidate.receipt_classification, classification):
+            self._raise_exact_drop_refused("receipt_ineligible")
+
+    @staticmethod
+    def _receipt_age_regressed(
+        original: HottopReceiptClassification,
+        current: HottopReceiptClassification,
+    ) -> bool:
+        """Return whether a later admission observes an impossible younger receipt age."""
+        return any(
+            current_age is not None and original_age is not None and current_age < original_age
+            for original_age, current_age in (
+                (
+                    original.drained_floor_age_seconds,
+                    current.drained_floor_age_seconds,
+                ),
+                (
+                    original.read_returned_age_seconds,
+                    current.read_returned_age_seconds,
+                ),
+            )
+        )
 
     def _raise_exact_drop_refused(self, reason: HottopExactDropRefusalReason) -> Never:
         """Raise typed exact-Drop refusal without erasing retained ownership."""
