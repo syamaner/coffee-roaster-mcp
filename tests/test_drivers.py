@@ -1196,6 +1196,10 @@ class SteppedLoopGate:
 
 def _stepped_candidate_exact_drop_driver(
     transport: FakeSerialTransport | None = None,
+    *,
+    serial_factory: SerialTransportFactory | None = None,
+    simulation_receipt_age_bound_seconds: float | None = 3.0,
+    require_eligible_receipt: bool = True,
 ) -> tuple[HottopRoasterDriver, FakeSerialTransport, MutableReceptionClock, SteppedLoopGate]:
     """Build a live candidate stream using only its stepped native worker."""
     transport = transport or FakeSerialTransport()
@@ -1204,10 +1208,10 @@ def _stepped_candidate_exact_drop_driver(
     driver = HottopRoasterDriver(
         port="fake",
         command_interval_seconds=0.01,
-        serial_factory=FakeSerialFactory(transport),
+        serial_factory=serial_factory or FakeSerialFactory(transport),
         hottop_reception="candidate/v1",
         reception_clock=clock,
-        simulation_receipt_age_bound_seconds=3.0,
+        simulation_receipt_age_bound_seconds=simulation_receipt_age_bound_seconds,
         command_loop_iteration_hook=gate,
     )
     owner = driver.reserve_inhibited_start("server", purpose="roast")
@@ -1218,24 +1222,30 @@ def _stepped_candidate_exact_drop_driver(
     claim = driver.claim_prepared_first_write(driver.prepare_promoted_first_write(owner, session))
     assert driver.dispatch_claimed_first_write(claim) is HottopFirstWriteDisposition.WRITTEN
     driver.hand_off_written_start_to_stream(owner, session)
-    gate.wait_completed(1)
-    drained = driver.snapshot_exact_drop_candidate()
-    assert drained.receipt_sequence == 0
-    assert drained.receipt is None
-    assert drained.receipt_classification.reasons == ("no_receipt",)
-    sleep(0.01)
-    clock.value = 11.0
-    transport.queue_read_data(
-        _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=195)
-    )
-    gate.release(1)
-    gate.wait_completed(2)
-    receipt = driver.snapshot_exact_drop_candidate()
-    assert receipt.receipt_sequence == 1
-    assert receipt.receipt is not None
-    assert receipt.receipt.latest_pair_c == (195.0, 202.0)
-    assert receipt.receipt_classification.eligible is True
-    return driver, transport, clock, gate
+    try:
+        gate.wait_completed(1)
+        if not require_eligible_receipt:
+            return driver, transport, clock, gate
+        drained = driver.snapshot_exact_drop_candidate()
+        assert drained.receipt_sequence == 0
+        assert drained.receipt is None
+        assert drained.receipt_classification.reasons == ("no_receipt",)
+        sleep(0.01)
+        clock.value = 11.0
+        transport.queue_read_data(
+            _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=195)
+        )
+        gate.release(1)
+        gate.wait_completed(2)
+        receipt = driver.snapshot_exact_drop_candidate()
+        assert receipt.receipt_sequence == 1
+        assert receipt.receipt is not None
+        assert receipt.receipt.latest_pair_c == (195.0, 202.0)
+        assert receipt.receipt_classification.eligible is True
+        return driver, transport, clock, gate
+    except BaseException:
+        _close_stepped_candidate_driver(driver, gate)
+        raise
 
 
 def _close_stepped_candidate_driver(driver: HottopRoasterDriver, gate: SteppedLoopGate) -> None:
@@ -1749,7 +1759,7 @@ def test_candidate_reconnect_refuses_pending_exact_drop_before_opening_replaceme
 
 
 def test_candidate_reconnect_refuses_unknown_closed_drop_before_factory_open() -> None:
-    """A closed chute does not clear an unknown Drop settlement for reconnect."""
+    """A closed chute does not clear an unknown exact Drop settlement for reconnect."""
 
     class ShortDropTransport(FakeSerialTransport):
         def write(self, data: bytes) -> int:
@@ -1779,6 +1789,47 @@ def test_candidate_reconnect_refuses_unknown_closed_drop_before_factory_open() -
             driver.connect()
 
         assert len(factory.calls) == 0
+        assert replacement_transport.writes_snapshot() == []
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_nonopted_reconnect_refuses_unknown_closed_drop_before_factory_open() -> None:
+    """A non-opted closed chute retains an unknown Drop across Stop and disconnect."""
+
+    class ShortDropTransport(FakeSerialTransport):
+        def write(self, data: bytes) -> int:
+            receipt = super().write(data)
+            return receipt - 1 if data[16] == 1 else receipt
+
+    old_transport = ShortDropTransport()
+    replacement_transport = FakeSerialTransport()
+    factory = SequentialSerialFactory([old_transport, replacement_transport])
+    driver, _transport, _clock, gate = _stepped_candidate_exact_drop_driver(
+        old_transport,
+        serial_factory=factory,
+        simulation_receipt_age_bound_seconds=None,
+        require_eligible_receipt=False,
+    )
+    try:
+        driver.drop_beans()
+        gate.release(1)
+        gate.wait_completed(2)
+        driver.emergency_stop(reason="test")
+        gate.release(2)
+        gate.wait_completed(3)
+
+        assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_settlement.result == "unknown"  # pyright: ignore[reportPrivateUsage]
+        assert driver.read_lifecycle_evidence().solenoid_open is False
+        _close_stepped_candidate_driver(driver, gate)
+        factory_calls_before_refusal = len(factory.calls)
+        assert factory_calls_before_refusal == 1
+
+        with pytest.raises(RuntimeError, match="retains command ownership"):
+            driver.connect()
+
+        assert len(factory.calls) == factory_calls_before_refusal
         assert replacement_transport.writes_snapshot() == []
     finally:
         _close_stepped_candidate_driver(driver, gate)
