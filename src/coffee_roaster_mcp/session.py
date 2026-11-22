@@ -1823,6 +1823,18 @@ class RoastSessionStore:
             ):
                 return TimingEvidenceAssembly("unavailable", "record_invalid")
 
+            # The driver candidate is classified over [lo, hi].  A charge or
+            # manual first-crack mark committed after that completed bracket
+            # cannot share a record with the pre-mark receipt.
+            charge = event_by_kind.get("beans_added")
+            manual_first_crack = event_by_kind.get("first_crack_detected")
+            if (charge is not None and charge[1].monotonic_seconds > hi) or (
+                session.first_crack_source == "manual_mark"
+                and manual_first_crack is not None
+                and manual_first_crack[1].monotonic_seconds > hi
+            ):
+                return TimingEvidenceAssembly("refused_identity", "session_changed_during_read")
+
             def event_evidence(kind: str, source: str) -> dict[str, object] | None:
                 indexed_event = event_by_kind.get(kind)
                 if indexed_event is None:

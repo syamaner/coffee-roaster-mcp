@@ -14,11 +14,11 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from anyio import create_memory_object_stream, create_task_group
+from anyio.streams.memory import MemoryObjectReceiveStream
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.shared.memory import create_connected_server_and_client_session
-from anyio import create_memory_object_stream, create_task_group
-from anyio.streams.memory import MemoryObjectReceiveStream
 from mcp.shared.message import SessionMessage
 from mcp.types import TextContent
 from pydantic import ValidationError
@@ -389,6 +389,19 @@ def test_simulation_reception_tool_projects_one_registered_eligible_snapshot(
                         break
                     await asyncio.sleep(0.01)
                 assert len(composition.transport.writes_snapshot()) > initial_writes
+                no_receipt = await client.call_tool(
+                    "get_hottop_reception_evidence",
+                    {
+                        "expected_session_id": session_id,
+                        "evidence_protocol": "hottop_reception_evidence/v1",
+                    },
+                )
+                assert no_receipt.isError is False
+                assert no_receipt.structuredContent is not None
+                assert no_receipt.structuredContent["record"]["pair"] == {
+                    "status": "ineligible",
+                    "reasons": ["no_receipt"],
+                }
                 clock.value = 179.1
                 composition.queue_status_bytes(_status_packet(bean_c=100, environment_c=100))
                 for _ in range(100):
@@ -405,6 +418,10 @@ def test_simulation_reception_tool_projects_one_registered_eligible_snapshot(
                 clock.value = 180.0
                 composition.queue_status_bytes(_status_packet(bean_c=195, environment_c=204))
                 await asyncio.sleep(0.05)
+                state = await client.call_tool("get_roast_state", {})
+                assert state.isError is False
+                assert state.structuredContent is not None
+                assert state.structuredContent["elapsed_monotonic_seconds"] == 80.0
                 result = await client.call_tool(
                     "get_hottop_reception_evidence",
                     {
@@ -433,15 +450,46 @@ def test_simulation_reception_tool_projects_one_registered_eligible_snapshot(
                 assert record["charge"]["canonical_seconds"] == 10.0
                 assert record["first_crack"]["canonical_seconds"] == 70.0
                 assert record["first_crack"]["source"] == "manual_mark"
-                dropped = await client.call_tool("drop_beans", {})
-                assert dropped.isError is False
-                settled = await client.call_tool(
+                assert record["command_settlements"]["emergency"] is None
+                clock.value = 181.1
+                expired = await client.call_tool(
                     "get_hottop_reception_evidence",
                     {
                         "expected_session_id": session_id,
                         "evidence_protocol": "hottop_reception_evidence/v1",
                     },
                 )
+                assert expired.isError is False
+                assert expired.structuredContent is not None
+                assert expired.structuredContent["record"]["pair"] == {
+                    "status": "ineligible",
+                    "reasons": ["receipt_age_exceeds_bound"],
+                }
+                writes_before_drop = len(composition.transport.writes_snapshot())
+                dropped = await client.call_tool("drop_beans", {})
+                assert dropped.isError is False
+                for _ in range(100):
+                    if len(composition.transport.writes_snapshot()) > writes_before_drop:
+                        break
+                    await asyncio.sleep(0.01)
+                assert len(composition.transport.writes_snapshot()) > writes_before_drop
+                settled = None
+                for _ in range(100):
+                    settled = await client.call_tool(
+                        "get_hottop_reception_evidence",
+                        {
+                            "expected_session_id": session_id,
+                            "evidence_protocol": "hottop_reception_evidence/v1",
+                        },
+                    )
+                    assert settled.structuredContent is not None
+                    current_settlement = settled.structuredContent["record"]["command_settlements"][
+                        "drop"
+                    ]
+                    if current_settlement["result"] == "accepted_by_host":
+                        break
+                    await asyncio.sleep(0.01)
+                assert settled is not None
                 assert settled.isError is False
                 assert settled.structuredContent is not None
                 settlement_record = settled.structuredContent["record"]
@@ -451,8 +499,36 @@ def test_simulation_reception_tool_projects_one_registered_eligible_snapshot(
                     "status": "ineligible",
                     "reasons": ["superseded"],
                 }
+                drop_settlement = settlement_record["command_settlements"]["drop"]
+                assert drop_settlement["transition"] == "drop"
+                assert drop_settlement["result"] == "accepted_by_host"
+                assert drop_settlement["attempt_seq"] is not None
+                assert drop_settlement["physical_effect"] == "not_established"
+                assert settlement_record["command_settlements"]["emergency"] is None
                 cleanup = await client.call_tool("emergency_stop", {"reason": "test cleanup"})
                 assert cleanup.isError is False
+                clock.value = 190.0
+                stopped = await client.call_tool("get_roast_state", {})
+                assert stopped.isError is False
+                assert stopped.structuredContent is not None
+                assert stopped.structuredContent["elapsed_monotonic_seconds"] == 81.1
+                faulted_read = await client.call_tool(
+                    "get_hottop_reception_evidence",
+                    {
+                        "expected_session_id": session_id,
+                        "evidence_protocol": "hottop_reception_evidence/v1",
+                    },
+                )
+                assert faulted_read.isError is False
+                assert faulted_read.structuredContent == {
+                    "evidence_protocol": "hottop_reception_evidence/v1",
+                    "evidence_version": 1,
+                    "outcome": "refused_identity",
+                    "reason_code": "session_faulted",
+                    "driver_read": "not_invoked",
+                    "requested_session_id": session_id,
+                    "record": None,
+                }
             await client_send.aclose()
 
     asyncio.run(exercise())

@@ -139,6 +139,50 @@ def test_timing_evidence_returns_atomic_mock_record() -> None:
     assert result.record.environment.clock_epoch_id == result.record.clock.epoch_id
 
 
+def test_hottop_reception_assembly_refuses_post_bracket_manual_mark_then_recovers() -> None:
+    """A manual mark after a frozen candidate bracket cannot inherit its receipt."""
+    clock = SimpleNamespace(value=0.0)
+    store = RoastSessionStore(
+        utc_now=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        monotonic_now=lambda: clock.value,
+        session_id_factory=lambda: "hottop-reception-session",
+    )
+    session = store.start_session()
+    clock.value = 10.0
+    store.record_event(session, "beans_added", provenance="manual_mark")
+    admission = store.admit_timing_evidence(session.id)
+
+    # The driver candidate and its bracket have already been frozen at 70.2.
+    # The manual mark is committed immediately before store assembly.
+    clock.value = 71.2
+    store.record_event(session, "first_crack_detected", provenance="manual_mark")
+    finalized: list[dict[str, object]] = []
+    refused = store.assemble_hottop_reception_evidence(
+        admission,
+        t0=70.2,
+        t1=70.2,
+        finalize=lambda record: finalized.append(record) or record,
+    )
+
+    assert refused.outcome == "refused_identity"
+    assert refused.reason_code == "session_changed_during_read"
+    assert refused.result is None
+    assert finalized == []
+    assert session.hottop_reception_evidence_sequence == 0
+
+    recovered = store.assemble_hottop_reception_evidence(
+        admission,
+        t0=72.0,
+        t1=72.0,
+        finalize=lambda record: record,
+    )
+
+    assert recovered.outcome == "evidence"
+    assert recovered.reason_code is None
+    assert recovered.result is not None
+    assert session.hottop_reception_evidence_sequence == 1
+
+
 def test_timing_evidence_preserves_exact_bracket_and_has_no_session_side_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
