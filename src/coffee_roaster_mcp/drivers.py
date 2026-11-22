@@ -2058,10 +2058,10 @@ class HottopRoasterDriver:
         """Publish stop state while coordinating with the command write path."""
         with self._state_lock:
             serial_transport = self._serial
-            self._disconnect_requested.set()
-            self._connected = False
-            self._stop_event.set()
             if self._hottop_reception == "candidate/v1":
+                self._disconnect_requested.set()
+                self._connected = False
+                self._stop_event.set()
                 self._reception_epoch += 1
                 self._reception_handle_token = self._reception_epoch
                 self._status_buffer = b""
@@ -2083,6 +2083,10 @@ class HottopRoasterDriver:
 
         try:
             with self._state_lock:
+                if self._hottop_reception == "off":
+                    self._disconnect_requested.set()
+                    self._connected = False
+                    self._stop_event.set()
                 if close_failed:
                     self._last_command_write_size = 0
                 return self._command_thread, self._serial
@@ -2606,8 +2610,11 @@ class HottopRoasterDriver:
         if queued_before == 0:
             self._publish_drained_floor(serial_transport, epoch, started_at)
             post_probe_time = self._reception_clock()
-            if self._candidate_queue_probe(serial_transport) == 0:
+            queued_after_empty_poll = self._candidate_queue_probe(serial_transport)
+            if queued_after_empty_poll == 0:
                 self._publish_drained_floor(serial_transport, epoch, post_probe_time)
+            elif queued_after_empty_poll is None:
+                self._invalidate_candidate_receipt(serial_transport, epoch)
             return
         if queued_before is None:
             self._invalidate_candidate_receipt(serial_transport, epoch)

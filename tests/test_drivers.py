@@ -1113,7 +1113,7 @@ def test_candidate_drop_first_attempt_is_fixed_and_unknown_refuses_repeat() -> N
     class PartialTransport(FakeSerialTransport):
         def write(self, data: bytes) -> int:
             self.writes.append(data)
-            return len(data) - 1
+            return len(data) - 1 if len(self.writes) == 1 else len(data)
 
     transport = PartialTransport()
     driver = HottopRoasterDriver(
@@ -1126,6 +1126,7 @@ def test_candidate_drop_first_attempt_is_fixed_and_unknown_refuses_repeat() -> N
         driver._begin_reception_epoch(transport)  # pyright: ignore[reportPrivateUsage]
     driver.drop_beans()
     driver._send_command_frame_candidate()  # pyright: ignore[reportPrivateUsage]
+    driver._send_command_frame_candidate()  # pyright: ignore[reportPrivateUsage]
 
     with pytest.raises(HottopDropRefused):
         driver.drop_beans()
@@ -1135,7 +1136,9 @@ def test_candidate_drop_first_attempt_is_fixed_and_unknown_refuses_repeat() -> N
     assert driver._drop_transition_count == 1  # pyright: ignore[reportPrivateUsage]
     assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
     assert driver._drop_settlement.result == "unknown"  # pyright: ignore[reportPrivateUsage]
-    assert driver._attempt_history[-1].role == "drop"  # pyright: ignore[reportPrivateUsage]
+    assert [attempt.role for attempt in driver._attempt_history[-2:]] == ["drop", "repeat"]  # pyright: ignore[reportPrivateUsage]
+    assert driver._attempt_history[-1].result == "accepted_by_host"  # pyright: ignore[reportPrivateUsage]
+    assert driver._drop_transition_count == 1  # pyright: ignore[reportPrivateUsage]
 
 
 def test_candidate_write_gate_rebuilds_emergency_frame_after_drop_is_closed() -> None:
@@ -1316,6 +1319,243 @@ def test_candidate_emergency_receipt_stays_with_exact_transition() -> None:
     finally:
         transport.release_stop_write.set()
         driver.disconnect()
+
+
+def test_candidate_superseded_stop_before_first_tick_is_not_credited() -> None:
+    """A heat revision before a tick cannot turn an unentered Stop into a receipt."""
+    transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_reception_epoch(transport)  # pyright: ignore[reportPrivateUsage]
+    driver.emergency_stop(reason="test")
+    driver.set_heat(heat_level_percent=50)
+    driver._send_command_frame_candidate()  # pyright: ignore[reportPrivateUsage]
+
+    assert transport.writes_snapshot()[0][10] == 50
+    assert driver._emergency_settlements[0].result == "pending"  # pyright: ignore[reportPrivateUsage]
+    assert driver._attempt_history[-1].role == "ordinary"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_candidate_distinct_inflight_stops_settle_their_own_write_results() -> None:
+    """A raising later Stop write cannot relabel an earlier in-flight Stop."""
+
+    class TwoStopTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_write_entered = Event()
+            self.release_first_write = Event()
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            if len(self.writes) == 1:
+                self.first_write_entered.set()
+                assert self.release_first_write.wait(timeout=1.0)
+                return len(data)
+            raise OSError("second stop write failed")
+
+    transport = TwoStopTransport()
+    driver = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_reception_epoch(transport)  # pyright: ignore[reportPrivateUsage]
+    driver.emergency_stop(reason="first")
+    first_tick = Thread(target=driver._send_command_frame_candidate)  # pyright: ignore[reportPrivateUsage]
+    first_tick.start()
+    assert transport.first_write_entered.wait(timeout=1.0)
+    driver.emergency_stop(reason="second")
+    transport.release_first_write.set()
+    first_tick.join(timeout=1.0)
+    assert not first_tick.is_alive()
+    driver._send_command_frame_candidate()  # pyright: ignore[reportPrivateUsage]
+
+    assert [settlement.result for settlement in driver._emergency_settlements] == [  # pyright: ignore[reportPrivateUsage]
+        "accepted_by_host",
+        "unknown",
+    ]
+
+
+def test_candidate_empty_poll_with_unreadable_repeat_probe_revokes_continuity() -> None:
+    """An unknown second empty-poll observation cannot retain an old receipt or floor."""
+
+    class UnreadableSecondEmptyProbeTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.empty_probes = 0
+            self.raise_on_second_empty_probe = False
+
+        @property
+        def in_waiting(self) -> int:
+            value = super().in_waiting
+            if value == 0:
+                self.empty_probes += 1
+                if self.raise_on_second_empty_probe and self.empty_probes == 2:
+                    raise OSError("second empty probe unavailable")
+            return value
+
+    transport = UnreadableSecondEmptyProbeTransport()
+    driver = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_reception_epoch(transport)  # pyright: ignore[reportPrivateUsage]
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+    )
+    driver._read_status_packet_candidate(transport)  # pyright: ignore[reportPrivateUsage]
+    assert driver._reception_record is not None  # pyright: ignore[reportPrivateUsage]
+    transport.empty_probes = 0
+    transport.raise_on_second_empty_probe = True
+    driver._read_status_packet_candidate(transport)  # pyright: ignore[reportPrivateUsage]
+
+    assert driver._reception_record is None  # pyright: ignore[reportPrivateUsage]
+    assert driver._reception_floor is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("read_outcome", ["unreadable", "empty", "error"])
+def test_candidate_unknown_read_outcomes_revoke_a_previously_good_record(
+    read_outcome: str,
+) -> None:
+    """Unreadable, empty, and failed reads all discard prior candidate continuity."""
+
+    class UnknownReadTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.outcome: str | None = None
+
+        @property
+        def in_waiting(self) -> int:
+            if self.outcome == "unreadable":
+                raise OSError("queue unavailable")
+            if self.outcome in {"empty", "error"}:
+                return 1
+            return super().in_waiting
+
+        def read(self, size: int) -> bytes:
+            if self.outcome == "empty":
+                return b""
+            if self.outcome == "error":
+                raise OSError("read failed")
+            return super().read(size)
+
+    transport = UnknownReadTransport()
+    driver = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_reception_epoch(transport)  # pyright: ignore[reportPrivateUsage]
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+    )
+    driver._read_status_packet_candidate(transport)  # pyright: ignore[reportPrivateUsage]
+    assert driver._reception_record is not None  # pyright: ignore[reportPrivateUsage]
+    transport.outcome = read_outcome
+    driver._read_status_packet_candidate(transport)  # pyright: ignore[reportPrivateUsage]
+
+    assert driver._reception_record is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_candidate_disconnect_during_real_loop_read_cannot_publish_receipt() -> None:
+    """Candidate disconnect revokes read ownership before the loop can publish a receipt."""
+
+    class BlockingReadTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.read_started = Event()
+            self.release_read = Event()
+
+        def read(self, size: int) -> bytes:
+            self.read_started.set()
+            assert self.release_read.wait(timeout=1.0)
+            return super().read(size)
+
+    transport = BlockingReadTransport()
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+    )
+    driver = HottopRoasterDriver(
+        port="fake-only",
+        command_interval_seconds=0.01,
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+    )
+    driver.connect()
+    try:
+        assert transport.read_started.wait(timeout=1.0)
+        disconnect_thread = Thread(target=driver.disconnect)
+        disconnect_thread.start()
+        assert driver._disconnect_requested.wait(timeout=1.0)  # pyright: ignore[reportPrivateUsage]
+        transport.release_read.set()
+        disconnect_thread.join(timeout=1.0)
+        assert not disconnect_thread.is_alive()
+        assert driver._reception_record is None  # pyright: ignore[reportPrivateUsage]
+        assert driver._status_packet_count == 0  # pyright: ignore[reportPrivateUsage]
+    finally:
+        transport.release_read.set()
+        if driver.read_state().connected:
+            driver.disconnect()
+
+
+@pytest.mark.parametrize(
+    ("reception", "connected_while_waiting"),
+    [("off", True), ("candidate/v1", False)],
+)
+def test_disconnect_preserves_off_mode_stop_timing_but_revokes_candidate_early(
+    reception: str, connected_while_waiting: bool
+) -> None:
+    """Only candidate mode revokes lifecycle visibility before the write lock opens."""
+
+    class SignallingLock:
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self.waiting = Event()
+
+        def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+            if get_ident() != main_thread:
+                self.waiting.set()
+            return self._lock.acquire(blocking, timeout)
+
+        def release(self) -> None:
+            self._lock.release()
+
+    transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        serial_factory=FakeSerialFactory(transport),
+        hottop_reception=cast(Any, reception),
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        if reception == "candidate/v1":
+            driver._begin_reception_epoch(transport)  # pyright: ignore[reportPrivateUsage]
+    gate = SignallingLock()
+    main_thread = get_ident()
+    driver._command_write_lock = gate  # pyright: ignore[reportAttributeAccessIssue, reportPrivateUsage]
+    assert gate.acquire()
+    worker = Thread(target=driver._request_command_loop_stop)  # pyright: ignore[reportPrivateUsage]
+    worker.start()
+    assert gate.waiting.wait(timeout=1.0)
+    assert driver.read_state().connected is connected_while_waiting
+    assert driver._disconnect_requested.is_set() is (reception == "candidate/v1")  # pyright: ignore[reportPrivateUsage]
+    gate.release()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert driver.read_state().connected is False
 
 
 def test_candidate_disconnect_discards_blocked_read_and_lost_queue_receipt() -> None:
