@@ -1071,27 +1071,30 @@ class HottopIneligibleReceptionPair(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     status: Literal["ineligible"]
-    reasons: tuple[
-        Literal[
-            "candidate_not_configured",
-            "no_receipt",
-            "epoch_or_handle_changed",
-            "superseded",
-            "unit_not_explicit_celsius",
-            "queue_unreadable",
-            "read_size_contradiction",
-            "read_truncated",
-            "misaligned_or_skipped",
-            "parser_remainder",
-            "backlog_visible",
-            "latest_pair_rejected",
-            "invalid_packet_history",
-            "no_drained_floor",
-            "clock_regression",
-            "receipt_age_bound_unset",
-            "receipt_age_exceeds_bound",
+    reasons: Annotated[
+        tuple[
+            Literal[
+                "candidate_not_configured",
+                "no_receipt",
+                "epoch_or_handle_changed",
+                "superseded",
+                "unit_not_explicit_celsius",
+                "queue_unreadable",
+                "read_size_contradiction",
+                "read_truncated",
+                "misaligned_or_skipped",
+                "parser_remainder",
+                "backlog_visible",
+                "latest_pair_rejected",
+                "invalid_packet_history",
+                "no_drained_floor",
+                "clock_regression",
+                "receipt_age_bound_unset",
+                "receipt_age_exceeds_bound",
+            ],
+            ...,
         ],
-        ...,
+        Field(json_schema_extra={"minItems": 1, "uniqueItems": True}),
     ]
 
     @model_validator(mode="after")
@@ -1107,16 +1110,57 @@ HottopReceptionPair = Annotated[
 ]
 
 
-class HottopCommandSettlementProjection(BaseModel):
+class _HottopCommandSettlementProjection(BaseModel):
     """One host-command settlement without a physical-effect assertion."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    transition: Literal["drop", "emergency"]
     transition_seq: TimingPositiveInt
     result: Literal["pending", "not_attempted", "entering", "accepted_by_host", "unknown"]
     attempt_seq: TimingPositiveInt | None
     physical_effect: Literal["not_established"]
+
+
+class HottopDropCommandSettlementProjection(_HottopCommandSettlementProjection):
+    """The latest settlement that belongs only to the normal Drop slot."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        frozen=True,
+        json_schema_extra={
+            "required": [
+                "transition",
+                "transition_seq",
+                "result",
+                "attempt_seq",
+                "physical_effect",
+            ]
+        },
+    )
+
+    transition: Literal["drop"]
+
+
+class HottopEmergencyCommandSettlementProjection(_HottopCommandSettlementProjection):
+    """The latest settlement that belongs only to the emergency slot."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        frozen=True,
+        json_schema_extra={
+            "required": [
+                "transition",
+                "transition_seq",
+                "result",
+                "attempt_seq",
+                "physical_effect",
+            ]
+        },
+    )
+
+    transition: Literal["emergency"]
 
 
 class HottopCommandSettlements(BaseModel):
@@ -1124,8 +1168,8 @@ class HottopCommandSettlements(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    drop: HottopCommandSettlementProjection | None
-    emergency: HottopCommandSettlementProjection | None
+    drop: HottopDropCommandSettlementProjection | None
+    emergency: HottopEmergencyCommandSettlementProjection | None
 
 
 class HottopReceptionEvidenceRecord(BaseModel):
@@ -1365,7 +1409,10 @@ def _install_hottop_reception_evidence_argument_adapter(mcp: FastMCP) -> None:
         adapted = metadata.model_copy(
             update={
                 "arg_model": _HottopReceptionEvidenceArguments,
-                "output_schema": _hottop_reception_evidence_output_schema(),
+                "output_schema": {
+                    "type": "object",
+                    **_hottop_reception_evidence_output_schema(),
+                },
             }
         )
     except Exception as exc:
@@ -1384,9 +1431,11 @@ def _hottop_reception_evidence_output_schema() -> dict[str, object]:
     outcome rows, so discovery must retain the source-bound ``oneOf`` shape.
     """
     schema = deepcopy(HottopReceptionEvidenceResult.model_json_schema())
+    definitions = cast(dict[str, object], schema["$defs"])
     properties = schema.pop("properties")
     required = schema.pop("required")
     schema.pop("additionalProperties", None)
+    schema.pop("type", None)
     schema.pop("title", None)
     schema.pop("description", None)
 
@@ -1401,7 +1450,7 @@ def _hottop_reception_evidence_output_schema() -> dict[str, object]:
         row_properties["reason_code"] = (
             {"enum": reasons} if reasons is not None else {"enum": [None]}
         )
-        row_properties["driver_read"] = {"enum": reads}
+        row_properties["driver_read"] = {"const": reads[0]} if len(reads) == 1 else {"enum": reads}
         row_properties["record"] = record
         return {
             "type": "object",
@@ -1459,7 +1508,41 @@ def _hottop_reception_evidence_output_schema() -> dict[str, object]:
             null_record,
         ),
     ]
-    return schema
+
+    def canonicalize(value: object, *, preserve_event_metadata: bool = False) -> object:
+        """Inline model definitions while retaining the frozen wire constraints."""
+        if isinstance(value, list):
+            return [
+                canonicalize(item, preserve_event_metadata=preserve_event_metadata)
+                for item in cast(list[object], value)
+            ]
+        if not isinstance(value, dict):
+            return value
+        raw_value = cast(dict[str, object], value)
+        reference = raw_value.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/$defs/"):
+            definition_name = reference.removeprefix("#/$defs/")
+            definition = definitions.get(definition_name)
+            if definition is None:
+                raise RuntimeError("Hottop reception evidence schema has an unknown definition.")
+            return canonicalize(
+                definition,
+                preserve_event_metadata=definition_name == "EventEvidence",
+            )
+        canonical = {
+            key: canonicalize(item, preserve_event_metadata=preserve_event_metadata)
+            for key, item in raw_value.items()
+            if key != "$defs"
+        }
+        if not preserve_event_metadata:
+            canonical.pop("title", None)
+            canonical.pop("description", None)
+            canonical.pop("discriminator", None)
+            if "const" in canonical or "enum" in canonical:
+                canonical.pop("type", None)
+        return canonical
+
+    return cast(dict[str, object], canonicalize(schema))
 
 
 def _install_exact_normal_drop_argument_adapter(mcp: FastMCP) -> None:
@@ -2995,6 +3078,7 @@ def _create_mcp_server(
                                 session=_serialize_session_state(
                                     session,
                                     config=server_context.config,
+                                    monotonic_now=server_context.session_store.operational_monotonic_now,
                                     first_crack_runtime=server_context.first_crack_runtime.snapshot(),
                                     first_crack_observation=(
                                         server_context.first_crack_runtime.observation_for_session(
@@ -3020,6 +3104,7 @@ def _create_mcp_server(
                 session=_serialize_session_state(
                     session,
                     config=server_context.config,
+                    monotonic_now=server_context.session_store.operational_monotonic_now,
                     first_crack_runtime=server_context.first_crack_runtime.snapshot(),
                     first_crack_observation=server_context.first_crack_runtime.observation_for_session(
                         session.id
@@ -3079,6 +3164,7 @@ def _create_mcp_server(
             session=_serialize_session_state(
                 session,
                 config=server_context.config,
+                monotonic_now=server_context.session_store.operational_monotonic_now,
                 first_crack_runtime=server_context.first_crack_runtime.snapshot(),
                 first_crack_observation=server_context.first_crack_runtime.observation_for_session(
                     session.id
@@ -3153,6 +3239,7 @@ def _create_mcp_server(
         return _serialize_session_state(
             session,
             config=server_context.config,
+            monotonic_now=server_context.session_store.operational_monotonic_now,
             device_state=device_state,
             first_crack_runtime=server_context.first_crack_runtime.snapshot(),
             first_crack_observation=server_context.first_crack_runtime.observation_for_session(
@@ -5015,7 +5102,9 @@ def _hottop_reception_capability(
     return None
 
 
-def _project_hottop_settlement(settlement: object) -> dict[str, object] | None:
+def _project_hottop_settlement(
+    settlement: object, *, expected_transition: Literal["drop", "emergency"]
+) -> dict[str, object] | None:
     """Project one driver settlement without exposing driver-private revisions."""
     if settlement is None:
         return None
@@ -5025,7 +5114,7 @@ def _project_hottop_settlement(settlement: object) -> dict[str, object] | None:
     attempt_seq = getattr(settlement, "attempt_seq", None)
     physical_effect = getattr(settlement, "physical_effect", None)
     if (
-        transition not in {"drop", "emergency"}
+        transition != expected_transition
         or type(transition_seq) is not int
         or transition_seq < 1
         or result not in {"pending", "not_attempted", "entering", "accepted_by_host", "unknown"}
@@ -5234,9 +5323,14 @@ def _run_hottop_reception_evidence(
             if core["drop"] is not None:
                 record_pair = {"status": "ineligible", "reasons": ("superseded",)}
             settlements = {
-                "drop": _project_hottop_settlement(candidate.drop_settlement),
+                "drop": _project_hottop_settlement(
+                    candidate.drop_settlement, expected_transition="drop"
+                ),
                 "emergency": _project_hottop_settlement(
-                    candidate.emergency_settlements[-1] if candidate.emergency_settlements else None
+                    candidate.emergency_settlements[-1]
+                    if candidate.emergency_settlements
+                    else None,
+                    expected_transition="emergency",
                 ),
             }
             record = {
@@ -6906,6 +7000,7 @@ def _serialize_session_state(
     session: RoastSession,
     *,
     config: AppConfig,
+    monotonic_now: Callable[[], float],
     device_state: RoasterDeviceState | None = None,
     first_crack_runtime: FirstCrackRuntimeSnapshot | None = None,
     first_crack_observation: ObservationSnapshot | None = None,
@@ -6914,8 +7009,18 @@ def _serialize_session_state(
     cold_temperature_projection: ColdTemperatureProjection | None = None,
 ) -> RoastSessionState:
     """Convert one in-memory session into an MCP-safe snapshot."""
+    if session.active:
+        sampled_monotonic_now = monotonic_now()
+
+        def projection_clock() -> float:
+            """Return this active projection's single sampled clock value."""
+            return sampled_monotonic_now
+
+    else:
+        projection_clock = monotonic_now
     metrics = compute_roast_metrics(
         session,
+        monotonic_now=projection_clock,
         ror_window_seconds=config.session.ror_window_seconds,
         ror_min_sample_seconds=config.session.ror_min_sample_seconds,
     )
@@ -6925,7 +7030,7 @@ def _serialize_session_state(
         phase=session.phase,
         created_at_utc=session.created_at_utc.isoformat(),
         stopped_at_utc=_iso_or_none(session.stopped_at_utc),
-        elapsed_monotonic_seconds=round(session.elapsed_monotonic_seconds(time.monotonic), 3),
+        elapsed_monotonic_seconds=round(session.elapsed_monotonic_seconds(projection_clock), 3),
         heat_level_percent=session.heat_level_percent,
         fan_level_percent=session.fan_level_percent,
         cooling_on=session.cooling_on,

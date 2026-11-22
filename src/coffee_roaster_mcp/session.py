@@ -1187,6 +1187,15 @@ class RoastSessionStore:
             session = self.start_session(purpose=purpose)
             return _copy_session_for_read(session)
 
+    def operational_monotonic_now(self) -> float:
+        """Return the operational monotonic time used for session lifecycle events.
+
+        State projections must use this clock rather than independently reading
+        the host clock so their elapsed values share the event timeline's
+        clock domain.
+        """
+        return self._monotonic_now()
+
     def reserve_session_start(self) -> SessionStartReservation:
         """Reserve session startup before preparing the configured driver."""
         with self._lock:

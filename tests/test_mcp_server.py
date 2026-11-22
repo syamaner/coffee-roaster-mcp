@@ -65,6 +65,7 @@ from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackSessionRuntime,
     RecordingArtifactPlan,
 )
+from coffee_roaster_mcp.hottop_simulation import HottopSimulationComposition
 from coffee_roaster_mcp.mcp_server import (
     SDK_REQUEST_LOGGER_NAME,
     ColdCharacterisationObservation,
@@ -87,6 +88,7 @@ from coffee_roaster_mcp.mcp_server import (
     _serialize_first_crack_status,  # pyright: ignore[reportPrivateUsage]
     _TelemetrySampler,  # pyright: ignore[reportPrivateUsage]
     build_server_context,
+    create_hottop_simulation_mcp_server,
     create_mcp_server,
     quiet_sdk_per_request_log,
 )
@@ -3550,6 +3552,49 @@ def test_get_roast_state_exposes_current_driver_state_and_event_timestamps(
     assert state.first_crack_status.detected_monotonic_seconds is None
     assert state.t0_status.status == "detected"
     assert state.t0_status.auto_detection_enabled is False
+
+
+def test_registered_session_state_uses_the_store_operational_clock(
+    tmp_path: Path,
+) -> None:
+    """A registered state projection shares the stepped session-event clock."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    context = build_server_context(config_path=config_path)
+    clock = [100.0]
+    object.__setattr__(
+        context,
+        "session_store",
+        RoastSessionStore(
+            default_log_dir=context.config.logging.log_dir / "roasts",
+            telemetry_log_interval_seconds=context.config.logging.sample_interval_seconds,
+            monotonic_now=lambda: clock[0],
+        ),
+    )
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(context)
+
+    started = _call_tool(server, "start_roast_session", ctx)
+    context.telemetry_sampler.stop_for_session(started.session.session_id, reason="stepped clock")
+    assert started.session.elapsed_monotonic_seconds == 0.0
+
+    clock[0] = 110.0
+    _call_tool(server, "mark_beans_added", ctx)
+    before_first_crack = _call_tool(
+        server, "get_roast_state", ctx, session_id=started.session.session_id
+    )
+    assert before_first_crack.development_time_seconds is None
+    assert before_first_crack.development_percent is None
+
+    clock[0] = 170.0
+    _call_tool(server, "mark_first_crack", ctx)
+    clock[0] = 180.0
+    state = _call_tool(server, "get_roast_state", ctx, session_id=started.session.session_id)
+
+    assert state.elapsed_monotonic_seconds == 80.0
+    assert state.roast_elapsed_seconds == 70.0
+    assert state.development_time_seconds == 10.0
+    assert state.development_percent == 14.286
 
 
 def test_get_roast_state_appends_normalized_driver_telemetry_samples(
@@ -9103,6 +9148,43 @@ def test_cold_temperature_projection_schema_is_additive_and_closed() -> None:
         "malformed",
     ]
     assert "cold_temperature_projection" not in cast(list[str], schema.get("required", []))
+
+
+def test_registered_hottop_reception_evidence_schema_preserves_frozen_shapes() -> None:
+    """Keep the registered evidence row and settlement required lists wire-exact."""
+    server = create_hottop_simulation_mcp_server(
+        config_path="not-read-for-discovery.yaml",
+        composition=HottopSimulationComposition(
+            clock=lambda: 0.0,
+            receipt_age_bound_seconds=1.0,
+        ),
+    )
+    tool = server._tool_manager.get_tool(  # pyright: ignore[reportPrivateUsage]
+        "get_hottop_reception_evidence"
+    )
+    assert tool is not None
+    schema = cast(dict[str, object], tool.output_schema)
+    assert schema["type"] == "object"
+    evidence_row = cast(list[dict[str, object]], schema["oneOf"])[0]
+    evidence_properties = cast(dict[str, object], evidence_row["properties"])
+    assert evidence_properties["driver_read"] == {"const": "invoked"}
+
+    record_schema = cast(dict[str, object], evidence_properties["record"])
+    record_properties = cast(dict[str, object], record_schema["properties"])
+    settlements = cast(dict[str, object], record_properties["command_settlements"])
+    settlement_properties = cast(dict[str, object], settlements["properties"])
+    expected_required = [
+        "transition",
+        "transition_seq",
+        "result",
+        "attempt_seq",
+        "physical_effect",
+    ]
+    for name in ("drop", "emergency"):
+        settlement_property = cast(dict[str, object], settlement_properties[name])
+        settlement_options = cast(list[dict[str, object]], settlement_property["anyOf"])
+        settlement_schema = settlement_options[0]
+        assert settlement_schema["required"] == expected_required
 
 
 def test_capture_evidence_real_stdio_has_closed_boundary_and_stopped_owner(tmp_path: Path) -> None:

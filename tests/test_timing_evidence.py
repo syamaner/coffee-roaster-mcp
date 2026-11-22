@@ -357,6 +357,57 @@ def test_event_evidence_rejects_inconsistent_source_time_basis() -> None:
         )
 
 
+def test_hottop_reception_read_models_close_settlement_slots_and_reasons() -> None:
+    """Advertised and typed read models reject crossed slots and bad refusal reasons."""
+    settlement_schema = mcp_server.HottopCommandSettlements.model_json_schema()
+    pair_schema = mcp_server.HottopIneligibleReceptionPair.model_json_schema()
+    settlement_validator: Any = Draft202012Validator(settlement_schema)
+    pair_validator: Any = Draft202012Validator(pair_schema)
+    settlement = {
+        "transition_seq": 1,
+        "result": "pending",
+        "attempt_seq": None,
+        "physical_effect": "not_established",
+    }
+    valid_settlements = (
+        {"drop": {**settlement, "transition": "drop"}, "emergency": None},
+        {"drop": None, "emergency": {**settlement, "transition": "emergency"}},
+    )
+    for value in valid_settlements:
+        settlement_validator.validate(value)
+        assert mcp_server.HottopCommandSettlements.model_validate(value)
+
+    invalid_settlements = (
+        {"drop": {**settlement, "transition": "emergency"}, "emergency": None},
+        {"drop": None, "emergency": {**settlement, "transition": "drop"}},
+    )
+    for value in invalid_settlements:
+        with pytest.raises(ValidationError):
+            settlement_validator.validate(value)
+        with pytest.raises((TypeError, ValueError)):
+            mcp_server.HottopCommandSettlements.model_validate(value)
+
+    for value in (
+        {"status": "ineligible", "reasons": ["no_receipt"]},
+        {"status": "ineligible", "reasons": ["no_receipt", "superseded"]},
+    ):
+        pair_validator.validate(value)
+        assert mcp_server.HottopIneligibleReceptionPair.model_validate(
+            {**value, "reasons": tuple(value["reasons"])}
+        )
+    invalid_pairs: tuple[dict[str, object], ...] = (
+        {"status": "ineligible", "reasons": []},
+        {"status": "ineligible", "reasons": ["no_receipt", "no_receipt"]},
+    )
+    for value in invalid_pairs:
+        with pytest.raises(ValidationError):
+            pair_validator.validate(value)
+        with pytest.raises((TypeError, ValueError)):
+            mcp_server.HottopIneligibleReceptionPair.model_validate(
+                {**value, "reasons": tuple(cast(list[str], value["reasons"]))}
+            )
+
+
 def test_timing_evidence_models_reject_inexact_rows() -> None:
     """Wire models reject inexact values before output."""
     with pytest.raises((TypeError, ValueError)):
