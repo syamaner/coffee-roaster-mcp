@@ -615,8 +615,8 @@ class HottopStatusReadScan:
         skipped_byte_count: Bytes discarded while seeking valid packet boundaries.
         prior_tail_length: Bytes supplied from an earlier parser read.
         tail_length: Unconsumed trailing bytes retained for a later parser read.
-        read_truncated: Whether the available queue or returned bytes exceeded the
-            requested read ownership.
+        read_truncated: Whether the pre-read queue could not have been fully
+            represented by the bounded returned bytes.
         decoder_temperature_unit: Unit used by the packet decoder.
         queued_before_read: Exact pre-read queue observation, when readable.
         requested_byte_count: Exact byte count requested from the transport.
@@ -657,6 +657,8 @@ class HottopStatusReadScan:
             "decoder_temperature_unit",
             _validate_hottop_temperature_unit(self.decoder_temperature_unit),
         )
+        if any(packet.temperature_unit != self.decoder_temperature_unit for packet in self.packets):
+            raise ValueError("packet temperature_unit must match the scanner decoder unit.")
         if self.queued_before_read is not None:
             _validate_nonnegative_exact_int(
                 self.queued_before_read,
@@ -780,6 +782,8 @@ class HottopReceivedPacket:
             )
         if self.configured_temperature_unit != self.scan.decoder_temperature_unit:
             raise ValueError("configured_temperature_unit must match the scanner decoder unit.")
+        if self.queued_before_read != self.scan.queued_before_read:
+            raise ValueError("queued_before_read must match the scanner observation.")
 
 
 @dataclass(frozen=True)
@@ -788,8 +792,9 @@ class HottopReceiptClassification:
 
     The result intentionally leaves sensor age unknown: this software-only
     receipt has host timing only and does not claim a physical sample time or
-    device-unit verification. It is evaluated as of the supplied host clock;
-    the runtime must classify again when it uses the receipt.
+    device-unit verification. It is evaluated only against the supplied host
+    observations; a caller using a receipt at a later time must classify it
+    again with its current observations.
 
     Attributes:
         eligible: Whether every host-receipt requirement was established.
@@ -804,6 +809,12 @@ class HottopReceiptClassification:
     drained_floor_age_seconds: float | None
     read_returned_age_seconds: float | None
     sensor_age: Literal["unknown"] = "unknown"
+
+    def __post_init__(self) -> None:
+        """Keep directly constructed classifications consistent with their reasons."""
+        _validate_exact_bool(self.eligible, label="eligible")
+        if self.eligible != (not self.reasons):
+            raise ValueError("eligible must agree with whether reasons are empty.")
 
     @property
     def primary_reason(self) -> HottopReceiptReason | None:
