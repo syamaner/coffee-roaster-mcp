@@ -54,8 +54,8 @@ class RoasterConfig:
     temperature_unit: TemperatureUnit = "celsius"
     temperature_unit_explicit: bool = False
     hottop_reception: HottopReceptionMode = "off"
-    hottop_receipt_report: HottopReceiptReportMode = "off"
     command_interval_seconds: float = 0.3
+    hottop_receipt_report: HottopReceiptReportMode = "off"
 
 
 @dataclass(frozen=True)

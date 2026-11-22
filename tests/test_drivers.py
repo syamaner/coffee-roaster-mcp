@@ -5252,3 +5252,150 @@ def test_receipt_report_observes_a_complete_packet_without_query_io() -> None:
         ) == query_counts
     finally:
         driver.disconnect()
+
+
+def test_receipt_report_held_read_cannot_publish_to_reused_active_handle() -> None:
+    """A read bound to an old epoch cannot alter a later reuse of its transport."""
+
+    class BlockingReadTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block_reads = False
+            self.read_started = Event()
+            self.release_read = Event()
+
+        def read(self, size: int) -> bytes:
+            if self.block_reads:
+                self.read_started.set()
+                assert self.release_read.wait(timeout=1.0)
+            return super().read(size)
+
+    held_transport = BlockingReadTransport()
+    replacement_transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(held_transport),
+        receipt_report="observe/v1",
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = held_transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    held_transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=184, raw_bean_temperature=184)
+    )
+    driver._read_status_packet_with_receipt_report(held_transport)  # pyright: ignore[reportPrivateUsage]
+    assert driver.read_state_and_receipt_observation()[0].bean_temp_c == 184.0
+
+    held_transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=199, raw_bean_temperature=199)
+    )
+    held_transport.block_reads = True
+    reader = Thread(
+        target=driver._read_status_packet_with_receipt_report,  # pyright: ignore[reportPrivateUsage]
+        args=(held_transport,),
+    )
+    reader.start()
+    assert held_transport.read_started.wait(timeout=1.0)
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = replacement_transport  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+        driver._serial = held_transport  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    held_transport.release_read.set()
+    reader.join(timeout=1.0)
+
+    state, observation = driver.read_state_and_receipt_observation()
+    assert not reader.is_alive()
+    assert state.bean_temp_c == state.env_temp_c == 184.0
+    assert observation.receipt is None
+    assert observation.observer_discard_count == 0
+
+
+def test_receipt_report_retains_ordinary_errors_and_partial_observations() -> None:
+    """Observer diagnostics preserve ordinary parser progress and read error accounting."""
+
+    class FailingClock:
+        def __call__(self) -> float:
+            raise OSError("observer clock failed")
+
+    transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        receipt_report="observe/v1",
+        reception_clock=FailingClock(),
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=184, raw_bean_temperature=184)
+    )
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+
+    driver._reception_clock = MutableReceptionClock(1.0)  # pyright: ignore[reportPrivateUsage]
+    state, observation = driver.read_state_and_receipt_observation()
+    assert state.bean_temp_c == state.env_temp_c == 184.0
+    assert state.raw_vendor_data["status_read_error_count"] == 1
+    assert observation.receipt is None
+    assert observation.observer_discard_count == 1
+
+    clock = MutableReceptionClock(1.0)
+    partial_transport = FakeSerialTransport()
+    partial_driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(partial_transport),
+        receipt_report="observe/v1",
+        reception_clock=clock,
+    )
+    with partial_driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        partial_driver._serial = partial_transport  # pyright: ignore[reportPrivateUsage]
+        partial_driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        partial_driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    partial_transport.queue_read_data(b"\x00" * 12)
+    partial_driver._read_status_packet_with_receipt_report(  # pyright: ignore[reportPrivateUsage]
+        partial_transport
+    )
+
+    partial_state, partial_observation = partial_driver.read_state_and_receipt_observation()
+    assert partial_state.raw_vendor_data["status_packet_count"] == 0
+    assert partial_observation.receipt is not None
+    assert partial_observation.receipt.scan.tail_length == 12
+
+
+def test_receipt_report_exposes_queued_and_read_error_negative_observations() -> None:
+    """Negative queue and read outcomes are cached without issuing reporting I/O."""
+
+    class NegativeQueueTransport(FakeSerialTransport):
+        @property
+        def in_waiting(self) -> int:
+            return -1
+
+    class FailingReadTransport(FakeSerialTransport):
+        def read(self, size: int) -> bytes:
+            _ = size
+            raise OSError("read failed")
+
+    for transport, expected_errors in (
+        (NegativeQueueTransport(), 0),
+        (FailingReadTransport(), 1),
+    ):
+        driver = HottopRoasterDriver(
+            port="fake",
+            serial_factory=FakeSerialFactory(transport),
+            receipt_report="observe/v1",
+        )
+        with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+            driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+            driver._connected = True  # pyright: ignore[reportPrivateUsage]
+            driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+        if isinstance(transport, FailingReadTransport):
+            transport.queue_read_data(b"x")
+        driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+
+        state, observation = driver.read_state_and_receipt_observation()
+        assert observation.receipt is None
+        assert observation.observer_discard_count == 1
+        assert state.raw_vendor_data["status_read_error_count"] == expected_errors

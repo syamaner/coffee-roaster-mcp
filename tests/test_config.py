@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from coffee_roaster_mcp.config import ConfigError, load_config
+from coffee_roaster_mcp.config import ConfigError, RoasterConfig, load_config
 
 
 def test_default_config_allows_mock_run_without_file(
@@ -40,6 +40,14 @@ def test_default_config_allows_mock_run_without_file(
     assert config.ambient.mode == "disabled"
     assert config.ambient.device is None
     assert config.ambient.poll_interval_seconds == 30.0
+
+
+def test_roaster_config_keeps_command_interval_at_its_existing_position() -> None:
+    """Appending receipt reporting cannot reinterpret legacy positional construction."""
+    config = RoasterConfig("hottop", None, 115_200, "celsius", False, "off", 0.75)
+
+    assert config.command_interval_seconds == 0.75
+    assert config.hottop_receipt_report == "off"
 
 
 def test_missing_explicit_config_file_fails(tmp_path: Path) -> None:
