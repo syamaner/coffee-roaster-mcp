@@ -51,9 +51,11 @@ from coffee_roaster_mcp.config import (
     ConfigError,
     FirstCrackMode,
     load_config,
+    trusted_manual_driver_admission,
     validate_first_crack_authority,
 )
 from coffee_roaster_mcp.drivers import (
+    HOTTOP_DRIVER_NAME,
     DriverLifecycleEvidence,
     ExactDropArbitration,
     ExactDropCancelled,
@@ -75,6 +77,12 @@ from coffee_roaster_mcp.first_crack_runtime import (
     FirstCrackSessionRuntime,
     RecordingArtifactPlan,
     build_first_crack_session_runtime,
+)
+from coffee_roaster_mcp.hottop_simulation import (
+    SYNTHETIC_HOTTOP_PORT,
+    HottopSimulationComposition,
+    build_trusted_simulation_ambient_reader_factory,
+    build_trusted_simulation_serial_factory,
 )
 from coffee_roaster_mcp.session import (
     CaptureSubject,
@@ -241,7 +249,7 @@ class CaptureEvidenceBootstrapResult(BaseModel):
 
     capture_protocol: Literal["capture_evidence/v1"]
     intent: Literal["bootstrap"]
-    capability: Literal["manual_mock_capture", "not_configured"]
+    capability: Literal["manual_mock_capture", "manual_hottop_simulation_capture", "not_configured"]
 
 
 class CaptureEvidenceResult(BaseModel):
@@ -346,6 +354,15 @@ class _LegacyHumanMarkArguments(ArgModelBase):
     """Strict raw SDK-boundary arguments for the legacy human first-crack mark."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class _HottopSimulationStartArguments(ArgModelBase):
+    """Strict raw SDK arguments for trusted Hottop simulation Start."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    purpose: Literal["roast"]
+    first_crack_observer_ack: Literal["manual/v1"]
 
 
 class FixedZeroCommandedStateResult(BaseModel):
@@ -977,6 +994,31 @@ def _install_legacy_human_mark_argument_adapter(mcp: FastMCP) -> None:
     tool.parameters = _LegacyHumanMarkArguments.model_json_schema(by_alias=True)
 
 
+def _install_hottop_simulation_start_argument_adapter(mcp: FastMCP) -> None:
+    """Require explicit raw Start authority only on the simulation server."""
+    tool = mcp._tool_manager.get_tool("start_roast_session")  # pyright: ignore[reportPrivateUsage]
+    if tool is None:
+        raise RuntimeError("Hottop simulation Start tool was not registered.")
+    existing_metadata = tool.fn_metadata
+    declared_metadata_fields = getattr(type(existing_metadata), "model_fields", None)
+    if (
+        not isinstance(declared_metadata_fields, Mapping)
+        or "arg_model" not in declared_metadata_fields
+    ):
+        raise RuntimeError("Hottop simulation Start argument adapter is unsupported.")
+    try:
+        adapted_metadata = existing_metadata.model_copy(
+            update={"arg_model": _HottopSimulationStartArguments}
+        )
+        binds_simulation_start = adapted_metadata.arg_model is _HottopSimulationStartArguments
+    except Exception as exc:
+        raise RuntimeError("Hottop simulation Start argument adapter is unsupported.") from exc
+    if not binds_simulation_start:
+        raise RuntimeError("Hottop simulation Start argument adapter is unsupported.")
+    tool.fn_metadata = adapted_metadata
+    tool.parameters = _HottopSimulationStartArguments.model_json_schema(by_alias=True)
+
+
 def _install_timing_evidence_argument_adapter(mcp: FastMCP) -> None:
     """Bind strict raw argument validation to only the timing-evidence tool."""
     tool = mcp._tool_manager.get_tool("get_timing_evidence")  # pyright: ignore[reportPrivateUsage]
@@ -1217,6 +1259,7 @@ class ServerContext:
     started_at_utc: datetime
     capture_evidence_publisher: CaptureEvidencePublisher
     capture_evidence_configured: bool
+    simulation_composition: HottopSimulationComposition | None = None
     lifecycle_barrier: Lock = field(default_factory=Lock)
     exact_normal_drop_baseline: _ExactNormalDropBaseline | None = None
 
@@ -1960,7 +2003,9 @@ class SessionFinalisationResult:
 
 
 def _validate_composed_manual_first_crack_authority(
-    config: AppConfig, driver: RoasterDriver
+    config: AppConfig,
+    driver: RoasterDriver,
+    simulation_composition: HottopSimulationComposition | None = None,
 ) -> None:
     """Require the closed mock declaration for manual first-crack authority.
 
@@ -1979,6 +2024,18 @@ def _validate_composed_manual_first_crack_authority(
     """
     if config.first_crack.event_authority == "automatic":
         return
+
+    if simulation_composition is not None:
+        if (
+            isinstance(driver, HottopRoasterDriver)
+            and config.roaster.driver == HOTTOP_DRIVER_NAME
+            and config.roaster.port == simulation_composition.synthetic_port
+            and config.roaster.hottop_reception == "candidate/v1"
+        ):
+            return
+        raise ConfigError(
+            "Composed driver does not support configured manual first-crack authority."
+        )
 
     try:
         driver_name = driver.name
@@ -2016,21 +2073,74 @@ def _validate_composed_manual_first_crack_authority(
         )
 
 
-def _manual_mock_capture_configured(config: AppConfig, driver: RoasterDriver) -> bool:
+def _manual_capture_configured(
+    config: AppConfig,
+    driver: RoasterDriver,
+    simulation_composition: HottopSimulationComposition | None = None,
+) -> bool:
     """Return the closed composition predicate for capture-evidence capability."""
     return bool(
         config.first_crack.event_authority == "manual"
-        and isinstance(driver, MockRoasterDriver)
-        and config.roaster.driver == "mock"
+        and (
+            (isinstance(driver, MockRoasterDriver) and config.roaster.driver == "mock")
+            or (
+                simulation_composition is not None
+                and isinstance(driver, HottopRoasterDriver)
+                and config.roaster.driver == HOTTOP_DRIVER_NAME
+                and config.roaster.port == simulation_composition.synthetic_port
+                and config.roaster.hottop_reception == "candidate/v1"
+            )
+        )
         and config.recording.enabled
         and config.recording.autocapture
     )
+
+
+def _validate_hottop_simulation_composition(
+    config: AppConfig, composition: HottopSimulationComposition
+) -> None:
+    """Validate the closed software-only composition before adapter construction."""
+    roaster = config.roaster
+    if (
+        roaster.driver != HOTTOP_DRIVER_NAME
+        or roaster.hottop_reception != "candidate/v1"
+        or roaster.port != SYNTHETIC_HOTTOP_PORT
+        or not roaster.temperature_unit_explicit
+        or roaster.temperature_unit != "celsius"
+    ):
+        raise ConfigError("Trusted Hottop simulation requires its exact candidate configuration.")
+    if type(composition) is not HottopSimulationComposition:
+        raise ConfigError("Trusted Hottop simulation requires its repository-owned composition.")
+    if (
+        config.first_crack.event_authority != "manual"
+        or config.first_crack.mode != "audio"
+        or config.audio.source != "wav"
+        or config.audio.wav_path is None
+        or config.audio.input_device is not None
+    ):
+        raise ConfigError("Trusted Hottop simulation requires manual synthetic WAV capture.")
+    if config.first_crack.local_model_dir is None:
+        raise ConfigError(
+            "Trusted Hottop simulation requires an explicit local first-crack model directory."
+        )
+    if (
+        not config.recording.enabled
+        or not config.recording.autocapture
+        or config.recording.devices
+        or config.recording.device is not None
+        or config.recording.channels is not None
+    ):
+        raise ConfigError("Trusted Hottop simulation requires one synthetic recording stream.")
+    if config.ambient.mode != "disabled" and config.ambient.device is not None:
+        raise ConfigError("Trusted Hottop simulation does not permit ambient device selection.")
 
 
 def build_server_context(
     *,
     config_path: str | Path | None = None,
     transport: str = "stdio",
+    simulation_composition: HottopSimulationComposition | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> ServerContext:
     """Build the MCP server lifecycle context from config and runtime transport.
 
@@ -2041,21 +2151,55 @@ def build_server_context(
     Returns:
         The initialized server context used by the MCP lifespan.
     """
-    config = load_config(path=config_path)
-    validate_first_crack_authority(config)
+    # Defer only the driver-family portion of manual admission until this
+    # composition can reject an untrusted candidate before adapter creation.
+    simulation_admission = (
+        trusted_manual_driver_admission()
+        if type(simulation_composition) is HottopSimulationComposition
+        else None
+    )
+    config = load_config(
+        path=config_path,
+        environ=environ,
+        # Defer only the driver-family portion of manual admission until this
+        # composition can reject an untrusted candidate before adapter creation.
+        manual_driver_admission=trusted_manual_driver_admission(),
+    )
+    if simulation_composition is not None:
+        _validate_hottop_simulation_composition(config, simulation_composition)
+    elif config.roaster.hottop_reception == "candidate/v1":
+        raise ConfigError("Hottop candidate configuration requires trusted simulation composition.")
+    validate_first_crack_authority(config, manual_driver_admission=simulation_admission)
     try:
-        roaster_driver = create_roaster_driver(
-            config.roaster.driver,
-            port=config.roaster.port,
-            baudrate=config.roaster.baudrate,
-            temperature_unit=config.roaster.temperature_unit,
-            command_interval_seconds=config.roaster.command_interval_seconds,
-            hottop_reception=config.roaster.hottop_reception,
-        )
+        if simulation_composition is None:
+            roaster_driver = create_roaster_driver(
+                config.roaster.driver,
+                port=config.roaster.port,
+                baudrate=config.roaster.baudrate,
+                temperature_unit=config.roaster.temperature_unit,
+                command_interval_seconds=config.roaster.command_interval_seconds,
+                hottop_reception=config.roaster.hottop_reception,
+            )
+        else:
+            roaster_driver = create_roaster_driver(
+                config.roaster.driver,
+                port=config.roaster.port,
+                baudrate=config.roaster.baudrate,
+                temperature_unit=config.roaster.temperature_unit,
+                command_interval_seconds=config.roaster.command_interval_seconds,
+                hottop_reception=config.roaster.hottop_reception,
+                serial_factory=build_trusted_simulation_serial_factory(simulation_composition),
+                reception_clock=simulation_composition.clock,
+                simulation_receipt_age_bound_seconds=(
+                    simulation_composition.receipt_age_bound_seconds
+                ),
+            )
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
-    _validate_composed_manual_first_crack_authority(config, roaster_driver)
-    capture_evidence_configured = _manual_mock_capture_configured(config, roaster_driver)
+    _validate_composed_manual_first_crack_authority(config, roaster_driver, simulation_composition)
+    capture_evidence_configured = _manual_capture_configured(
+        config, roaster_driver, simulation_composition
+    )
     capture_evidence_publisher = CaptureEvidencePublisher()
     server_context: ServerContext | None = None
 
@@ -2083,6 +2227,8 @@ def build_server_context(
     first_crack_runtime = build_first_crack_session_runtime(
         config, session_is_retained=session_is_retained
     )
+    if simulation_composition is not None and config.first_crack.event_authority == "manual":
+        first_crack_runtime.admit_trusted_manual_driver(admission=simulation_admission)
     if capture_evidence_configured:
         first_crack_runtime.set_capture_evidence_publisher(capture_evidence_publisher)
     server_context = ServerContext(
@@ -2091,11 +2237,19 @@ def build_server_context(
         session_store=session_store,
         roaster_driver=roaster_driver,
         first_crack_runtime=first_crack_runtime,
-        ambient_runtime=build_ambient_session_runtime(config),
+        ambient_runtime=build_ambient_session_runtime(
+            config,
+            reader_factory=(
+                build_trusted_simulation_ambient_reader_factory(simulation_composition)
+                if simulation_composition is not None
+                else None
+            ),
+        ),
         telemetry_sampler=telemetry_sampler,
         started_at_utc=datetime.now(UTC),
         capture_evidence_publisher=capture_evidence_publisher,
         capture_evidence_configured=capture_evidence_configured,
+        simulation_composition=simulation_composition,
     )
     return server_context
 
@@ -2115,10 +2269,51 @@ def create_mcp_server(
         A configured FastMCP server instance.
     """
 
+    return _create_mcp_server(
+        config_path=config_path,
+        transport=transport,
+        simulation_composition=None,
+        environ=None,
+    )
+
+
+def create_hottop_simulation_mcp_server(
+    *,
+    config_path: str | Path,
+    composition: HottopSimulationComposition,
+    environ: Mapping[str, str] | None = None,
+) -> FastMCP:
+    """Create the trusted in-process Hottop software simulation server.
+
+    This composition is intentionally unavailable to the CLI and deployed
+    server factory. It exists only for owner-approved in-process simulation.
+    """
+    return _create_mcp_server(
+        config_path=config_path,
+        transport="stdio",
+        simulation_composition=composition,
+        environ={} if environ is None else environ,
+    )
+
+
+def _create_mcp_server(
+    *,
+    config_path: str | Path | None,
+    transport: str,
+    simulation_composition: HottopSimulationComposition | None,
+    environ: Mapping[str, str] | None,
+) -> FastMCP:
+    """Create a FastMCP server from one already-authorized composition."""
+
     @asynccontextmanager
     async def server_lifespan(_: FastMCP) -> AsyncGenerator[ServerContext, None]:
         """Load typed config once for the MCP process lifetime."""
-        server_context = build_server_context(config_path=config_path, transport=transport)
+        server_context = build_server_context(
+            config_path=config_path,
+            transport=transport,
+            simulation_composition=simulation_composition,
+            environ=environ,
+        )
         try:
             yield server_context
         finally:
@@ -2188,7 +2383,10 @@ def create_mcp_server(
                 capture_protocol=capture_protocol,
                 intent="bootstrap",
                 capability=(
-                    "manual_mock_capture"
+                    "manual_hottop_simulation_capture"
+                    if server_context.simulation_composition is not None
+                    and server_context.capture_evidence_configured
+                    else "manual_mock_capture"
                     if server_context.capture_evidence_configured
                     else "not_configured"
                 ),
@@ -2233,21 +2431,37 @@ def create_mcp_server(
     ) -> StartRoastSessionResult:
         """Start one new authoritative roast session and prepare the driver."""
         server_context = ctx.request_context.lifespan_context
-        validate_first_crack_authority(server_context.config)
+        validate_first_crack_authority(
+            server_context.config,
+            manual_driver_admission=(
+                trusted_manual_driver_admission()
+                if type(server_context.simulation_composition) is HottopSimulationComposition
+                else None
+            ),
+        )
         manual = server_context.config.first_crack.event_authority == "manual"
-        if (manual and first_crack_observer_ack != "manual/v1") or (
+        simulated_hottop = server_context.simulation_composition is not None
+        if simulated_hottop:
+            if purpose != "roast" or first_crack_observer_ack != "manual/v1":
+                raise ValueError(
+                    "Trusted Hottop simulation requires explicit roast purpose and "
+                    "manual/v1 acknowledgement."
+                )
+        elif (manual and first_crack_observer_ack != "manual/v1") or (
             not manual and first_crack_observer_ack is not None
         ):
             raise ValueError(
                 "Requested first-crack observer protocol does not match configured authority."
             )
         _validate_composed_manual_first_crack_authority(
-            server_context.config, server_context.roaster_driver
+            server_context.config,
+            server_context.roaster_driver,
+            server_context.simulation_composition,
         )
         with server_context.lifecycle_barrier:
             reservation = server_context.session_store.reserve_session_start()
         driver = server_context.roaster_driver
-        if manual and isinstance(driver, HottopRoasterDriver):
+        if simulated_hottop and isinstance(driver, HottopRoasterDriver):
             try:
                 owner = driver.reserve_inhibited_start(reservation.token, purpose=purpose)
             except BaseException:
@@ -3015,6 +3229,8 @@ def create_mcp_server(
     _install_capture_evidence_argument_adapter(mcp)
     _install_timing_evidence_argument_adapter(mcp)
     _install_exact_normal_drop_argument_adapter(mcp)
+    if simulation_composition is not None:
+        _install_hottop_simulation_start_argument_adapter(mcp)
     return mcp
 
 
