@@ -762,6 +762,7 @@ def test_simulation_sdk_manual_confirmation_keeps_capture_until_finalised(tmp_pa
             assert capture_after["outcome"] == capture["outcome"] == "observed"
             assert capture_after["session_id"] == session_id
             assert capture_after["recorder_generation"] == capture["recorder_generation"]
+            assert capture_after["inputs"] == capture["inputs"]
 
     asyncio.run(exercise())
     assert session_id is not None
@@ -771,6 +772,11 @@ def test_simulation_sdk_manual_confirmation_keeps_capture_until_finalised(tmp_pa
     with wave.open(str(recordings[0]), "rb") as recording:
         assert recording.getnframes() == 480
         assert recording.getframerate() == 16000
+    sidecars = list((tmp_path / "captures").rglob("roast.recording.json"))
+    assert len(sidecars) == 1
+    sidecar = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    assert sidecar["frame_count"] == 480
+    assert sidecar["milestones"]["first_crack"] is None
 
 
 def test_composed_lifespan_starts_staged_driver_capture_telemetry_and_synthetic_ambient(

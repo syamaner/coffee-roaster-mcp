@@ -156,6 +156,7 @@ def test_confirmation_is_diagnostic_durable_and_clock_mapped(tmp_path: Path) -> 
     assert backend.thread_id == worker.ident
     confirmation = next(row for row in sink.rows if isinstance(row, ConfirmationRecord))
     assert confirmation.payload.decision_available_at.session_relative_seconds.value == 10
+    assert confirmation.payload.decision_available_at.utc.value == "2026-01-01T00:00:10+00:00"
     assert confirmation.payload.model_onset.recording_relative_seconds.value == 3
     assert backend.thread_id != calling_thread_id
     observer.update_boundaries(charge_at=1, human_at=11)
@@ -200,8 +201,14 @@ def test_unmapped_event_clock_withholds_capture_mapping(tmp_path: Path) -> None:
     assert summary.drop_cutoff.value.session_relative_seconds.value == 81.1
     assert summary.drop_cutoff.value.recording_relative_seconds.value is None
     assert summary.drop_cutoff.value.recording_relative_seconds.null_reason == "clock_unavailable"
+    assert summary.drop_cutoff.value.utc.value is None
+    assert summary.drop_cutoff.value.utc.null_reason == "clock_unavailable"
     assert summary.human_mark.value is not None
+    assert summary.human_mark.value.session_relative_seconds.value == 70
     assert summary.human_mark.value.recording_relative_seconds.value is None
+    assert summary.human_mark.value.recording_relative_seconds.null_reason == "clock_unavailable"
+    assert summary.human_mark.value.utc.value is None
+    assert summary.human_mark.value.utc.null_reason == "clock_unavailable"
     assert not [row for row in sink.rows if isinstance(row, WindowRecord)]
     for row in sink.rows:
         accepted = row.accepted_at.session_relative_seconds.value

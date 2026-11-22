@@ -120,19 +120,13 @@ class ClockMapping(Closed):
 
     def at(self, instant: float, *, event_domain_mapped: bool = True) -> Time:
         """Project a capture-clock instant without exporting its raw epoch."""
-        elapsed = instant - self.session_origin
         if not event_domain_mapped:
             return Time(
                 session_relative_seconds=absent("clock_unavailable"),
-                recording_relative_seconds=(
-                    absent(
-                        "not_yet_observed" if self.recording_pending else "recorder_never_started"
-                    )
-                    if self.recording_origin is None
-                    else present(instant - self.recording_origin)
-                ),
+                recording_relative_seconds=absent("clock_unavailable"),
                 utc=absent("clock_unavailable"),
             )
+        elapsed = instant - self.session_origin
         return Time(
             session_relative_seconds=present(elapsed),
             recording_relative_seconds=(
@@ -150,7 +144,7 @@ class ClockMapping(Closed):
             return Time(
                 session_relative_seconds=present(elapsed),
                 recording_relative_seconds=absent("clock_unavailable"),
-                utc=present((self.session_utc + timedelta(seconds=elapsed)).isoformat()),
+                utc=absent("clock_unavailable"),
             )
         return self.at(instant)
 
