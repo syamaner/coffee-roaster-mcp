@@ -920,7 +920,7 @@ class ManualFirstCrackAttempt:
 
     token: str
     started_monotonic_seconds: float
-    deadline_monotonic_seconds: float
+    deadline_monotonic_seconds: float | None
     completion: Future[ManualFirstCrackSettlement]
     observer_publication_token: object | None = None
     on_live: Callable[[RoastSession, object], None] | None = None
@@ -1562,7 +1562,7 @@ class RoastSessionStore:
         default_log_dir: Path = Path("./logs/roasts"),
         telemetry_log_interval_seconds: float = 1.0,
         manual_first_crack_writer_enabled: bool = False,
-        manual_first_crack_budget_seconds: float = 1.0,
+        manual_first_crack_budget_seconds: float | None = 1.0,
     ) -> None:
         """Initialize the single-session store.
 
@@ -1578,7 +1578,7 @@ class RoastSessionStore:
             manual_first_crack_writer_enabled: Enable the bounded, private
                 writer used only by the composed manual/mock recording route.
             manual_first_crack_budget_seconds: Injected producer budget for
-                that private writer; production composition fixes it at one.
+                that private writer; ``None`` retains no producer deadline.
         """
         import time
 
@@ -1588,7 +1588,7 @@ class RoastSessionStore:
             raise ValueError("session_history_limit must be >= 1.")
         if not math.isfinite(telemetry_log_interval_seconds) or telemetry_log_interval_seconds <= 0:
             raise ValueError("telemetry_log_interval_seconds must be greater than 0.")
-        if (
+        if manual_first_crack_budget_seconds is not None and (
             not math.isfinite(manual_first_crack_budget_seconds)
             or manual_first_crack_budget_seconds <= 0
         ):
@@ -4388,6 +4388,27 @@ class RoastSessionStore:
                 session.pending_driver_command_token = None
                 session.pending_driver_command_kind = None
 
+    def assert_exact_active_emergency_owner(
+        self, session: RoastSession, expected_session_id: str
+    ) -> None:
+        """Validate one exact latest active session for an emergency command.
+
+        The check is deliberately narrower than stopped-fault recovery: it
+        establishes current ownership only and does not reserve or promote a
+        recovery operation.
+        """
+        with self._lock:
+            try:
+                self._assert_latest_session(session)
+            except SessionLifecycleError as exc:
+                raise SessionLifecycleError(
+                    "Expected session is not the latest roast session."
+                ) from exc
+            if session.id != expected_session_id:
+                raise SessionLifecycleError("Expected session is not the latest roast session.")
+            if not session.active:
+                raise SessionLifecycleError("Expected session is not an active roast session.")
+
     def start_cooling(self, session: RoastSession) -> RoastEvent:
         """Start cooling for one active session."""
         with self._lock:
@@ -4489,7 +4510,9 @@ class RoastSessionStore:
                 else started_monotonic_seconds
             )
             deadline_monotonic_seconds = (
-                started_monotonic_seconds + self._manual_first_crack_budget_seconds
+                None
+                if self._manual_first_crack_budget_seconds is None
+                else started_monotonic_seconds + self._manual_first_crack_budget_seconds
             )
             token = uuid4().hex
             event = self._new_event_locked(session, "first_crack_detected")
@@ -4560,8 +4583,12 @@ class RoastSessionStore:
         """Return the injected monotonic clock used by manual-mark deadlines."""
         return self._monotonic_now()
 
-    def manual_first_crack_remaining_seconds(self, attempt: ManualFirstCrackAttempt) -> float:
+    def manual_first_crack_remaining_seconds(
+        self, attempt: ManualFirstCrackAttempt
+    ) -> float | None:
         """Return remaining producer budget in the attempt's clock domain."""
+        if attempt.deadline_monotonic_seconds is None:
+            return None
         return attempt.deadline_monotonic_seconds - self._monotonic_now()
 
     def revoke_manual_first_crack_live_publication(self, attempt: ManualFirstCrackAttempt) -> None:
@@ -4659,7 +4686,7 @@ class RoastSessionStore:
         session: RoastSession,
         token: str,
         event: RoastEvent,
-        deadline_monotonic_seconds: float,
+        deadline_monotonic_seconds: float | None,
         on_live: Callable[[RoastSession, object], None] | None,
         observer_publication_token: object | None,
         caller_completion: Future[ManualFirstCrackSettlement],
@@ -4683,7 +4710,10 @@ class RoastSessionStore:
                 or not session.active
                 or session.faulted_at_utc is not None
                 or token in self._manual_first_crack_live_revoked_tokens
-                or self._monotonic_now() >= deadline_monotonic_seconds
+                or (
+                    deadline_monotonic_seconds is not None
+                    and self._monotonic_now() >= deadline_monotonic_seconds
+                )
             ):
                 historical = self._settle_manual_first_crack_historical_locked(
                     session, token=token, canonical_evidence="zero"
@@ -4760,7 +4790,10 @@ class RoastSessionStore:
                 or not session.active
                 or session.faulted_at_utc is not None
                 or token in self._manual_first_crack_live_revoked_tokens
-                or self._monotonic_now() >= deadline_monotonic_seconds
+                or (
+                    deadline_monotonic_seconds is not None
+                    and self._monotonic_now() >= deadline_monotonic_seconds
+                )
             ):
                 historical = self._settle_manual_first_crack_historical_locked(
                     session, token=token, canonical_evidence="verified"

@@ -11,6 +11,7 @@ import sys
 import wave
 from collections.abc import Callable
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -28,11 +29,14 @@ import coffee_roaster_mcp.ambient_runtime as ambient_runtime_module
 import coffee_roaster_mcp.artifacts as artifacts_module
 import coffee_roaster_mcp.audio as audio_module
 import coffee_roaster_mcp.mcp_server as mcp_server
+import coffee_roaster_mcp.session as session_module
 from coffee_roaster_mcp.config import AmbientConfig, AppConfig, ConfigError, FirstCrackConfig
 from coffee_roaster_mcp.detector import FirstCrackDetectorAdapter
 from coffee_roaster_mcp.drivers import (
     HOTTOP_PACKET_LENGTH,
     HOTTOP_PACKET_PREFIX,
+    HottopRoasterDriver,
+    build_hottop_command_packet,
     calculate_hottop_packet_checksum,
 )
 from coffee_roaster_mcp.first_crack_observer import ObservationModel
@@ -143,7 +147,7 @@ def _tool_context(context: ServerContext) -> Any:
     return SimpleNamespace(request_context=SimpleNamespace(lifespan_context=context))
 
 
-async def _call(server: Any, name: str, context: ServerContext, **kwargs: object) -> object:
+async def _call(server: Any, name: str, context: ServerContext, **kwargs: object) -> Any:
     """Call one registered tool with an actual lifecycle context."""
     manager = server._tool_manager  # pyright: ignore[reportPrivateUsage]
     tool = manager.get_tool(name)
@@ -191,6 +195,31 @@ def test_simulation_rejects_wrong_port_before_driver_construction(
         build_server_context(config_path=config, simulation_composition=composition)
 
     assert factory_calls == []
+
+
+def test_simulation_config_without_factory_binding_cannot_enable_manual_writer(
+    tmp_path: Path,
+) -> None:
+    """Synthetic config values alone cannot grant the factory-bound writer authority."""
+    config = _simulation_config(tmp_path)
+    context = build_server_context(
+        config_path=config,
+        simulation_composition=HottopSimulationComposition(
+            clock=_Clock(), receipt_age_bound_seconds=1.0
+        ),
+        environ={},
+    )
+
+    try:
+        assert context.capture_evidence_configured
+        assert not mcp_server._manual_first_crack_writer_composition(  # pyright: ignore[reportPrivateUsage]
+            context
+        )
+        assert not context.session_store._manual_first_crack_writer_enabled  # pyright: ignore[reportPrivateUsage]
+    finally:
+        context.first_crack_runtime.shutdown()
+        context.ambient_runtime.shutdown()
+        context.session_store.shutdown_manual_first_crack_writer()
 
 
 def test_simulation_requires_local_model_before_driver_or_downloader(
@@ -346,6 +375,365 @@ def test_simulation_reception_tool_uses_the_registered_closed_protocol_in_memory
                 )
                 assert malformed.isError is True
             await client_send.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_simulation_exact_active_stop_enters_driver_before_held_human_mark_settles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The factory-bound exact owner reaches synthetic Stop before a held Mark settles."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+    first_crack_persisting = Event()
+    release_first_crack = Event()
+    driver_entered = Event()
+    driver_entries: list[HottopRoasterDriver] = []
+    writer_timeouts: list[str] = []
+    writes_before_driver_entry: list[int] = []
+    runtime_cleanup_calls: list[str] = []
+    canonical_event_frames: list[bytes] = []
+    original_append = session_module._CanonicalGenerationWriter._append_verified  # pyright: ignore[reportPrivateUsage]
+    original_emergency_stop = HottopRoasterDriver.emergency_stop
+    original_freeze = FirstCrackSessionRuntime.freeze_observation_boundary
+    original_stop_sampler = mcp_server._TelemetrySampler.stop_for_session  # pyright: ignore[reportPrivateUsage]
+    original_stop_ambient = ambient_runtime_module.AmbientSessionRuntime.stop_for_session
+
+    def hold_first_crack(
+        writer: object,
+        frame: bytes,
+    ) -> None:
+        """Hold the canonical human first-crack writer after its frame is enqueued."""
+        original_append(writer, frame)  # type: ignore[arg-type]
+        if b'"first_crack_detected"' in frame or b'"fault"' in frame:
+            canonical_event_frames.append(frame)
+        if b'"first_crack_detected"' in frame:
+            first_crack_persisting.set()
+            if not release_first_crack.wait(timeout=1.0):
+                writer_timeouts.append("first_crack")
+
+    def record_driver_entry(driver: HottopRoasterDriver, *, reason: str) -> object:
+        """Observe candidate/v1 method entry separately from its transport frame."""
+        driver_entries.append(driver)
+        writes_before_driver_entry.append(len(composition.transport.writes_snapshot()))
+        driver_entered.set()
+        return original_emergency_stop(driver, reason=reason)
+
+    def record_first_crack_cleanup(
+        runtime: FirstCrackSessionRuntime,
+        session: object,
+        ticket: object | None,
+        *,
+        reason: str,
+    ) -> None:
+        """Count emergency cleanup without changing the registered handler path."""
+        runtime_cleanup_calls.append("first_crack")
+        original_freeze(runtime, cast(Any, session), ticket, reason=reason)
+
+    def record_sampler_cleanup(sampler: object, session_id: str, *, reason: str) -> None:
+        """Count telemetry cleanup without altering sampler ownership semantics."""
+        runtime_cleanup_calls.append("telemetry")
+        original_stop_sampler(sampler, session_id, reason=reason)  # type: ignore[arg-type]
+
+    def record_ambient_cleanup(runtime: object, session_id: str, *, reason: str) -> object:
+        """Count ambient cleanup without altering ambient ownership semantics."""
+        runtime_cleanup_calls.append("ambient")
+        return original_stop_ambient(runtime, session_id, reason=reason)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        session_module._CanonicalGenerationWriter,  # pyright: ignore[reportPrivateUsage]
+        "_append_verified",
+        hold_first_crack,
+    )
+    monkeypatch.setattr(HottopRoasterDriver, "emergency_stop", record_driver_entry)
+    monkeypatch.setattr(
+        FirstCrackSessionRuntime, "freeze_observation_boundary", record_first_crack_cleanup
+    )
+    monkeypatch.setattr(
+        mcp_server._TelemetrySampler,  # pyright: ignore[reportPrivateUsage]
+        "stop_for_session",
+        record_sampler_cleanup,
+    )
+    monkeypatch.setattr(
+        ambient_runtime_module.AmbientSessionRuntime,
+        "stop_for_session",
+        record_ambient_cleanup,
+    )
+
+    async def wait_for_event(event: Event) -> None:
+        """Wait for one deterministic test witness without blocking the MCP loop."""
+        assert await asyncio.to_thread(event.wait, 1.0)
+
+    async def wait_for_emergency_frame(frame: bytes) -> None:
+        """Observe the new emergency write after entry and before storage release."""
+        assert writes_before_driver_entry
+        while frame not in composition.transport.writes_snapshot()[writes_before_driver_entry[0] :]:
+            await asyncio.sleep(0)
+
+    async def exercise() -> None:
+        """Use the registered SDK client for the exact active-owner route."""
+        client_send, server_receive = create_memory_object_stream[SessionMessage](0)
+        server_send, client_receive = create_memory_object_stream[SessionMessage | Exception](0)
+        low_level = server._mcp_server  # pyright: ignore[reportPrivateUsage]
+        async with create_task_group() as group:
+            group.start_soon(
+                low_level.run,
+                cast(MemoryObjectReceiveStream[SessionMessage | Exception], server_receive),
+                server_send,
+                low_level.create_initialization_options(),
+            )
+            async with ClientSession(client_receive, client_send) as client:
+                await client.initialize()
+                started = await client.call_tool(
+                    "start_roast_session",
+                    {"purpose": "roast", "first_crack_observer_ack": "manual/v1"},
+                )
+                assert started.structuredContent is not None
+                session_id = cast(str, started.structuredContent["session"]["session_id"])
+                assert not (await client.call_tool("mark_beans_added", {})).isError
+
+                wrong_owner = await client.call_tool(
+                    "emergency_stop", {"expected_session_id": "not-the-active-session"}
+                )
+                assert wrong_owner.isError
+                assert driver_entries == []
+                assert runtime_cleanup_calls == []
+
+                mark = asyncio.create_task(client.call_tool("mark_first_crack", {}))
+                await wait_for_event(first_crack_persisting)
+                stop = asyncio.create_task(
+                    client.call_tool("emergency_stop", {"expected_session_id": session_id})
+                )
+                await wait_for_event(driver_entered)
+                assert not release_first_crack.is_set()
+                assert len(driver_entries) == 1
+                emergency_frame = build_hottop_command_packet(
+                    heat_level_percent=0,
+                    fan_level_percent=0,
+                    main_fan_level_percent=100,
+                    cooling_motor_on=True,
+                )
+                await asyncio.wait_for(wait_for_emergency_frame(emergency_frame), timeout=1.0)
+
+                release_first_crack.set()
+                stopped = await asyncio.wait_for(stop, timeout=5.0)
+                marked = await asyncio.wait_for(mark, timeout=5.0)
+                assert writer_timeouts == []
+                assert not stopped.isError
+                assert marked.isError
+                assert runtime_cleanup_calls == ["first_crack", "telemetry", "ambient"]
+                state = await client.call_tool("get_roast_state", {"session_id": session_id})
+                assert state.structuredContent is not None
+                events = state.structuredContent["events"]
+                assert [json.loads(frame)["kind"] for frame in canonical_event_frames] == [
+                    "first_crack_detected",
+                    "fault",
+                ]
+                # The historical queued mark was stored before the emergency;
+                # its displaced completion must not create a second live mark.
+                assert sum(event["kind"] == "first_crack_detected" for event in events) == 0
+                assert sum(event["kind"] == "fault" for event in events) == 1
+            await client_send.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_simulation_replaced_exact_active_owner_refuses_before_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement after exact active selection cannot fall back to reason-only Stop."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+
+    async def exercise() -> None:
+        """Replace only the exact owner between selection and endpoint admission."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            await _call(server, "mark_beans_added", context)
+            original_session = context.session_store.get_active_session()
+            assert original_session is not None
+            driver_entries: list[str] = []
+            runtime_cleanup_calls: list[str] = []
+            original_assert = context.session_store.assert_exact_active_emergency_owner
+            original_emergency_stop = context.roaster_driver.emergency_stop
+            original_freeze = context.first_crack_runtime.freeze_observation_boundary
+            original_first_crack_stop = context.first_crack_runtime.stop_for_session
+            original_stop_sampler = context.telemetry_sampler.stop_for_session
+            original_stop_ambient = context.ambient_runtime.stop_for_session
+            replaced = False
+
+            def replace_after_selection(session: object, expected_session_id: str) -> None:
+                """Create a successor only after the store accepted the original owner."""
+                nonlocal replaced
+                original_assert(cast(Any, session), expected_session_id)
+                if not replaced:
+                    replaced = True
+                    context.session_store.stop_session()
+                    context.session_store.start_session()
+
+            def record_driver_entry(*, reason: str) -> object:
+                """Record driver entry if an identity refusal were incorrectly bypassed."""
+                driver_entries.append(reason)
+                return original_emergency_stop(reason=reason)
+
+            def record_first_crack_cleanup(
+                session: object, ticket: object | None, *, reason: str
+            ) -> None:
+                """Record whether a refused owner enters first-crack cleanup."""
+                runtime_cleanup_calls.append("first_crack")
+                original_freeze(cast(Any, session), ticket, reason=reason)
+
+            def record_observer_cleanup(session_id: str, *, reason: str) -> object:
+                """Record whether a refused owner stops its first-crack observer."""
+                runtime_cleanup_calls.append("observer")
+                return original_first_crack_stop(session_id, reason=reason)
+
+            def record_sampler_cleanup(session_id: str, *, reason: str) -> None:
+                """Record whether a refused owner enters telemetry cleanup."""
+                runtime_cleanup_calls.append("telemetry")
+                original_stop_sampler(session_id, reason=reason)
+
+            def record_ambient_cleanup(session_id: str, *, reason: str) -> object:
+                """Record whether a refused owner enters ambient cleanup."""
+                runtime_cleanup_calls.append("ambient")
+                return original_stop_ambient(session_id, reason=reason)
+
+            monkeypatch.setattr(
+                context.session_store,
+                "assert_exact_active_emergency_owner",
+                replace_after_selection,
+            )
+            monkeypatch.setattr(context.roaster_driver, "emergency_stop", record_driver_entry)
+            monkeypatch.setattr(
+                context.first_crack_runtime,
+                "freeze_observation_boundary",
+                record_first_crack_cleanup,
+            )
+            monkeypatch.setattr(
+                context.first_crack_runtime,
+                "stop_for_session",
+                record_observer_cleanup,
+            )
+            monkeypatch.setattr(
+                context.telemetry_sampler, "stop_for_session", record_sampler_cleanup
+            )
+            monkeypatch.setattr(context.ambient_runtime, "stop_for_session", record_ambient_cleanup)
+
+            with pytest.raises(ValueError, match="not the latest roast session"):
+                await _call(
+                    server,
+                    "emergency_stop",
+                    context,
+                    expected_session_id=started.session.session_id,
+                )
+            assert driver_entries == []
+            assert runtime_cleanup_calls == []
+
+            await _call(server, "emergency_stop", context, reason="synthetic cleanup")
+            assert driver_entries == ["synthetic cleanup"]
+
+    asyncio.run(exercise())
+
+
+def test_simulation_stopped_nonfault_exact_stop_refuses_before_runtime_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stopped non-fault owner cannot enter driver or runtime cleanup through Stop."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+
+    async def exercise() -> None:
+        """Invoke the registered emergency handler against one stopped non-fault owner."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            await _call(server, "mark_beans_added", context)
+            runtime_cleanup_calls: list[str] = []
+            driver_entries: list[str] = []
+            original_driver_stop = context.roaster_driver.emergency_stop
+            original_first_crack_freeze = context.first_crack_runtime.freeze_observation_boundary
+            original_first_crack_stop = context.first_crack_runtime.stop_for_session
+            original_sampler_stop = context.telemetry_sampler.stop_for_session
+            original_ambient_stop = context.ambient_runtime.stop_for_session
+
+            def record_driver_entry(*, reason: str) -> object:
+                """Record an emergency driver call that must not occur."""
+                driver_entries.append(reason)
+                return original_driver_stop(reason=reason)
+
+            def record_first_crack_cleanup(session_id: str, *, reason: str) -> object:
+                """Record first-crack cleanup attempted by a refused owner."""
+                runtime_cleanup_calls.append("first_crack")
+                return original_first_crack_stop(session_id, reason=reason)
+
+            def record_first_crack_boundary_cleanup(
+                session: object, ticket: object | None, *, reason: str
+            ) -> None:
+                """Record primary-boundary cleanup attempted by a refused owner."""
+                runtime_cleanup_calls.append("first_crack_boundary")
+                original_first_crack_freeze(cast(Any, session), ticket, reason=reason)
+
+            def record_sampler_cleanup(session_id: str, *, reason: str) -> None:
+                """Record telemetry cleanup attempted by a refused owner."""
+                runtime_cleanup_calls.append("telemetry")
+                original_sampler_stop(session_id, reason=reason)
+
+            def record_ambient_cleanup(session_id: str, *, reason: str) -> object:
+                """Record ambient cleanup attempted by a refused owner."""
+                runtime_cleanup_calls.append("ambient")
+                return original_ambient_stop(session_id, reason=reason)
+
+            monkeypatch.setattr(context.roaster_driver, "emergency_stop", record_driver_entry)
+            monkeypatch.setattr(
+                context.first_crack_runtime,
+                "stop_for_session",
+                record_first_crack_cleanup,
+            )
+            monkeypatch.setattr(
+                context.first_crack_runtime,
+                "freeze_observation_boundary",
+                record_first_crack_boundary_cleanup,
+            )
+            monkeypatch.setattr(
+                context.telemetry_sampler, "stop_for_session", record_sampler_cleanup
+            )
+            monkeypatch.setattr(context.ambient_runtime, "stop_for_session", record_ambient_cleanup)
+            context.session_store.stop_session()
+
+            with pytest.raises(ValueError, match="not a stopped fault session"):
+                await _call(
+                    server,
+                    "emergency_stop",
+                    context,
+                    expected_session_id=started.session.session_id,
+                )
+
+            assert driver_entries == []
+            assert runtime_cleanup_calls == []
 
     asyncio.run(exercise())
 
