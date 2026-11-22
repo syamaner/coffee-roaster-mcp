@@ -3627,8 +3627,12 @@ def test_canonical_writer_exclusively_binds_first_target_and_appends_owned_targe
     occupied_path.parent.mkdir(parents=True, exist_ok=True)
     occupied_path.write_bytes(original_bytes)
 
-    with pytest.raises(FileExistsError):
+    with pytest.raises(
+        session_module.EventLogRecordingError,
+        match="^Canonical log storage or verification failed\\.$",
+    ) as raised:
         occupied_writer.append({"type": "event", "kind": "beans_added"}, lane="event")
+    assert isinstance(raised.value.__cause__, FileExistsError)
     assert occupied_path.read_bytes() == original_bytes
     assert occupied_session.mock_log_torn
     occupied_store.shutdown_manual_first_crack_writer()

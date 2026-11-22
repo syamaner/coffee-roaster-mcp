@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import struct
@@ -142,12 +143,15 @@ def _tool_context(context: ServerContext) -> Any:
     return SimpleNamespace(request_context=SimpleNamespace(lifespan_context=context))
 
 
-def _call(server: Any, name: str, context: ServerContext, **kwargs: object) -> object:
+async def _call(server: Any, name: str, context: ServerContext, **kwargs: object) -> object:
     """Call one registered tool with an actual lifecycle context."""
     manager = server._tool_manager  # pyright: ignore[reportPrivateUsage]
     tool = manager.get_tool(name)
     assert tool is not None
-    return tool.fn(_tool_context(context), **kwargs)
+    result = tool.fn(_tool_context(context), **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 def test_candidate_without_trusted_composition_refuses_before_native_transport(
@@ -884,7 +888,7 @@ def test_composed_lifespan_starts_staged_driver_capture_telemetry_and_synthetic_
         async with lifespan(server) as context:
             started = cast(
                 StartRoastSessionResult,
-                _call(
+                await _call(
                     server,
                     "start_roast_session",
                     context,
@@ -896,12 +900,14 @@ def test_composed_lifespan_starts_staged_driver_capture_telemetry_and_synthetic_
             assert selected_callables == []
             assert composition.transport.writes_snapshot()
             assert started.session.device_state is None
-            readback = cast(RuntimeConfigSnapshot, _call(server, "get_runtime_config", context))
+            readback = cast(
+                RuntimeConfigSnapshot, await _call(server, "get_runtime_config", context)
+            )
             assert readback.first_crack_event_authority == "manual"
             assert readback.first_crack_observer_protocol == "manual/v1"
             capture = cast(
                 CaptureEvidenceBootstrapResult,
-                _call(
+                await _call(
                     server,
                     "get_capture_evidence",
                     context,
@@ -910,26 +916,26 @@ def test_composed_lifespan_starts_staged_driver_capture_telemetry_and_synthetic_
                 ),
             )
             assert capture.capability == "manual_hottop_simulation_capture"
-            _call(server, "mark_beans_added", context)
-            before_mark = cast(RoastSessionState, _call(server, "get_roast_state", context))
+            await _call(server, "mark_beans_added", context)
+            before_mark = cast(RoastSessionState, await _call(server, "get_roast_state", context))
             assert before_mark.phase == "roasting"
             assert before_mark.first_crack_at_utc is None
-            marked = cast(EventCommandResult, _call(server, "mark_first_crack", context))
-            after_mark = cast(RoastSessionState, _call(server, "get_roast_state", context))
+            marked = cast(EventCommandResult, await _call(server, "mark_first_crack", context))
+            after_mark = cast(RoastSessionState, await _call(server, "get_roast_state", context))
             assert after_mark.phase == "development"
             assert after_mark.first_crack_at_utc == marked.event.recorded_at_utc
             assert [event.kind for event in after_mark.events].count("first_crack_detected") == 1
             canonical_session = context.session_store.get_active_session()
             assert canonical_session is not None
             assert canonical_session.first_crack_source == "manual_mark"
-            state = cast(RoastSessionState, _call(server, "get_roast_state", context))
+            state = cast(RoastSessionState, await _call(server, "get_roast_state", context))
             assert state.ambient_status.status == "ok"
             assert state.ambient_status.temperature_c == 21.5
             assert state.ambient_status.last_reading_monotonic_seconds == 100.0
             assert state.device_state is not None
             assert state.device_state.connected is True
 
-            _call(server, "emergency_stop", context, reason="synthetic test cleanup")
+            await _call(server, "emergency_stop", context, reason="synthetic test cleanup")
 
     asyncio.run(exercise())
     assert list((tmp_path / "recordings").rglob("*.wav"))

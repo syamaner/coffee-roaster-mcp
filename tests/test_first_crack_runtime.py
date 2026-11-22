@@ -2689,7 +2689,10 @@ def test_manual_recording_continues_during_pending_boundary_until_real_freeze(
     def call(name: str, **arguments: object) -> Any:
         tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
         assert tool is not None
-        return tool.fn(ctx, **arguments)
+        result = tool.fn(ctx, **arguments)
+        if inspect.isawaitable(result):
+            return asyncio.run(_await_direct_tool_result(result))
+        return result
 
     started = call("start_roast_session", first_crack_observer_ack="manual/v1")
     session = context.session_store.get_session_snapshot(session_id=started.session.session_id)
@@ -4123,7 +4126,10 @@ def _accepted_emergency_clock_witness(
     def call(name: str, **arguments: object):
         tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
         assert tool is not None
-        return tool.fn(ctx, **arguments)
+        result = tool.fn(ctx, **arguments)
+        if inspect.isawaitable(result):
+            return asyncio.run(_await_direct_tool_result(result))
+        return result
 
     def emergency_event(*, repeated: bool = False):
         if trigger == "public":
@@ -4311,7 +4317,10 @@ def test_public_drop_pending_boundary_fences_post_accepted_positive_until_store_
     def call(name: str, **arguments: object):
         tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
         assert tool is not None
-        return tool.fn(ctx, **arguments)
+        result = tool.fn(ctx, **arguments)
+        if inspect.isawaitable(result):
+            return asyncio.run(_await_direct_tool_result(result))
+        return result
 
     started = call("start_roast_session", first_crack_observer_ack="manual/v1")
     session_id = started.session.session_id
@@ -4991,7 +5000,10 @@ def test_public_drop_pending_timeout_keeps_owned_result_cutoff_unknown(
     def call(name: str, **arguments: object):
         tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
         assert tool is not None
-        return tool.fn(ctx, **arguments)
+        result = tool.fn(ctx, **arguments)
+        if inspect.isawaitable(result):
+            return asyncio.run(_await_direct_tool_result(result))
+        return result
 
     started = call("start_roast_session", first_crack_observer_ack="manual/v1")
     session_id = started.session.session_id
@@ -5097,7 +5109,10 @@ def test_manual_public_generic_drop_commit_failure_freezes_at_original_deadline(
     def call(name: str, **arguments: object) -> Any:
         tool = server._tool_manager.get_tool(name)  # pyright: ignore[reportPrivateUsage]
         assert tool is not None
-        return tool.fn(ctx, **arguments)
+        result = tool.fn(ctx, **arguments)
+        if inspect.isawaitable(result):
+            return asyncio.run(_await_direct_tool_result(result))
+        return result
 
     started = call("start_roast_session", first_crack_observer_ack="manual/v1")
     session_id = started.session.session_id
