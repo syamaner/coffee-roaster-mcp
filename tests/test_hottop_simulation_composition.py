@@ -572,6 +572,258 @@ def test_simulation_exact_active_stop_enters_driver_before_held_human_mark_settl
     asyncio.run(exercise())
 
 
+def test_simulation_cancelled_held_manual_mark_settles_live_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling a legacy caller leaves its owned synthetic mark to settle live."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+    first_crack_persisting = Event()
+    release_first_crack = Event()
+    attempts: list[session_module.ManualFirstCrackAttempt] = []
+    observer_notifications: list[object | None] = []
+    terminal_dispositions: list[str] = []
+    original_append = session_module._CanonicalGenerationWriter._append_verified  # pyright: ignore[reportPrivateUsage]
+
+    def hold_first_crack(writer: object, frame: bytes) -> None:
+        """Hold the original mark before its canonical append can settle."""
+        if b'"first_crack_detected"' in frame:
+            first_crack_persisting.set()
+            assert release_first_crack.wait(timeout=1.0)
+        original_append(writer, frame)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        session_module._CanonicalGenerationWriter,  # pyright: ignore[reportPrivateUsage]
+        "_append_verified",
+        hold_first_crack,
+    )
+
+    async def wait_for_event(event: Event) -> None:
+        """Wait for one synthetic writer witness without blocking the event loop."""
+        assert await asyncio.to_thread(event.wait, 1.0)
+
+    async def wait_for_terminal_audit() -> None:
+        """Wait until the owned writer emits its terminal audit disposition."""
+        while terminal_dispositions != ["live"]:
+            await asyncio.sleep(0)
+
+    async def exercise() -> None:
+        """Use the actual registered handler while its store-owned Future is held."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            original_begin = context.session_store.begin_manual_first_crack_write
+            original_notify = context.first_crack_runtime.notify_human_mark
+            original_terminal_audit = (
+                context.session_store._append_manual_first_crack_terminal_audit
+            )  # pyright: ignore[reportPrivateUsage]
+
+            def record_attempt(*args: Any, **kwargs: Any) -> session_module.ManualFirstCrackAttempt:
+                """Capture the exact store-owned completion Future for this handler call."""
+                attempt = original_begin(*args, **kwargs)
+                attempts.append(attempt)
+                return attempt
+
+            def record_observer_notification(*args: Any, **kwargs: Any) -> None:
+                """Record the publication claim consumed by a live settlement."""
+                publication_token = kwargs.get("publication_token")
+                if publication_token is not None:
+                    observer_notifications.append(publication_token)
+                original_notify(*args, **kwargs)
+
+            def record_terminal_audit(*args: Any, **kwargs: Any) -> None:
+                """Record the terminal disposition without replacing the real audit write."""
+                terminal_dispositions.append(cast(str, kwargs["disposition"]))
+                original_terminal_audit(*args, **kwargs)
+
+            monkeypatch.setattr(
+                context.session_store, "begin_manual_first_crack_write", record_attempt
+            )
+            monkeypatch.setattr(
+                context.first_crack_runtime, "notify_human_mark", record_observer_notification
+            )
+            monkeypatch.setattr(
+                context.session_store,
+                "_append_manual_first_crack_terminal_audit",
+                record_terminal_audit,
+            )
+            await _call(
+                server,
+                "start_roast_session",
+                context,
+                purpose="roast",
+                first_crack_observer_ack="manual/v1",
+            )
+            await _call(server, "mark_beans_added", context)
+
+            caller = asyncio.create_task(_call(server, "mark_first_crack", context))
+            await wait_for_event(first_crack_persisting)
+            assert len(attempts) == 1
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+            assert not attempts[0].completion.cancelled()
+
+            release_first_crack.set()
+            settlement = await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(attempts[0].completion)), timeout=1.0
+            )
+            assert settlement.outcome == "live"
+            assert settlement.event is not None
+            await asyncio.wait_for(wait_for_terminal_audit(), timeout=1.0)
+            state = cast(RoastSessionState, await _call(server, "get_roast_state", context))
+            assert state.first_crack_at_utc is not None
+            assert state.development_time_seconds is not None
+            assert len(observer_notifications) == 1
+            assert terminal_dispositions == ["live"]
+            duplicate = cast(EventCommandResult, await _call(server, "mark_first_crack", context))
+            assert duplicate.event.kind == settlement.event.kind
+            assert duplicate.event.recorded_at_utc == settlement.event.recorded_at_utc.isoformat()
+            assert sum(event.kind == "first_crack_detected" for event in state.events) == 1
+            await _call(server, "emergency_stop", context, reason="synthetic test cleanup")
+
+    asyncio.run(exercise())
+
+
+def test_simulation_cancelled_held_manual_mark_becomes_historical_after_exact_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exact synthetic Stop displaces a cancelled held mark without replaying Stop."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+    first_crack_persisting = Event()
+    release_first_crack = Event()
+    driver_entered = Event()
+    attempts: list[session_module.ManualFirstCrackAttempt] = []
+    observer_notifications: list[object | None] = []
+    terminal_dispositions: list[str] = []
+    driver_calls: list[str] = []
+    original_append = session_module._CanonicalGenerationWriter._append_verified  # pyright: ignore[reportPrivateUsage]
+    original_emergency_stop = HottopRoasterDriver.emergency_stop
+
+    def hold_first_crack(writer: object, frame: bytes) -> None:
+        """Hold the original mark before its canonical append can settle."""
+        if b'"first_crack_detected"' in frame:
+            first_crack_persisting.set()
+            assert release_first_crack.wait(timeout=1.0)
+        original_append(writer, frame)  # type: ignore[arg-type]
+
+    def record_driver_entry(driver: HottopRoasterDriver, *, reason: str) -> object:
+        """Witness exactly one competing registered Stop before releasing the mark."""
+        driver_calls.append(reason)
+        driver_entered.set()
+        return original_emergency_stop(driver, reason=reason)
+
+    monkeypatch.setattr(
+        session_module._CanonicalGenerationWriter,  # pyright: ignore[reportPrivateUsage]
+        "_append_verified",
+        hold_first_crack,
+    )
+    monkeypatch.setattr(HottopRoasterDriver, "emergency_stop", record_driver_entry)
+
+    async def wait_for_event(event: Event) -> None:
+        """Wait for one synthetic witness without blocking the event loop."""
+        assert await asyncio.to_thread(event.wait, 1.0)
+
+    async def wait_for_terminal_audit() -> None:
+        """Wait until the displaced mark records its historical disposition."""
+        while terminal_dispositions != ["historical"]:
+            await asyncio.sleep(0)
+
+    async def exercise() -> None:
+        """Cancel the registered Mark caller, then let an exact Stop win admission."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            original_begin = context.session_store.begin_manual_first_crack_write
+            original_notify = context.first_crack_runtime.notify_human_mark
+            original_terminal_audit = (
+                context.session_store._append_manual_first_crack_terminal_audit
+            )  # pyright: ignore[reportPrivateUsage]
+
+            def record_attempt(*args: Any, **kwargs: Any) -> session_module.ManualFirstCrackAttempt:
+                """Capture the exact store-owned completion Future for this handler call."""
+                attempt = original_begin(*args, **kwargs)
+                attempts.append(attempt)
+                return attempt
+
+            def record_observer_notification(*args: Any, **kwargs: Any) -> None:
+                """Record any erroneous live observer publication after Stop wins."""
+                publication_token = kwargs.get("publication_token")
+                if publication_token is not None:
+                    observer_notifications.append(publication_token)
+                original_notify(*args, **kwargs)
+
+            def record_terminal_audit(*args: Any, **kwargs: Any) -> None:
+                """Record the terminal disposition without replacing the real audit write."""
+                terminal_dispositions.append(cast(str, kwargs["disposition"]))
+                original_terminal_audit(*args, **kwargs)
+
+            monkeypatch.setattr(
+                context.session_store, "begin_manual_first_crack_write", record_attempt
+            )
+            monkeypatch.setattr(
+                context.first_crack_runtime, "notify_human_mark", record_observer_notification
+            )
+            monkeypatch.setattr(
+                context.session_store,
+                "_append_manual_first_crack_terminal_audit",
+                record_terminal_audit,
+            )
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            await _call(server, "mark_beans_added", context)
+
+            caller = asyncio.create_task(_call(server, "mark_first_crack", context))
+            await wait_for_event(first_crack_persisting)
+            assert len(attempts) == 1
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+            assert not attempts[0].completion.cancelled()
+
+            stop = asyncio.create_task(
+                _call(
+                    server,
+                    "emergency_stop",
+                    context,
+                    expected_session_id=started.session.session_id,
+                )
+            )
+            await wait_for_event(driver_entered)
+            assert driver_calls == ["manual emergency stop"]
+            release_first_crack.set()
+            stopped = cast(EventCommandResult, await asyncio.wait_for(stop, timeout=2.0))
+            assert stopped.event.kind == "fault"
+            settlement = await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(attempts[0].completion)), timeout=1.0
+            )
+            assert settlement.outcome == "historical"
+            await asyncio.wait_for(wait_for_terminal_audit(), timeout=1.0)
+            state = cast(RoastSessionState, await _call(server, "get_roast_state", context))
+            assert sum(event.kind == "first_crack_detected" for event in state.events) == 0
+            assert sum(event.kind == "fault" for event in state.events) == 1
+            assert state.first_crack_at_utc is None
+            assert state.first_crack_monotonic_seconds is None
+            assert state.development_time_seconds is None
+            assert state.development_percent is None
+            assert observer_notifications == []
+            assert terminal_dispositions == ["historical"]
+            assert driver_calls == ["manual emergency stop"]
+
+    asyncio.run(exercise())
+
+
 def test_simulation_replaced_exact_active_owner_refuses_before_driver(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

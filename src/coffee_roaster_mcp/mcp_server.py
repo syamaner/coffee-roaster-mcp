@@ -4784,7 +4784,7 @@ async def _record_manual_first_crack_with_budget(
             raise ValueError("Manual first-crack mark remains pending; do not resend it.")
         try:
             if remaining is None:
-                settlement = await asyncio.wrap_future(attempt.completion)
+                settlement = await asyncio.shield(asyncio.wrap_future(attempt.completion))
             else:
                 settlement = await asyncio.wait_for(
                     asyncio.shield(asyncio.wrap_future(attempt.completion)),
