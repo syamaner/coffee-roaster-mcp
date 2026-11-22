@@ -381,8 +381,9 @@ def test_simulation_reception_tool_uses_the_registered_closed_protocol_in_memory
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("hold_schedule", ["before_storage", "after_storage"])
 def test_simulation_exact_active_stop_enters_driver_before_held_human_mark_settles(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hold_schedule: str
 ) -> None:
     """The factory-bound exact owner reaches synthetic Stop before a held Mark settles."""
     config = _simulation_config(tmp_path)
@@ -406,11 +407,15 @@ def test_simulation_exact_active_stop_enters_driver_before_held_human_mark_settl
         writer: object,
         frame: bytes,
     ) -> None:
-        """Hold the canonical human first-crack writer after its frame is enqueued."""
+        """Hold the human first-crack turn on either side of real storage."""
+        if b'"first_crack_detected"' in frame and hold_schedule == "before_storage":
+            first_crack_persisting.set()
+            if not release_first_crack.wait(timeout=1.0):
+                writer_timeouts.append("first_crack")
         original_append(writer, frame)  # type: ignore[arg-type]
         if b'"first_crack_detected"' in frame or b'"fault"' in frame:
             canonical_event_frames.append(frame)
-        if b'"first_crack_detected"' in frame:
+        if b'"first_crack_detected"' in frame and hold_schedule == "after_storage":
             first_crack_persisting.set()
             if not release_first_crack.wait(timeout=1.0):
                 writer_timeouts.append("first_crack")
@@ -501,6 +506,8 @@ def test_simulation_exact_active_stop_enters_driver_before_held_human_mark_settl
                 assert wrong_owner.isError
                 assert driver_entries == []
                 assert runtime_cleanup_calls == []
+                canonical_path = tmp_path / "logs" / "roasts" / session_id / "roast.jsonl"
+                assert canonical_path.exists()
 
                 mark = asyncio.create_task(client.call_tool("mark_first_crack", {}))
                 await wait_for_event(first_crack_persisting)
@@ -517,6 +524,23 @@ def test_simulation_exact_active_stop_enters_driver_before_held_human_mark_settl
                     cooling_motor_on=True,
                 )
                 await asyncio.wait_for(wait_for_emergency_frame(emergency_frame), timeout=1.0)
+
+                # The held mark must neither become a live observation nor permit
+                # an active export to create derived output.  The before-storage
+                # schedule also proves the historical row is still absent on disk.
+                held_bytes = canonical_path.read_bytes()
+                unavailable = await client.call_tool("export_roast_log", {"session_id": session_id})
+                assert unavailable.structuredContent is not None
+                assert unavailable.structuredContent["ready"] is False
+                assert canonical_path.read_bytes() == held_bytes
+                assert not (canonical_path.parent / "roast.csv").exists()
+                assert not (canonical_path.parent / "summary.json").exists()
+                if hold_schedule == "before_storage":
+                    # The single real writer call is intentionally still blocked.
+                    # Its frame cannot be present before storage starts.
+                    assert [
+                        json.loads(line)["kind"] for line in held_bytes.decode().splitlines()
+                    ] == ["beans_added"]
 
                 release_first_crack.set()
                 stopped = await asyncio.wait_for(stop, timeout=5.0)
@@ -536,6 +560,13 @@ def test_simulation_exact_active_stop_enters_driver_before_held_human_mark_settl
                 # its displaced completion must not create a second live mark.
                 assert sum(event["kind"] == "first_crack_detected" for event in events) == 0
                 assert sum(event["kind"] == "fault" for event in events) == 1
+                assert state.structuredContent["first_crack_at_utc"] is None
+                assert state.structuredContent["development_time_seconds"] is None
+                assert state.structuredContent["development_percent"] is None
+                assert [
+                    json.loads(line)["kind"]
+                    for line in canonical_path.read_text(encoding="utf-8").splitlines()
+                ] == ["beans_added", "first_crack_detected", "fault"]
             await client_send.aclose()
 
     asyncio.run(exercise())
@@ -1117,6 +1148,10 @@ def test_simulation_sdk_manual_confirmation_keeps_capture_until_finalised(tmp_pa
                 {"purpose": "roast", "first_crack_observer_ack": "manual/v1"},
             )
             session_id = started["session"]["session_id"]
+            assert session_id is not None
+            before_charge = await call("export_roast_log", {"session_id": session_id})
+            assert before_charge["ready"] is False
+            assert not (tmp_path / "logs" / "roasts" / session_id / "roast.jsonl").exists()
             await call("mark_beans_added", {})
             (tmp_path / "charge-ready").touch()
 
@@ -1521,17 +1556,20 @@ def test_trusted_simulation_export_refuses_occupied_marker_and_unsettled_snapsho
     asyncio.run(unsettled_exercise())
 
 
-@pytest.mark.parametrize("mutation", ["missing", "tampered"])
-def test_trusted_simulation_export_refuses_missing_or_tampered_canonical_log(
-    tmp_path: Path, mutation: str
+@pytest.mark.parametrize(
+    "mutation",
+    ["replaced_equal_bytes", "deleted_before_derived", "tampered_after_derived"],
+)
+def test_trusted_simulation_export_refuses_canonical_log_races(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
-    """Trusted export never substitutes a missing or modified canonical JSONL."""
+    """Trusted export refuses replacement, deletion, and post-write tampering races."""
     config = _simulation_config(tmp_path)
     composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
     server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
 
     async def exercise() -> None:
-        """Reach a terminal synthetic session, then invalidate its canonical bytes."""
+        """Reach a terminal synthetic session, then race its sealed canonical bytes."""
         lifespan = server.settings.lifespan
         assert lifespan is not None
         async with lifespan(server) as context:
@@ -1550,19 +1588,43 @@ def test_trusted_simulation_export_refuses_missing_or_tampered_canonical_log(
             await _call(server, "start_cooling", context)
             await _call(server, "stop_cooling", context)
             session = context.session_store.get_latest_session()
-            assert session is not None and session.log_writer is not None
+            assert (
+                session is not None
+                and session.log_writer is not None
+                and session.canonical_writer is not None
+            )
             canonical_path = session.log_writer.log_dir / "roast.jsonl"
-            if mutation == "missing":
-                canonical_path.unlink()
+            canonical_bytes = canonical_path.read_bytes()
+            if mutation == "replaced_equal_bytes":
+                replacement = canonical_path.with_name("replacement.jsonl")
+                replacement.write_bytes(canonical_bytes)
+                replacement.replace(canonical_path)
+                assert canonical_path.read_bytes() == canonical_bytes
+                assert (canonical_path.stat().st_dev, canonical_path.stat().st_ino) != (
+                    session.canonical_writer._identity  # pyright: ignore[reportPrivateUsage]
+                )
             else:
-                canonical_path.write_bytes(b'{"kind":"tampered"}\n')
+                original_export = mcp_server.export_roast_snapshot
+
+                def race_derived_export(*args: Any, **kwargs: Any) -> Any:
+                    """Run the real derived export after the selected canonical race."""
+                    if mutation == "deleted_before_derived":
+                        canonical_path.unlink()
+                        return original_export(*args, **kwargs)
+                    exported = original_export(*args, **kwargs)
+                    canonical_path.write_bytes(b'{"kind":"tampered"}\n')
+                    return exported
+
+                monkeypatch.setattr(mcp_server, "export_roast_snapshot", race_derived_export)
 
             unavailable = await _call(
                 server, "export_roast_log", context, session_id=started.session.session_id
             )
             assert unavailable.ready is False
-            assert not (session.log_writer.log_dir / "roast.csv").exists()
-            assert not (session.log_writer.log_dir / "summary.json").exists()
+            if mutation == "deleted_before_derived":
+                assert not canonical_path.exists()
+                assert not (session.log_writer.log_dir / "roast.csv").exists()
+                assert not (session.log_writer.log_dir / "summary.json").exists()
 
     asyncio.run(exercise())
 
