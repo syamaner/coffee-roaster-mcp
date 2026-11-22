@@ -754,6 +754,8 @@ class TimingEvidenceAdmission:
     session_id: str | None
     identity_rejection: TimingEvidenceIdentityRejection | None = None
     busy_rejection: TimingEvidenceBusyRejection | None = None
+    canonical_charge: RoastEvent | None = None
+    human_first_crack: RoastEvent | None = None
 
 
 @dataclass(frozen=True)
@@ -1574,6 +1576,20 @@ class RoastSessionStore:
         with self._lock:
             return self._timing_evidence_identity_rejection_locked(expected_session_id)
 
+    def _timing_evidence_observations_locked(
+        self, session: RoastSession
+    ) -> tuple[RoastEvent | None, RoastEvent | None]:
+        """Return the canonical charge and human first-crack state under ownership."""
+        charge: RoastEvent | None = None
+        first_crack: RoastEvent | None = None
+        for event in session.event_timeline:
+            if event.kind == "beans_added" and charge is None:
+                charge = event
+            elif event.kind == "first_crack_detected" and first_crack is None:
+                first_crack = event
+        human_first_crack = first_crack if session.first_crack_source == "manual_mark" else None
+        return charge, human_first_crack
+
     def admit_timing_evidence(self, expected_session_id: str) -> TimingEvidenceAdmission:
         """Revalidate an exact roast session without reserving or mutating it."""
         with self._lock:
@@ -1612,10 +1628,13 @@ class RoastSessionStore:
                     session.id,
                     busy_rejection="drop_in_progress",
                 )
+            canonical_charge, human_first_crack = self._timing_evidence_observations_locked(session)
             return TimingEvidenceAdmission(
                 session,
                 session.capture_ownership_sequence,
                 session.id,
+                canonical_charge=canonical_charge,
+                human_first_crack=human_first_crack,
             )
 
     def read_timing_evidence_clock(self) -> float:
@@ -1828,6 +1847,17 @@ class RoastSessionStore:
             # cannot share a record with the pre-mark receipt.
             charge = event_by_kind.get("beans_added")
             manual_first_crack = event_by_kind.get("first_crack_detected")
+            current_charge = charge[1] if charge is not None else None
+            current_human_first_crack = (
+                manual_first_crack[1]
+                if session.first_crack_source == "manual_mark" and manual_first_crack is not None
+                else None
+            )
+            if (
+                admission.canonical_charge != current_charge
+                or admission.human_first_crack != current_human_first_crack
+            ):
+                return TimingEvidenceAssembly("refused_identity", "session_changed_during_read")
             if (charge is not None and charge[1].monotonic_seconds > hi) or (
                 session.first_crack_source == "manual_mark"
                 and manual_first_crack is not None

@@ -171,7 +171,7 @@ def test_hottop_reception_assembly_refuses_post_bracket_manual_mark_then_recover
     assert session.hottop_reception_evidence_sequence == 0
 
     recovered = store.assemble_hottop_reception_evidence(
-        admission,
+        store.admit_timing_evidence(session.id),
         t0=72.0,
         t1=72.0,
         finalize=lambda record: record,
@@ -180,6 +180,72 @@ def test_hottop_reception_assembly_refuses_post_bracket_manual_mark_then_recover
     assert recovered.outcome == "evidence"
     assert recovered.reason_code is None
     assert recovered.result is not None
+    assert session.hottop_reception_evidence_sequence == 1
+    recovered_record = cast(dict[str, object], recovered.result)
+    assert recovered_record["reception_evidence_sequence"] == 1
+
+
+@pytest.mark.parametrize("transition", ["charge", "first_crack"])
+def test_hottop_reception_assembly_refuses_same_tick_transition_after_admission(
+    transition: str,
+) -> None:
+    """A same-clock charge or human FC added in-read cannot reuse a receipt."""
+    clock = SimpleNamespace(value=0.0)
+    store = RoastSessionStore(
+        utc_now=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        monotonic_now=lambda: clock.value,
+        session_id_factory=lambda: f"same-tick-{transition}",
+    )
+    session = store.start_session()
+    if transition == "first_crack":
+        clock.value = 10.0
+        store.record_event(session, "beans_added", provenance="manual_mark")
+    admission = store.admit_timing_evidence(session.id)
+
+    clock.value = 70.2
+    if transition == "charge":
+        store.record_event(session, "beans_added", provenance="manual_mark")
+    else:
+        store.record_event(session, "first_crack_detected", provenance="manual_mark")
+    refused = store.assemble_hottop_reception_evidence(
+        admission,
+        t0=70.2,
+        t1=70.2,
+        finalize=lambda record: record,
+    )
+
+    assert refused.outcome == "refused_identity"
+    assert refused.reason_code == "session_changed_during_read"
+    assert session.hottop_reception_evidence_sequence == 0
+
+
+def test_hottop_reception_assembly_accepts_previously_established_same_tick_mark() -> None:
+    """A human FC observed before sampling remains valid at the same clock tick."""
+    clock = SimpleNamespace(value=0.0)
+    store = RoastSessionStore(
+        utc_now=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        monotonic_now=lambda: clock.value,
+        session_id_factory=lambda: "established-same-tick",
+    )
+    session = store.start_session()
+    clock.value = 10.0
+    store.record_event(session, "beans_added", provenance="manual_mark")
+    clock.value = 70.2
+    store.record_event(session, "first_crack_detected", provenance="manual_mark")
+    admission = store.admit_timing_evidence(session.id)
+
+    accepted = store.assemble_hottop_reception_evidence(
+        admission,
+        t0=70.2,
+        t1=70.2,
+        finalize=lambda record: record,
+    )
+
+    assert accepted.outcome == "evidence"
+    assert accepted.reason_code is None
+    assert accepted.result is not None
+    accepted_record = cast(dict[str, object], accepted.result)
+    assert accepted_record["reception_evidence_sequence"] == 1
     assert session.hottop_reception_evidence_sequence == 1
 
 
