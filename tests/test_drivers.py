@@ -1147,33 +1147,32 @@ def test_candidate_public_factory_negative_drop_receipt_remains_unknown_after_st
         serial_factory=FakeSerialFactory(transport),
     )
     assert isinstance(driver, HottopRoasterDriver)
+    driver.drop_beans()
     driver.connect()
     try:
-        driver.drop_beans()
-        assert transport.first_drop_written.wait(timeout=1.0)
+        assert transport.repeat_drop_written.wait(timeout=1.0)
         first_evidence = driver.read_lifecycle_evidence()
         assert first_evidence.last_command_write_size == 0
-        assert first_evidence.command_send_attempts == 1
+        assert first_evidence.command_send_attempts == 2
         assert first_evidence.command_write_count == 0
         assert first_evidence.command_loop_error_count == 1
 
-        assert transport.repeat_drop_written.wait(timeout=1.0)
         transport.release_repeat_drop.set()
-        assert _wait_for_hottop_write(
-            transport,
-            lambda frame: frame[16] == 1,
-            start_index=1,
-        )
         assert transport.next_drop_written.wait(timeout=1.0)
+        repeat_evidence = driver.read_lifecycle_evidence()
+        assert repeat_evidence.last_command_write_size == HOTTOP_PACKET_LENGTH
+        assert repeat_evidence.command_write_count == 1
         driver.stop_cooling()
         stopped_evidence = driver.read_lifecycle_evidence()
         assert stopped_evidence.solenoid_open is False
         transition_count = driver._drop_transition_count  # pyright: ignore[reportPrivateUsage]
+        revision = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
 
         with pytest.raises(HottopDropRefused):
             driver.drop_beans()
 
         assert driver._drop_transition_count == transition_count  # pyright: ignore[reportPrivateUsage]
+        assert driver._command_state_revision == revision  # pyright: ignore[reportPrivateUsage]
         assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
         assert driver._drop_settlement.result == "unknown"  # pyright: ignore[reportPrivateUsage]
         assert [attempt.role for attempt in driver._attempt_history[:2]] == [  # pyright: ignore[reportPrivateUsage]
