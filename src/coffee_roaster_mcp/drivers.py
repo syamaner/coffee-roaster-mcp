@@ -1881,6 +1881,7 @@ class HottopRoasterDriver:
         self._receipt_report_floor: HottopDrainedFloor | None = None
         self._receipt_report_record: HottopReceivedPacket | None = None
         self._receipt_report_discard_count = 0
+        self._receipt_report_last_observed_at: float | None = None
         self._attempt_sequence = 0
         self._attempt_history: list[HottopWriteAttempt] = []
         self._drop_transition_count = 0
@@ -2524,7 +2525,24 @@ class HottopRoasterDriver:
     ) -> tuple[RoasterState, HottopReceiptObservation]:
         """Return cached normalized state and passive receipt facts atomically."""
         with self._state_lock:
-            observed_at = self._reception_clock()
+            observed_at = self._receipt_report_clock_sample()
+            if observed_at is None:
+                record = self._receipt_report_record
+                self._receipt_report_record = None
+                if self._connected:
+                    self._receipt_report_discard_count += 1
+                observed_at = self._receipt_report_last_observed_at
+                if observed_at is None and record is not None:
+                    observed_at = record.read_returned_at
+            else:
+                self._receipt_report_last_observed_at = observed_at
+            # A receipt is only ever built after a finite clock sample, so this
+            # fallback can only be its real read-returned host observation.
+            if observed_at is None:
+                # No receipt can exist without a finite sampled clock.  Keep the
+                # public snapshot constructible without claiming that zero is a
+                # sampled time; it is paired with an explicitly unusable receipt.
+                observed_at = 0.0
             observation = HottopReceiptObservation(
                 receipt=self._receipt_report_record,
                 classification=classify_hottop_received_packet(
@@ -3196,34 +3214,29 @@ class HottopRoasterDriver:
             epoch = self._receipt_report_epoch
             handle_token = self._receipt_report_handle_token
 
-        started_at: float | None = None
-        diagnostic_failed = False
+        started_at = self._receipt_report_clock_sample()
         try:
-            started_at = self._reception_clock()
-        except Exception:
-            diagnostic_failed = True
-        try:
-            queued_before = cast(object, getattr(serial_transport, "in_waiting"))  # noqa: B009
+            queued_before = cast(object, getattr(serial_transport, "in_waiting", 0))  # noqa: B009
         except Exception:
             self._discard_receipt_report_record(
                 serial_transport, epoch, handle_token, count_read_error=True
             )
             return
-        if not _is_nonnegative_exact_int(queued_before):
-            self._discard_receipt_report_record(serial_transport, epoch, handle_token)
-            return
-        queued_before_int = cast(int, queued_before)
-
-        if queued_before_int == 0:
+        # Keep the legacy pre-read admission intact.  Receipt diagnostics are
+        # deliberately stricter and only use exact integer queue observations.
+        if not isinstance(queued_before, int) or queued_before <= 0:
+            if not _is_nonnegative_exact_int(queued_before):
+                self._discard_receipt_report_record(serial_transport, epoch, handle_token)
+                return
             if not prior_tail and started_at is not None:
                 self._publish_receipt_report_floor(
                     serial_transport, epoch, handle_token, started_at
                 )
-            elif diagnostic_failed:
-                self._discard_receipt_report_record(
-                    serial_transport, epoch, handle_token, count_read_error=True
-                )
+            elif started_at is None:
+                self._discard_receipt_report_record(serial_transport, epoch, handle_token)
             return
+        queued_before_int = int(queued_before)
+        diagnostic_queue_before = _is_nonnegative_exact_int(queued_before)
 
         read = getattr(serial_transport, "read", None)
         if not callable(read):
@@ -3238,89 +3251,128 @@ class HottopRoasterDriver:
             )
             return
 
-        try:
-            returned_at = self._reception_clock()
-            queued_after = cast(object, getattr(serial_transport, "in_waiting"))  # noqa: B009
-        except Exception:
-            self._update_legacy_status_from_chunk(
-                chunk, prior_tail, temperature_unit, serial_transport, epoch, handle_token
-            )
-            self._discard_receipt_report_record(
-                serial_transport, epoch, handle_token, count_read_error=True
-            )
-            return
-        if not _is_nonnegative_exact_int(queued_after):
-            self._update_legacy_status_from_chunk(
-                chunk, prior_tail, temperature_unit, serial_transport, epoch, handle_token
-            )
-            self._discard_receipt_report_record(
-                serial_transport, epoch, handle_token, count_read_error=True
-            )
-            return
         if not isinstance(chunk, bytes) or not chunk:
             self._discard_receipt_report_record(serial_transport, epoch, handle_token)
             return
 
         try:
-            scan = scan_hottop_status_read(
-                chunk,
-                prior_tail=prior_tail,
-                queued_before_read=queued_before_int,
-                requested_byte_count=requested,
-                temperature_unit=temperature_unit,
-            )
             statuses, remaining_buffer = _parse_hottop_status_buffer(
                 prior_tail + chunk,
                 temperature_unit=temperature_unit,
             )
-            scan_matches_legacy = (
-                scan.packets == tuple(statuses) and scan.tail_bytes == remaining_buffer
-            )
         except Exception:
-            self._update_legacy_status_from_chunk(
-                chunk, prior_tail, temperature_unit, serial_transport, epoch, handle_token
-            )
             self._discard_receipt_report_record(
                 serial_transport, epoch, handle_token, count_read_error=True
             )
             return
 
         with self._state_lock:
-            if not scan_matches_legacy or not self._receipt_report_binding_is_active_locked(
+            if not self._receipt_report_binding_is_active_locked(
                 serial_transport, epoch, handle_token
             ):
-                if self._receipt_report_binding_is_active_locked(
-                    serial_transport, epoch, handle_token
-                ):
-                    self._receipt_report_record = None
-                    self._receipt_report_discard_count += 1
                 return
             self._publish_legacy_statuses_locked(statuses, remaining_buffer)
-            if started_at is None:
-                self._receipt_report_record = None
-                self._receipt_report_discard_count += 1
-                self._status_read_error_count += 1
-                return
-            self._receipt_report_sequence += 1
-            self._receipt_report_record = build_hottop_received_packet(
-                epoch=epoch,
-                handle_identity=handle_token,
-                sequence=self._receipt_report_sequence,
-                read_started_at=started_at,
-                read_returned_at=returned_at,
-                configured_temperature_unit=temperature_unit,
-                queued_before_read=queued_before_int,
-                queued_after_read=queued_after,
-                scan=scan,
-                drained_floor=self._receipt_report_floor,
+        self._publish_receipt_report_diagnostics(
+            serial_transport,
+            epoch,
+            handle_token,
+            chunk,
+            prior_tail,
+            temperature_unit,
+            queued_before_int,
+            diagnostic_queue_before,
+            requested,
+            started_at,
+            statuses,
+            remaining_buffer,
+        )
+
+    def _publish_receipt_report_diagnostics(
+        self,
+        serial_transport: SerialTransport,
+        epoch: int,
+        handle_token: int,
+        chunk: bytes,
+        prior_tail: bytes,
+        temperature_unit: HottopTemperatureUnit,
+        queued_before: int,
+        diagnostic_queue_before: bool,
+        requested: int,
+        started_at: float | None,
+        statuses: list[HottopStatusPacket],
+        remaining_buffer: bytes,
+    ) -> None:
+        """Publish optional receipt facts without changing ordinary parser state."""
+        returned_at = self._receipt_report_clock_sample()
+        try:
+            queued_after = cast(object, getattr(serial_transport, "in_waiting"))  # noqa: B009
+        except Exception:
+            self._discard_receipt_report_record(serial_transport, epoch, handle_token)
+            return
+        if (
+            started_at is None
+            or returned_at is None
+            or not diagnostic_queue_before
+            or not _is_nonnegative_exact_int(queued_after)
+        ):
+            self._discard_receipt_report_record(serial_transport, epoch, handle_token)
+            return
+        try:
+            scan = scan_hottop_status_read(
+                chunk,
+                prior_tail=prior_tail,
+                queued_before_read=queued_before,
+                requested_byte_count=requested,
+                temperature_unit=temperature_unit,
             )
-            if queued_after == 0 and scan.tail_length == 0:
-                self._receipt_report_floor = HottopDrainedFloor(
+        except Exception:
+            self._discard_receipt_report_record(serial_transport, epoch, handle_token)
+            return
+        if scan.packets != tuple(statuses) or scan.tail_bytes != remaining_buffer:
+            self._discard_receipt_report_record(serial_transport, epoch, handle_token)
+            return
+        with self._state_lock:
+            if not self._receipt_report_binding_is_active_locked(
+                serial_transport, epoch, handle_token
+            ):
+                return
+            try:
+                sequence = self._receipt_report_sequence + 1
+                receipt = build_hottop_received_packet(
                     epoch=epoch,
                     handle_identity=handle_token,
-                    sequence=self._receipt_report_sequence,
-                    observed_at=returned_at,
+                    sequence=sequence,
+                    read_started_at=started_at,
+                    read_returned_at=returned_at,
+                    configured_temperature_unit=temperature_unit,
+                    queued_before_read=queued_before,
+                    queued_after_read=queued_after,
+                    scan=scan,
+                    drained_floor=self._receipt_report_floor,
                 )
+                floor = (
+                    HottopDrainedFloor(epoch, handle_token, sequence, returned_at)
+                    if queued_after == 0 and scan.tail_length == 0
+                    else None
+                )
+            except Exception:
+                self._receipt_report_record = None
+                self._receipt_report_discard_count += 1
+                return
+            self._receipt_report_sequence = sequence
+            self._receipt_report_record = receipt
+            self._receipt_report_last_observed_at = returned_at
+            if floor is not None:
+                self._receipt_report_floor = floor
+
+    def _receipt_report_clock_sample(self) -> float | None:
+        """Return one finite observer-clock value without letting diagnostics escape."""
+        try:
+            value = self._reception_clock()
+            _validate_finite_time(value, label="receipt_report_clock")
+            return float(value)
+        except Exception:
+            return None
 
     def _update_legacy_status_from_chunk(
         self,
