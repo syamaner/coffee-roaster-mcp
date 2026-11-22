@@ -10,7 +10,7 @@ from importlib import import_module
 from math import isfinite
 from threading import Event, Lock, Thread
 from time import monotonic
-from typing import Any, Literal, Protocol, cast, runtime_checkable
+from typing import Any, Literal, Never, Protocol, cast, runtime_checkable
 
 from coffee_roaster_mcp.controls import validate_control_percent
 from coffee_roaster_mcp.session import EventPayloadValue, SessionPurpose
@@ -524,10 +524,6 @@ HottopSettlementResult = Literal[
 HottopAttemptRole = Literal["ordinary", "drop", "emergency", "repeat"]
 
 
-class HottopDropRefused(RuntimeError):
-    """Raised when candidate-mode Drop admission retains uncertain ownership."""
-
-
 @dataclass(frozen=True)
 class HottopWriteAttempt:
     """Bounded host-side evidence for one candidate command write entry."""
@@ -556,6 +552,48 @@ class HottopCommandSettlement:
     attempt_handle_identity: int | None = None
     attempt_seq: int | None = None
     attempt_revision: int | None = None
+
+
+HottopExactDropRefusalReason = Literal[
+    "candidate_mode_required",
+    "receipt_age_bound_unset",
+    "stop_first",
+    "stream_lost",
+    "receipt_replaced",
+    "receipt_missing",
+    "receipt_ineligible",
+    "receipt_expired",
+    "prior_unresolved",
+    "prior_drop_open",
+    "prior_drop_transition_unaccounted",
+    "emergency_since_session_baseline",
+]
+
+
+@dataclass(frozen=True)
+class HottopExactDropRefusalEvidence:
+    """Closed driver evidence for one refused candidate exact-Drop invocation.
+
+    `retained_prior_drop` is separate from the invocation reason: it identifies
+    a prior Drop settlement without inferring that its commanded or physical
+    effect is absent.
+    """
+
+    reason: HottopExactDropRefusalReason
+    retained_prior_drop: HottopCommandSettlement | None = None
+
+
+class HottopDropRefused(RuntimeError):
+    """Legacy base for candidate-mode Drop admission refusal."""
+
+
+class HottopExactDropRefused(HottopDropRefused):
+    """Raised with typed evidence when an exact candidate Drop is refused."""
+
+    def __init__(self, evidence: HottopExactDropRefusalEvidence) -> None:
+        """Store closed refusal evidence while retaining RuntimeError compatibility."""
+        self.evidence = evidence
+        super().__init__(evidence.reason)
 
 
 @dataclass(frozen=True)
@@ -862,6 +900,56 @@ class HottopReceiptClassification:
     def primary_reason(self) -> HottopReceiptReason | None:
         """Return the first fixed-order ineligibility reason, when present."""
         return self.reasons[0] if self.reasons else None
+
+
+@dataclass(frozen=True)
+class HottopExactDropCandidate:
+    """Immutable driver snapshot required for one candidate exact Drop.
+
+    This is a host-side identity snapshot, not a physical-state claim. The
+    driver mints it while holding its state lock, and rechecks every field at
+    admission. `streaming` distinguishes a revoked stream from a receipt that
+    was merely ineligible when observed.
+
+    Attributes:
+        streaming: Whether the driver owned an active candidate stream.
+        epoch: Current candidate reception epoch.
+        handle_token: Opaque token for the current stream handle.
+        receipt_sequence: Current receipt sequence.
+        receipt: Current typed host receipt, if one remains published.
+        receipt_classification: Point-in-time host-receipt eligibility.
+        drop_transition_count: Candidate Drop transition count.
+        emergency_count: Candidate Stop transition count.
+        drop_settlement: Current Drop settlement, if any.
+        emergency_settlements: Retained candidate Stop settlements.
+    """
+
+    streaming: bool
+    epoch: int
+    handle_token: int
+    receipt_sequence: int
+    receipt: HottopReceivedPacket | None
+    receipt_classification: HottopReceiptClassification
+    drop_transition_count: int
+    emergency_count: int
+    drop_settlement: HottopCommandSettlement | None
+    emergency_settlements: tuple[HottopCommandSettlement, ...]
+
+
+@dataclass(frozen=True)
+class HottopExactDropArbitration:
+    """Store-owned operation evidence bound to one driver receipt snapshot.
+
+    Session and operation fields are intentionally opaque to the driver: the
+    session store owns their meaning and arbitration policy. The driver uses
+    only `candidate` to prove its own stream, receipt, and command-state
+    invariants at the atomic command transition.
+    """
+
+    operation_id: str
+    session_id: str
+    operation_token: str
+    candidate: HottopExactDropCandidate
 
 
 def scan_hottop_status_read(
@@ -1639,6 +1727,7 @@ class HottopRoasterDriver:
         command_frame_provider: HottopCommandFrameProvider | None = None,
         hottop_reception: HottopReceptionMode = "off",
         reception_clock: Callable[[], float] | None = None,
+        simulation_receipt_age_bound_seconds: float | None = None,
     ) -> None:
         """Initialize Hottop lifecycle dependencies.
 
@@ -1653,6 +1742,8 @@ class HottopRoasterDriver:
             command_frame_provider: Optional command-frame source for each loop tick.
             hottop_reception: Opt-in host-receipt candidate mode.
             reception_clock: Optional injected host clock for simulated candidate tests.
+            simulation_receipt_age_bound_seconds: Required positive host-receipt
+                age bound for candidate exact Drop admission.
         """
         if command_interval_seconds <= 0:
             raise ValueError("command_interval_seconds must be greater than 0.")
@@ -1672,6 +1763,11 @@ class HottopRoasterDriver:
             raise ValueError("candidate/v1 requires temperature_unit celsius.")
         if hottop_reception == "candidate/v1" and command_frame_provider is not None:
             raise ValueError("candidate/v1 does not permit command_frame_provider.")
+        if simulation_receipt_age_bound_seconds is not None:
+            _validate_positive_finite_bound(
+                simulation_receipt_age_bound_seconds,
+                label="simulation_receipt_age_bound_seconds",
+            )
         self._port = port
         self._baudrate = baudrate
         self._temperature_unit: HottopTemperatureUnit = normalized_temperature_unit
@@ -1681,6 +1777,7 @@ class HottopRoasterDriver:
         )
         self._hottop_reception: HottopReceptionMode = hottop_reception
         self._reception_clock = reception_clock or monotonic
+        self._simulation_receipt_age_bound_seconds = simulation_receipt_age_bound_seconds
         self._join_timeout_seconds = join_timeout_seconds
         self._serial: SerialTransport | None = None
         self._connected = False
@@ -2149,6 +2246,40 @@ class HottopRoasterDriver:
             for settlement in settlements
         )
 
+    def _candidate_reconnect_inhibited_locked(self) -> bool:
+        """Return whether retained candidate command ownership forbids reconnect.
+
+        Reconnect has a narrower boundary than a new staged Start: ordinary
+        preconnect command state, such as a fan setting, remains supported.
+        A commanded open chute would be replayed on the replacement stream,
+        however, and any unresolved Drop or Stop settlement remains owned by
+        its earlier transport.
+        """
+        if self._hottop_reception != "candidate/v1":
+            return False
+        if self._solenoid_open:
+            return True
+        # Exact-Drop ownership is only enabled for the bounded simulated
+        # receipt path.  Preserve ordinary candidate reconnect compatibility
+        # when that opt-in is absent: a disconnected Stop must not prevent
+        # its normal lifecycle recovery.  A prior unresolved Drop remains
+        # independent command ownership and cannot be replayed on a
+        # replacement stream.
+        if self._simulation_receipt_age_bound_seconds is None:
+            return self._drop_settlement is not None and self._drop_settlement.result in {
+                "pending",
+                "entering",
+                "unknown",
+            }
+        settlements = (
+            (self._drop_settlement, *self._emergency_settlements)
+            if self._drop_settlement is not None
+            else tuple(self._emergency_settlements)
+        )
+        return any(
+            settlement.result in {"pending", "entering", "unknown"} for settlement in settlements
+        )
+
     def _refuse_staged_connect(self) -> None:
         """Refuse unrelated legacy reuse before waiting on native lifecycle work."""
         with self._state_lock:
@@ -2165,6 +2296,12 @@ class HottopRoasterDriver:
                     return
                 if self._command_thread is not None and self._command_thread.is_alive():
                     raise RuntimeError("Previous Hottop command loop is still stopping.")
+                if (
+                    self._hottop_reception == "candidate/v1"
+                    and self._reception_epoch != 0
+                    and self._candidate_reconnect_inhibited_locked()
+                ):
+                    raise RuntimeError("candidate/v1 retains command ownership before reconnect.")
                 if self._port is None:
                     raise ValueError("Hottop serial port is required before connect.")
                 port = self._port
@@ -2179,19 +2316,34 @@ class HottopRoasterDriver:
                 write_timeout=self._write_timeout_seconds,
             )
 
+            replacement_inhibited = False
             with self._state_lock:
-                self._serial = serial_transport
-                if self._hottop_reception == "candidate/v1":
-                    self._begin_reception_epoch(serial_transport)
-                self._connected = True
-                self._disconnect_requested.clear()
-                self._stop_event.clear()
-                self._command_thread = Thread(
-                    target=self._command_loop,
-                    daemon=True,
-                    name="HottopCommandLoop",
-                )
-                self._command_thread.start()
+                # Factory entry is unbounded.  Recheck the precise reconnect
+                # boundary before publishing its handle so a prior epoch's
+                # exact Drop cannot be written or settled on this transport.
+                if (
+                    self._hottop_reception == "candidate/v1"
+                    and self._reception_epoch != 0
+                    and self._candidate_reconnect_inhibited_locked()
+                ):
+                    replacement_inhibited = True
+                else:
+                    self._serial = serial_transport
+                    if self._hottop_reception == "candidate/v1":
+                        self._begin_reception_epoch(serial_transport)
+                    self._connected = True
+                    self._disconnect_requested.clear()
+                    self._stop_event.clear()
+                    self._command_thread = Thread(
+                        target=self._command_loop,
+                        daemon=True,
+                        name="HottopCommandLoop",
+                    )
+                    self._command_thread.start()
+            if replacement_inhibited:
+                if serial_transport.is_open:
+                    serial_transport.close()
+                raise RuntimeError("candidate/v1 retains command ownership before reconnect.")
 
     def disconnect(self) -> None:
         """Stop command loop and close serial transport."""
@@ -2410,37 +2562,182 @@ class HottopRoasterDriver:
             self._command_state_revision += 1
         return self.read_state()
 
-    def drop_beans(self) -> RoasterState:
+    def snapshot_exact_drop_candidate(self) -> HottopExactDropCandidate:
+        """Return one immutable candidate exact-Drop snapshot under the state lock."""
+        if self._hottop_reception != "candidate/v1":
+            raise RuntimeError("Exact Drop candidates require candidate/v1 reception.")
+        with self._state_lock:
+            return HottopExactDropCandidate(
+                streaming=self._candidate_streaming_owner_locked(),
+                epoch=self._reception_epoch,
+                handle_token=self._reception_handle_token,
+                receipt_sequence=self._reception_sequence,
+                receipt=self._reception_record,
+                receipt_classification=self._classify_current_receipt_locked(),
+                drop_transition_count=self._drop_transition_count,
+                emergency_count=self._emergency_count,
+                drop_settlement=self._drop_settlement,
+                emergency_settlements=tuple(self._emergency_settlements),
+            )
+
+    def drop_beans(
+        self,
+        *,
+        exact_drop: HottopExactDropArbitration | ExactDropArbitration | None = None,
+    ) -> RoasterState:
         """Apply Hottop compound bean-drop command state."""
         with self._state_lock:
-            if self._hottop_reception == "candidate/v1" and (
-                self._solenoid_open
-                or (
-                    self._drop_settlement is not None
-                    and self._drop_settlement.result in {"pending", "entering", "unknown"}
-                )
-            ):
+            if exact_drop is not None:
+                if not isinstance(exact_drop, HottopExactDropArbitration):
+                    raise TypeError("candidate exact Drop requires HottopExactDropArbitration.")
+                self._admit_exact_drop_locked(exact_drop)
+            elif self._hottop_reception == "candidate/v1" and self._drop_is_unresolved_locked():
                 raise HottopDropRefused("candidate Drop retains an unresolved command settlement.")
-            self._heat_level_percent = 0
-            # Keep the drum motor RUNNING through the drop so the rotating drum
-            # tumbles beans out the open chute. A stopped drum traps ~half the
-            # charge below the chute (coffee-roaster-mcp#163). stop_cooling is
-            # the end-of-roast action that stops the drum once beans are clear.
-            self._drum_motor_on = True
-            self._solenoid_open = True
-            self._cooling_motor_on = True
-            self._main_fan_level_percent = 100
-            self._command_state_revision += 1
-            if self._hottop_reception == "candidate/v1":
-                self._drop_transition_count += 1
-                self._drop_settlement = HottopCommandSettlement(
-                    transition="drop",
-                    transition_seq=self._drop_transition_count,
-                    transition_revision=self._command_state_revision,
-                    transition_epoch=self._reception_epoch,
-                    result="pending",
-                )
+            self._apply_drop_transition_locked()
         return self.read_state()
+
+    def _candidate_streaming_owner_locked(self) -> bool:
+        """Return whether one staged owner still owns the live candidate stream."""
+        command_thread = self._command_thread
+        return bool(
+            self._serial is not None
+            and self._serial.is_open
+            and self._connected
+            and not self._disconnect_requested.is_set()
+            and not self._stop_event.is_set()
+            and self._start_owner is not None
+            and self._start_phase is HottopStartPhase.STREAMING
+            and self._start_handle is self._serial
+            and self._start_stream_admission is not None
+            and self._start_stream_admission.is_set()
+            and command_thread is not None
+            and command_thread.is_alive()
+        )
+
+    def _drop_is_unresolved_locked(self) -> bool:
+        """Return whether candidate command ownership forbids another Drop."""
+        return self._solenoid_open or (
+            self._drop_settlement is not None
+            and self._drop_settlement.result in {"pending", "entering", "unknown"}
+        )
+
+    def _admit_exact_drop_locked(self, exact_drop: HottopExactDropArbitration) -> None:
+        """Recheck one receipt identity and admit only an exact candidate Drop."""
+        if self._hottop_reception != "candidate/v1":
+            self._raise_exact_drop_refused("candidate_mode_required")
+        age_bound = self._simulation_receipt_age_bound_seconds
+        if age_bound is None:
+            self._raise_exact_drop_refused("receipt_age_bound_unset")
+        candidate = exact_drop.candidate
+        prior_drop = self._drop_settlement
+        if prior_drop is not None and prior_drop.result in {"pending", "entering", "unknown"}:
+            self._raise_exact_drop_refused("prior_unresolved")
+        if self._solenoid_open:
+            self._raise_exact_drop_refused("prior_drop_open")
+        if not candidate.receipt_classification.eligible:
+            self._raise_exact_drop_refused("receipt_ineligible")
+        if (
+            candidate.drop_transition_count != self._drop_transition_count
+            or candidate.drop_settlement != self._drop_settlement
+        ):
+            self._raise_exact_drop_refused("prior_drop_transition_unaccounted")
+        if (
+            candidate.emergency_count != self._emergency_count
+            or candidate.emergency_settlements != tuple(self._emergency_settlements)
+        ):
+            self._raise_exact_drop_refused("emergency_since_session_baseline")
+        if not candidate.streaming or not self._candidate_streaming_owner_locked():
+            self._raise_exact_drop_refused("stream_lost")
+        if (
+            candidate.epoch != self._reception_epoch
+            or candidate.handle_token != self._reception_handle_token
+        ):
+            self._raise_exact_drop_refused("stream_lost")
+        if candidate.receipt is not self._reception_record:
+            self._raise_exact_drop_refused(
+                "receipt_missing" if self._reception_record is None else "receipt_replaced"
+            )
+        if candidate.receipt_sequence != self._reception_sequence:
+            self._raise_exact_drop_refused("receipt_replaced")
+        classification = self._classify_current_receipt_locked()
+        if not classification.eligible:
+            reason: HottopExactDropRefusalReason = (
+                "receipt_expired"
+                if "receipt_age_exceeds_bound" in classification.reasons
+                else "receipt_ineligible"
+            )
+            self._raise_exact_drop_refused(reason)
+        if self._receipt_age_regressed(candidate.receipt_classification, classification):
+            self._raise_exact_drop_refused("receipt_ineligible")
+
+    @staticmethod
+    def _receipt_age_regressed(
+        original: HottopReceiptClassification,
+        current: HottopReceiptClassification,
+    ) -> bool:
+        """Return whether a later admission observes an impossible younger receipt age."""
+        return any(
+            current_age is not None and original_age is not None and current_age < original_age
+            for original_age, current_age in (
+                (
+                    original.drained_floor_age_seconds,
+                    current.drained_floor_age_seconds,
+                ),
+                (
+                    original.read_returned_age_seconds,
+                    current.read_returned_age_seconds,
+                ),
+            )
+        )
+
+    def _raise_exact_drop_refused(self, reason: HottopExactDropRefusalReason) -> Never:
+        """Raise typed exact-Drop refusal without erasing retained ownership."""
+        prior_drop = self._drop_settlement
+        retained_prior_drop = (
+            prior_drop
+            if reason == "prior_drop_open"
+            else (
+                prior_drop
+                if prior_drop is not None
+                and prior_drop.result in {"pending", "entering", "unknown"}
+                else None
+            )
+        )
+        raise HottopExactDropRefused(HottopExactDropRefusalEvidence(reason, retained_prior_drop))
+
+    def _classify_current_receipt_locked(self) -> HottopReceiptClassification:
+        """Classify the current receipt from this driver's injected host clock."""
+        return classify_hottop_received_packet(
+            self._reception_record,
+            candidate_configured=True,
+            current_epoch=self._reception_epoch,
+            current_handle_identity=self._reception_handle_token,
+            current_sequence=self._reception_sequence,
+            now=self._reception_clock(),
+            receipt_age_bound_seconds=self._simulation_receipt_age_bound_seconds,
+        )
+
+    def _apply_drop_transition_locked(self) -> None:
+        """Apply the shared compound Drop transition while the state lock is held."""
+        self._heat_level_percent = 0
+        # Keep the drum motor RUNNING through the drop so the rotating drum
+        # tumbles beans out the open chute. A stopped drum traps ~half the
+        # charge below the chute (coffee-roaster-mcp#163). stop_cooling is the
+        # end-of-roast action that stops the drum once beans are clear.
+        self._drum_motor_on = True
+        self._solenoid_open = True
+        self._cooling_motor_on = True
+        self._main_fan_level_percent = 100
+        self._command_state_revision += 1
+        if self._hottop_reception == "candidate/v1":
+            self._drop_transition_count += 1
+            self._drop_settlement = HottopCommandSettlement(
+                transition="drop",
+                transition_seq=self._drop_transition_count,
+                transition_revision=self._command_state_revision,
+                transition_epoch=self._reception_epoch,
+                result="pending",
+            )
 
     def start_cooling(self) -> RoasterState:
         """Start Hottop cooling motor and main fan."""
@@ -3150,6 +3447,8 @@ def create_roaster_driver(
     command_interval_seconds: float = 0.3,
     hottop_reception: HottopReceptionMode = "off",
     serial_factory: SerialTransportFactory | None = None,
+    reception_clock: Callable[[], float] | None = None,
+    simulation_receipt_age_bound_seconds: float | None = None,
 ) -> RoasterDriver:
     """Create the configured roaster driver.
 
@@ -3161,6 +3460,9 @@ def create_roaster_driver(
         command_interval_seconds: Configured command interval.
         hottop_reception: Opt-in Hottop receipt candidate mode.
         serial_factory: Trusted injected simulated serial transport factory.
+        reception_clock: Trusted host clock for deterministic simulated reception.
+        simulation_receipt_age_bound_seconds: Positive candidate exact-Drop host
+            receipt age bound supplied by trusted composition.
 
     Returns:
         Driver adapter for the configured driver.
@@ -3180,6 +3482,8 @@ def create_roaster_driver(
             command_interval_seconds=command_interval_seconds,
             hottop_reception=hottop_reception,
             serial_factory=serial_factory,
+            reception_clock=reception_clock,
+            simulation_receipt_age_bound_seconds=simulation_receipt_age_bound_seconds,
         )
     raise ValueError(
         f"Roaster driver {driver_name!r} is not implemented in this bootstrap runtime."

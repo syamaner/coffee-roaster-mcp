@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from dataclasses import replace
 from enum import IntEnum
-from threading import Event, Lock, Thread, get_ident
+from threading import Condition, Event, Lock, Thread, get_ident
 from time import monotonic, sleep
 from typing import Any, Never, cast
 
@@ -17,9 +17,12 @@ from coffee_roaster_mcp.drivers import (
     HOTTOP_PACKET_PREFIX,
     CommandStreaming,
     DriverLifecycleEvidence,
+    ExactDropArbitration,
     FixedZeroCommandedState,
     HottopDrainedFloor,
     HottopDropRefused,
+    HottopExactDropArbitration,
+    HottopExactDropRefused,
     HottopFirstWriteDisposition,
     HottopReceiptClassification,
     HottopReceivedPacket,
@@ -231,6 +234,18 @@ class FakeSerialFactory:
     def __call__(self, *args: object, **kwargs: object) -> FakeSerialTransport:
         self.calls.append((args, kwargs))
         return self.transport
+
+
+class SequentialSerialFactory:
+    """Factory that returns its supplied fake transports in connection order."""
+
+    def __init__(self, transports: list[FakeSerialTransport]) -> None:
+        self.transports = transports
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def __call__(self, *args: object, **kwargs: object) -> FakeSerialTransport:
+        self.calls.append((args, kwargs))
+        return self.transports[len(self.calls) - 1]
 
 
 class BlockingSerialFactory:
@@ -1112,6 +1127,809 @@ def test_candidate_refuses_provider_non_celsius_and_mock_composition() -> None:
         )
     with pytest.raises(ValueError, match="mock driver"):
         create_roaster_driver("mock", hottop_reception="candidate/v1")
+
+
+class MutableReceptionClock:
+    """Deterministic injected host clock for candidate exact-Drop tests."""
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        """Return the current test-controlled host time."""
+        return self.value
+
+
+class SteppedLoopGate:
+    """Park the real command worker after each completed iteration for tests."""
+
+    def __init__(self) -> None:
+        self._condition = Condition()
+        self._completed = 0
+        self._released = 0
+        self._closing = False
+        self.failure: BaseException | None = None
+
+    def __call__(self) -> None:
+        """Report one complete iteration and wait for its explicit release."""
+        with self._condition:
+            self._completed += 1
+            generation = self._completed
+            self._condition.notify_all()
+            deadline = monotonic() + 1.0
+            while not self._closing and self._released < generation:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    self.failure = AssertionError(
+                        f"command worker was not released after iteration {generation}"
+                    )
+                    self._condition.notify_all()
+                    raise self.failure
+                self._condition.wait(timeout=remaining)
+
+    def wait_completed(self, generation: int) -> None:
+        """Require the real worker to have completed one exact iteration."""
+        with self._condition:
+            deadline = monotonic() + 1.0
+            while self._completed < generation and self.failure is None:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise AssertionError(f"command worker did not complete iteration {generation}")
+                self._condition.wait(timeout=remaining)
+            if self.failure is not None:
+                raise AssertionError("command worker hook failed") from self.failure
+
+    def release(self, generation: int) -> None:
+        """Release exactly the worker iteration identified by ``generation``."""
+        with self._condition:
+            assert self._completed >= generation
+            assert self._released == generation - 1
+            self._released = generation
+            self._condition.notify_all()
+
+    def close(self) -> None:
+        """Unblock a parked worker during deterministic test cleanup."""
+        with self._condition:
+            self._closing = True
+            self._condition.notify_all()
+
+
+def _stepped_candidate_exact_drop_driver(
+    transport: FakeSerialTransport | None = None,
+    *,
+    serial_factory: SerialTransportFactory | None = None,
+    simulation_receipt_age_bound_seconds: float | None = 3.0,
+    require_eligible_receipt: bool = True,
+) -> tuple[HottopRoasterDriver, FakeSerialTransport, MutableReceptionClock, SteppedLoopGate]:
+    """Build a live candidate stream using only its stepped native worker."""
+    transport = transport or FakeSerialTransport()
+    clock = MutableReceptionClock(10.0)
+    gate = SteppedLoopGate()
+    driver = HottopRoasterDriver(
+        port="fake",
+        command_interval_seconds=0.01,
+        serial_factory=serial_factory or FakeSerialFactory(transport),
+        hottop_reception="candidate/v1",
+        reception_clock=clock,
+        simulation_receipt_age_bound_seconds=simulation_receipt_age_bound_seconds,
+        command_loop_iteration_hook=gate,
+    )
+    owner = driver.reserve_inhibited_start("server", purpose="roast")
+    driver.open_inhibited_start(owner)
+    driver.begin_inhibited_start_promotion(owner)
+    session = object()
+    driver.bind_promoted_inhibited_start(owner, session)
+    claim = driver.claim_prepared_first_write(driver.prepare_promoted_first_write(owner, session))
+    assert driver.dispatch_claimed_first_write(claim) is HottopFirstWriteDisposition.WRITTEN
+    driver.hand_off_written_start_to_stream(owner, session)
+    try:
+        gate.wait_completed(1)
+        if not require_eligible_receipt:
+            return driver, transport, clock, gate
+        drained = driver.snapshot_exact_drop_candidate()
+        assert drained.receipt_sequence == 0
+        assert drained.receipt is None
+        assert drained.receipt_classification.reasons == ("no_receipt",)
+        sleep(0.01)
+        clock.value = 11.0
+        transport.queue_read_data(
+            _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=195)
+        )
+        gate.release(1)
+        gate.wait_completed(2)
+        receipt = driver.snapshot_exact_drop_candidate()
+        assert receipt.receipt_sequence == 1
+        assert receipt.receipt is not None
+        assert receipt.receipt.latest_pair_c == (195.0, 202.0)
+        assert receipt.receipt_classification.eligible is True
+        return driver, transport, clock, gate
+    except BaseException:
+        _close_stepped_candidate_driver(driver, gate)
+        raise
+
+
+def _close_stepped_candidate_driver(driver: HottopRoasterDriver, gate: SteppedLoopGate) -> None:
+    """Release and join the one real worker even when a test assertion fails."""
+    gate.close()
+    driver.disconnect()
+    if gate.failure is not None:
+        raise AssertionError("command worker hook failed") from gate.failure
+
+
+def _exact_drop_arbitration(driver: HottopRoasterDriver) -> HottopExactDropArbitration:
+    """Bind one opaque store operation to the driver's current receipt snapshot."""
+    return HottopExactDropArbitration(
+        operation_id="operation-1",
+        session_id="session-1",
+        operation_token="token-1",
+        candidate=driver.snapshot_exact_drop_candidate(),
+    )
+
+
+def test_candidate_exact_drop_admits_one_current_receipt_and_one_command_revision() -> None:
+    """One current eligible receipt admits exactly the shared Drop transition."""
+    driver, transport, clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        clock.value = 12.0
+        arbitration = _exact_drop_arbitration(driver)
+        revision_before = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+        state = driver.drop_beans(exact_drop=arbitration)
+        gate.release(2)
+        gate.wait_completed(3)
+        writes = transport.writes_snapshot()
+        assert arbitration.candidate.streaming is True
+        assert arbitration.candidate.receipt_classification.eligible is True
+        assert state.raw_vendor_data["solenoid_open"] is True
+        assert driver._command_state_revision == revision_before + 1  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_transition_count == 1  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_settlement.transition_revision == revision_before + 1  # pyright: ignore[reportPrivateUsage]
+        assert writes[-1][10] == 0
+        assert writes[-1][16] == 1
+        assert (
+            sum(
+                previous[16] == 0 and current[16] == 1
+                for previous, current in zip(writes, writes[1:], strict=False)
+            )
+            == 1
+        )
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_exact_drop_refuses_mock_only_arbitration_without_receipt_identity() -> None:
+    """Mock arbitration cannot substitute for an evaluated candidate receipt."""
+    driver, _transport, _clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        mock_only = ExactDropArbitration(
+            operation_id="operation-1",
+            session_id="session-1",
+            cancelled=Event(),
+            expected_drop_transition_count=0,
+            expected_emergency_count=0,
+        )
+        with pytest.raises(TypeError, match="HottopExactDropArbitration"):
+            driver.drop_beans(exact_drop=mock_only)
+        assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_exact_drop_refuses_receipt_replaced_after_snapshot() -> None:
+    """A later producer receipt supersedes the exact snapshot before admission."""
+    driver, transport, clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        arbitration = _exact_drop_arbitration(driver)
+        clock.value = 12.0
+        transport.queue_read_data(
+            _build_hottop_status_packet(raw_env_temperature=203, raw_bean_temperature=194)
+        )
+        gate.release(2)
+        gate.wait_completed(3)
+        with pytest.raises(HottopExactDropRefused) as raised:
+            driver.drop_beans(exact_drop=arbitration)
+        assert raised.value.evidence.reason == "receipt_replaced"
+        assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+        assert not any(
+            previous[16] == 0 and frame[16] == 1
+            for previous, frame in zip(
+                transport.writes_snapshot(), transport.writes_snapshot()[1:], strict=False
+            )
+        )
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_exact_drop_refuses_record_disappearing_after_snapshot() -> None:
+    """A current stream still refuses once its exact receipt is discarded."""
+    driver, transport, _clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        arbitration = _exact_drop_arbitration(driver)
+        driver._invalidate_candidate_receipt(transport, driver._reception_epoch)  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(HottopExactDropRefused) as raised:
+            driver.drop_beans(exact_drop=arbitration)
+        assert raised.value.evidence.reason == "receipt_missing"
+        assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_exact_drop_refuses_expired_same_receipt() -> None:
+    """The admission lock reclassifies the unchanged receipt with the injected clock."""
+    driver, _transport, clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        arbitration = _exact_drop_arbitration(driver)
+        clock.value = 14.1
+        with pytest.raises(HottopExactDropRefused) as raised:
+            driver.drop_beans(exact_drop=arbitration)
+        assert raised.value.evidence.reason == "receipt_expired"
+        assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_exact_drop_refuses_disconnect_epoch_change_after_snapshot() -> None:
+    """A revoked stream cannot use an otherwise eligible prior receipt."""
+    driver, _transport, _clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        arbitration = _exact_drop_arbitration(driver)
+        _close_stepped_candidate_driver(driver, gate)
+        with pytest.raises(HottopExactDropRefused) as raised:
+            driver.drop_beans(exact_drop=arbitration)
+        assert raised.value.evidence.reason == "stream_lost"
+        assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_exact_drop_refuses_stop_linearised_first() -> None:
+    """An independent Stop before admission prevents an additional Drop transition."""
+    driver, _transport, _clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        arbitration = _exact_drop_arbitration(driver)
+        driver.emergency_stop(reason="test")
+        revision_after_stop = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(HottopExactDropRefused) as raised:
+            driver.drop_beans(exact_drop=arbitration)
+        assert raised.value.evidence.reason == "emergency_since_session_baseline"
+        assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+        assert driver._emergency_count == 1  # pyright: ignore[reportPrivateUsage]
+        assert driver._command_state_revision == revision_after_stop  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_exact_drop_refuses_changed_drop_history_without_replacing_receipt() -> None:
+    """A settled prior Drop remains distinct from a replaced receipt snapshot."""
+    driver, transport, clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        arbitration = _exact_drop_arbitration(driver)
+        receipt = arbitration.candidate.receipt
+        driver.drop_beans(exact_drop=arbitration)
+        gate.release(2)
+        gate.wait_completed(3)
+        writes_after_drop = transport.writes_snapshot()
+        assert any(
+            previous[16] == 0 and frame[16] == 1
+            for previous, frame in zip(writes_after_drop, writes_after_drop[1:], strict=False)
+        )
+        driver.stop_cooling()
+        gate.release(3)
+        gate.wait_completed(4)
+        assert receipt is driver._reception_record  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(HottopExactDropRefused) as unchanged_receipt:
+            driver.drop_beans(exact_drop=arbitration)
+        assert unchanged_receipt.value.evidence.reason == "prior_drop_transition_unaccounted"
+        replacement_start = len(transport.writes_snapshot())
+        clock.value = 12.0
+        transport.queue_read_data(
+            _build_hottop_status_packet(raw_env_temperature=203, raw_bean_temperature=194)
+        )
+        gate.release(4)
+        gate.wait_completed(5)
+        replacement_receipt = driver._reception_record  # pyright: ignore[reportPrivateUsage]
+        assert replacement_receipt is not None
+        assert replacement_receipt.latest_pair_c == (194.0, 203.0)
+        with pytest.raises(HottopExactDropRefused) as raised:
+            driver.drop_beans(exact_drop=arbitration)
+        assert raised.value.evidence.reason == "prior_drop_transition_unaccounted"
+        assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_settlement.result == "accepted_by_host"  # pyright: ignore[reportPrivateUsage]
+        replacement_writes = transport.writes_snapshot()[replacement_start:]
+        assert not any(
+            previous[16] == 0 and frame[16] == 1
+            for previous, frame in zip(replacement_writes, replacement_writes[1:], strict=False)
+        )
+        assert receipt is not replacement_receipt
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_exact_drop_refuses_accepted_open_drop_with_prior_evidence() -> None:
+    """An accepted commanded-open Drop refuses a duplicate before mutation."""
+    driver, _transport, _clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        arbitration = _exact_drop_arbitration(driver)
+        driver.drop_beans(exact_drop=arbitration)
+        gate.release(2)
+        gate.wait_completed(3)
+        revision = driver._command_state_revision  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(HottopExactDropRefused) as raised:
+            driver.drop_beans(exact_drop=arbitration)
+        assert raised.value.evidence.reason == "prior_drop_open"
+        assert raised.value.evidence.retained_prior_drop is not None
+        assert raised.value.evidence.retained_prior_drop.result == "accepted_by_host"
+        assert driver._command_state_revision == revision  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_transition_count == 1  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_stop_after_unknown_exact_drop_write_preserves_history_and_refuses_repeat() -> (
+    None
+):
+    """An uncertain first write retains its Drop and independent Stop history."""
+
+    class PartialTransport(FakeSerialTransport):
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data) if len(self.writes) == 1 else len(data) - 1
+
+    transport = PartialTransport()
+    driver, _transport, _clock, gate = _stepped_candidate_exact_drop_driver(transport)
+    try:
+        arbitration = _exact_drop_arbitration(driver)
+        driver.drop_beans(exact_drop=arbitration)
+        gate.release(2)
+        gate.wait_completed(3)
+        driver.emergency_stop(reason="test")
+        with pytest.raises(HottopExactDropRefused) as raised:
+            driver.drop_beans(exact_drop=arbitration)
+        assert raised.value.evidence.reason == "prior_unresolved"
+        assert raised.value.evidence.retained_prior_drop is not None
+        assert raised.value.evidence.retained_prior_drop.result == "unknown"
+        assert driver._drop_transition_count == 1  # pyright: ignore[reportPrivateUsage]
+        assert driver._emergency_count == 1  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_settlement.result == "unknown"  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_exact_drop_cannot_upgrade_an_originally_ineligible_receipt() -> None:
+    """A backwards host clock cannot make an ineligible snapshot admissible."""
+    driver, _transport, clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        clock.value = 14.1
+        arbitration = _exact_drop_arbitration(driver)
+        assert arbitration.candidate.receipt_classification.eligible is False
+        clock.value = 12.0
+        with pytest.raises(HottopExactDropRefused) as raised:
+            driver.drop_beans(exact_drop=arbitration)
+        assert raised.value.evidence.reason == "receipt_ineligible"
+        assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_exact_drop_refuses_backward_clock_for_originally_eligible_receipt() -> None:
+    """A backward host clock cannot upgrade an originally eligible snapshot."""
+    driver, _transport, clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        arbitration = _exact_drop_arbitration(driver)
+        assert arbitration.candidate.receipt_classification.eligible is True
+        clock.value = 10.0
+        with pytest.raises(HottopExactDropRefused) as raised:
+            driver.drop_beans(exact_drop=arbitration)
+        assert raised.value.evidence.reason == "receipt_ineligible"
+        assert driver._drop_transition_count == 0  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_stepped_worker_admits_one_drop_wire_edge() -> None:
+    """The native worker emits only one closed-to-open Drop edge after receipt 195."""
+    driver, transport, _clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        arbitration = _exact_drop_arbitration(driver)
+        driver.drop_beans(exact_drop=arbitration)
+        gate.release(2)
+        gate.wait_completed(3)
+        gate.release(3)
+        gate.wait_completed(4)
+        writes = transport.writes_snapshot()
+        assert writes[0][16] == 0
+        assert (
+            sum(
+                previous[16] == 0 and current[16] == 1
+                for previous, current in zip(writes, writes[1:], strict=False)
+            )
+            == 1
+        )
+        assert driver.snapshot_exact_drop_candidate().drop_transition_count == 1
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_stepped_worker_refuses_replaced_195_after_194() -> None:
+    """A later real-worker receipt replaces 195 before old arbitration dispatch."""
+    driver, transport, clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        old = _exact_drop_arbitration(driver)
+        clock.value = 12.0
+        transport.queue_read_data(
+            _build_hottop_status_packet(raw_env_temperature=203, raw_bean_temperature=194)
+        )
+        gate.release(2)
+        gate.wait_completed(3)
+        replacement = driver.snapshot_exact_drop_candidate()
+        assert replacement.receipt_sequence == 2
+        assert replacement.receipt is not None
+        assert replacement.receipt.latest_pair_c == (194.0, 203.0)
+        with pytest.raises(HottopExactDropRefused, match="receipt_replaced"):
+            driver.drop_beans(exact_drop=old)
+        gate.release(3)
+        gate.wait_completed(4)
+        gate.release(4)
+        gate.wait_completed(5)
+        writes = transport.writes_snapshot()
+        assert not any(
+            previous[16] == 0 and current[16] == 1
+            for previous, current in zip(writes, writes[1:], strict=False)
+        )
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_stepped_worker_refuses_backward_eligible_age() -> None:
+    """A 13-to-12 clock regression refuses the same otherwise eligible receipt."""
+    driver, transport, clock, gate = _stepped_candidate_exact_drop_driver()
+    try:
+        clock.value = 13.0
+        arbitration = _exact_drop_arbitration(driver)
+        assert arbitration.candidate.receipt_classification.eligible is True
+        clock.value = 12.0
+        with pytest.raises(HottopExactDropRefused, match="receipt_ineligible"):
+            driver.drop_beans(exact_drop=arbitration)
+        assert driver.snapshot_exact_drop_candidate().drop_transition_count == 0
+        gate.release(2)
+        gate.wait_completed(3)
+        gate.release(3)
+        gate.wait_completed(4)
+        writes = transport.writes_snapshot()
+        assert not any(
+            previous[16] == 0 and current[16] == 1
+            for previous, current in zip(writes, writes[1:], strict=False)
+        )
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_stepped_worker_keeps_prior_disposition_before_ineligible_receipt() -> None:
+    """Accepted-open and unknown prior Drops remain visible despite later ineligibility."""
+
+    class ShortDropTransport(FakeSerialTransport):
+        def write(self, data: bytes) -> int:
+            result = super().write(data)
+            return result - 1 if data[16] == 1 else result
+
+    for transport, expected_reason, expected_result in (
+        (FakeSerialTransport(), "prior_drop_open", "accepted_by_host"),
+        (ShortDropTransport(), "prior_unresolved", "unknown"),
+    ):
+        driver, transport, clock, gate = _stepped_candidate_exact_drop_driver(transport)
+        try:
+            first = _exact_drop_arbitration(driver)
+            driver.drop_beans(exact_drop=first)
+            gate.release(2)
+            gate.wait_completed(3)
+            if expected_result == "unknown":
+                driver.stop_cooling()
+                clock.value = 12.0
+                transport.queue_read_data(
+                    _build_hottop_status_packet(raw_env_temperature=203, raw_bean_temperature=194)
+                )
+                gate.release(3)
+                gate.wait_completed(4)
+            clock.value = 14.1
+            ineligible = _exact_drop_arbitration(driver)
+            assert ineligible.candidate.receipt_classification.eligible is False
+            with pytest.raises(HottopExactDropRefused) as raised:
+                driver.drop_beans(exact_drop=ineligible)
+            assert raised.value.evidence.reason == expected_reason
+            assert raised.value.evidence.retained_prior_drop is not None
+            assert raised.value.evidence.retained_prior_drop.result == expected_result
+        finally:
+            _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_stepped_worker_disconnect_preserves_pending_drop_before_write() -> None:
+    """Disconnecting a held ordinary write cannot credit or replace a pending Drop."""
+
+    class HeldOrdinaryWriteTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hold_ordinary_write = False
+            self.ordinary_write_started = Event()
+            self.release_ordinary_write = Event()
+
+        def write(self, data: bytes) -> int:
+            result = super().write(data)
+            if self.hold_ordinary_write and data[16] == 0:
+                self.ordinary_write_started.set()
+                assert self.release_ordinary_write.wait(timeout=1.0)
+            return result
+
+    held_transport = HeldOrdinaryWriteTransport()
+    driver, _transport, _clock, gate = _stepped_candidate_exact_drop_driver(held_transport)
+    disconnect_errors: list[BaseException] = []
+    try:
+        arbitration = _exact_drop_arbitration(driver)
+        driver.set_heat(heat_level_percent=25)
+        held_transport.hold_ordinary_write = True
+        gate.release(2)
+        assert held_transport.ordinary_write_started.wait(timeout=1.0)
+        driver.drop_beans(exact_drop=arbitration)
+
+        def disconnect() -> None:
+            try:
+                driver.disconnect()
+            except BaseException as error:
+                disconnect_errors.append(error)
+
+        disconnect_worker = Thread(target=disconnect)
+        disconnect_worker.start()
+        assert held_transport.closed.wait(timeout=1.0)
+        gate.close()
+        held_transport.release_ordinary_write.set()
+        disconnect_worker.join(timeout=1.0)
+        assert not disconnect_worker.is_alive()
+        assert disconnect_errors == []
+        candidate = driver.snapshot_exact_drop_candidate()
+        assert candidate.drop_settlement is not None
+        assert candidate.drop_settlement.result == "pending"
+        assert not any(frame[16] == 1 for frame in held_transport.writes_snapshot())
+        with pytest.raises(RuntimeError, match="retains command ownership"):
+            driver.connect()
+    finally:
+        held_transport.release_ordinary_write.set()
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_reconnect_refuses_pending_exact_drop_before_opening_replacement() -> None:
+    """A disconnected pending exact Drop cannot replay on a later transport."""
+
+    class HoldSecondWriteTransport(FakeSerialTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hold_second_write = False
+            self.second_write_entered = Event()
+            self.release_second_write = Event()
+
+        def write(self, data: bytes) -> int:
+            with self._write_lock:
+                self.writes.append(data)
+            if self.hold_second_write and data[16] == 0:
+                self.second_write_entered.set()
+                assert self.release_second_write.wait(timeout=1.0)
+            return len(data)
+
+    old_transport = HoldSecondWriteTransport()
+    replacement_transport = FakeSerialTransport()
+    factory = SequentialSerialFactory([old_transport, replacement_transport])
+    driver, _transport, _clock, gate = _stepped_candidate_exact_drop_driver(old_transport)
+    disconnect_error: list[BaseException] = []
+    try:
+        driver._serial_factory = factory  # pyright: ignore[reportPrivateUsage]
+        driver._write_timeout_seconds = 0.01  # pyright: ignore[reportPrivateUsage]
+        arbitration = _exact_drop_arbitration(driver)
+        old_transport.hold_second_write = True
+        gate.release(2)
+        assert old_transport.second_write_entered.wait(timeout=1.0)
+        driver.drop_beans(exact_drop=arbitration)
+
+        def disconnect() -> None:
+            try:
+                driver.disconnect()
+            except BaseException as error:
+                disconnect_error.append(error)
+
+        disconnect_worker = Thread(target=disconnect)
+        disconnect_worker.start()
+        assert old_transport.closed.wait(timeout=1.0)
+        gate.close()
+        old_transport.release_second_write.set()
+        disconnect_worker.join(timeout=1.0)
+
+        assert not disconnect_worker.is_alive()
+        assert disconnect_error == []
+        assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_settlement.result == "pending"  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_settlement.attempt_epoch is None  # pyright: ignore[reportPrivateUsage]
+        assert sum(frame[16] == 1 for frame in old_transport.writes_snapshot()) == 0
+
+        with pytest.raises(RuntimeError):
+            driver.connect()
+
+        assert len(factory.calls) == 0
+        assert replacement_transport.writes_snapshot() == []
+    finally:
+        old_transport.release_second_write.set()
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_reconnect_refuses_unknown_closed_drop_before_factory_open() -> None:
+    """A closed chute does not clear an unknown exact Drop settlement for reconnect."""
+
+    class ShortDropTransport(FakeSerialTransport):
+        def write(self, data: bytes) -> int:
+            receipt = super().write(data)
+            return receipt - 1 if data[16] == 1 else receipt
+
+    old_transport = ShortDropTransport()
+    replacement_transport = FakeSerialTransport()
+    factory = SequentialSerialFactory([old_transport, replacement_transport])
+    driver, _transport, _clock, gate = _stepped_candidate_exact_drop_driver(old_transport)
+    try:
+        driver._serial_factory = factory  # pyright: ignore[reportPrivateUsage]
+        arbitration = _exact_drop_arbitration(driver)
+        driver.drop_beans(exact_drop=arbitration)
+        gate.release(2)
+        gate.wait_completed(3)
+        driver.emergency_stop(reason="test")
+        gate.release(3)
+        gate.wait_completed(4)
+
+        assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_settlement.result == "unknown"  # pyright: ignore[reportPrivateUsage]
+        assert driver.read_lifecycle_evidence().solenoid_open is False
+        _close_stepped_candidate_driver(driver, gate)
+
+        with pytest.raises(RuntimeError, match="retains command ownership"):
+            driver.connect()
+
+        assert len(factory.calls) == 0
+        assert replacement_transport.writes_snapshot() == []
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_nonopted_reconnect_refuses_unknown_closed_drop_before_factory_open() -> None:
+    """A non-opted closed chute retains an unknown Drop across Stop and disconnect."""
+
+    class ShortDropTransport(FakeSerialTransport):
+        def write(self, data: bytes) -> int:
+            receipt = super().write(data)
+            return receipt - 1 if data[16] == 1 else receipt
+
+    old_transport = ShortDropTransport()
+    replacement_transport = FakeSerialTransport()
+    factory = SequentialSerialFactory([old_transport, replacement_transport])
+    driver, _transport, _clock, gate = _stepped_candidate_exact_drop_driver(
+        old_transport,
+        serial_factory=factory,
+        simulation_receipt_age_bound_seconds=None,
+        require_eligible_receipt=False,
+    )
+    try:
+        driver.drop_beans()
+        gate.release(1)
+        gate.wait_completed(2)
+        driver.emergency_stop(reason="test")
+        gate.release(2)
+        gate.wait_completed(3)
+
+        assert driver._drop_settlement is not None  # pyright: ignore[reportPrivateUsage]
+        assert driver._drop_settlement.result == "unknown"  # pyright: ignore[reportPrivateUsage]
+        assert driver.read_lifecycle_evidence().solenoid_open is False
+        _close_stepped_candidate_driver(driver, gate)
+        factory_calls_before_refusal = len(factory.calls)
+        assert factory_calls_before_refusal == 1
+
+        with pytest.raises(RuntimeError, match="retains command ownership"):
+            driver.connect()
+
+        assert len(factory.calls) == factory_calls_before_refusal
+        assert replacement_transport.writes_snapshot() == []
+    finally:
+        _close_stepped_candidate_driver(driver, gate)
+
+
+def test_candidate_clean_reconnect_streams_a_new_closed_frame() -> None:
+    """A disconnected ordinary Stop does not take replacement-stream credit."""
+    first_transport = FakeSerialTransport()
+    replacement_transport = FakeSerialTransport()
+    factory = SequentialSerialFactory([first_transport, replacement_transport])
+    driver = HottopRoasterDriver(
+        port="fake",
+        command_interval_seconds=0.01,
+        serial_factory=factory,
+        hottop_reception="candidate/v1",
+    )
+
+    driver.connect()
+    _wait_for_hottop_write(first_transport, lambda frame: frame[16] == 0)
+    driver.disconnect()
+    stopped = driver.emergency_stop(reason="test")
+    assert stopped.safety_method == "emergency_stop"
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        prior_stop = driver._emergency_settlement  # pyright: ignore[reportPrivateUsage]
+    assert prior_stop is not None
+    assert prior_stop.attempt_epoch is None
+    driver.connect()
+    replacement_first_frame = _wait_for_hottop_write(
+        replacement_transport,
+        lambda frame: frame[16] == 0,
+    )
+    driver.disconnect()
+
+    assert len(factory.calls) == 2
+    assert replacement_transport.writes_snapshot()[0][16] == 0
+    assert replacement_first_frame[16] == 0
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        assert driver._emergency_settlement is prior_stop  # pyright: ignore[reportPrivateUsage]
+        replacement_stop = driver._emergency_settlement  # pyright: ignore[reportPrivateUsage]
+    assert replacement_stop is not None
+    assert replacement_stop.attempt_epoch is None
+
+
+def test_candidate_reconnect_preserves_fan_only_preconnect_compatibility() -> None:
+    """A closed, settled candidate may retain an ordinary fan setting on reconnect."""
+    first_transport = FakeSerialTransport()
+    replacement_transport = FakeSerialTransport()
+    factory = SequentialSerialFactory([first_transport, replacement_transport])
+    driver = HottopRoasterDriver(
+        port="fake",
+        command_interval_seconds=0.01,
+        serial_factory=factory,
+        hottop_reception="candidate/v1",
+    )
+
+    driver.connect()
+    _wait_for_hottop_write(first_transport, lambda frame: frame[16] == 0)
+    driver.disconnect()
+    driver.set_fan(fan_level_percent=30)
+    driver.connect()
+    replacement_first_frame = _wait_for_hottop_write(
+        replacement_transport,
+        lambda frame: frame[12] == 3,
+    )
+    driver.disconnect()
+
+    assert len(factory.calls) == 2
+    assert replacement_transport.writes_snapshot()[0][16] == 0
+    assert replacement_first_frame[16] == 0
+    assert replacement_first_frame[12] == 3
+
+
+def test_candidate_reconnect_rechecks_open_chute_before_installing_replacement() -> None:
+    """A command change during factory entry cannot publish an open replacement stream."""
+    first_transport = FakeSerialTransport()
+    replacement_transport = FakeSerialTransport()
+    factory = SequentialSerialFactory([first_transport])
+    driver = HottopRoasterDriver(
+        port="fake",
+        command_interval_seconds=0.01,
+        serial_factory=factory,
+        hottop_reception="candidate/v1",
+    )
+    driver.connect()
+    _wait_for_hottop_write(first_transport, lambda frame: frame[16] == 0)
+    driver.disconnect()
+
+    def admit_replacement(*args: object, **kwargs: object) -> FakeSerialTransport:
+        del args, kwargs
+        driver.drop_beans()
+        return replacement_transport
+
+    driver._serial_factory = admit_replacement  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(RuntimeError, match="retains command ownership"):
+        driver.connect()
+
+    assert replacement_transport.writes_snapshot() == []
+    assert replacement_transport.close_calls == 1
+    assert driver._drop_transition_count == 1  # pyright: ignore[reportPrivateUsage]
 
 
 def test_candidate_public_factory_negative_drop_receipt_remains_unknown_after_stop() -> None:
