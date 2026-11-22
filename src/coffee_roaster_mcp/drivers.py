@@ -495,6 +495,24 @@ _HOTTOP_MIN_PLAUSIBLE_TEMP_C = 1.0
 _HOTTOP_MAX_PLAUSIBLE_TEMP_C = 320.0
 _HOTTOP_STATUS_READ_MAX_BYTES = HOTTOP_PACKET_LENGTH * 4
 
+HottopReceiptReason = Literal[
+    "candidate_not_configured",
+    "no_receipt",
+    "epoch_or_handle_changed",
+    "superseded",
+    "unit_not_explicit_celsius",
+    "queue_unreadable",
+    "read_truncated",
+    "misaligned_or_skipped",
+    "parser_remainder",
+    "backlog_visible",
+    "latest_pair_rejected",
+    "no_drained_floor",
+    "clock_regression",
+    "receipt_age_bound_unset",
+    "receipt_age_exceeds_bound",
+]
+
 
 @dataclass(frozen=True)
 class HottopCommandPacket:
@@ -583,6 +601,400 @@ class HottopStatusPacket:
     temperature_unit: HottopTemperatureUnit
     resolved_temperature_unit: ResolvedHottopTemperatureUnit | None
     raw_packet: bytes
+
+
+@dataclass(frozen=True)
+class HottopStatusReadScan:
+    """Pure status-read parse result with byte-ownership information.
+
+    Attributes:
+        packets: Complete, checksum-valid status packets in receive order.
+        packet_offsets: Start offsets for `packets` in the combined parser input.
+        skipped_byte_count: Bytes discarded while seeking valid packet boundaries.
+        prior_tail_length: Bytes supplied from an earlier parser read.
+        tail_length: Unconsumed trailing bytes retained for a later parser read.
+        read_truncated: Whether the available queue or returned bytes exceeded the
+            requested read ownership.
+    """
+
+    packets: tuple[HottopStatusPacket, ...]
+    packet_offsets: tuple[int, ...]
+    skipped_byte_count: int
+    prior_tail_length: int
+    tail_length: int
+    read_truncated: bool
+
+    def __post_init__(self) -> None:
+        """Validate internally consistent scanner metadata."""
+        if len(self.packets) != len(self.packet_offsets):
+            raise ValueError("packet offsets must correspond to parsed packets.")
+        for label, value in (
+            ("skipped_byte_count", self.skipped_byte_count),
+            ("prior_tail_length", self.prior_tail_length),
+            ("tail_length", self.tail_length),
+        ):
+            _validate_nonnegative_exact_int(value, label=label)
+        if any(isinstance(offset, bool) or offset < 0 for offset in self.packet_offsets):
+            raise ValueError("packet offsets must be non-negative exact integers.")
+        _validate_exact_bool(self.read_truncated, label="read_truncated")
+
+
+@dataclass(frozen=True)
+class HottopDrainedFloor:
+    """One same-epoch proof that the status parser and receive queue were drained.
+
+    The identity is an opaque numeric token owned by the caller. It deliberately
+    is not a transport object and is never a claim about physical acquisition
+    time.
+
+    Attributes:
+        epoch: Reception epoch in which the drain was observed.
+        handle_identity: Opaque numeric identity for the active handle.
+        sequence: Receive sequence current when the drain was observed.
+        observed_at: Host-clock time recorded before the zero-queue probe.
+    """
+
+    epoch: int
+    handle_identity: int
+    sequence: int
+    observed_at: float
+
+    def __post_init__(self) -> None:
+        """Validate a finite, non-negative drain-floor observation."""
+        _validate_nonnegative_exact_int(self.epoch, label="epoch")
+        _validate_nonnegative_exact_int(self.handle_identity, label="handle_identity")
+        _validate_nonnegative_exact_int(self.sequence, label="sequence")
+        _validate_finite_time(self.observed_at, label="observed_at")
+
+
+@dataclass(frozen=True)
+class HottopReceivedPacket:
+    """Typed host-receipt candidate derived from one bounded status read.
+
+    `latest_pair_c` belongs only to the newest parsed packet. An invalid newest
+    packet therefore never falls back to an earlier accepted pair.
+
+    Attributes:
+        epoch: Reception epoch associated with this bounded read.
+        handle_identity: Opaque numeric identity for the read handle.
+        sequence: Monotonic receipt sequence assigned by the caller.
+        read_started_at: Host-clock time recorded before the pre-read probe.
+        read_returned_at: Host-clock time recorded when the read returned.
+        configured_temperature_unit: Configured raw Hottop temperature mode.
+        queued_before_read: Exact pre-read queue observation, when readable.
+        queued_after_read: Exact post-read queue observation, when readable.
+        scan: Pure scanner output for this read.
+        drained_floor: Earlier same-epoch fully-drained observation, if any.
+        latest_pair_c: Newest packet's normalized Celsius pair, or `None`.
+        latest_resolved_temperature_unit: Unit resolved for the newest packet.
+    """
+
+    epoch: int
+    handle_identity: int
+    sequence: int
+    read_started_at: float
+    read_returned_at: float
+    configured_temperature_unit: HottopTemperatureUnit
+    queued_before_read: int | None
+    queued_after_read: int | None
+    scan: HottopStatusReadScan
+    drained_floor: HottopDrainedFloor | None
+    latest_pair_c: tuple[float, float] | None
+    latest_resolved_temperature_unit: ResolvedHottopTemperatureUnit | None
+
+    def __post_init__(self) -> None:
+        """Validate receipt fields without accepting a transport instance."""
+        _validate_nonnegative_exact_int(self.epoch, label="epoch")
+        _validate_nonnegative_exact_int(self.handle_identity, label="handle_identity")
+        _validate_nonnegative_exact_int(self.sequence, label="sequence")
+        _validate_finite_time(self.read_started_at, label="read_started_at")
+        _validate_finite_time(self.read_returned_at, label="read_returned_at")
+        object.__setattr__(
+            self,
+            "configured_temperature_unit",
+            _validate_hottop_temperature_unit(self.configured_temperature_unit),
+        )
+        for label, value in (
+            ("queued_before_read", self.queued_before_read),
+            ("queued_after_read", self.queued_after_read),
+        ):
+            if value is not None:
+                _validate_nonnegative_exact_int(value, label=label)
+        if self.latest_pair_c is not None and (
+            len(self.latest_pair_c) != 2
+            or not all(
+                not isinstance(value, bool) and isfinite(value) for value in self.latest_pair_c
+            )
+        ):
+            raise ValueError("latest_pair_c must contain two finite temperatures.")
+        if self.latest_resolved_temperature_unit not in ("celsius", "fahrenheit", None):
+            raise ValueError("latest_resolved_temperature_unit is invalid.")
+
+
+@dataclass(frozen=True)
+class HottopReceiptClassification:
+    """Pure eligibility result for a typed Hottop host-receipt candidate.
+
+    The result intentionally leaves sensor age unknown: this software-only
+    receipt has host timing only and does not claim a physical sample time.
+
+    Attributes:
+        eligible: Whether every host-receipt requirement was established.
+        reasons: Ineligibility reasons in the fixed public precedence order.
+        drained_floor_age_seconds: Host age measured from the drained floor.
+        read_returned_age_seconds: Host age measured from read completion.
+        sensor_age: Physical sensor age, always unknown for this receipt.
+    """
+
+    eligible: bool
+    reasons: tuple[HottopReceiptReason, ...]
+    drained_floor_age_seconds: float | None
+    read_returned_age_seconds: float | None
+    sensor_age: Literal["unknown"] = "unknown"
+
+    @property
+    def primary_reason(self) -> HottopReceiptReason | None:
+        """Return the first fixed-order ineligibility reason, when present."""
+        return self.reasons[0] if self.reasons else None
+
+
+def scan_hottop_status_read(
+    read_bytes: bytes,
+    *,
+    prior_tail: bytes = b"",
+    queued_before_read: object,
+    requested_byte_count: int = _HOTTOP_STATUS_READ_MAX_BYTES,
+    temperature_unit: HottopTemperatureUnit = "celsius",
+) -> HottopStatusReadScan:
+    """Scan one bounded Hottop read without changing driver or parser state.
+
+    Args:
+        read_bytes: Bytes returned by the bounded transport read.
+        prior_tail: Parser tail retained before this read, if any.
+        queued_before_read: Explicit pre-read queue observation.
+        requested_byte_count: Exact maximum requested from the transport.
+        temperature_unit: Raw unit passed to the existing packet parser.
+
+    Returns:
+        Packet offsets, parsing ownership metadata, and truncation evidence.
+    """
+    _validate_positive_exact_int(requested_byte_count, label="requested_byte_count")
+    normalized_temperature_unit = _validate_hottop_temperature_unit(temperature_unit)
+    buffer = prior_tail + read_bytes
+    packet_offsets: list[int] = []
+    packets: list[HottopStatusPacket] = []
+    cursor = 0
+    skipped_byte_count = 0
+
+    while cursor + HOTTOP_PACKET_LENGTH <= len(buffer):
+        if not buffer.startswith(HOTTOP_PACKET_PREFIX, cursor):
+            cursor += 1
+            skipped_byte_count += 1
+            continue
+        candidate = buffer[cursor : cursor + HOTTOP_PACKET_LENGTH]
+        if is_hottop_command_packet(candidate) or not validate_hottop_packet_checksum(candidate):
+            cursor += 1
+            skipped_byte_count += 1
+            continue
+        packets.append(
+            parse_hottop_status_packet(
+                candidate,
+                temperature_unit=normalized_temperature_unit,
+            )
+        )
+        packet_offsets.append(cursor)
+        cursor += HOTTOP_PACKET_LENGTH
+
+    tail_length = len(buffer) - cursor
+    if tail_length > HOTTOP_PACKET_LENGTH - 1:
+        skipped_byte_count += tail_length - (HOTTOP_PACKET_LENGTH - 1)
+        tail_length = HOTTOP_PACKET_LENGTH - 1
+    read_truncated = False
+    if _is_nonnegative_exact_int(queued_before_read):
+        queued_before_read_int = cast(int, queued_before_read)
+        read_truncated = queued_before_read_int > requested_byte_count or len(read_bytes) < min(
+            queued_before_read_int,
+            requested_byte_count,
+        )
+    return HottopStatusReadScan(
+        packets=tuple(packets),
+        packet_offsets=tuple(packet_offsets),
+        skipped_byte_count=skipped_byte_count,
+        prior_tail_length=len(prior_tail),
+        tail_length=tail_length,
+        read_truncated=read_truncated,
+    )
+
+
+def build_hottop_received_packet(
+    *,
+    epoch: int,
+    handle_identity: int,
+    sequence: int,
+    read_started_at: float,
+    read_returned_at: float,
+    configured_temperature_unit: HottopTemperatureUnit,
+    queued_before_read: object,
+    queued_after_read: object,
+    scan: HottopStatusReadScan,
+    drained_floor: HottopDrainedFloor | None,
+) -> HottopReceivedPacket:
+    """Build one typed receipt using only the newest parsed packet.
+
+    Args:
+        epoch: Explicit current reception epoch.
+        handle_identity: Explicit opaque current-handle identity.
+        sequence: Explicit monotonically assigned receipt sequence.
+        read_started_at: Host time immediately before the pre-read probe.
+        read_returned_at: Host time when the bounded read returned.
+        configured_temperature_unit: Configured raw Hottop unit mode.
+        queued_before_read: Explicit pre-read queue observation.
+        queued_after_read: Explicit post-read queue observation.
+        scan: Scanner result for these bytes.
+        drained_floor: Earlier same-epoch fully-drained floor, if established.
+
+    Returns:
+        A typed receipt with the newest packet's pair or `None`.
+    """
+    latest_packet = scan.packets[-1] if scan.packets else None
+    latest_pair_c = (
+        (latest_packet.bean_temp_c, latest_packet.env_temp_c)
+        if latest_packet is not None
+        and latest_packet.bean_temp_c is not None
+        and latest_packet.env_temp_c is not None
+        else None
+    )
+    return HottopReceivedPacket(
+        epoch=epoch,
+        handle_identity=handle_identity,
+        sequence=sequence,
+        read_started_at=read_started_at,
+        read_returned_at=read_returned_at,
+        configured_temperature_unit=configured_temperature_unit,
+        queued_before_read=_queue_observation_or_none(queued_before_read),
+        queued_after_read=_queue_observation_or_none(queued_after_read),
+        scan=scan,
+        drained_floor=drained_floor,
+        latest_pair_c=latest_pair_c,
+        latest_resolved_temperature_unit=(
+            latest_packet.resolved_temperature_unit if latest_packet is not None else None
+        ),
+    )
+
+
+def classify_hottop_received_packet(
+    receipt: HottopReceivedPacket | None,
+    *,
+    candidate_configured: bool,
+    current_epoch: int,
+    current_handle_identity: int,
+    current_sequence: int,
+    now: float,
+    receipt_age_bound_seconds: float | None,
+) -> HottopReceiptClassification:
+    """Classify a receipt from explicit host observations in fixed reason order.
+
+    Args:
+        receipt: Typed receipt candidate, or `None` when no receipt exists.
+        candidate_configured: Whether the candidate feature is explicitly enabled.
+        current_epoch: Epoch current at publication time.
+        current_handle_identity: Opaque active-handle identity at publication time.
+        current_sequence: Latest receipt sequence at publication time.
+        now: Explicit host clock observation used for age comparison.
+        receipt_age_bound_seconds: Positive host-receipt age bound, if configured.
+
+    Returns:
+        Eligibility, all applicable fixed-order reasons, and host receipt ages.
+    """
+    _validate_exact_bool(candidate_configured, label="candidate_configured")
+    _validate_nonnegative_exact_int(current_epoch, label="current_epoch")
+    _validate_nonnegative_exact_int(current_handle_identity, label="current_handle_identity")
+    _validate_nonnegative_exact_int(current_sequence, label="current_sequence")
+    _validate_finite_time(now, label="now")
+    if receipt_age_bound_seconds is not None:
+        _validate_positive_finite_bound(
+            receipt_age_bound_seconds,
+            label="receipt_age_bound_seconds",
+        )
+
+    reasons: list[HottopReceiptReason] = []
+    if not candidate_configured:
+        reasons.append("candidate_not_configured")
+    if receipt is None:
+        reasons.append("no_receipt")
+        return HottopReceiptClassification(
+            eligible=False,
+            reasons=tuple(reasons),
+            drained_floor_age_seconds=None,
+            read_returned_age_seconds=None,
+        )
+
+    epoch_or_handle_changed = (
+        receipt.epoch != current_epoch or receipt.handle_identity != current_handle_identity
+    )
+    if epoch_or_handle_changed:
+        reasons.append("epoch_or_handle_changed")
+    if receipt.sequence != current_sequence:
+        reasons.append("superseded")
+    if receipt.configured_temperature_unit != "celsius" or (
+        receipt.latest_pair_c is not None and receipt.latest_resolved_temperature_unit != "celsius"
+    ):
+        reasons.append("unit_not_explicit_celsius")
+    queue_readable = (
+        receipt.queued_before_read is not None and receipt.queued_after_read is not None
+    )
+    if not queue_readable:
+        reasons.append("queue_unreadable")
+    if receipt.scan.read_truncated:
+        reasons.append("read_truncated")
+    if receipt.scan.skipped_byte_count != 0:
+        reasons.append("misaligned_or_skipped")
+    if receipt.scan.prior_tail_length != 0 or receipt.scan.tail_length != 0:
+        reasons.append("parser_remainder")
+    if queue_readable and receipt.queued_after_read != 0:
+        reasons.append("backlog_visible")
+    if receipt.latest_pair_c is None:
+        reasons.append("latest_pair_rejected")
+
+    floor = receipt.drained_floor
+    floor_is_prior = (
+        floor is not None
+        and floor.epoch == receipt.epoch
+        and floor.handle_identity == receipt.handle_identity
+        and floor.sequence < receipt.sequence
+        and floor.observed_at < receipt.read_started_at
+    )
+    if not floor_is_prior:
+        reasons.append("no_drained_floor")
+
+    clock_regression = (
+        receipt.read_returned_at < receipt.read_started_at
+        or now < receipt.read_returned_at
+        or (floor is not None and now < floor.observed_at)
+    )
+    if clock_regression:
+        reasons.append("clock_regression")
+    if receipt_age_bound_seconds is None:
+        reasons.append("receipt_age_bound_unset")
+
+    drained_floor_age_seconds: float | None = None
+    read_returned_age_seconds: float | None = None
+    if floor_is_prior and not clock_regression:
+        assert floor is not None
+        drained_floor_age_seconds = now - floor.observed_at
+        read_returned_age_seconds = now - receipt.read_returned_at
+        if (
+            receipt_age_bound_seconds is not None
+            and drained_floor_age_seconds > receipt_age_bound_seconds
+        ):
+            reasons.append("receipt_age_exceeds_bound")
+
+    return HottopReceiptClassification(
+        eligible=not reasons,
+        reasons=tuple(reasons),
+        drained_floor_age_seconds=drained_floor_age_seconds,
+        read_returned_age_seconds=read_returned_age_seconds,
+    )
 
 
 def build_hottop_command_packet(
@@ -1890,6 +2302,45 @@ def _validate_exact_bool(value: object, *, label: str) -> None:
     """Validate that a state field is exactly a bool."""
     if not isinstance(value, bool):
         raise TypeError(f"{label} must be a boolean.")
+
+
+def _is_nonnegative_exact_int(value: object) -> bool:
+    """Return whether a value is an exact non-negative integer, excluding bool."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _queue_observation_or_none(value: object) -> int | None:
+    """Retain an exact queue observation without preserving an arbitrary object."""
+    return cast(int, value) if _is_nonnegative_exact_int(value) else None
+
+
+def _validate_nonnegative_exact_int(value: object, *, label: str) -> None:
+    """Validate one exact non-negative integer field."""
+    if not _is_nonnegative_exact_int(value):
+        raise ValueError(f"{label} must be a non-negative exact integer.")
+
+
+def _validate_positive_exact_int(value: object, *, label: str) -> None:
+    """Validate one exact positive integer bound."""
+    if not _is_nonnegative_exact_int(value) or value == 0:
+        raise ValueError(f"{label} must be a positive exact integer.")
+
+
+def _validate_finite_time(value: object, *, label: str) -> None:
+    """Validate one finite host-clock observation without reading a clock."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+        raise ValueError(f"{label} must be a finite host-clock time.")
+
+
+def _validate_positive_finite_bound(value: object, *, label: str) -> None:
+    """Validate one finite positive host-receipt age bound."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{label} must be a finite positive bound.")
 
 
 def _validate_driver_name(value: object) -> None:
