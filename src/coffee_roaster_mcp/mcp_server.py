@@ -2169,7 +2169,10 @@ def build_server_context(
         _validate_hottop_simulation_composition(config, simulation_composition)
     elif config.roaster.hottop_reception == "candidate/v1":
         raise ConfigError("Hottop candidate configuration requires trusted simulation composition.")
-    validate_first_crack_authority(config, manual_driver_admission=simulation_admission)
+    if simulation_admission is None:
+        validate_first_crack_authority(config)
+    else:
+        validate_first_crack_authority(config, manual_driver_admission=simulation_admission)
     try:
         if simulation_composition is None:
             roaster_driver = create_roaster_driver(
@@ -2431,14 +2434,13 @@ def _create_mcp_server(
     ) -> StartRoastSessionResult:
         """Start one new authoritative roast session and prepare the driver."""
         server_context = ctx.request_context.lifespan_context
-        validate_first_crack_authority(
-            server_context.config,
-            manual_driver_admission=(
-                trusted_manual_driver_admission()
-                if type(server_context.simulation_composition) is HottopSimulationComposition
-                else None
-            ),
-        )
+        if type(server_context.simulation_composition) is HottopSimulationComposition:
+            validate_first_crack_authority(
+                server_context.config,
+                manual_driver_admission=trusted_manual_driver_admission(),
+            )
+        else:
+            validate_first_crack_authority(server_context.config)
         manual = server_context.config.first_crack.event_authority == "manual"
         simulated_hottop = server_context.simulation_composition is not None
         if simulated_hottop:
