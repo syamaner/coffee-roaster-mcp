@@ -557,6 +557,10 @@ def test_simulation_reception_tool_projects_one_registered_eligible_snapshot(
         if json.loads(line)["record_type"] == "fc_observation_summary"
     )
     assert frozen["payload"]["human_mark"]["value"]["session_relative_seconds"]["value"] == 70.0
+    assert frozen["payload"]["human_mark"]["value"]["utc"] == {
+        "value": None,
+        "null_reason": "clock_unavailable",
+    }
     assert frozen["payload"]["frozen_at"]["recording_relative_seconds"] == {
         "value": None,
         "null_reason": "clock_unavailable",

@@ -1314,7 +1314,7 @@ class FirstCrackObserver:
         if not self._event_domain_mapped:
             outcome = "unavailable"
             coverage = False
-            if not self.failed:
+            if not self.failed and self.valid:
                 self.reason = "clock_domain_unmapped"
         if confirmation is None:
             order = "both_absent" if self.human_at is None else "model_absent"

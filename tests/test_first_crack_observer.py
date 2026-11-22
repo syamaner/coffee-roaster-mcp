@@ -223,7 +223,7 @@ def test_unmapped_freeze_skips_owned_window_boundaries_and_preserves_failure_rea
     observer._event_domain_mapped = False
     observer.charge_at = 110.0
     observer.cutoff = 181.1
-    observer._owned_windows.append(window(start=1544653.0))
+    observer._owned_windows.append(window(start=120.0))
     observer.failed = True
     observer.reason = "inference_failed"
 
@@ -373,8 +373,11 @@ def test_new_generation_rejects_blocked_prior_inference(tmp_path: Path) -> None:
     capture.windows.append(window())
     assert observer.start()
     assert backend.entered.wait(2)
+    observer._event_domain_mapped = False
     observer.invalidate()
     assert observer.summary is not None
+    assert observer.summary.outcome == "unavailable"
+    assert observer.summary.reason.value == "session_changed"
     assert observer.summary.drop_cutoff.value is None
     assert observer.summary.drop_cutoff.null_reason == "not_yet_observed"
     assert not observer.summary.coverage_complete
