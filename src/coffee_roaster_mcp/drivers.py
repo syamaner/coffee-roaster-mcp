@@ -3303,6 +3303,7 @@ class HottopRoasterDriver:
         requested = min(queued_before_int, _HOTTOP_STATUS_READ_MAX_BYTES)
         try:
             chunk = read(requested)
+            returned_at = self._receipt_report_clock_sample()
         except Exception:
             self._discard_receipt_report_record(
                 serial_transport, epoch, handle_token, count_read_error=True
@@ -3336,6 +3337,7 @@ class HottopRoasterDriver:
             diagnostic_queue_before,
             requested,
             started_at,
+            returned_at,
             statuses,
             remaining_buffer,
         )
@@ -3353,11 +3355,11 @@ class HottopRoasterDriver:
         diagnostic_queue_before: bool,
         requested: int,
         started_at: float | None,
+        returned_at: float | None,
         statuses: list[HottopStatusPacket],
         remaining_buffer: bytes,
     ) -> None:
         """Publish optional receipt facts without changing ordinary parser state."""
-        returned_at = self._receipt_report_clock_sample()
         try:
             queued_after = cast(object, getattr(serial_transport, "in_waiting"))  # noqa: B009
         except Exception:

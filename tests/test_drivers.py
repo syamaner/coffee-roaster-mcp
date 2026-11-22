@@ -5254,6 +5254,58 @@ def test_receipt_report_observes_a_complete_packet_without_query_io() -> None:
         driver.disconnect()
 
 
+def test_receipt_report_ages_from_transport_return_across_parser_delay_and_silence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Receipt age stays bound to transport return, not later parser work or silence."""
+
+    transport = FakeSerialTransport()
+    clock = MutableReceptionClock(10.0)
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        receipt_report="observe/v1",
+        reception_clock=clock,
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    original_parse = drivers_module._parse_hottop_status_buffer  # pyright: ignore[reportPrivateUsage]
+
+    def parse_after_delay(
+        buffer: bytes, *, temperature_unit: HottopTemperatureUnit
+    ) -> tuple[list[drivers_module.HottopStatusPacket], bytes]:
+        result = original_parse(buffer, temperature_unit=temperature_unit)
+        clock.value = 14.0
+        return result
+
+    monkeypatch.setattr(drivers_module, "_parse_hottop_status_buffer", parse_after_delay)
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197)
+    )
+
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+    _, completion_observation = driver.read_state_and_receipt_observation()
+    completion_report = project_cold_receipt_report(completion_observation)
+
+    assert completion_observation.receipt is not None
+    assert completion_observation.receipt.read_returned_at == 10.0
+    assert completion_observation.receipt_sequence == 1
+    assert completion_observation.classification.sensor_age == "unknown"
+    assert completion_report.read_returned_age_seconds == 4.0
+    clock.value = 24.0
+
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+    _, silent_observation = driver.read_state_and_receipt_observation()
+    silent_report = project_cold_receipt_report(silent_observation)
+
+    assert silent_observation.receipt is completion_observation.receipt
+    assert silent_observation.receipt_sequence == 1
+    assert silent_observation.classification.sensor_age == "unknown"
+    assert silent_report.read_returned_age_seconds == 14.0
+
+
 def test_receipt_report_held_read_cannot_publish_to_reused_active_handle() -> None:
     """A read bound to an old epoch cannot alter a later reuse of its transport."""
 
