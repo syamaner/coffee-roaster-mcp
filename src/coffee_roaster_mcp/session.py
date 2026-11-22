@@ -5725,10 +5725,12 @@ class RoastSessionStore:
                 if safety_payload is None
                 else dict(safety_payload)
             )
-            if session.manual_first_crack_pending or session.first_crack_source == "manual_mark":
-                # A fault cannot make an accepted or still-writing human mark
-                # eligible for standard replay. This is evidence-only state;
-                # it deliberately has no driver consequence.
+            if self._manual_first_crack_writer_enabled and (
+                session.manual_first_crack_pending or session.first_crack_source == "manual_mark"
+            ):
+                # A fault cannot make an accepted or still-writing configured
+                # manual-writer mark eligible for standard replay. This is
+                # evidence-only state; it deliberately has no driver consequence.
                 session.manual_first_crack_export_disqualified = True
             _apply_emergency_safety_payload(session, normalized_safety_payload)
             event_payload = _build_emergency_fault_payload(

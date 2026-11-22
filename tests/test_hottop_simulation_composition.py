@@ -790,6 +790,11 @@ def test_simulation_sdk_manual_confirmation_keeps_capture_until_finalised(tmp_pa
             assert capture_after["session_id"] == session_id
             assert capture_after["recorder_generation"] == capture["recorder_generation"]
             assert capture_after["inputs"] == capture["inputs"]
+            stopped = await call("emergency_stop", {"reason": "simulation test stop"})
+            assert stopped["event"]["kind"] == "fault"
+            assert (tmp_path / "capture-stopped").exists()
+            exported = await call("export_roast_log", {"session_id": session_id})
+            assert exported["ready"] is True
 
     asyncio.run(exercise())
     assert session_id is not None
