@@ -5312,6 +5312,84 @@ def test_receipt_report_held_read_cannot_publish_to_reused_active_handle() -> No
     assert observation.observer_discard_count == 0
 
 
+@pytest.mark.parametrize(
+    ("late_scanner_failure", "publish_newer"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_receipt_report_held_scanner_publishes_state_and_receipt_decision_together(
+    monkeypatch: pytest.MonkeyPatch, late_scanner_failure: bool, publish_newer: bool
+) -> None:
+    """A held scanner cannot pair new ordinary state with an earlier receipt."""
+
+    class HeldScanner:
+        def __init__(self, scanner: Callable[..., HottopStatusReadScan]) -> None:
+            self._scanner = scanner
+            self.started = Event()
+            self.release = Event()
+            self.calls = 0
+
+        def __call__(self, *args: object, **kwargs: object) -> HottopStatusReadScan:
+            self.calls += 1
+            if self.calls == 1:
+                self.started.set()
+                assert self.release.wait(timeout=1.0)
+            if late_scanner_failure and self.calls == 1:
+                raise OSError("scanner failed late")
+            return self._scanner(*args, **kwargs)
+
+    transport = FakeSerialTransport()
+    driver = HottopRoasterDriver(
+        port="fake",
+        serial_factory=FakeSerialFactory(transport),
+        receipt_report="observe/v1",
+        reception_clock=MutableReceptionClock(1.0),
+    )
+    with driver._state_lock:  # pyright: ignore[reportPrivateUsage]
+        driver._serial = transport  # pyright: ignore[reportPrivateUsage]
+        driver._connected = True  # pyright: ignore[reportPrivateUsage]
+        driver._begin_receipt_report_handle()  # pyright: ignore[reportPrivateUsage]
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=184, raw_bean_temperature=184)
+    )
+    driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+
+    held_scanner = HeldScanner(drivers_module.scan_hottop_status_read)
+    monkeypatch.setattr(drivers_module, "scan_hottop_status_read", held_scanner)
+    transport.queue_read_data(
+        _build_hottop_status_packet(raw_env_temperature=190, raw_bean_temperature=190)
+    )
+    reader = Thread(
+        target=driver._read_status_packet_with_receipt_report,  # pyright: ignore[reportPrivateUsage]
+        args=(transport,),
+    )
+    reader.start()
+    assert held_scanner.started.wait(timeout=1.0)
+
+    held_state, held_observation = driver.read_state_and_receipt_observation()
+    assert held_state.bean_temp_c == held_state.env_temp_c == 184.0
+    assert held_observation.receipt is not None
+    assert held_observation.receipt.latest_pair_c == (184.0, 184.0)
+
+    if publish_newer:
+        transport.queue_read_data(
+            _build_hottop_status_packet(raw_env_temperature=191, raw_bean_temperature=191)
+        )
+        driver._read_status_packet_with_receipt_report(transport)  # pyright: ignore[reportPrivateUsage]
+
+    held_scanner.release.set()
+    reader.join(timeout=1.0)
+    state, observation = driver.read_state_and_receipt_observation()
+    assert not reader.is_alive()
+    expected_temperature = 191.0 if publish_newer else 190.0
+    assert state.bean_temp_c == state.env_temp_c == expected_temperature
+    if late_scanner_failure:
+        assert observation.receipt is None
+        assert observation.observer_discard_count == 1
+    else:
+        assert observation.receipt is not None
+        assert observation.receipt.latest_pair_c == (expected_temperature, expected_temperature)
+
+
 def test_receipt_report_retains_ordinary_errors_and_partial_observations() -> None:
     """Observer diagnostics preserve ordinary parser progress and read error accounting."""
 
