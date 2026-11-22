@@ -645,6 +645,15 @@ class RoastSession:
     timing_evidence_last_hi: float | None = field(
         default=None, kw_only=True, compare=False, repr=False
     )
+    hottop_reception_evidence_sequence: int = field(
+        default=0, kw_only=True, compare=False, repr=False
+    )
+    hottop_reception_evidence_last_lo: float | None = field(
+        default=None, kw_only=True, compare=False, repr=False
+    )
+    hottop_reception_evidence_last_hi: float | None = field(
+        default=None, kw_only=True, compare=False, repr=False
+    )
     purpose: SessionPurpose = "roast"
     phase: RoastPhase = "pre_roast"
     beans_added_at_utc: datetime | None = None
@@ -1738,6 +1747,134 @@ class RoastSessionStore:
             session.timing_evidence_sequence += 1
             session.timing_evidence_last_lo = lo
             session.timing_evidence_last_hi = hi
+            return TimingEvidenceAssembly("evidence", None, result)
+
+    def assemble_hottop_reception_evidence(
+        self,
+        admission: TimingEvidenceAdmission,
+        *,
+        t0: float,
+        t1: float,
+        finalize: Callable[[dict[str, object]], object],
+    ) -> TimingEvidenceAssembly:
+        """Atomically assemble one simulated-Hottop reception record.
+
+        This deliberately has its own sequence and ordering state.  Generic
+        mock timing evidence therefore remains neither an input nor a freshness
+        upgrade for the Hottop exact-session protocol.
+        """
+        with self._lock:
+            session = admission.session
+            if (
+                session is None
+                or self._latest_session is not session
+                or admission.ownership_sequence is None
+                or session.capture_ownership_sequence != admission.ownership_sequence
+                or admission.session_id is None
+                or session.id != admission.session_id
+            ):
+                return TimingEvidenceAssembly("refused_identity", "session_changed_during_read")
+            if (
+                self._normal_drop_in_flight is not None
+                or session.pending_driver_command_kind == "drop"
+            ):
+                return TimingEvidenceAssembly("refused_busy", "drop_in_progress")
+            if session.faulted_at_utc is not None or session.phase == "fault" or not session.active:
+                return TimingEvidenceAssembly("refused_identity", "session_changed_during_read")
+            if self._finalisation_blocks_mutation(session):
+                return TimingEvidenceAssembly("refused_busy", "finalisation_in_progress")
+
+            lo = t0 - session.monotonic_start
+            hi = t1 - session.monotonic_start
+            if not math.isfinite(lo) or not math.isfinite(hi):
+                return TimingEvidenceAssembly("unavailable", "clock_invalid")
+            if lo < 0 or hi < lo:
+                return TimingEvidenceAssembly("unavailable", "clock_regression")
+            if (
+                session.hottop_reception_evidence_last_lo is not None
+                and lo < session.hottop_reception_evidence_last_lo
+            ) or (
+                session.hottop_reception_evidence_last_hi is not None
+                and hi < session.hottop_reception_evidence_last_hi
+            ):
+                return TimingEvidenceAssembly("unavailable", "out_of_order_read")
+            maximum = 2**53 - 1
+            if session.hottop_reception_evidence_sequence >= maximum:
+                return TimingEvidenceAssembly("unavailable", "sequence_exhausted")
+            if not 1 <= session.capture_ownership_sequence <= maximum:
+                return TimingEvidenceAssembly("unavailable", "record_invalid")
+
+            event_by_kind: dict[str, tuple[int, RoastEvent]] = {}
+            for index, event in enumerate(session.event_timeline):
+                if event.kind in {"beans_added", "first_crack_detected", "beans_dropped"}:
+                    event_by_kind.setdefault(event.kind, (index, event))
+            if (session.beans_added_source is not None and "beans_added" not in event_by_kind) or (
+                session.first_crack_source is not None
+                and "first_crack_detected" not in event_by_kind
+            ):
+                return TimingEvidenceAssembly("unavailable", "record_invalid")
+
+            def event_evidence(kind: str, source: str) -> dict[str, object] | None:
+                indexed_event = event_by_kind.get(kind)
+                if indexed_event is None:
+                    return None
+                index, event = indexed_event
+                if (
+                    type(index) is not int
+                    or not 0 <= index <= maximum
+                    or type(event.monotonic_seconds) is not float
+                    or not math.isfinite(event.monotonic_seconds)
+                    or event.monotonic_seconds < 0
+                ):
+                    raise ValueError("Invalid canonical timing event.")
+                return {
+                    "kind": kind,
+                    "event_index": index,
+                    "canonical_seconds": event.monotonic_seconds,
+                    "clock_epoch_id": self._clock_epoch_id,
+                    "source": source,
+                    "time_basis": (
+                        "detector_clock_rebased"
+                        if source == "model_detection"
+                        else "producer_canonical_record"
+                    ),
+                    "physical_time_bound": "not_provided",
+                }
+
+            try:
+                result = finalize(
+                    {
+                        "session_id": session.id,
+                        "session_ownership_sequence": session.capture_ownership_sequence,
+                        "clock": {
+                            "epoch_id": self._clock_epoch_id,
+                            "domain": "session_relative_store_monotonic",
+                            "suspend_behaviour": "unqualified",
+                        },
+                        "reception_evidence_sequence": (
+                            session.hottop_reception_evidence_sequence + 1
+                        ),
+                        "phase": session.phase,
+                        "charge": event_evidence(
+                            "beans_added", session.beans_added_source or "unattributed"
+                        ),
+                        "first_crack": event_evidence(
+                            "first_crack_detected", session.first_crack_source or "unattributed"
+                        ),
+                        "drop": event_evidence("beans_dropped", "unattributed"),
+                        "decision": {
+                            "operational_lo_seconds": lo,
+                            "operational_hi_seconds": hi,
+                            "clock_epoch_id": self._clock_epoch_id,
+                            "basis": "producer_classification_bracket",
+                        },
+                    }
+                )
+            except Exception:  # noqa: BLE001 - validation is an unavailable business outcome.
+                return TimingEvidenceAssembly("unavailable", "record_invalid")
+            session.hottop_reception_evidence_sequence += 1
+            session.hottop_reception_evidence_last_lo = lo
+            session.hottop_reception_evidence_last_hi = hi
             return TimingEvidenceAssembly("evidence", None, result)
 
     def reserve_fixed_zero_containment(
@@ -4681,6 +4818,9 @@ def _copy_session_for_read(session: RoastSession) -> RoastSession:
         timing_evidence_sequence=session.timing_evidence_sequence,
         timing_evidence_last_lo=session.timing_evidence_last_lo,
         timing_evidence_last_hi=session.timing_evidence_last_hi,
+        hottop_reception_evidence_sequence=session.hottop_reception_evidence_sequence,
+        hottop_reception_evidence_last_lo=session.hottop_reception_evidence_last_lo,
+        hottop_reception_evidence_last_hi=session.hottop_reception_evidence_last_hi,
         purpose=session.purpose,
         phase=session.phase,
         beans_added_at_utc=session.beans_added_at_utc,

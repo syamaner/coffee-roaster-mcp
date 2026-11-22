@@ -10,12 +10,14 @@ import re
 import time
 from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
 from types import TracebackType
 from typing import Annotated, Any, Literal, cast
+from uuid import uuid4
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
@@ -60,6 +62,7 @@ from coffee_roaster_mcp.drivers import (
     ExactDropArbitration,
     ExactDropCancelled,
     FixedZeroCommandedState,
+    HottopExactDropCandidate,
     HottopFirstWriteDisposition,
     HottopRoasterDriver,
     HottopStartSettlement,
@@ -626,6 +629,26 @@ class _TimingEvidenceArguments(ArgModelBase):
     evidence_protocol: Literal["timing_evidence/v1"]
 
 
+class _HottopReceptionEvidenceArguments(ArgModelBase):
+    """Strict raw SDK-boundary arguments for simulated Hottop reception evidence."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_session_id: FixedZeroSessionId
+    evidence_protocol: Literal["hottop_reception_evidence/v1"]
+
+
+_HOTTOP_RECEPTION_EVIDENCE_INPUT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "expected_session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "evidence_protocol": {"const": "hottop_reception_evidence/v1"},
+    },
+    "required": ["expected_session_id", "evidence_protocol"],
+    "additionalProperties": False,
+}
+
+
 class TimingClock(BaseModel):
     """Closed identifier for the store-relative synthetic clock."""
 
@@ -944,6 +967,288 @@ class TimingEvidenceResult(BaseModel):
         return self
 
 
+HottopReceptionReason = Literal[
+    "unknown_session",
+    "not_latest_session",
+    "session_faulted",
+    "session_not_active",
+    "session_purpose_not_eligible",
+    "session_changed_during_read",
+    "capability_absent",
+    "capability_version_unsupported",
+    "composition_not_simulated",
+    "composition_mismatch",
+    "finalisation_in_progress",
+    "drop_in_progress",
+    "clock_invalid",
+    "clock_regression",
+    "driver_raised",
+    "driver_not_streaming",
+    "out_of_order_read",
+    "sequence_exhausted",
+    "record_invalid",
+]
+HottopReceiptToken = Annotated[str, Strict(), StringConstraints(pattern=r"^[0-9a-f]{32}$")]
+
+
+class HottopReceptionComposition(BaseModel):
+    """Closed trusted-composition identity for a simulated reception record."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    kind: Literal["simulated_injected_transport"]
+    composition_id: HottopReceiptToken
+    reception_capability_version: Literal[1]
+
+
+class HottopReceptionDecision(BaseModel):
+    """Store-clock bracket around the immutable driver snapshot decision."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    operational_lo_seconds: Annotated[float, Strict(), Field(ge=0, allow_inf_nan=False)]
+    operational_hi_seconds: Annotated[float, Strict(), Field(ge=0, allow_inf_nan=False)]
+    clock_epoch_id: TimingEpochId
+    basis: Literal["producer_classification_bracket"]
+
+    @model_validator(mode="after")
+    def _validate_order(self) -> HottopReceptionDecision:
+        if self.operational_lo_seconds > self.operational_hi_seconds:
+            raise ValueError("Operational decision bracket must be ordered.")
+        return self
+
+
+class HottopReceptionReceipt(BaseModel):
+    """Driver-owned receipt identity that accompanies an eligible temperature pair."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    epoch: TimingPositiveInt
+    sequence: TimingPositiveInt
+    basis: Literal["host_receipt_after_drained_floor"]
+
+
+class HottopReceptionHostClock(BaseModel):
+    """Closed statement of the driver host-clock relationship."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    domain: Literal["driver_reception_monotonic"]
+    relation_to_operational: Literal["not_established"]
+
+
+class HottopEligibleReceptionPair(BaseModel):
+    """A pair from one immutable eligible driver receipt snapshot."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    status: Literal["eligible"]
+    bean_c: TimingFiniteFloat
+    environment_c: TimingFiniteFloat
+    unit: Literal["celsius"]
+    receipt_token: HottopReceiptToken
+    reception: HottopReceptionReceipt
+    host_receipt_clock: HottopReceptionHostClock
+    drained_floor_age_seconds: Annotated[float, Strict(), Field(ge=0, allow_inf_nan=False)]
+    read_returned_age_seconds: Annotated[float, Strict(), Field(ge=0, allow_inf_nan=False)]
+    age_bound_seconds: Annotated[float, Strict(), Field(ge=0, allow_inf_nan=False)]
+    age_bound_basis: Literal["simulation_composition_unqualified"]
+
+    @model_validator(mode="after")
+    def _validate_host_clock(self) -> HottopEligibleReceptionPair:
+        if not (
+            self.read_returned_age_seconds
+            <= self.drained_floor_age_seconds
+            <= self.age_bound_seconds
+        ):
+            raise ValueError("Reception host ages must be ordered within the configured bound.")
+        return self
+
+
+class HottopIneligibleReceptionPair(BaseModel):
+    """Closed host-receipt refusal facts with no caller-supplied temperature pair."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    status: Literal["ineligible"]
+    reasons: tuple[
+        Literal[
+            "candidate_not_configured",
+            "no_receipt",
+            "epoch_or_handle_changed",
+            "superseded",
+            "unit_not_explicit_celsius",
+            "queue_unreadable",
+            "read_size_contradiction",
+            "read_truncated",
+            "misaligned_or_skipped",
+            "parser_remainder",
+            "backlog_visible",
+            "latest_pair_rejected",
+            "invalid_packet_history",
+            "no_drained_floor",
+            "clock_regression",
+            "receipt_age_bound_unset",
+            "receipt_age_exceeds_bound",
+        ],
+        ...,
+    ]
+
+    @model_validator(mode="after")
+    def _validate_reasons(self) -> HottopIneligibleReceptionPair:
+        if not self.reasons or len(set(self.reasons)) != len(self.reasons):
+            raise ValueError("Ineligible pair reasons must be non-empty and unique.")
+        return self
+
+
+HottopReceptionPair = Annotated[
+    HottopEligibleReceptionPair | HottopIneligibleReceptionPair,
+    Field(discriminator="status"),
+]
+
+
+class HottopCommandSettlementProjection(BaseModel):
+    """One host-command settlement without a physical-effect assertion."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    transition: Literal["drop", "emergency"]
+    transition_seq: TimingPositiveInt
+    result: Literal["pending", "not_attempted", "entering", "accepted_by_host", "unknown"]
+    attempt_seq: TimingPositiveInt | None
+    physical_effect: Literal["not_established"]
+
+
+class HottopCommandSettlements(BaseModel):
+    """Retained latest settlement projections for the synthetic composition."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    drop: HottopCommandSettlementProjection | None
+    emergency: HottopCommandSettlementProjection | None
+
+
+class HottopReceptionEvidenceRecord(BaseModel):
+    """Closed source-bound Hottop reception evidence record."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    session_id: FixedZeroSessionId
+    session_ownership_sequence: TimingPositiveInt
+    driver: Literal["hottop_kn8828b_2k_plus"]
+    composition: HottopReceptionComposition
+    clock: TimingClock
+    reception_evidence_sequence: TimingPositiveInt
+    phase: Literal["pre_roast", "roasting", "development", "dropped", "cooling"]
+    charge: EventEvidence | None
+    first_crack: EventEvidence | None
+    drop: EventEvidence | None
+    decision: HottopReceptionDecision
+    pair: HottopReceptionPair
+    command_settlements: HottopCommandSettlements
+    sensor_age: Literal["unknown"]
+    physical_qualification: Literal["none_simulated_transport_only"]
+
+    @model_validator(mode="after")
+    def _validate_record(self) -> HottopReceptionEvidenceRecord:
+        events = (
+            (self.charge, "beans_added"),
+            (self.first_crack, "first_crack_detected"),
+            (self.drop, "beans_dropped"),
+        )
+        if any(event is not None and event.kind != kind for event, kind in events):
+            raise ValueError("Event kind must match the record slot.")
+        if any(
+            event is not None and event.clock_epoch_id != self.clock.epoch_id for event, _ in events
+        ):
+            raise ValueError("Event epoch must match the record clock.")
+        if self.decision.clock_epoch_id != self.clock.epoch_id:
+            raise ValueError("Decision epoch must match the record clock.")
+        present = [event for event, _ in events if event is not None]
+        if any(
+            later.event_index <= earlier.event_index
+            or later.canonical_seconds < earlier.canonical_seconds
+            for earlier, later in zip(present, present[1:], strict=False)
+        ):
+            raise ValueError("Present events must preserve canonical order.")
+        return self
+
+
+class HottopReceptionEvidenceResult(BaseModel):
+    """Closed result for one simulated Hottop reception evidence request."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    evidence_protocol: Literal["hottop_reception_evidence/v1"]
+    evidence_version: Literal[1]
+    outcome: Literal[
+        "evidence", "refused_identity", "refused_capability", "refused_busy", "unavailable"
+    ]
+    reason_code: HottopReceptionReason | None
+    driver_read: Literal["not_invoked", "invoked"]
+    requested_session_id: FixedZeroSessionId
+    record: HottopReceptionEvidenceRecord | None
+
+    @model_validator(mode="after")
+    def _validate_outcome(self) -> HottopReceptionEvidenceResult:
+        rows: dict[str, tuple[frozenset[str] | None, frozenset[str]]] = {
+            "evidence": (None, frozenset({"invoked"})),
+            "refused_identity": (
+                frozenset(
+                    {
+                        "unknown_session",
+                        "not_latest_session",
+                        "session_faulted",
+                        "session_not_active",
+                        "session_purpose_not_eligible",
+                        "session_changed_during_read",
+                    }
+                ),
+                frozenset({"not_invoked", "invoked"}),
+            ),
+            "refused_capability": (
+                frozenset(
+                    {
+                        "capability_absent",
+                        "capability_version_unsupported",
+                        "composition_not_simulated",
+                        "composition_mismatch",
+                    }
+                ),
+                frozenset({"not_invoked", "invoked"}),
+            ),
+            "refused_busy": (
+                frozenset({"finalisation_in_progress", "drop_in_progress"}),
+                frozenset({"not_invoked", "invoked"}),
+            ),
+            "unavailable": (
+                frozenset(
+                    {
+                        "clock_invalid",
+                        "clock_regression",
+                        "driver_raised",
+                        "driver_not_streaming",
+                        "out_of_order_read",
+                        "sequence_exhausted",
+                        "record_invalid",
+                    }
+                ),
+                frozenset({"not_invoked", "invoked"}),
+            ),
+        }
+        reasons, reads = rows[self.outcome]
+        if self.driver_read not in reads or (reasons is None) != (self.reason_code is None):
+            raise ValueError("Hottop reception result has an invalid outcome row.")
+        if reasons is not None and self.reason_code not in reasons:
+            raise ValueError("Hottop reception result has an invalid reason code.")
+        if (self.outcome == "evidence") != (self.record is not None):
+            raise ValueError("Hottop reception record must exactly follow evidence outcome.")
+        if self.record is not None and self.record.session_id != self.requested_session_id:
+            raise ValueError("Hottop reception record must match the requested session.")
+        return self
+        return self
+
+
 def _install_fixed_zero_argument_adapter(mcp: FastMCP) -> None:
     """Bind strict raw argument validation to only the new fixed-zero tool."""
     tool = mcp._tool_manager.get_tool("contain_heat_fixed_zero")  # pyright: ignore[reportPrivateUsage]
@@ -1044,6 +1349,119 @@ def _install_timing_evidence_argument_adapter(mcp: FastMCP) -> None:
     tool.parameters = _TimingEvidenceArguments.model_json_schema(by_alias=True)
 
 
+def _install_hottop_reception_evidence_argument_adapter(mcp: FastMCP) -> None:
+    """Bind the closed raw argument schema to simulation reception evidence only."""
+    tool = mcp._tool_manager.get_tool("get_hottop_reception_evidence")  # pyright: ignore[reportPrivateUsage]
+    if tool is None:
+        raise RuntimeError("Hottop reception evidence tool was not registered.")
+    metadata = tool.fn_metadata
+    declared_metadata_fields = getattr(type(metadata), "model_fields", None)
+    if (
+        not isinstance(declared_metadata_fields, Mapping)
+        or "arg_model" not in declared_metadata_fields
+    ):
+        raise RuntimeError("Hottop reception evidence argument adapter is unsupported.")
+    try:
+        adapted = metadata.model_copy(
+            update={
+                "arg_model": _HottopReceptionEvidenceArguments,
+                "output_schema": _hottop_reception_evidence_output_schema(),
+            }
+        )
+    except Exception as exc:
+        raise RuntimeError("Hottop reception evidence argument adapter is unsupported.") from exc
+    if adapted.arg_model is not _HottopReceptionEvidenceArguments:
+        raise RuntimeError("Hottop reception evidence argument adapter is unsupported.")
+    tool.fn_metadata = adapted
+    tool.parameters = _HOTTOP_RECEPTION_EVIDENCE_INPUT_SCHEMA
+
+
+def _hottop_reception_evidence_output_schema() -> dict[str, object]:
+    """Return the frozen discriminated public schema, not the SDK nullable flattening.
+
+    FastMCP otherwise advertises the Pydantic result model as one object with
+    nullable fields.  The protocol deliberately exposes mutually exclusive
+    outcome rows, so discovery must retain the source-bound ``oneOf`` shape.
+    """
+    schema = deepcopy(HottopReceptionEvidenceResult.model_json_schema())
+    properties = schema.pop("properties")
+    required = schema.pop("required")
+    schema.pop("additionalProperties", None)
+    schema.pop("title", None)
+    schema.pop("description", None)
+
+    def row(
+        outcome: str,
+        reasons: list[str] | None,
+        reads: list[str],
+        record: object,
+    ) -> dict[str, object]:
+        row_properties = deepcopy(properties)
+        row_properties["outcome"] = {"const": outcome}
+        row_properties["reason_code"] = (
+            {"enum": reasons} if reasons is not None else {"enum": [None]}
+        )
+        row_properties["driver_read"] = {"enum": reads}
+        row_properties["record"] = record
+        return {
+            "type": "object",
+            "properties": row_properties,
+            "required": required,
+            "additionalProperties": False,
+        }
+
+    record_schema = cast(dict[str, list[object]], properties["record"])["anyOf"][0]
+    null_record = {"const": None}
+    schema["oneOf"] = [
+        row("evidence", None, ["invoked"], record_schema),
+        row(
+            "refused_identity",
+            [
+                "unknown_session",
+                "not_latest_session",
+                "session_faulted",
+                "session_not_active",
+                "session_purpose_not_eligible",
+                "session_changed_during_read",
+            ],
+            ["not_invoked", "invoked"],
+            null_record,
+        ),
+        row(
+            "refused_capability",
+            [
+                "capability_absent",
+                "capability_version_unsupported",
+                "composition_not_simulated",
+                "composition_mismatch",
+            ],
+            ["not_invoked", "invoked"],
+            null_record,
+        ),
+        row(
+            "refused_busy",
+            ["finalisation_in_progress", "drop_in_progress"],
+            ["not_invoked", "invoked"],
+            null_record,
+        ),
+        row(
+            "unavailable",
+            [
+                "clock_invalid",
+                "clock_regression",
+                "driver_raised",
+                "driver_not_streaming",
+                "out_of_order_read",
+                "sequence_exhausted",
+                "record_invalid",
+            ],
+            ["not_invoked", "invoked"],
+            null_record,
+        ),
+    ]
+    return schema
+
+
 def _install_exact_normal_drop_argument_adapter(mcp: FastMCP) -> None:
     """Bind strict raw argument validation to only the exact mock Drop tool."""
     tool = mcp._tool_manager.get_tool("drop_beans_exact_session")  # pyright: ignore[reportPrivateUsage]
@@ -1123,6 +1541,28 @@ class _ExactNormalDropBaseline:
     clock_epoch_id: str
     emergency_baseline: int
     drop_baseline: int
+
+
+@dataclass(frozen=True)
+class _HottopReceptionIssuedEvidence:
+    """Server-only binding between one public receipt token and driver snapshot."""
+
+    session_id: str
+    ownership_sequence: int
+    reception_evidence_sequence: int
+    receipt_token: str
+    candidate: HottopExactDropCandidate
+
+
+@dataclass
+class _HottopReceptionEvidenceRegistry:
+    """Mutable server-owned receipt binding kept outside the frozen context."""
+
+    issued: _HottopReceptionIssuedEvidence | None = None
+
+    def install(self, issued: _HottopReceptionIssuedEvidence | None) -> None:
+        """Replace the current-owner binding after a successful evidence read."""
+        self.issued = issued
 
 
 ExactNormalDropOutcome = Literal[
@@ -1260,6 +1700,11 @@ class ServerContext:
     capture_evidence_publisher: CaptureEvidencePublisher
     capture_evidence_configured: bool
     simulation_composition: HottopSimulationComposition | None = None
+    simulation_composition_id: str | None = None
+    hottop_reception_registry: _HottopReceptionEvidenceRegistry = field(
+        default_factory=_HottopReceptionEvidenceRegistry
+    )
+    hottop_reception_lock: Lock = field(default_factory=Lock)
     lifecycle_barrier: Lock = field(default_factory=Lock)
     exact_normal_drop_baseline: _ExactNormalDropBaseline | None = None
 
@@ -2218,6 +2663,9 @@ def build_server_context(
     session_store = RoastSessionStore(
         default_log_dir=config.logging.log_dir / "roasts",
         telemetry_log_interval_seconds=config.logging.sample_interval_seconds,
+        monotonic_now=(
+            simulation_composition.clock if simulation_composition is not None else time.monotonic
+        ),
     )
 
     def session_is_retained(session_id: str) -> bool:
@@ -2253,6 +2701,7 @@ def build_server_context(
         capture_evidence_publisher=capture_evidence_publisher,
         capture_evidence_configured=capture_evidence_configured,
         simulation_composition=simulation_composition,
+        simulation_composition_id=(uuid4().hex if simulation_composition is not None else None),
     )
     return server_context
 
@@ -2767,6 +3216,26 @@ def _create_mcp_server(
             expected_session_id=expected_session_id,
         )
 
+    if simulation_composition is not None:
+
+        @mcp.tool()
+        def get_hottop_reception_evidence(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
+            ctx: Context[ServerSession, ServerContext],
+            expected_session_id: str,
+            evidence_protocol: Literal["hottop_reception_evidence/v1"],
+        ) -> HottopReceptionEvidenceResult:
+            """Read one immutable trusted-simulation Hottop reception snapshot.
+
+            This read performs no serial I/O and does not establish physical
+            sensor age, transport health, or a physical effect.
+            """
+            _ = evidence_protocol
+            return _run_hottop_reception_evidence(
+                ctx.request_context.lifespan_context,
+                expected_session_id=expected_session_id,
+                trusted_composition=simulation_composition,
+            )
+
     @mcp.tool()
     def drop_beans_exact_session(  # pyright: ignore[reportUntypedFunctionDecorator, reportUnusedFunction]
         ctx: Context[ServerSession, ServerContext],
@@ -3233,6 +3702,7 @@ def _create_mcp_server(
     _install_exact_normal_drop_argument_adapter(mcp)
     if simulation_composition is not None:
         _install_hottop_simulation_start_argument_adapter(mcp)
+        _install_hottop_reception_evidence_argument_adapter(mcp)
     return mcp
 
 
@@ -4468,6 +4938,348 @@ def _run_timing_evidence(
         assert isinstance(assembled.result, TimingEvidenceResult)
         return assembled.result
     return _timing_evidence_result(
+        outcome=assembled.outcome,
+        requested_session_id=expected_session_id,
+        reason_code=assembled.reason_code,
+        driver_read="invoked",
+    )
+
+
+def _hottop_reception_result(
+    *,
+    outcome: Literal[
+        "evidence", "refused_identity", "refused_capability", "refused_busy", "unavailable"
+    ],
+    requested_session_id: str,
+    reason_code: HottopReceptionReason | None,
+    driver_read: Literal["not_invoked", "invoked"],
+    record: object | None = None,
+) -> HottopReceptionEvidenceResult:
+    """Build one closed simulated-Hottop reception result without leakage."""
+    return HottopReceptionEvidenceResult.model_validate(
+        {
+            "evidence_protocol": "hottop_reception_evidence/v1",
+            "evidence_version": 1,
+            "outcome": outcome,
+            "reason_code": reason_code,
+            "driver_read": driver_read,
+            "requested_session_id": requested_session_id,
+            "record": record,
+        }
+    )
+
+
+def _hottop_reception_capability(
+    server_context: ServerContext,
+    *,
+    trusted_composition: HottopSimulationComposition,
+) -> HottopReceptionReason | None:
+    """Check the closed trusted composition before obtaining a driver snapshot."""
+    if server_context.simulation_composition is None:
+        return "composition_not_simulated"
+    if server_context.simulation_composition is not trusted_composition:
+        return "composition_mismatch"
+    if (
+        server_context.simulation_composition_id is None
+        or type(server_context.simulation_composition_id) is not str
+        or re.fullmatch(_TIMING_EPOCH_PATTERN, server_context.simulation_composition_id) is None
+    ):
+        return "composition_mismatch"
+    driver: Any = server_context.roaster_driver
+    if type(driver) is not HottopRoasterDriver:
+        return "capability_absent"
+    try:
+        capabilities: Any = driver.capabilities
+        version: Any = capabilities.hottop_reception_candidate_version
+        driver_name: Any = driver.name
+        capability_driver: Any = capabilities.driver
+        configured_driver: Any = server_context.config.roaster.driver
+        configured_port: Any = server_context.config.roaster.port
+        configured_mode: Any = server_context.config.roaster.hottop_reception
+        configured_unit: Any = server_context.config.roaster.temperature_unit
+    except Exception:  # noqa: BLE001 - declaration reads fail closed without leakage.
+        return "composition_mismatch"
+    if type(capabilities) is not RoasterCapabilities or version is None:
+        return "capability_absent"
+    if type(version) is not int or version != 1:
+        return "capability_version_unsupported"
+    if (
+        driver_name != HOTTOP_DRIVER_NAME
+        or capability_driver != HOTTOP_DRIVER_NAME
+        or configured_driver != HOTTOP_DRIVER_NAME
+        or configured_port != trusted_composition.synthetic_port
+        or configured_mode != "candidate/v1"
+        or configured_unit != "celsius"
+    ):
+        return "composition_mismatch"
+    return None
+
+
+def _project_hottop_settlement(settlement: object) -> dict[str, object] | None:
+    """Project one driver settlement without exposing driver-private revisions."""
+    if settlement is None:
+        return None
+    transition = getattr(settlement, "transition", None)
+    transition_seq = getattr(settlement, "transition_seq", None)
+    result = getattr(settlement, "result", None)
+    attempt_seq = getattr(settlement, "attempt_seq", None)
+    physical_effect = getattr(settlement, "physical_effect", None)
+    if (
+        transition not in {"drop", "emergency"}
+        or type(transition_seq) is not int
+        or transition_seq < 1
+        or result not in {"pending", "not_attempted", "entering", "accepted_by_host", "unknown"}
+        or (attempt_seq is not None and (type(attempt_seq) is not int or attempt_seq < 1))
+        or physical_effect != "not_established"
+    ):
+        raise ValueError("Invalid Hottop command settlement.")
+    return {
+        "transition": transition,
+        "transition_seq": transition_seq,
+        "result": result,
+        "attempt_seq": attempt_seq,
+        "physical_effect": physical_effect,
+    }
+
+
+def _project_hottop_reception_pair(
+    candidate: HottopExactDropCandidate,
+    *,
+    receipt_age_bound_seconds: float,
+) -> tuple[dict[str, object], str | None]:
+    """Project one immutable candidate snapshot without re-reading its driver."""
+    if (
+        type(receipt_age_bound_seconds) not in {int, float}
+        or isinstance(receipt_age_bound_seconds, bool)
+        or not math.isfinite(receipt_age_bound_seconds)
+        or receipt_age_bound_seconds <= 0
+    ):
+        raise ValueError("Invalid trusted receipt age bound.")
+    age_bound_seconds = float(receipt_age_bound_seconds)
+    classification = candidate.receipt_classification
+    receipt = candidate.receipt
+    if type(candidate.streaming) is not bool:
+        raise ValueError("Invalid Hottop streaming declaration.")
+    if not candidate.streaming:
+        raise RuntimeError("driver_not_streaming")
+    if candidate.drop_transition_count != 0 or candidate.emergency_count != 0:
+        return {"status": "ineligible", "reasons": ("superseded",)}, None
+    if not classification.eligible:
+        reasons = classification.reasons
+        if not reasons or any(type(reason) is not str for reason in reasons):
+            raise ValueError("Invalid Hottop receipt classification.")
+        return {"status": "ineligible", "reasons": reasons}, None
+    if (
+        receipt is None
+        or receipt.latest_pair_c is None
+        or receipt.latest_resolved_temperature_unit != "celsius"
+        or receipt.configured_temperature_unit != "celsius"
+        or type(receipt.epoch) is not int
+        or receipt.epoch < 1
+        or type(receipt.sequence) is not int
+        or receipt.sequence < 1
+        or type(classification.drained_floor_age_seconds) is not float
+        or type(classification.read_returned_age_seconds) is not float
+        or classification.drained_floor_age_seconds < 0
+        or classification.read_returned_age_seconds < 0
+        or not math.isfinite(classification.drained_floor_age_seconds)
+        or not math.isfinite(classification.read_returned_age_seconds)
+        or classification.read_returned_age_seconds > classification.drained_floor_age_seconds
+        or classification.drained_floor_age_seconds > age_bound_seconds
+    ):
+        raise ValueError("Eligible Hottop receipt is incomplete.")
+    bean_c, environment_c = receipt.latest_pair_c
+    if type(bean_c) is not float or type(environment_c) is not float:
+        raise ValueError("Hottop receipt temperatures must be exact floats.")
+    token = uuid4().hex
+    return (
+        {
+            "status": "eligible",
+            "bean_c": bean_c,
+            "environment_c": environment_c,
+            "unit": "celsius",
+            "receipt_token": token,
+            "reception": {
+                "epoch": receipt.epoch,
+                "sequence": receipt.sequence,
+                "basis": "host_receipt_after_drained_floor",
+            },
+            "host_receipt_clock": {
+                "domain": "driver_reception_monotonic",
+                "relation_to_operational": "not_established",
+            },
+            "drained_floor_age_seconds": classification.drained_floor_age_seconds,
+            "read_returned_age_seconds": classification.read_returned_age_seconds,
+            "age_bound_seconds": age_bound_seconds,
+            "age_bound_basis": "simulation_composition_unqualified",
+        },
+        token,
+    )
+
+
+def _run_hottop_reception_evidence(
+    server_context: ServerContext,
+    *,
+    expected_session_id: str,
+    trusted_composition: HottopSimulationComposition,
+) -> HottopReceptionEvidenceResult:
+    """Read a trusted immutable simulated-Hottop candidate without native I/O."""
+    store = server_context.session_store
+    identity_rejection = store.inspect_timing_evidence_identity(expected_session_id)
+    if identity_rejection is not None:
+        return _hottop_reception_result(
+            outcome="refused_identity",
+            requested_session_id=expected_session_id,
+            reason_code=identity_rejection,
+            driver_read="not_invoked",
+        )
+    capability_rejection = _hottop_reception_capability(
+        server_context, trusted_composition=trusted_composition
+    )
+    if capability_rejection is not None:
+        return _hottop_reception_result(
+            outcome="refused_capability",
+            requested_session_id=expected_session_id,
+            reason_code=capability_rejection,
+            driver_read="not_invoked",
+        )
+    admission = store.admit_timing_evidence(expected_session_id)
+    if admission.identity_rejection is not None:
+        return _hottop_reception_result(
+            outcome="refused_identity",
+            requested_session_id=expected_session_id,
+            reason_code=admission.identity_rejection,
+            driver_read="not_invoked",
+        )
+    if admission.busy_rejection is not None:
+        return _hottop_reception_result(
+            outcome="refused_busy",
+            requested_session_id=expected_session_id,
+            reason_code=admission.busy_rejection,
+            driver_read="not_invoked",
+        )
+    with server_context.hottop_reception_lock:
+        t0 = _timing_clock_value(store)
+        if t0 is None:
+            return _hottop_reception_result(
+                outcome="unavailable",
+                requested_session_id=expected_session_id,
+                reason_code="clock_invalid",
+                driver_read="not_invoked",
+            )
+        try:
+            driver = cast(HottopRoasterDriver, server_context.roaster_driver)
+            candidate: object = driver.snapshot_exact_drop_candidate()
+        except Exception:  # noqa: BLE001 - never expose adapter failure text.
+            return _hottop_reception_result(
+                outcome="unavailable",
+                requested_session_id=expected_session_id,
+                reason_code="driver_raised",
+                driver_read="invoked",
+            )
+        t1 = _timing_clock_value(store)
+        if t1 is None:
+            return _hottop_reception_result(
+                outcome="unavailable",
+                requested_session_id=expected_session_id,
+                reason_code="clock_invalid",
+                driver_read="invoked",
+            )
+        if t1 < t0:
+            return _hottop_reception_result(
+                outcome="unavailable",
+                requested_session_id=expected_session_id,
+                reason_code="clock_regression",
+                driver_read="invoked",
+            )
+        if type(candidate) is not HottopExactDropCandidate:
+            return _hottop_reception_result(
+                outcome="unavailable",
+                requested_session_id=expected_session_id,
+                reason_code="record_invalid",
+                driver_read="invoked",
+            )
+        try:
+            pair, token = _project_hottop_reception_pair(
+                candidate,
+                receipt_age_bound_seconds=trusted_composition.receipt_age_bound_seconds,
+            )
+        except RuntimeError as exc:
+            if str(exc) == "driver_not_streaming":
+                return _hottop_reception_result(
+                    outcome="unavailable",
+                    requested_session_id=expected_session_id,
+                    reason_code="driver_not_streaming",
+                    driver_read="invoked",
+                )
+            return _hottop_reception_result(
+                outcome="unavailable",
+                requested_session_id=expected_session_id,
+                reason_code="record_invalid",
+                driver_read="invoked",
+            )
+        except Exception:  # noqa: BLE001 - malformed immutable snapshot is unavailable.
+            return _hottop_reception_result(
+                outcome="unavailable",
+                requested_session_id=expected_session_id,
+                reason_code="record_invalid",
+                driver_read="invoked",
+            )
+
+        def finalize(core: dict[str, object]) -> HottopReceptionEvidenceResult:
+            record_pair = pair
+            # A command transition can be recorded by the store after the
+            # immutable driver snapshot but before this store-owned record.
+            # It must never inherit a pre-transition receipt token.
+            if core["drop"] is not None:
+                record_pair = {"status": "ineligible", "reasons": ("superseded",)}
+            settlements = {
+                "drop": _project_hottop_settlement(candidate.drop_settlement),
+                "emergency": _project_hottop_settlement(
+                    candidate.emergency_settlements[-1] if candidate.emergency_settlements else None
+                ),
+            }
+            record = {
+                **core,
+                "driver": HOTTOP_DRIVER_NAME,
+                "composition": {
+                    "kind": "simulated_injected_transport",
+                    "composition_id": server_context.simulation_composition_id,
+                    "reception_capability_version": 1,
+                },
+                "pair": record_pair,
+                "command_settlements": settlements,
+                "sensor_age": "unknown",
+                "physical_qualification": "none_simulated_transport_only",
+            }
+            result = _hottop_reception_result(
+                outcome="evidence",
+                requested_session_id=expected_session_id,
+                reason_code=None,
+                driver_read="invoked",
+                record=record,
+            )
+            assert result.record is not None
+            server_context.hottop_reception_registry.install(
+                _HottopReceptionIssuedEvidence(
+                    session_id=result.record.session_id,
+                    ownership_sequence=result.record.session_ownership_sequence,
+                    reception_evidence_sequence=result.record.reception_evidence_sequence,
+                    receipt_token=token,
+                    candidate=candidate,
+                )
+                if token is not None and record_pair["status"] == "eligible"
+                else None,
+            )
+            return result
+
+        assembled = store.assemble_hottop_reception_evidence(
+            admission, t0=t0, t1=t1, finalize=finalize
+        )
+    if assembled.outcome == "evidence":
+        assert isinstance(assembled.result, HottopReceptionEvidenceResult)
+        return assembled.result
+    return _hottop_reception_result(
         outcome=assembled.outcome,
         requested_session_id=expected_session_id,
         reason_code=assembled.reason_code,
