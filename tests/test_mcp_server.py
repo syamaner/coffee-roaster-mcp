@@ -8508,6 +8508,85 @@ def test_initial_emergency_stop_driver_error_blocks_fault_recovery_commands(
     assert driver.actions == ["connect"]
 
 
+@pytest.mark.parametrize("guarded_fault", [False, True])
+def test_ordinary_emergency_stop_pre_driver_admission_failure_stops_owned_runtimes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    guarded_fault: bool,
+) -> None:
+    """An ordinary Stop keeps its selected session as the cleanup owner on admission failure."""
+    config_path = tmp_path / "coffee-roaster-mcp.yaml"
+    config_path.write_text(f"logging:\n  log_dir: {tmp_path / 'logs'}\n", encoding="utf-8")
+    server_context = build_server_context(config_path=config_path)
+    driver = RecordingRoasterDriver()
+    object.__setattr__(server_context, "roaster_driver", driver)
+    server = create_mcp_server(config_path=config_path)
+    ctx = _ctx(server_context)
+    started = _call_tool(server, "start_roast_session", ctx)
+    session_id = started.session.session_id
+    expected_session_id: str | None = None
+    if guarded_fault:
+        _call_tool(server, "emergency_stop", ctx, reason="prepare guarded Stop")
+        expected_session_id = session_id
+
+    cleanup_calls: list[tuple[str, str, str]] = []
+
+    def fail_admission(_session: RoastSession) -> None:
+        """Reproduce the pre-driver cancellation admission failure."""
+        raise SessionLifecycleError("synthetic admission rejection")
+
+    def record_first_crack_cleanup(session_id: str, *, reason: str) -> object:
+        """Record the first-crack cleanup owner without touching a runtime."""
+        cleanup_calls.append(("first_crack", session_id, reason))
+        return None
+
+    def record_telemetry_cleanup(session_id: str, *, reason: str) -> None:
+        """Record the telemetry cleanup owner without touching a runtime."""
+        cleanup_calls.append(("telemetry", session_id, reason))
+
+    def record_ambient_cleanup(session_id: str, *, reason: str) -> object:
+        """Record the ambient cleanup owner without touching a runtime."""
+        cleanup_calls.append(("ambient", session_id, reason))
+        return None
+
+    actions_before = list(driver.actions)
+    monkeypatch.setattr(
+        server_context.session_store,
+        "cancel_nonfinalisation_driver_command",
+        fail_admission,
+    )
+    monkeypatch.setattr(
+        server_context.first_crack_runtime,
+        "stop_for_session",
+        record_first_crack_cleanup,
+    )
+    monkeypatch.setattr(
+        server_context.telemetry_sampler,
+        "stop_for_session",
+        record_telemetry_cleanup,
+    )
+    monkeypatch.setattr(
+        server_context.ambient_runtime,
+        "stop_for_session",
+        record_ambient_cleanup,
+    )
+
+    with pytest.raises(SessionLifecycleError, match="synthetic admission rejection"):
+        _call_tool(
+            server,
+            "emergency_stop",
+            ctx,
+            expected_session_id=expected_session_id,
+        )
+
+    assert cleanup_calls == [
+        ("first_crack", session_id, "emergency stop"),
+        ("telemetry", session_id, "emergency stop"),
+        ("ambient", session_id, "emergency stop"),
+    ]
+    assert driver.actions == actions_before
+
+
 @pytest.mark.parametrize("authority", ["automatic", "manual"])
 def test_active_emergency_stop_recording_failure_retains_in_memory_fault_block(
     tmp_path: Path,

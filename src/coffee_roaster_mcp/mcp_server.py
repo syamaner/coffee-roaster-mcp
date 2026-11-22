@@ -1840,6 +1840,13 @@ def _exact_normal_drop_public_result(
 
 
 @dataclass(frozen=True)
+class _TrustedHottopSimulationBinding:
+    """Private factory binding for one trusted in-process simulation."""
+
+    composition: HottopSimulationComposition
+
+
+@dataclass(frozen=True)
 class ServerContext:
     """Server bootstrap context.
 
@@ -1868,6 +1875,8 @@ class ServerContext:
     mock_replay_publisher: _MockReplayPublisher
     simulation_composition: HottopSimulationComposition | None = None
     simulation_composition_id: str | None = None
+    _trusted_hottop_simulation_binding: _TrustedHottopSimulationBinding | None = None
+    _trusted_hottop_simulation_driver: HottopRoasterDriver | None = None
     hottop_reception_registry: _HottopReceptionEvidenceRegistry = field(
         default_factory=_HottopReceptionEvidenceRegistry
     )
@@ -2923,6 +2932,46 @@ def _manual_mock_capture_configured(config: AppConfig, driver: RoasterDriver) ->
     )
 
 
+def _trusted_hottop_simulation(server_context: ServerContext) -> bool:
+    """Return whether this context retains the factory-bound synthetic authority."""
+    binding = server_context._trusted_hottop_simulation_binding  # pyright: ignore[reportPrivateUsage]
+    driver = server_context.roaster_driver
+    config = server_context.config
+    return bool(
+        type(binding) is _TrustedHottopSimulationBinding
+        and type(binding.composition) is HottopSimulationComposition
+        and server_context.simulation_composition is binding.composition
+        and type(driver) is HottopRoasterDriver
+        and driver is server_context._trusted_hottop_simulation_driver  # pyright: ignore[reportPrivateUsage]
+        and driver._port == SYNTHETIC_HOTTOP_PORT  # pyright: ignore[reportPrivateUsage]
+        and config.roaster.port == SYNTHETIC_HOTTOP_PORT
+        and config.first_crack.event_authority == "manual"
+        and config.recording.enabled
+        and config.recording.autocapture
+    )
+
+
+def _trusted_hottop_simulation_components(
+    *,
+    config: AppConfig,
+    driver: RoasterDriver,
+    simulation_composition: HottopSimulationComposition | None,
+    binding: _TrustedHottopSimulationBinding | None,
+) -> bool:
+    """Return whether one factory-built composition may own the synthetic writer."""
+    return bool(
+        type(binding) is _TrustedHottopSimulationBinding
+        and type(binding.composition) is HottopSimulationComposition
+        and simulation_composition is binding.composition
+        and type(driver) is HottopRoasterDriver
+        and driver._port == SYNTHETIC_HOTTOP_PORT  # pyright: ignore[reportPrivateUsage]
+        and config.roaster.port == SYNTHETIC_HOTTOP_PORT
+        and config.first_crack.event_authority == "manual"
+        and config.recording.enabled
+        and config.recording.autocapture
+    )
+
+
 def _validate_hottop_simulation_composition(
     config: AppConfig, composition: HottopSimulationComposition
 ) -> None:
@@ -3011,6 +3060,7 @@ def build_server_context(
     transport: str = "stdio",
     simulation_composition: HottopSimulationComposition | None = None,
     environ: Mapping[str, str] | None = None,
+    _trusted_hottop_simulation_binding: _TrustedHottopSimulationBinding | None = None,
 ) -> ServerContext:
     """Build the MCP server lifecycle context from config and runtime transport.
 
@@ -3074,8 +3124,16 @@ def build_server_context(
     capture_evidence_configured = _manual_capture_configured(
         config, roaster_driver, simulation_composition
     )
+    trusted_simulation = _trusted_hottop_simulation_components(
+        config=config,
+        driver=roaster_driver,
+        simulation_composition=simulation_composition,
+        binding=_trusted_hottop_simulation_binding,
+    )
     unavailable_export_marker = (
-        _establish_unavailable_export_marker(config) if simulation_composition is None else None
+        _establish_unavailable_export_marker(config)
+        if simulation_composition is None or trusted_simulation
+        else None
     )
     capture_evidence_publisher = CaptureEvidencePublisher()
     server_context: ServerContext | None = None
@@ -3102,6 +3160,8 @@ def build_server_context(
             default_log_dir=config.logging.log_dir / "roasts",
             telemetry_log_interval_seconds=config.logging.sample_interval_seconds,
             monotonic_now=simulation_composition.clock,
+            manual_first_crack_writer_enabled=trusted_simulation,
+            manual_first_crack_budget_seconds=(None if trusted_simulation else 1.0),
         )
     mock_replay_publisher = _MockReplayPublisher()
 
@@ -3142,6 +3202,10 @@ def build_server_context(
         capture_evidence_configured=capture_evidence_configured,
         simulation_composition=simulation_composition,
         simulation_composition_id=(uuid4().hex if simulation_composition is not None else None),
+        _trusted_hottop_simulation_binding=_trusted_hottop_simulation_binding,
+        _trusted_hottop_simulation_driver=(
+            cast(HottopRoasterDriver, roaster_driver) if trusted_simulation else None
+        ),
         unavailable_export_marker=unavailable_export_marker,
         mock_replay_publisher=mock_replay_publisher,
     )
@@ -3199,6 +3263,12 @@ def _create_mcp_server(
 ) -> FastMCP:
     """Create a FastMCP server from one already-authorized composition."""
 
+    trusted_hottop_simulation_binding = (
+        _TrustedHottopSimulationBinding(simulation_composition)
+        if type(simulation_composition) is HottopSimulationComposition
+        else None
+    )
+
     @asynccontextmanager
     async def server_lifespan(_: FastMCP) -> AsyncGenerator[ServerContext, None]:
         """Load typed config once for the MCP process lifetime."""
@@ -3207,6 +3277,7 @@ def _create_mcp_server(
             transport=transport,
             simulation_composition=simulation_composition,
             environ=environ,
+            _trusted_hottop_simulation_binding=trusted_hottop_simulation_binding,
         )
         try:
             yield server_context
@@ -3969,6 +4040,42 @@ def _create_mcp_server(
             server_context.config, server_context.roaster_driver
         )
         manual_mock_replay = manual_mock_export and server_context.capture_evidence_configured
+        trusted_hottop_export = (
+            _trusted_hottop_simulation(server_context) and session.purpose == "roast"
+        )
+        if trusted_hottop_export:
+            if persistence_incomplete or session.active:
+                unavailable = _unavailable_manual_mock_export(
+                    server_context,
+                    session.id,
+                    note=(
+                        "Roast log recording is unavailable: JSONL persistence is incomplete."
+                        if persistence_incomplete
+                        else "Roast log export is unavailable while this roast session is active."
+                    ),
+                )
+                if unavailable is None:
+                    raise ValueError("Roast export is unavailable.")
+                return unavailable
+            export = await _export_trusted_hottop_simulation_snapshot(server_context, session.id)
+            if export is not None:
+                return ExportRoastLogResult(
+                    session_id=export.session_id,
+                    log_dir=str(export.log_dir),
+                    jsonl_path=str(export.jsonl_path),
+                    csv_path=str(export.csv_path),
+                    summary_path=str(export.summary_path),
+                    ready=export.ready,
+                    note=export.note,
+                )
+            unavailable = _unavailable_manual_mock_export(
+                server_context,
+                session.id,
+                note="Roast log export is unavailable.",
+            )
+            if unavailable is None:
+                raise ValueError("Roast export is unavailable.")
+            return unavailable
         if persistence_incomplete or (
             session.active and session.purpose == "roast" and manual_mock_export
         ):
@@ -4050,6 +4157,7 @@ def _create_mcp_server(
         """Call the configured driver safety method and record a fault event."""
         server_context = ctx.request_context.lifespan_context
         session: RoastSession | None = None
+        cleanup_owner: RoastSession | None = None
         has_verified_containment = False
         primary_error: BaseException | None = None
         observation_ticket: object | None = None
@@ -4060,25 +4168,71 @@ def _create_mcp_server(
             tuple[RoastEvent, RoastSession, MockDropPersistenceTicket | None] | None
         ) = None
         guarded_fault_refusal = False
+        mode: Literal["ACTIVE_REASON_ONLY", "ACTIVE_OWNER", "STOPPED_FAULT"]
         snapshot: RoastSession | None = None
         try:
             with server_context.lifecycle_barrier:
                 if expected_session_id is None:
                     session = _require_active_session(server_context)
+                    mode = "ACTIVE_REASON_ONLY"
+                    cleanup_owner = session
+                elif _trusted_hottop_simulation(server_context):
+                    candidate_session = server_context.session_store.get_latest_session()
+                    if candidate_session is None or candidate_session.id != expected_session_id:
+                        raise ValueError("Expected session is not the latest roast session.")
+                    if candidate_session.active:
+                        try:
+                            server_context.session_store.assert_exact_active_emergency_owner(
+                                candidate_session,
+                                expected_session_id,
+                            )
+                        except SessionLifecycleError as exc:
+                            raise ValueError(str(exc)) from exc
+                        session = candidate_session
+                        mode = "ACTIVE_OWNER"
+                    else:
+                        session = _require_guarded_fault_recovery_session(
+                            server_context,
+                            expected_session_id=expected_session_id,
+                            allow_in_flight=True,
+                        )
+                        cleanup_owner = session
+                        server_context.session_store.cancel_session_start_for_emergency_stop()
+                        mode = "STOPPED_FAULT"
                 else:
                     session = _require_guarded_fault_recovery_session(
                         server_context,
                         expected_session_id=expected_session_id,
                         allow_in_flight=True,
                     )
+                    cleanup_owner = session
                     server_context.session_store.cancel_session_start_for_emergency_stop()
-                server_context.session_store.cancel_nonfinalisation_driver_command(session)
+                    mode = "STOPPED_FAULT"
+                try:
+                    server_context.session_store.cancel_nonfinalisation_driver_command(session)
+                except SessionLifecycleError as exc:
+                    if mode == "ACTIVE_OWNER":
+                        latest = server_context.session_store.get_latest_session()
+                        if latest is None or latest.id != expected_session_id:
+                            raise ValueError(
+                                "Expected session is not the latest roast session."
+                            ) from exc
+                    raise
                 if _manual_first_crack_writer_composition(server_context):
                     # Endpoint ownership is visible to new mark admission
                     # before the emergency driver call. A captured session
                     # which completed meanwhile is left untouched so this
                     # eligible emergency still reaches its driver boundary.
-                    server_context.session_store.admit_manual_first_crack_endpoint(session)
+                    try:
+                        server_context.session_store.admit_manual_first_crack_endpoint(session)
+                    except SessionLifecycleError as exc:
+                        if mode == "ACTIVE_OWNER":
+                            latest = server_context.session_store.get_latest_session()
+                            if latest is None or latest.id != expected_session_id:
+                                raise ValueError(
+                                    "Expected session is not the latest roast session."
+                                ) from exc
+                        raise
                 else:
                     server_context.session_store.revoke_unconsumed_manual_first_crack_live_publication(
                         session
@@ -4091,6 +4245,8 @@ def _create_mcp_server(
                     )
                     if revoke_publication is not None:
                         revoke_publication(session)
+                if cleanup_owner is None:
+                    cleanup_owner = session
                 safety_payload = run_driver_emergency_stop(server_context, reason=reason)
                 if server_context.config.first_crack.event_authority == "manual":
                     observation_ticket = (
@@ -4101,7 +4257,7 @@ def _create_mcp_server(
                 has_verified_containment = has_verified_emergency_containment(
                     safety_payload=safety_payload
                 )
-                if expected_session_id is not None and not has_verified_containment:
+                if mode == "STOPPED_FAULT" and not has_verified_containment:
                     guarded_fault_recording = _retain_guarded_emergency_stop_block(
                         server_context,
                         session=session,
@@ -4135,7 +4291,7 @@ def _create_mcp_server(
                             )
                     except Exception as exc:
                         if (
-                            expected_session_id is None
+                            mode != "STOPPED_FAULT"
                             and has_verified_containment
                             and _manual_first_crack_writer_composition(server_context)
                         ):
@@ -4147,7 +4303,7 @@ def _create_mcp_server(
                                 "Emergency stop command was accepted, but fault recording "
                                 "is unavailable."
                             ) from exc
-                        if expected_session_id is not None:
+                        if mode == "STOPPED_FAULT":
                             with suppress(Exception):  # Preserve the persistence failure.
                                 server_context.session_store.retain_fault_block(
                                     session,
@@ -4173,7 +4329,7 @@ def _create_mcp_server(
                                 + event.monotonic_seconds,
                             )
                         except Exception as exc:
-                            if expected_session_id is not None:
+                            if mode == "STOPPED_FAULT":
                                 with suppress(Exception):
                                     server_context.session_store.retain_fault_block(
                                         session,
@@ -4214,7 +4370,7 @@ def _create_mcp_server(
                         ticket=deferred_mock_fault_ticket,
                     )
                 except Exception as exc:
-                    if expected_session_id is not None:
+                    if mode == "STOPPED_FAULT":
                         with suppress(Exception):
                             server_context.session_store.retain_fault_block(
                                 session, safety_payload=safety_payload
@@ -4259,25 +4415,25 @@ def _create_mcp_server(
             primary_error = exc
             raise
         finally:
-            if session is not None:
+            if cleanup_owner is not None:
                 cleanup_error: Exception | None = None
                 for stop_runtime in (
                     lambda: (
                         server_context.first_crack_runtime.freeze_observation_boundary(
-                            session, observation_ticket, reason="emergency_stop"
+                            cleanup_owner, observation_ticket, reason="emergency_stop"
                         )
                         if server_context.config.first_crack.event_authority == "manual"
                         and observation_ticket is not None
                         else server_context.first_crack_runtime.stop_for_session(
-                            session.id, reason="emergency stop"
+                            cleanup_owner.id, reason="emergency stop"
                         )
                     ),
                     lambda: server_context.telemetry_sampler.stop_for_session(
-                        session.id,
+                        cleanup_owner.id,
                         reason="emergency stop",
                     ),
                     lambda: server_context.ambient_runtime.stop_for_session(
-                        session.id,
+                        cleanup_owner.id,
                         reason="emergency stop",
                     ),
                 ):
@@ -4469,9 +4625,12 @@ def _record_session_event(
 
 def _manual_first_crack_writer_composition(server_context: ServerContext) -> bool:
     """Return whether this context owns the bounded manual first-crack writer."""
-    return server_context.capture_evidence_configured and _manual_mock_capture_configured(
-        server_context.config,
-        server_context.roaster_driver,
+    return server_context.capture_evidence_configured and (
+        _manual_mock_capture_configured(
+            server_context.config,
+            server_context.roaster_driver,
+        )
+        or _trusted_hottop_simulation(server_context)
     )
 
 
@@ -4499,6 +4658,54 @@ def _unavailable_manual_mock_export(
         ready=False,
         note=note,
     )
+
+
+async def _export_trusted_hottop_simulation_snapshot(
+    server_context: ServerContext, session_id: str
+) -> RoastLogExport | None:
+    """Export one settled trusted-simulation generation without owning JSONL writes."""
+    deadline = time.monotonic() + server_context.mock_replay_publisher.budget_seconds
+
+    def remaining_seconds() -> float:
+        """Return the remaining bounded export budget."""
+        return max(0.0, deadline - time.monotonic())
+
+    try:
+        prepared = await asyncio.wait_for(
+            asyncio.to_thread(
+                server_context.session_store.prepare_manual_mock_replay_export,
+                session_id=session_id,
+                timeout_seconds=remaining_seconds(),
+            ),
+            timeout=remaining_seconds(),
+        )
+    except TimeoutError:
+        return None
+    if prepared is None or remaining_seconds() <= 0:
+        return None
+    session, writer = prepared
+    try:
+        before = await asyncio.wait_for(
+            asyncio.to_thread(writer.read_sealed_bytes), timeout=remaining_seconds()
+        )
+    except (EventLogRecordingError, OSError, TimeoutError):
+        return None
+    observation = server_context.first_crack_runtime.observation_for_session(session.id)
+    try:
+        export = export_roast_snapshot(
+            session,
+            roaster_driver=server_context.config.roaster.driver,
+            ror_window_seconds=server_context.config.session.ror_window_seconds,
+            ror_min_sample_seconds=server_context.config.session.ror_min_sample_seconds,
+            first_crack_observation=observation,
+            require_existing_jsonl=True,
+        )
+        after = await asyncio.wait_for(
+            asyncio.to_thread(writer.read_sealed_bytes), timeout=remaining_seconds()
+        )
+    except (EventLogRecordingError, OSError, TimeoutError, ValueError):
+        return None
+    return export if before == after else None
 
 
 async def _await_mock_replay_export(
@@ -4530,9 +4737,9 @@ async def _record_manual_first_crack_with_budget(
 ) -> EventCommandResult:
     """Await one composed manual mark without cancelling its owned writer.
 
-    The store's injected one-second deadline covers staging, append and
-    verification.  A local timeout only revokes live publication; it never
-    abandons, retries, or infers the writer's eventual filesystem result.
+    The store's injected producer deadline, when configured, covers staging,
+    append and verification. A local timeout only revokes live publication; it
+    never abandons, retries, or infers the writer's eventual filesystem result.
     """
     started_monotonic_seconds = server_context.session_store.manual_first_crack_monotonic_now()
     session = _require_active_session(server_context)
@@ -4564,7 +4771,7 @@ async def _record_manual_first_crack_with_budget(
         settlement = await asyncio.wrap_future(attempt.completion)
     else:
         remaining = server_context.session_store.manual_first_crack_remaining_seconds(attempt)
-        if remaining <= 0:
+        if remaining is not None and remaining <= 0:
             settlement = (
                 server_context.session_store.settle_or_revoke_manual_first_crack_live_publication(
                     attempt
@@ -4577,10 +4784,13 @@ async def _record_manual_first_crack_with_budget(
             _discard_human_mark_publication(server_context, attempt.observer_publication_token)
             raise ValueError("Manual first-crack mark remains pending; do not resend it.")
         try:
-            settlement = await asyncio.wait_for(
-                asyncio.shield(asyncio.wrap_future(attempt.completion)),
-                timeout=remaining,
-            )
+            if remaining is None:
+                settlement = await asyncio.shield(asyncio.wrap_future(attempt.completion))
+            else:
+                settlement = await asyncio.wait_for(
+                    asyncio.shield(asyncio.wrap_future(attempt.completion)),
+                    timeout=remaining,
+                )
         except TimeoutError:
             # Choose live settlement versus revocation under the store lock.
             # A completed future cannot straddle a separate done()/revoke().
