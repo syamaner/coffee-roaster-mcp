@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import inspect
 import json
 import os
@@ -33,6 +34,7 @@ import coffee_roaster_mcp.session as session_module
 from coffee_roaster_mcp.config import AmbientConfig, AppConfig, ConfigError, FirstCrackConfig
 from coffee_roaster_mcp.detector import FirstCrackDetectorAdapter
 from coffee_roaster_mcp.drivers import (
+    HOTTOP_DRIVER_NAME,
     HOTTOP_PACKET_LENGTH,
     HOTTOP_PACKET_PREFIX,
     HottopRoasterDriver,
@@ -1186,7 +1188,7 @@ def test_simulation_sdk_manual_confirmation_keeps_capture_until_finalised(tmp_pa
             assert stopped["event"]["kind"] == "fault"
             assert (tmp_path / "capture-stopped").exists()
             exported = await call("export_roast_log", {"session_id": session_id})
-            assert exported["ready"] is True
+            assert exported["ready"] is False
 
     asyncio.run(exercise())
     assert session_id is not None
@@ -1327,3 +1329,145 @@ def test_composed_lifespan_starts_staged_driver_capture_telemetry_and_synthetic_
 
     asyncio.run(exercise())
     assert list((tmp_path / "recordings").rglob("*.wav"))
+
+
+def test_trusted_simulation_export_preserves_canonical_writer_and_closed_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Trusted simulation exports only settled writer-owned canonical JSONL."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+
+    async def exercise() -> None:
+        """Run active, terminal, and interrupted registered-tool export paths."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            session_id = started.session.session_id
+            active = context.session_store.get_active_session()
+            assert active is not None and active.log_writer is not None
+            raw_dir = active.log_writer.log_dir
+            entries_before = tuple(raw_dir.iterdir()) if raw_dir.exists() else ()
+            marker = context.unavailable_export_marker
+            assert marker is not None and not marker.exists()
+            for arguments in ({}, {"session_id": session_id}):
+                unavailable = await _call(server, "export_roast_log", context, **arguments)
+                assert unavailable.ready is False
+                assert "while this roast session is active" in unavailable.note
+                assert Path(unavailable.log_dir) == marker
+            entries_after = tuple(raw_dir.iterdir()) if raw_dir.exists() else ()
+            assert entries_after == entries_before
+            assert not marker.exists()
+
+            await _call(server, "mark_beans_added", context)
+            assert active.mock_log_torn is False
+            raw_jsonl = raw_dir / "roast.jsonl"
+            first_row = json.loads(raw_jsonl.read_text(encoding="utf-8").splitlines()[0])
+            assert first_row["kind"] == "beans_added"
+            assert active.canonical_writer is not None
+            assert (raw_jsonl.stat().st_dev, raw_jsonl.stat().st_ino) == (
+                active.canonical_writer._identity  # pyright: ignore[reportPrivateUsage]
+            )
+
+            await _call(server, "mark_first_crack", context)
+            await _call(server, "drop_beans", context)
+            await _call(server, "start_cooling", context)
+            await _call(server, "stop_cooling", context)
+            canonical_before = raw_jsonl.read_bytes()
+            identity_before = (raw_jsonl.stat().st_dev, raw_jsonl.stat().st_ino)
+            for arguments in ({}, {"session_id": session_id}):
+                exported = await _call(server, "export_roast_log", context, **arguments)
+                assert exported.ready is True
+                assert Path(exported.jsonl_path) == raw_jsonl
+                summary = json.loads(Path(exported.summary_path).read_text(encoding="utf-8"))
+                assert summary["roaster_driver"] == HOTTOP_DRIVER_NAME
+            assert raw_jsonl.read_bytes() == canonical_before
+            assert (raw_jsonl.stat().st_dev, raw_jsonl.stat().st_ino) == identity_before
+            event_kinds = [json.loads(line)["kind"] for line in canonical_before.decode().splitlines()]
+            with Path(raw_dir / "roast.csv").open(newline="", encoding="utf-8") as output:
+                assert [row["event"] for row in csv.DictReader(output) if row["event"]] == event_kinds
+
+            interrupted = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            await _call(server, "mark_beans_added", context)
+            await _call(server, "mark_first_crack", context)
+            await _call(server, "emergency_stop", context, reason="synthetic interruption")
+            interrupted_session = context.session_store.get_latest_session()
+            assert interrupted_session is not None and interrupted_session.log_writer is not None
+            interrupted_dir = interrupted_session.log_writer.log_dir
+            for arguments in ({}, {"session_id": interrupted.session.session_id}):
+                unavailable = await _call(server, "export_roast_log", context, **arguments)
+                assert unavailable.ready is False
+            assert not (interrupted_dir / "roast.csv").exists()
+            assert not (interrupted_dir / "summary.json").exists()
+
+    asyncio.run(exercise())
+
+
+def test_trusted_simulation_export_refuses_markerless_and_unsettled_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Trusted simulation fails closed when its unavailable marker or settlement is absent."""
+    config = _simulation_config(tmp_path)
+    composition = HottopSimulationComposition(clock=_Clock(), receipt_age_bound_seconds=1.0)
+    server = create_hottop_simulation_mcp_server(config_path=config, composition=composition)
+
+    async def exercise() -> None:
+        """Exercise marker and writer-settlement refusal through registered tools."""
+        lifespan = server.settings.lifespan
+        assert lifespan is not None
+        async with lifespan(server) as context:
+            started = cast(
+                StartRoastSessionResult,
+                await _call(
+                    server,
+                    "start_roast_session",
+                    context,
+                    purpose="roast",
+                    first_crack_observer_ack="manual/v1",
+                ),
+            )
+            monkeypatch.setattr(context, "unavailable_export_marker", None)
+            with pytest.raises(ValueError, match="Roast export is unavailable\\."):
+                await _call(server, "export_roast_log", context)
+            with pytest.raises(ValueError, match="Unknown session_id"):
+                await _call(server, "export_roast_log", context, session_id="unknown")
+            monkeypatch.setattr(
+                context,
+                "unavailable_export_marker",
+                tmp_path / "unavailable",
+            )
+            await _call(server, "mark_beans_added", context)
+            await _call(server, "drop_beans", context)
+            await _call(server, "start_cooling", context)
+            await _call(server, "stop_cooling", context)
+            session = context.session_store.get_latest_session()
+            assert session is not None and session.canonical_writer is not None
+            monkeypatch.setattr(session.canonical_writer, "wait_for_idle", lambda **_kwargs: False)
+            unavailable = await _call(
+                server, "export_roast_log", context, session_id=started.session.session_id
+            )
+            assert unavailable.ready is False
+            assert not (session.log_writer.log_dir / "roast.csv").exists()  # type: ignore[union-attr]
+            assert not (session.log_writer.log_dir / "summary.json").exists()  # type: ignore[union-attr]
+
+    asyncio.run(exercise())

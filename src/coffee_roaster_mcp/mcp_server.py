@@ -3969,6 +3969,44 @@ def _create_mcp_server(
             server_context.config, server_context.roaster_driver
         )
         manual_mock_replay = manual_mock_export and server_context.capture_evidence_configured
+        trusted_hottop_export = (
+            _trusted_hottop_simulation(server_context) and session.purpose == "roast"
+        )
+        if trusted_hottop_export:
+            if persistence_incomplete or session.active:
+                unavailable = _unavailable_manual_mock_export(
+                    server_context,
+                    session.id,
+                    note=(
+                        "Roast log recording is unavailable: JSONL persistence is incomplete."
+                        if persistence_incomplete
+                        else "Roast log export is unavailable while this roast session is active."
+                    ),
+                )
+                if unavailable is None:
+                    raise ValueError("Roast export is unavailable.")
+                return unavailable
+            export = await _export_trusted_hottop_simulation_snapshot(
+                server_context, session.id
+            )
+            if export is not None:
+                return ExportRoastLogResult(
+                    session_id=export.session_id,
+                    log_dir=str(export.log_dir),
+                    jsonl_path=str(export.jsonl_path),
+                    csv_path=str(export.csv_path),
+                    summary_path=str(export.summary_path),
+                    ready=export.ready,
+                    note=export.note,
+                )
+            unavailable = _unavailable_manual_mock_export(
+                server_context,
+                session.id,
+                note="Roast log export is unavailable.",
+            )
+            if unavailable is None:
+                raise ValueError("Roast export is unavailable.")
+            return unavailable
         if persistence_incomplete or (
             session.active and session.purpose == "roast" and manual_mock_export
         ):
@@ -4550,6 +4588,54 @@ def _unavailable_manual_mock_export(
         ready=False,
         note=note,
     )
+
+
+async def _export_trusted_hottop_simulation_snapshot(
+    server_context: ServerContext, session_id: str
+) -> RoastLogExport | None:
+    """Export one settled trusted-simulation generation without owning JSONL writes."""
+    deadline = time.monotonic() + server_context.mock_replay_publisher.budget_seconds
+
+    def remaining_seconds() -> float:
+        """Return the remaining bounded export budget."""
+        return max(0.0, deadline - time.monotonic())
+
+    try:
+        prepared = await asyncio.wait_for(
+            asyncio.to_thread(
+                server_context.session_store.prepare_manual_mock_replay_export,
+                session_id=session_id,
+                timeout_seconds=remaining_seconds(),
+            ),
+            timeout=remaining_seconds(),
+        )
+    except TimeoutError:
+        return None
+    if prepared is None or remaining_seconds() <= 0:
+        return None
+    session, writer = prepared
+    try:
+        before = await asyncio.wait_for(
+            asyncio.to_thread(writer.read_sealed_bytes), timeout=remaining_seconds()
+        )
+    except (EventLogRecordingError, OSError, TimeoutError):
+        return None
+    observation = server_context.first_crack_runtime.observation_for_session(session.id)
+    try:
+        export = export_roast_snapshot(
+            session,
+            roaster_driver=server_context.config.roaster.driver,
+            ror_window_seconds=server_context.config.session.ror_window_seconds,
+            ror_min_sample_seconds=server_context.config.session.ror_min_sample_seconds,
+            first_crack_observation=observation,
+            require_existing_jsonl=True,
+        )
+        after = await asyncio.wait_for(
+            asyncio.to_thread(writer.read_sealed_bytes), timeout=remaining_seconds()
+        )
+    except (EventLogRecordingError, OSError, TimeoutError, ValueError):
+        return None
+    return export if before == after else None
 
 
 async def _await_mock_replay_export(

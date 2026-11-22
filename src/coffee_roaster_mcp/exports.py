@@ -317,6 +317,7 @@ def export_roast_snapshot(
     ror_window_seconds: float = 60.0,
     ror_min_sample_seconds: float = 10.0,
     first_crack_observation: ObservationSnapshot | None = None,
+    require_existing_jsonl: bool = False,
 ) -> RoastLogExport:
     """Write a deterministic snapshot export for one roast session.
 
@@ -329,6 +330,7 @@ def export_roast_snapshot(
         roaster_driver: Configured roaster driver used for the session.
         ror_window_seconds: Rolling telemetry window for RoR calculations.
         ror_min_sample_seconds: Minimum valid sensor sample span required for RoR.
+        require_existing_jsonl: Refuse to create the canonical JSONL file.
 
     Returns:
         Export file paths and readiness metadata.
@@ -349,6 +351,8 @@ def export_roast_snapshot(
     if jsonl_path.exists() and not jsonl_path.is_file():
         raise ValueError(f"JSONL export path exists but is not a file: {jsonl_path}")
     if not jsonl_path.exists():
+        if require_existing_jsonl:
+            raise ValueError("Canonical JSONL export is unavailable.")
         _write_event_jsonl(jsonl_path, session=session)
     _write_event_csv(
         csv_path,
