@@ -2050,6 +2050,7 @@ def build_server_context(
             baudrate=config.roaster.baudrate,
             temperature_unit=config.roaster.temperature_unit,
             command_interval_seconds=config.roaster.command_interval_seconds,
+            hottop_reception=config.roaster.hottop_reception,
         )
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc

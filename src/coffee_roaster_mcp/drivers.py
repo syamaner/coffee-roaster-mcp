@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from importlib import import_module
 from math import isfinite
 from threading import Event, Lock, Thread
+from time import monotonic
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 from coffee_roaster_mcp.controls import validate_control_percent
@@ -129,6 +130,7 @@ class RoasterCapabilities:
     manual_first_crack_version: int | None = None
     timing_evidence_version: int | None = None
     normal_drop_version: int | None = None
+    hottop_reception_candidate_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -514,6 +516,46 @@ HottopReceiptReason = Literal[
     "receipt_age_bound_unset",
     "receipt_age_exceeds_bound",
 ]
+HottopReceptionMode = Literal["off", "candidate/v1"]
+HottopWriteResult = Literal["entering", "accepted_by_host", "unknown"]
+HottopSettlementResult = Literal[
+    "pending", "not_attempted", "entering", "accepted_by_host", "unknown"
+]
+HottopAttemptRole = Literal["ordinary", "drop", "emergency", "repeat"]
+
+
+class HottopDropRefused(RuntimeError):
+    """Raised when candidate-mode Drop admission retains uncertain ownership."""
+
+
+@dataclass(frozen=True)
+class HottopWriteAttempt:
+    """Bounded host-side evidence for one candidate command write entry."""
+
+    epoch: int
+    handle_identity: int
+    attempt_seq: int
+    revision: int
+    frame: bytes
+    solenoid: int
+    result: HottopWriteResult
+    role: HottopAttemptRole = "ordinary"
+
+
+@dataclass(frozen=True)
+class HottopCommandSettlement:
+    """First-attempt-only settlement for one Drop or emergency transition."""
+
+    transition: Literal["drop", "emergency"]
+    transition_seq: int
+    transition_revision: int
+    transition_epoch: int
+    result: HottopSettlementResult
+    physical_effect: Literal["not_established"] = "not_established"
+    attempt_epoch: int | None = None
+    attempt_handle_identity: int | None = None
+    attempt_seq: int | None = None
+    attempt_revision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1592,6 +1634,8 @@ class HottopRoasterDriver:
         join_timeout_seconds: float = 1.0,
         command_loop_iteration_hook: Callable[[], None] | None = None,
         command_frame_provider: HottopCommandFrameProvider | None = None,
+        hottop_reception: HottopReceptionMode = "off",
+        reception_clock: Callable[[], float] | None = None,
     ) -> None:
         """Initialize Hottop lifecycle dependencies.
 
@@ -1604,17 +1648,36 @@ class HottopRoasterDriver:
             join_timeout_seconds: Maximum disconnect wait for command-loop cleanup.
             command_loop_iteration_hook: Optional hook called after a loop iteration.
             command_frame_provider: Optional command-frame source for each loop tick.
+            hottop_reception: Opt-in host-receipt candidate mode.
+            reception_clock: Optional injected host clock for simulated candidate tests.
         """
         if command_interval_seconds <= 0:
             raise ValueError("command_interval_seconds must be greater than 0.")
         if join_timeout_seconds <= 0:
             raise ValueError("join_timeout_seconds must be greater than 0.")
         normalized_temperature_unit = _validate_hottop_temperature_unit(temperature_unit)
+        if hottop_reception not in {"off", "candidate/v1"}:
+            raise ValueError("hottop_reception must be exactly 'off' or 'candidate/v1'.")
+        if hottop_reception == "candidate/v1" and (
+            serial_factory is None or serial_factory is _create_pyserial_transport
+        ):
+            raise ValueError(
+                "candidate/v1 requires an injected simulated transport; "
+                "physical transport not qualified"
+            )
+        if hottop_reception == "candidate/v1" and normalized_temperature_unit != "celsius":
+            raise ValueError("candidate/v1 requires temperature_unit celsius.")
+        if hottop_reception == "candidate/v1" and command_frame_provider is not None:
+            raise ValueError("candidate/v1 does not permit command_frame_provider.")
         self._port = port
         self._baudrate = baudrate
         self._temperature_unit: HottopTemperatureUnit = normalized_temperature_unit
         self._command_interval_seconds = command_interval_seconds
-        self._serial_factory = serial_factory or _create_pyserial_transport
+        self._serial_factory = (
+            _create_pyserial_transport if serial_factory is None else serial_factory
+        )
+        self._hottop_reception: HottopReceptionMode = hottop_reception
+        self._reception_clock = reception_clock or monotonic
         self._join_timeout_seconds = join_timeout_seconds
         self._serial: SerialTransport | None = None
         self._connected = False
@@ -1656,6 +1719,20 @@ class HottopRoasterDriver:
         self._ignored_temperature_packet_count = 0
         self._status_read_error_count = 0
         self._status_buffer = b""
+        self._reception_epoch = 0
+        self._reception_handle_token = 0
+        self._reception_sequence = 0
+        self._reception_floor: HottopDrainedFloor | None = None
+        self._reception_record: HottopReceivedPacket | None = None
+        self._reception_discard_count = 0
+        self._attempt_sequence = 0
+        self._attempt_history: list[HottopWriteAttempt] = []
+        self._drop_transition_count = 0
+        self._emergency_count = 0
+        self._drop_settlement: HottopCommandSettlement | None = None
+        self._emergency_settlement: HottopCommandSettlement | None = None
+        self._emergency_settlements: list[HottopCommandSettlement] = []
+        self._emergency_transition_frames: list[tuple[int, int, int, bytes]] = []
 
     @property
     def capabilities(self) -> RoasterCapabilities:
@@ -1680,6 +1757,9 @@ class HottopRoasterDriver:
                 interval_seconds=self._command_interval_seconds,
             ),
             heat_containment_version=1,
+            hottop_reception_candidate_version=(
+                1 if self._hottop_reception == "candidate/v1" else None
+            ),
         )
 
     def inspect_inhibited_start(
@@ -1691,6 +1771,8 @@ class HottopRoasterDriver:
 
     def reserve_inhibited_start(self, server_token: str) -> HottopStartOwner:
         """Allocate exact ownership before any native factory entry."""
+        if self._hottop_reception == "candidate/v1":
+            raise RuntimeError("candidate/v1 does not support inhibited Start.")
         self._refuse_staged_connect()
         with self._lifecycle_lock, self._state_lock:
             if self._start_owner is not None:
@@ -1938,6 +2020,8 @@ class HottopRoasterDriver:
 
             with self._state_lock:
                 self._serial = serial_transport
+                if self._hottop_reception == "candidate/v1":
+                    self._begin_reception_epoch(serial_transport)
                 self._connected = True
                 self._disconnect_requested.clear()
                 self._stop_event.clear()
@@ -1974,6 +2058,15 @@ class HottopRoasterDriver:
         """Publish stop state while coordinating with the command write path."""
         with self._state_lock:
             serial_transport = self._serial
+            if self._hottop_reception == "candidate/v1":
+                self._disconnect_requested.set()
+                self._connected = False
+                self._stop_event.set()
+                self._reception_epoch += 1
+                self._reception_handle_token = self._reception_epoch
+                self._status_buffer = b""
+                self._reception_floor = None
+                self._reception_record = None
 
         close_failed = False
         write_lock_acquired = self._command_write_lock.acquire(timeout=self._write_timeout_seconds)
@@ -1990,9 +2083,10 @@ class HottopRoasterDriver:
 
         try:
             with self._state_lock:
-                self._disconnect_requested.set()
-                self._connected = False
-                self._stop_event.set()
+                if self._hottop_reception == "off":
+                    self._disconnect_requested.set()
+                    self._connected = False
+                    self._stop_event.set()
                 if close_failed:
                     self._last_command_write_size = 0
                 return self._command_thread, self._serial
@@ -2120,6 +2214,14 @@ class HottopRoasterDriver:
     def drop_beans(self) -> RoasterState:
         """Apply Hottop compound bean-drop command state."""
         with self._state_lock:
+            if self._hottop_reception == "candidate/v1" and (
+                self._solenoid_open
+                or (
+                    self._drop_settlement is not None
+                    and self._drop_settlement.result in {"pending", "entering", "unknown"}
+                )
+            ):
+                raise HottopDropRefused("candidate Drop retains an unresolved command settlement.")
             self._heat_level_percent = 0
             # Keep the drum motor RUNNING through the drop so the rotating drum
             # tumbles beans out the open chute. A stopped drum traps ~half the
@@ -2130,6 +2232,15 @@ class HottopRoasterDriver:
             self._cooling_motor_on = True
             self._main_fan_level_percent = 100
             self._command_state_revision += 1
+            if self._hottop_reception == "candidate/v1":
+                self._drop_transition_count += 1
+                self._drop_settlement = HottopCommandSettlement(
+                    transition="drop",
+                    transition_seq=self._drop_transition_count,
+                    transition_revision=self._command_state_revision,
+                    transition_epoch=self._reception_epoch,
+                    result="pending",
+                )
         return self.read_state()
 
     def start_cooling(self) -> RoasterState:
@@ -2152,6 +2263,7 @@ class HottopRoasterDriver:
             self._drum_motor_on = False
             self._main_fan_level_percent = 0
             self._command_state_revision += 1
+            self._close_unattempted_drop_settlement()
         return self.read_state()
 
     def emergency_stop(self, *, reason: str) -> EmergencyStopResult:
@@ -2164,6 +2276,33 @@ class HottopRoasterDriver:
             self._cooling_motor_on = True
             self._main_fan_level_percent = 100
             self._command_state_revision += 1
+            if self._hottop_reception == "candidate/v1":
+                self._emergency_count += 1
+                settlement = HottopCommandSettlement(
+                    transition="emergency",
+                    transition_seq=self._emergency_count,
+                    transition_revision=self._command_state_revision,
+                    transition_epoch=self._reception_epoch,
+                    result="pending",
+                )
+                self._emergency_settlement = settlement
+                self._emergency_settlements.append(settlement)
+                self._emergency_transition_frames.append(
+                    (
+                        settlement.transition_seq,
+                        settlement.transition_epoch,
+                        settlement.transition_revision,
+                        self._current_command_frame_locked(),
+                    )
+                )
+                if len(self._emergency_settlements) > 64:
+                    retired = self._emergency_settlements.pop(0)
+                    self._emergency_transition_frames = [
+                        frame
+                        for frame in self._emergency_transition_frames
+                        if frame[0] != retired.transition_seq
+                    ]
+                self._close_unattempted_drop_settlement()
             heat_level_percent = self._heat_level_percent
             fan_level_percent = self._main_fan_level_percent
             cooling_on = self._cooling_motor_on
@@ -2199,6 +2338,9 @@ class HottopRoasterDriver:
 
     def _send_command_frame(self) -> None:
         """Send one command-frame tick if packet construction is available."""
+        if self._hottop_reception == "candidate/v1":
+            self._send_command_frame_candidate()
+            return
         try:
             with self._state_lock:
                 self._command_loop_iterations += 1
@@ -2231,6 +2373,172 @@ class HottopRoasterDriver:
             with self._state_lock:
                 self._command_loop_error_count += 1
                 self._last_command_write_size = 0
+
+    def _send_command_frame_candidate(self) -> None:
+        """Send one candidate frame after atomically recording its host entry evidence."""
+        try:
+            with self._state_lock:
+                self._command_loop_iterations += 1
+                self._command_frame_poll_count += 1
+            with self._command_write_lock:
+                with self._state_lock:
+                    serial_transport = self._serial
+                    if (
+                        self._stop_event.is_set()
+                        or self._disconnect_requested.is_set()
+                        or not self._connected
+                        or serial_transport is None
+                        or not serial_transport.is_open
+                    ):
+                        return
+                    revision = self._command_state_revision
+                    frame = self._current_command_frame_locked()
+                    self._command_send_attempts += 1
+                    self._attempt_sequence += 1
+                    role = self._candidate_attempt_role(frame, revision)
+                    attempt = HottopWriteAttempt(
+                        epoch=self._reception_epoch,
+                        handle_identity=self._reception_handle_token,
+                        attempt_seq=self._attempt_sequence,
+                        revision=revision,
+                        frame=frame,
+                        solenoid=frame[_HOTTOP_COMMAND_SOLENOID_INDEX],
+                        result="entering",
+                        role=role,
+                    )
+                    self._append_write_attempt(attempt)
+                    self._settle_entering_attempt(attempt)
+                try:
+                    receipt = serial_transport.write(frame)
+                except BaseException:
+                    with self._state_lock:
+                        self._last_command_write_size = 0
+                        self._settle_attempt(attempt, "unknown")
+                    raise
+                with self._state_lock:
+                    self._last_command_write_size = (
+                        receipt if type(receipt) is int and receipt >= 0 else 0
+                    )
+                    result: HottopWriteResult = (
+                        "accepted_by_host"
+                        if type(receipt) is int and receipt == len(frame) == HOTTOP_PACKET_LENGTH
+                        else "unknown"
+                    )
+                    if result == "accepted_by_host":
+                        self._command_write_count += 1
+                    else:
+                        self._command_loop_error_count += 1
+                    self._settle_attempt(attempt, result)
+            self._read_status_packet_candidate(serial_transport)
+        except Exception:
+            with self._state_lock:
+                self._command_loop_error_count += 1
+
+    def _candidate_attempt_role(self, frame: bytes, revision: int) -> HottopAttemptRole:
+        """Classify a candidate attempt without treating repeated frames as evidence."""
+        if frame[_HOTTOP_COMMAND_SOLENOID_INDEX] == 1:
+            if self._drop_settlement is not None and self._drop_settlement.result == "pending":
+                return "drop"
+            return "repeat"
+        if self._pending_emergency_settlement(frame, revision) is not None:
+            return "emergency"
+        return "ordinary"
+
+    def _pending_emergency_settlement(
+        self, frame: bytes, revision: int
+    ) -> HottopCommandSettlement | None:
+        """Return only the exact pending emergency transition for this frame."""
+        for settlement in reversed(self._emergency_settlements):
+            expected_frame = next(
+                (
+                    stored_frame
+                    for sequence, epoch, stored_revision, stored_frame in (
+                        self._emergency_transition_frames
+                    )
+                    if (
+                        sequence == settlement.transition_seq
+                        and epoch == settlement.transition_epoch
+                        and stored_revision == settlement.transition_revision
+                    )
+                ),
+                None,
+            )
+            if (
+                settlement.result == "pending"
+                and settlement.transition_epoch == self._reception_epoch
+                and settlement.transition_revision == revision
+                and expected_frame == frame
+            ):
+                return settlement
+        return None
+
+    def _append_write_attempt(self, attempt: HottopWriteAttempt) -> None:
+        """Retain a bounded current-operation attempt history."""
+        self._attempt_history.append(attempt)
+        if len(self._attempt_history) > 64:
+            del self._attempt_history[0]
+
+    def _settle_entering_attempt(self, attempt: HottopWriteAttempt) -> None:
+        """Fix the first eligible transition attempt at host write entry."""
+        if attempt.role == "drop" and self._drop_settlement is not None:
+            self._drop_settlement = replace(
+                self._drop_settlement,
+                result="entering",
+                attempt_epoch=attempt.epoch,
+                attempt_handle_identity=attempt.handle_identity,
+                attempt_seq=attempt.attempt_seq,
+                attempt_revision=attempt.revision,
+            )
+        elif attempt.role == "emergency":
+            settlement = self._pending_emergency_settlement(attempt.frame, attempt.revision)
+            if settlement is not None:
+                self._replace_emergency_settlement(
+                    settlement.transition_seq,
+                    replace(
+                        settlement,
+                        result="entering",
+                        attempt_epoch=attempt.epoch,
+                        attempt_handle_identity=attempt.handle_identity,
+                        attempt_seq=attempt.attempt_seq,
+                        attempt_revision=attempt.revision,
+                    ),
+                )
+
+    def _settle_attempt(self, attempt: HottopWriteAttempt, result: HottopWriteResult) -> None:
+        """Finalize only the attempt that fixed a settlement's entry identity."""
+        for attribute in ("_drop_settlement",):
+            settlement = cast(HottopCommandSettlement | None, getattr(self, attribute))
+            if settlement is None or settlement.attempt_seq != attempt.attempt_seq:
+                continue
+            setattr(self, attribute, replace(settlement, result=result))
+        for settlement in self._emergency_settlements:
+            if settlement.attempt_seq == attempt.attempt_seq:
+                self._replace_emergency_settlement(
+                    settlement.transition_seq, replace(settlement, result=result)
+                )
+                break
+        for index, recorded in enumerate(self._attempt_history):
+            if recorded.attempt_seq == attempt.attempt_seq:
+                self._attempt_history[index] = replace(recorded, result=result)
+                break
+
+    def _replace_emergency_settlement(
+        self, transition_seq: int, replacement: HottopCommandSettlement
+    ) -> None:
+        """Replace one bounded emergency settlement without relabelling another."""
+        for index, settlement in enumerate(self._emergency_settlements):
+            if settlement.transition_seq == transition_seq:
+                self._emergency_settlements[index] = replacement
+                if self._emergency_settlement is settlement:
+                    self._emergency_settlement = replacement
+                return
+
+    def _close_unattempted_drop_settlement(self) -> None:
+        """Finalize a pending Drop only while closing its commanded solenoid state."""
+        if self._hottop_reception != "candidate/v1" or self._drop_settlement is None:
+            return
+        if self._drop_settlement.result == "pending":
+            self._drop_settlement = replace(self._drop_settlement, result="not_attempted")
 
     def _read_status_packet(self, serial_transport: SerialTransport) -> None:
         """Read available Hottop status bytes and update normalized temperatures."""
@@ -2268,17 +2576,155 @@ class HottopRoasterDriver:
             with self._state_lock:
                 self._status_read_error_count += 1
 
+    def _begin_reception_epoch(self, handle: SerialTransport) -> None:
+        """Start a receive epoch while the new handle is atomically published."""
+        self._reception_epoch += 1
+        self._reception_handle_token = self._reception_epoch
+        self._status_buffer = b""
+        self._reception_floor = None
+        self._reception_record = None
+        _ = handle
+
+    def _invalidate_candidate_receipt(self, serial_transport: SerialTransport, epoch: int) -> None:
+        """Discard receipt continuity only if this remains the active receive owner."""
+        with self._state_lock:
+            if self._serial is serial_transport and self._reception_epoch == epoch:
+                self._status_buffer = b""
+                self._reception_floor = None
+                self._reception_record = None
+
+    def _read_status_packet_candidate(self, serial_transport: SerialTransport) -> None:
+        """Read one bounded simulated candidate chunk with host-receipt provenance."""
+        with self._state_lock:
+            epoch = self._reception_epoch
+            if (
+                self._serial is not serial_transport
+                or self._disconnect_requested.is_set()
+                or not self._connected
+            ):
+                self._reception_discard_count += 1
+                return
+            prior_tail = self._status_buffer
+            temperature_unit = self._temperature_unit
+
+        started_at = self._reception_clock()
+        queued_before = self._candidate_queue_probe(serial_transport)
+        if queued_before == 0:
+            self._publish_drained_floor(serial_transport, epoch, started_at)
+            post_probe_time = self._reception_clock()
+            queued_after_empty_poll = self._candidate_queue_probe(serial_transport)
+            if queued_after_empty_poll == 0:
+                self._publish_drained_floor(serial_transport, epoch, post_probe_time)
+            elif queued_after_empty_poll is None:
+                self._invalidate_candidate_receipt(serial_transport, epoch)
+            return
+        if queued_before is None:
+            self._invalidate_candidate_receipt(serial_transport, epoch)
+            return
+        read = getattr(serial_transport, "read", None)
+        if not callable(read):
+            self._invalidate_candidate_receipt(serial_transport, epoch)
+            return
+        requested = min(queued_before, _HOTTOP_STATUS_READ_MAX_BYTES)
+        try:
+            chunk = read(requested)
+        except Exception:
+            with self._state_lock:
+                self._status_read_error_count += 1
+            self._invalidate_candidate_receipt(serial_transport, epoch)
+            return
+        returned_at = self._reception_clock()
+        post_probe_time = self._reception_clock()
+        queued_after = self._candidate_queue_probe(serial_transport)
+        if not isinstance(chunk, bytes) or not chunk:
+            self._invalidate_candidate_receipt(serial_transport, epoch)
+            return
+        scan = scan_hottop_status_read(
+            chunk,
+            prior_tail=prior_tail,
+            queued_before_read=queued_before,
+            requested_byte_count=requested,
+            temperature_unit=temperature_unit,
+        )
+        with self._state_lock:
+            if (
+                self._serial is not serial_transport
+                or self._reception_epoch != epoch
+                or self._disconnect_requested.is_set()
+                or not self._connected
+            ):
+                self._reception_discard_count += 1
+                return
+            self._reception_sequence += 1
+            receipt = build_hottop_received_packet(
+                epoch=epoch,
+                handle_identity=self._reception_handle_token,
+                sequence=self._reception_sequence,
+                read_started_at=started_at,
+                read_returned_at=returned_at,
+                configured_temperature_unit=temperature_unit,
+                queued_before_read=queued_before,
+                queued_after_read=queued_after,
+                scan=scan,
+                drained_floor=self._reception_floor,
+            )
+            self._status_buffer = scan.tail_bytes
+            self._reception_record = receipt
+            for status in scan.packets:
+                self._status_packet_count += 1
+                self._latest_raw_bean_temperature = status.raw_bean_temperature
+                self._latest_raw_env_temperature = status.raw_env_temperature
+                if status.bean_temp_c is None or status.env_temp_c is None:
+                    self._ignored_temperature_packet_count += 1
+                else:
+                    self._latest_bean_temp_c = status.bean_temp_c
+                    self._latest_env_temp_c = status.env_temp_c
+                self._latest_resolved_temperature_unit = status.resolved_temperature_unit
+        if queued_after == 0:
+            self._publish_drained_floor(serial_transport, epoch, post_probe_time)
+
+    def _candidate_queue_probe(self, serial_transport: SerialTransport) -> int | None:
+        """Return only an exact non-negative queue observation from a fake transport."""
+        try:
+            value: object = getattr(serial_transport, "in_waiting", None)
+            return _queue_observation_or_none(value)
+        except Exception:
+            return None
+
+    def _publish_drained_floor(
+        self, serial_transport: SerialTransport, epoch: int, observed_at: float
+    ) -> None:
+        """Publish a floor only for the still-current empty parser and queue state."""
+        with self._state_lock:
+            if (
+                self._serial is serial_transport
+                and self._reception_epoch == epoch
+                and not self._status_buffer
+                and not self._disconnect_requested.is_set()
+                and self._connected
+            ):
+                self._reception_floor = HottopDrainedFloor(
+                    epoch=epoch,
+                    handle_identity=self._reception_handle_token,
+                    sequence=self._reception_sequence,
+                    observed_at=observed_at,
+                )
+
     def _current_command_frame(self) -> bytes:
         """Return the current Hottop command-state packet."""
         with self._state_lock:
-            return build_hottop_command_packet(
-                heat_level_percent=self._heat_level_percent,
-                fan_level_percent=self._roast_fan_level_percent,
-                main_fan_level_percent=self._main_fan_level_percent,
-                solenoid_open=self._solenoid_open,
-                drum_motor_on=self._drum_motor_on,
-                cooling_motor_on=self._cooling_motor_on,
-            )
+            return self._current_command_frame_locked()
+
+    def _current_command_frame_locked(self) -> bytes:
+        """Build the current command packet while the state lock is held."""
+        return build_hottop_command_packet(
+            heat_level_percent=self._heat_level_percent,
+            fan_level_percent=self._roast_fan_level_percent,
+            main_fan_level_percent=self._main_fan_level_percent,
+            solenoid_open=self._solenoid_open,
+            drum_motor_on=self._drum_motor_on,
+            cooling_motor_on=self._cooling_motor_on,
+        )
 
 
 def _percent_to_hottop_fan_scale(value: int) -> int:
@@ -2485,6 +2931,8 @@ def create_roaster_driver(
     baudrate: int = 115_200,
     temperature_unit: HottopTemperatureUnit = "celsius",
     command_interval_seconds: float = 0.3,
+    hottop_reception: HottopReceptionMode = "off",
+    serial_factory: SerialTransportFactory | None = None,
 ) -> RoasterDriver:
     """Create the configured roaster driver.
 
@@ -2494,6 +2942,8 @@ def create_roaster_driver(
         baudrate: Configured roaster baudrate.
         temperature_unit: Configured roaster temperature unit.
         command_interval_seconds: Configured command interval.
+        hottop_reception: Opt-in Hottop receipt candidate mode.
+        serial_factory: Trusted injected simulated serial transport factory.
 
     Returns:
         Driver adapter for the configured driver.
@@ -2502,6 +2952,8 @@ def create_roaster_driver(
         ValueError: If the driver is not implemented in the current runtime.
     """
     if driver_name == "mock":
+        if hottop_reception == "candidate/v1":
+            raise ValueError("candidate/v1 is not supported by the mock driver.")
         return MockRoasterDriver()
     if driver_name == HOTTOP_DRIVER_NAME:
         return HottopRoasterDriver(
@@ -2509,6 +2961,8 @@ def create_roaster_driver(
             baudrate=baudrate,
             temperature_unit=temperature_unit,
             command_interval_seconds=command_interval_seconds,
+            hottop_reception=hottop_reception,
+            serial_factory=serial_factory,
         )
     raise ValueError(
         f"Roaster driver {driver_name!r} is not implemented in this bootstrap runtime."

@@ -34,7 +34,13 @@ from coffee_roaster_mcp.cold_temperature import (
     COLD_TEMPERATURE_NOT_ELIGIBLE,
     ColdTemperatureProjection,
 )
-from coffee_roaster_mcp.config import AppConfig, ConfigError, FirstCrackConfig, RecordingConfig
+from coffee_roaster_mcp.config import (
+    AppConfig,
+    ConfigError,
+    FirstCrackConfig,
+    RecordingConfig,
+    RoasterConfig,
+)
 from coffee_roaster_mcp.detector import (
     FirstCrackDetectorOutput,
     build_first_crack_detector_adapter,
@@ -45,11 +51,15 @@ from coffee_roaster_mcp.drivers import (
     EmergencyStopResult,
     ExactDropArbitration,
     FixedZeroCommandedState,
+    HottopReceptionMode,
     HottopRoasterDriver,
     HottopStartPhase,
+    HottopTemperatureUnit,
     MockRoasterDriver,
     RoasterCapabilities,
+    RoasterDriver,
     RoasterState,
+    SerialTransportFactory,
     build_hottop_command_packet,
 )
 from coffee_roaster_mcp.first_crack_runtime import (
@@ -11390,6 +11400,54 @@ def test_manual_authority_composition_refuses_before_driver_creation(
     with pytest.raises(ConfigError, match="requires mock driver"):
         build_server_context(config_path=tmp_path / "not-read.yaml")
     assert not calls
+
+
+def test_build_server_context_forwards_candidate_and_refuses_physical_composition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The configured candidate reaches the factory and cannot open physical transport."""
+    config = AppConfig(
+        roaster=RoasterConfig(
+            driver=HOTTOP_DRIVER_NAME,
+            port="/dev/not-opened",
+            temperature_unit="celsius",
+            temperature_unit_explicit=True,
+            hottop_reception="candidate/v1",
+        )
+    )
+    received: list[HottopReceptionMode] = []
+    original_factory = mcp_server.create_roaster_driver
+
+    def load(**_kwargs: object) -> AppConfig:
+        return config
+
+    def factory(
+        driver_name: str,
+        *,
+        port: str | None = None,
+        baudrate: int = 115_200,
+        temperature_unit: HottopTemperatureUnit = "celsius",
+        command_interval_seconds: float = 0.3,
+        hottop_reception: HottopReceptionMode = "off",
+        serial_factory: SerialTransportFactory | None = None,
+    ) -> RoasterDriver:
+        received.append(hottop_reception)
+        return original_factory(
+            driver_name,
+            port=port,
+            baudrate=baudrate,
+            temperature_unit=temperature_unit,
+            command_interval_seconds=command_interval_seconds,
+            hottop_reception=hottop_reception,
+            serial_factory=serial_factory,
+        )
+
+    monkeypatch.setattr(mcp_server, "load_config", load)
+    monkeypatch.setattr(mcp_server, "create_roaster_driver", factory)
+
+    with pytest.raises(ConfigError, match="injected simulated transport"):
+        build_server_context(config_path=tmp_path / "not-read.yaml")
+    assert received == ["candidate/v1"]
 
 
 @pytest.mark.parametrize("version", [None, True, "1", 0, 2])

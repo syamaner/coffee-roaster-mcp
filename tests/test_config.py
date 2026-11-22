@@ -459,6 +459,30 @@ def test_temperature_unit_error_reports_context(tmp_path: Path) -> None:
         load_config(config_path, environ={})
 
 
+def test_hottop_reception_is_exact_and_requires_explicit_celsius_after_overrides(
+    tmp_path: Path,
+) -> None:
+    """Candidate config retains temperature-unit provenance across environment merging."""
+    config_path = tmp_path / "candidate.yaml"
+    config_path.write_text(
+        "roaster:\n  hottop_reception: candidate/v1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="explicitly configured"):
+        load_config(config_path, environ={})
+    config = load_config(config_path, environ={"COFFEE_ROASTER_TEMP_UNIT": "celsius"})
+
+    assert config.roaster.hottop_reception == "candidate/v1"
+    assert config.roaster.temperature_unit_explicit is True
+
+    config_path.write_text(
+        "roaster:\n  hottop_reception: ' candidate/v1 '\n  temperature_unit: celsius\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="exactly"):
+        load_config(config_path, environ={})
+
+
 def test_recording_defaults_are_disabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

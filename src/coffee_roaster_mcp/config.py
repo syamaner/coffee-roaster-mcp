@@ -13,6 +13,7 @@ DEFAULT_CONFIG_FILENAME = "coffee-roaster-mcp.yaml"
 
 TransportType = Literal["stdio"]
 TemperatureUnit = Literal["celsius", "fahrenheit", "auto"]
+HottopReceptionMode = Literal["off", "candidate/v1"]
 FirstCrackMode = Literal["disabled", "audio", "manual"]
 FirstCrackEventAuthority = Literal["automatic", "manual"]
 ModelPrecision = Literal["int8", "fp32"]
@@ -37,6 +38,8 @@ class RoasterConfig:
     port: str | None = None
     baudrate: int = 115_200
     temperature_unit: TemperatureUnit = "celsius"
+    temperature_unit_explicit: bool = False
+    hottop_reception: HottopReceptionMode = "off"
     command_interval_seconds: float = 0.3
 
 
@@ -236,6 +239,7 @@ def load_config(
     source_path = config_path if config_path_exists else None
     config = _config_from_mapping(raw_config, source_path=source_path)
     config = _apply_env_overrides(config, env)
+    _validate_hottop_reception_config(config)
     validate_first_crack_authority(config)
     return config
 
@@ -312,6 +316,11 @@ def _roaster_from_mapping(raw: Mapping[str, Any]) -> RoasterConfig:
         temperature_unit=_temperature_unit(
             _string(raw, "temperature_unit", "celsius", label="roaster.temperature_unit"),
             label="roaster.temperature_unit",
+        ),
+        temperature_unit_explicit="temperature_unit" in raw,
+        hottop_reception=_hottop_reception(
+            _string(raw, "hottop_reception", "off", label="roaster.hottop_reception"),
+            label="roaster.hottop_reception",
         ),
         command_interval_seconds=_float(
             raw,
@@ -521,6 +530,15 @@ def _apply_env_overrides(config: AppConfig, environ: Mapping[str, str]) -> AppCo
             temperature_unit=_temperature_unit(
                 environ["COFFEE_ROASTER_TEMP_UNIT"],
                 label="COFFEE_ROASTER_TEMP_UNIT",
+            ),
+            temperature_unit_explicit=True,
+        )
+    if "COFFEE_ROASTER_HOTTOP_RECEPTION" in environ:
+        roaster = replace(
+            roaster,
+            hottop_reception=_hottop_reception(
+                environ["COFFEE_ROASTER_HOTTOP_RECEPTION"],
+                label="COFFEE_ROASTER_HOTTOP_RECEPTION",
             ),
         )
 
@@ -985,6 +1003,25 @@ def _temperature_unit(value: str, label: str = "temperature_unit") -> Temperatur
     if normalized not in {"celsius", "fahrenheit", "auto"}:
         raise ConfigError(f"{label} must be one of: celsius, fahrenheit, auto.")
     return cast(TemperatureUnit, normalized)
+
+
+def _hottop_reception(value: str, label: str) -> HottopReceptionMode:
+    """Validate the deliberately exact Hottop reception candidate token."""
+    if value not in {"off", "candidate/v1"}:
+        raise ConfigError(f"{label} must be exactly 'off' or 'candidate/v1'.")
+    return cast(HottopReceptionMode, value)
+
+
+def _validate_hottop_reception_config(config: AppConfig) -> None:
+    """Refuse candidate composition without an explicitly supplied Celsius unit."""
+    roaster = config.roaster
+    if roaster.hottop_reception != "candidate/v1":
+        return
+    if not roaster.temperature_unit_explicit or roaster.temperature_unit != "celsius":
+        raise ConfigError(
+            "roaster.hottop_reception candidate/v1 requires an explicitly configured "
+            "roaster.temperature_unit of celsius."
+        )
 
 
 def _first_crack_event_authority(value: str) -> FirstCrackEventAuthority:
