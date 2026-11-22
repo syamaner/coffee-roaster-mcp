@@ -1,6 +1,8 @@
 """Roaster driver contract, capability, and safety behavior coverage."""
 
 from collections.abc import Callable
+from dataclasses import replace
+from enum import IntEnum
 from threading import Event, Lock, Thread, get_ident
 from time import monotonic, sleep
 from typing import Any, Never, cast
@@ -484,6 +486,242 @@ def test_hottop_received_packet_classifier_rejects_missing_or_invalid_newest_pai
     assert no_receipt.reasons == ("no_receipt",)
     assert receipt.latest_pair_c is None
     assert invalid_newest.reasons == ("latest_pair_rejected",)
+
+
+def test_hottop_status_scan_binds_decoder_queue_sizes_and_tail_bytes() -> None:
+    """Scanner output retains only the observations needed to bind a receipt."""
+    packet = _build_hottop_status_packet(raw_env_temperature=200, raw_bean_temperature=195)
+    scan = scan_hottop_status_read(
+        packet + b"\xa5\x96",
+        queued_before_read=38,
+        requested_byte_count=40,
+        temperature_unit="celsius",
+    )
+
+    assert scan.decoder_temperature_unit == "celsius"
+    assert scan.queued_before_read == 38
+    assert scan.requested_byte_count == 40
+    assert scan.returned_byte_count == 38
+    assert scan.tail_length == 2
+    assert scan.tail_bytes == b"\xa5\x96"
+
+
+@pytest.mark.parametrize(
+    ("scan_unit", "builder_queue", "replacement"),
+    [
+        ("auto", 36, None),
+        ("celsius", 35, None),
+        ("celsius", 36, (196.0, 201.0)),
+    ],
+)
+def test_hottop_received_packet_rejects_conflicting_scanner_bindings(
+    scan_unit: HottopTemperatureUnit,
+    builder_queue: int,
+    replacement: tuple[float, float] | None,
+) -> None:
+    """A receipt cannot relabel auto decoding, queue evidence, or newest values."""
+    scan = scan_hottop_status_read(
+        _build_hottop_status_packet(raw_env_temperature=200, raw_bean_temperature=195),
+        queued_before_read=36,
+        requested_byte_count=144,
+        temperature_unit=scan_unit,
+    )
+    if scan_unit == "auto" or builder_queue != 36:
+        with pytest.raises(ValueError):
+            _build_received_packet(
+                scan=scan,
+                queued_before_read=builder_queue,
+                queued_after_read=0,
+            )
+        return
+
+    receipt = _build_received_packet(
+        scan=scan,
+        queued_before_read=builder_queue,
+        queued_after_read=0,
+    )
+    with pytest.raises(ValueError, match="latest_pair_c"):
+        replace(receipt, latest_pair_c=replacement)
+
+
+class _QueueIntEnum(IntEnum):
+    """Non-exact queue-like integer used to prove strict queue evidence."""
+
+    ONE = 1
+
+
+@pytest.mark.parametrize("queue_observation", [True, _QueueIntEnum.ONE, -1, "1"])
+def test_hottop_received_packet_classifier_refuses_non_exact_queue_observations(
+    queue_observation: object,
+) -> None:
+    """Only built-in ints establish a queue observation."""
+    scan = scan_hottop_status_read(
+        _build_hottop_status_packet(raw_env_temperature=200, raw_bean_temperature=195),
+        queued_before_read=queue_observation,
+        requested_byte_count=144,
+    )
+    receipt = _build_received_packet(
+        scan=scan,
+        queued_before_read=queue_observation,
+        queued_after_read=0,
+    )
+
+    assert scan.queued_before_read is None
+    assert _classify_received_packet(receipt).primary_reason == "queue_unreadable"
+
+
+@pytest.mark.parametrize(
+    ("queued_before_read", "requested_byte_count", "read_bytes"),
+    [
+        (36, 35, _build_hottop_status_packet(raw_env_temperature=200, raw_bean_temperature=195)),
+        (35, 144, _build_hottop_status_packet(raw_env_temperature=200, raw_bean_temperature=195)),
+    ],
+)
+def test_hottop_received_packet_classifier_refuses_read_size_contradictions(
+    queued_before_read: int,
+    requested_byte_count: int,
+    read_bytes: bytes,
+) -> None:
+    """A returned byte count cannot exceed either owned read bound."""
+    scan = scan_hottop_status_read(
+        read_bytes,
+        queued_before_read=queued_before_read,
+        requested_byte_count=requested_byte_count,
+    )
+    receipt = _build_received_packet(
+        scan=scan,
+        queued_before_read=queued_before_read,
+        queued_after_read=0,
+    )
+
+    assert scan.read_size_contradiction is True
+    assert "read_size_contradiction" in _classify_received_packet(receipt).reasons
+
+
+def test_hottop_received_packet_classifier_refuses_invalid_intervening_history() -> None:
+    """A later plausible pair cannot erase an implausible packet in the read."""
+    scan = scan_hottop_status_read(
+        b"".join(
+            (
+                _build_hottop_status_packet(raw_env_temperature=200, raw_bean_temperature=195),
+                _build_hottop_status_packet(raw_env_temperature=0, raw_bean_temperature=0),
+                _build_hottop_status_packet(raw_env_temperature=202, raw_bean_temperature=197),
+            )
+        ),
+        queued_before_read=108,
+        requested_byte_count=144,
+    )
+    receipt = _build_received_packet(scan=scan, queued_before_read=108, queued_after_read=0)
+
+    result = _classify_received_packet(receipt)
+
+    assert receipt.latest_pair_c == (197.0, 202.0)
+    assert result.eligible is False
+    assert result.reasons == ("invalid_packet_history",)
+
+
+def test_hottop_received_packet_classifier_preserves_no_receipt_primary_reason() -> None:
+    """An unset bound supplements, but does not replace, absent receipt evidence."""
+    result = _classify_received_packet(None, receipt_age_bound_seconds=None)
+
+    assert result.reasons == ("no_receipt", "receipt_age_bound_unset")
+
+
+@pytest.mark.parametrize(
+    ("receipt_change", "now", "receipt_age_bound_seconds", "expected_reason"),
+    [
+        ({"epoch": 3}, 13.0, 3.0, "epoch_or_handle_changed"),
+        ({"handle_identity": 8}, 13.0, 3.0, "epoch_or_handle_changed"),
+        ({"sequence": 1}, 13.0, 3.0, "superseded"),
+        ({"drained_floor": None}, 13.0, 3.0, "no_drained_floor"),
+        (
+            {
+                "drained_floor": HottopDrainedFloor(
+                    epoch=3,
+                    handle_identity=9,
+                    sequence=1,
+                    observed_at=10.0,
+                )
+            },
+            13.0,
+            3.0,
+            "no_drained_floor",
+        ),
+        ({}, 11.5, 3.0, "clock_regression"),
+        ({}, 13.0, None, "receipt_age_bound_unset"),
+        ({}, 13.1, 3.0, "receipt_age_exceeds_bound"),
+    ],
+)
+def test_hottop_received_packet_classifier_primary_refusals(
+    receipt_change: dict[str, object],
+    now: float,
+    receipt_age_bound_seconds: float | None,
+    expected_reason: str,
+) -> None:
+    """Epoch, sequence, floor, and host-clock evidence have stable refusal order."""
+    scan = scan_hottop_status_read(
+        _build_hottop_status_packet(raw_env_temperature=200, raw_bean_temperature=195),
+        queued_before_read=36,
+        requested_byte_count=144,
+    )
+    receipt = replace(
+        _build_received_packet(scan=scan, queued_before_read=36, queued_after_read=0),
+        **receipt_change,
+    )
+
+    result = _classify_received_packet(
+        receipt,
+        now=now,
+        receipt_age_bound_seconds=receipt_age_bound_seconds,
+    )
+
+    assert result.primary_reason == expected_reason
+
+
+def test_hottop_received_packet_classifier_accepts_exact_age_bound() -> None:
+    """The host receipt age bound is inclusive at its exact endpoint."""
+    scan = scan_hottop_status_read(
+        _build_hottop_status_packet(raw_env_temperature=200, raw_bean_temperature=195),
+        queued_before_read=36,
+        requested_byte_count=144,
+    )
+
+    assert _classify_received_packet(
+        _build_received_packet(scan=scan, queued_before_read=36, queued_after_read=0)
+    ).eligible
+
+
+@pytest.mark.parametrize(
+    ("read_bytes", "expected_reason"),
+    [
+        (
+            b"\x00"
+            + _build_hottop_status_packet(raw_env_temperature=200, raw_bean_temperature=195),
+            "misaligned_or_skipped",
+        ),
+        (
+            _build_hottop_status_packet(raw_env_temperature=200, raw_bean_temperature=195)[:12],
+            "parser_remainder",
+        ),
+    ],
+)
+def test_hottop_received_packet_classifier_refuses_resync_and_partial_history(
+    read_bytes: bytes,
+    expected_reason: str,
+) -> None:
+    """Noise and incomplete bytes never become a contiguous receipt selection."""
+    scan = scan_hottop_status_read(
+        read_bytes,
+        queued_before_read=len(read_bytes),
+        requested_byte_count=144,
+    )
+    receipt = _build_received_packet(
+        scan=scan,
+        queued_before_read=len(read_bytes),
+        queued_after_read=0,
+    )
+
+    assert _classify_received_packet(receipt).primary_reason == expected_reason
 
 
 @pytest.mark.parametrize("invalid_bound", [0, -1, True, float("inf"), float("nan")])
