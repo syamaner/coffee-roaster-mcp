@@ -34,6 +34,7 @@ from coffee_roaster_mcp.config import (
     AudioConfig,
     ConfigError,
     FirstCrackConfig,
+    trusted_manual_driver_admission,
     validate_first_crack_authority,
 )
 from coffee_roaster_mcp.detector import (
@@ -282,6 +283,7 @@ class FirstCrackSessionRuntime:
         self._recording_plan: RecordingArtifactPlan | None = None
         self._capture_evidence = capture_evidence
         self._capture_recorder_generation = 0
+        self._trusted_manual_driver_admitted = False
         if config.first_crack.event_authority == "manual":
             try:
                 validate_first_crack_authority(config)
@@ -343,6 +345,16 @@ class FirstCrackSessionRuntime:
             if self._active_session_id is not None:
                 raise RuntimeError("Capture evidence publisher cannot change during a session.")
             self._capture_evidence = publisher
+
+    def admit_trusted_manual_driver(self, *, admission: object) -> None:
+        """Admit the already-validated trusted simulation's manual authority."""
+        with self._lock:
+            if self._active_session_id is not None:
+                raise RuntimeError("Manual authority cannot change during a session.")
+            validate_first_crack_authority(self._config, manual_driver_admission=admission)
+            if admission is not trusted_manual_driver_admission():
+                raise ConfigError("Manual first-crack authority is not admitted.")
+            self._trusted_manual_driver_admitted = True
 
     def _build_default_audio_pipeline(self, config: AudioConfig) -> AudioCapturePipeline:
         """Build the real capture pipeline, teeing the pending session recorder."""
@@ -549,7 +561,14 @@ class FirstCrackSessionRuntime:
                     durability="pending",
                     worker_reaped=False,
                 )
-                validate_first_crack_authority(self._config)
+                validate_first_crack_authority(
+                    self._config,
+                    manual_driver_admission=(
+                        trusted_manual_driver_admission()
+                        if self._trusted_manual_driver_admitted
+                        else None
+                    ),
+                )
                 ClockMapping(
                     session_origin=session.monotonic_start, session_utc=session.created_at_utc
                 )

@@ -11,6 +11,19 @@ from typing import Any, Literal, cast
 
 DEFAULT_CONFIG_FILENAME = "coffee-roaster-mcp.yaml"
 
+
+class _TrustedManualDriverAdmission:
+    """Opaque proof emitted only by the trusted simulation composition."""
+
+
+_TRUSTED_MANUAL_DRIVER_ADMISSION = _TrustedManualDriverAdmission()
+
+
+def trusted_manual_driver_admission() -> object:
+    """Return the internal proof required for simulated manual-driver admission."""
+    return _TRUSTED_MANUAL_DRIVER_ADMISSION
+
+
 TransportType = Literal["stdio"]
 TemperatureUnit = Literal["celsius", "fahrenheit", "auto"]
 HottopReceptionMode = Literal["off", "candidate/v1"]
@@ -219,8 +232,15 @@ class ConfigError(ValueError):
 def load_config(
     path: str | Path | None = None,
     environ: Mapping[str, str] | None = None,
+    *,
+    manual_driver_admission: object | None = None,
 ) -> AppConfig:
-    """Load RoastPilot configuration from defaults, YAML, and environment overrides."""
+    """Load RoastPilot configuration from defaults, YAML, and environment overrides.
+
+    ``manual_driver_admission`` is an opaque proof reserved for the closed
+    trusted in-process simulation composition; no configuration or environment
+    value controls it.
+    """
     env = os.environ if environ is None else environ
     env_config_path = (
         _none_if_empty(env["COFFEE_ROASTER_MCP_CONFIG"])
@@ -240,7 +260,7 @@ def load_config(
     config = _config_from_mapping(raw_config, source_path=source_path)
     config = _apply_env_overrides(config, env)
     _validate_hottop_reception_config(config)
-    validate_first_crack_authority(config)
+    validate_first_crack_authority(config, manual_driver_admission=manual_driver_admission)
     return config
 
 
@@ -1031,8 +1051,16 @@ def _first_crack_event_authority(value: str) -> FirstCrackEventAuthority:
     return cast(FirstCrackEventAuthority, normalized)
 
 
-def validate_first_crack_authority(config: AppConfig) -> None:
-    """Validate the closed mock-only human/shadow protocol before side effects."""
+def validate_first_crack_authority(
+    config: AppConfig, *, manual_driver_admission: object | None = None
+) -> None:
+    """Validate human/shadow authority before side effects.
+
+    ``manual_driver_admission`` is an internal opaque composition proof. The
+    normal configuration path has no proof, retaining the mock-only policy;
+    the trusted server composition supplies it only after it has bound its
+    closed in-memory Hottop adapters.
+    """
     fc = config.first_crack
     if fc.event_authority not in {"automatic", "manual"}:
         raise ConfigError("first_crack.event_authority must be one of: automatic, manual.")
@@ -1042,7 +1070,10 @@ def validate_first_crack_authority(config: AppConfig) -> None:
             "first_crack.observation_closing_timeout_seconds must be finite and >= 0."
         )
     if fc.event_authority == "manual" and not (
-        config.roaster.driver == "mock"
+        (
+            config.roaster.driver == "mock"
+            or manual_driver_admission is _TRUSTED_MANUAL_DRIVER_ADMISSION
+        )
         and fc.mode == "audio"
         and fc.allow_manual_override is True
         and config.recording.enabled is True
